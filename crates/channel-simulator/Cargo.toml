@@ -1,0 +1,19 @@
+[package]
+name = "channel-simulator"
+version = "0.1.0"
+edition = "2021"
+description = "Network simulator for testing Stellar payment channels"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+rand = { workspace = true }
+parking_lot = { workspace = true }
+channel-router = { path = "../channel-router" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread"] }

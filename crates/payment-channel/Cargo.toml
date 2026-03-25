@@ -1,0 +1,18 @@
+[package]
+name = "payment-channel"
+version = "0.1.0"
+edition = "2021"
+description = "Payment channel management library for Stellar"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread"] }
