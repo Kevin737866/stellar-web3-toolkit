@@ -1,0 +1,20 @@
+[package]
+name = "watchtower"
+version = "0.1.0"
+edition = "2021"
+description = "Watchtower service for monitoring Stellar payment channels"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+parking_lot = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+once_cell = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread"] }

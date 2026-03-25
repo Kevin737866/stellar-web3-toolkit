@@ -1,0 +1,20 @@
+[package]
+name = "channel-router"
+version = "0.1.0"
+edition = "2021"
+description = "Multi-hop payment routing for Stellar payment channels"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }
+priority-queue = { workspace = true }
+fxhash = { workspace = true }
+parking_lot = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread"] }

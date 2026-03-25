@@ -1,0 +1,5 @@
+error: duplicate key
+  --> Cargo.toml:42:12
+   |
+42 | [workspace.dependencies]
+   |            ^^^^^^^^^^^^
