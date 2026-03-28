@@ -1,0 +1,69 @@
+[package]
+name = "stellar-did"
+version = "0.1.0"
+edition = "2021"
+description = "W3C DID method implementation for Stellar blockchain"
+license = "MIT"
+repository = "https://github.com/Kevin737866/stellar-web3-toolkit"
+
+[dependencies]
+# Soroban and Stellar dependencies
+soroban-sdk = { workspace = true }
+stellar-xdr = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Cryptographic dependencies
+ed25519-dalek = "2.0"
+sha2 = { workspace = true }
+hmac = { workspace = true }
+rand = { workspace = true }
+
+# HTTP and API
+reqwest = { workspace = true }
+axum = { version = "0.7", optional = true }
+tokio = { workspace = true }
+tower = { version = "0.4", optional = true }
+tower-http = { version = "0.5", features = ["cors", "trace"], optional = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Utilities
+hex = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+base64 = "0.21"
+url = "2.4"
+
+# GraphQL support
+# async-graphql = { version = "7.0", optional = true }
+# async-graphql-axum = { version = "7.0", optional = true }
+
+# JSON-LD support
+# json-ld = { version = "0.16", optional = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tokio-test = "0.4"
+mockito = "1.2"
+
+[features]
+default = ["resolver-api"]
+resolver-api = ["axum", "tower", "tower-http"]
+# graphql = ["async-graphql", "async-graphql-axum"]
+# jsonld = ["json-ld"]
+
+[[bin]]
+name = "stellar-did-resolver"
+required-features = ["resolver-api"]
+
+[lib]
+name = "stellar_did"
+path = "src/lib.rs"
