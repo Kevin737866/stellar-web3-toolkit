@@ -96,24 +96,30 @@ See [GitHub Issues](https://github.com/Kevin737866/stellar-web3-toolkit/issues) 
 - [ ] Payment channel network
 - [ ] AMM liquidity pool implementation
 
+## Documentation & Resources
+
+- [Security Policy](SECURITY.md) - Vulnerability reporting and security SLA
+- [Contributor Onboarding Guide](docs/CONTRIBUTING_ONBOARDING.md) - Setup guide, workflow, and testing
+- [Protocol Terms Glossary](docs/GLOSSARY.md) - Reference for Stellar & Soroban terminology
+- [Architecture Decision Records (ADRs)](docs/adr/README.md) - Architectural design rationale
+- [Soroban Documentation](https://soroban.stellar.org/)
+- [Stellar Developers](https://developers.stellar.org/)
+- [Rust Documentation](https://doc.rust-lang.org/)
+
 ## Contributing
+
+Please review our [Contributor Onboarding Guide](docs/CONTRIBUTING_ONBOARDING.md) and [Security Policy](SECURITY.md) before contributing.
 
 1. Fork the repository
 2. Create a feature branch
 3. Make your changes
-4. Add tests
+4. Add tests (`cargo test --workspace`)
 5. Submit a pull request
 
 ## License
 
 MIT License - see [LICENSE](LICENSE) file for details.
 
-## Resources
-
-- [Soroban Documentation](https://soroban.stellar.org/)
-- [Stellar Developers](https://developers.stellar.org/)
-- [Rust Documentation](https://doc.rust-lang.org/)
-
 ## Support
 
-For questions and support, please open an issue on GitHub.
+For questions and support, please open an issue on GitHub or report security vulnerabilities according to our [Security Policy](SECURITY.md).
