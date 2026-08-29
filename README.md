@@ -108,6 +108,13 @@ See [GitHub Issues](https://github.com/Kevin737866/stellar-web3-toolkit/issues) 
 
 MIT License - see [LICENSE](LICENSE) file for details.
 
+## Documentation & Developer Guides
+
+- **[SDK Migration Guide](docs/SDK_MIGRATION_GUIDE.md)**: Upgrading across `stellar-sdk` and `soroban-sdk` versions, API renames, and type migration.
+- **[Contract Dev Getting Started Guide](docs/GETTING_STARTED_CONTRACT_DEV.md)**: Tutorial for writing, building, testing, and deploying Soroban contracts.
+- **[Soroban Storage Best Practices](docs/SOROBAN_STORAGE_BEST_PRACTICES.md)**: Instance vs Persistent vs Temporary storage selection, TTL bumping, and cost optimization.
+- **[Account Abstraction & Session Keys Guide](docs/ACCOUNT_ABSTRACTION_SESSION_KEYS.md)**: Session-based UX, policy enforcement, and multi-guardian social recovery.
+
 ## Resources
 
 - [Soroban Documentation](https://soroban.stellar.org/)

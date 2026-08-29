@@ -40,7 +40,7 @@ fn next_salt(env: &Env) -> BytesN<32> {
     env.storage().instance().set(&DataKey::Nonce, &(n.saturating_add(1)));
     let mut raw = [0u8; 32];
     raw[24..32].copy_from_slice(&n.to_be_bytes());
-    env.crypto().sha256(&Bytes::from_slice(env, &raw))
+    env.crypto().sha256(&Bytes::from_slice(env, &raw)).to_bytes()
 }
 
 #[contractimpl]
