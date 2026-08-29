@@ -21,6 +21,16 @@ serde_json = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Wallet: recovery phrases, keypair derivation, signing, and funding
+bip39 = "2"
+stellar-strkey = "0.0.18"
+ureq = "2"
+ed25519-dalek.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+hex.workspace = true
+rand.workspace = true
+
 [dev-dependencies]
 tempfile = "3.8"
 assert_cmd = "2.0"

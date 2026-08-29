@@ -21,6 +21,32 @@ pub enum ToolkitCommand {
         #[arg(long, default_value = ".")]
         workspace: PathBuf,
     },
+    /// Wallet commands: recovery phrases, keypair derivation, funding, signing
+    #[command(subcommand)]
+    Wallet(WalletCommand),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum WalletCommand {
+    /// Generate a 24-word recovery phrase and derive a Stellar keypair
+    Generate,
+    /// Recover a Stellar keypair from an existing recovery phrase
+    Recover {
+        /// The BIP-39 recovery phrase (quote it for shell safety)
+        phrase: String,
+    },
+    /// Fund a Stellar account on testnet using the Friendbot faucet
+    Fund {
+        /// The account id (G...) to fund
+        account: String,
+    },
+    /// Sign a message/transaction envelope (hex) with a secret key (S...)
+    Sign {
+        /// Stellar secret key (S...)
+        secret: String,
+        /// Message / transaction envelope as hex
+        message: String,
+    },
 }
 
 impl ToolkitCommand {
@@ -49,8 +75,42 @@ impl ToolkitCommand {
                 println!("amm_router:  {}", router.display());
                 Ok(())
             }
+            Self::Wallet(wallet) => run_wallet(wallet),
         }
     }
+}
+
+fn run_wallet(wallet: &WalletCommand) -> Result<()> {
+    use crate::wallet;
+    match wallet {
+        WalletCommand::Generate => {
+            let w = wallet::generate_wallet()?;
+            print_wallet(&w);
+            println!(
+                "\n⚠  Write down your recovery phrase and store it somewhere safe. "
+            );
+            println!("Anyone with it controls the account. It is shown only once.");
+            Ok(())
+        }
+        WalletCommand::Recover { phrase } => {
+            let w = wallet::recover_wallet(phrase)?;
+            print_wallet(&w);
+            Ok(())
+        }
+        WalletCommand::Fund { account } => wallet::fund_account(account),
+        WalletCommand::Sign { secret, message } => {
+            let signature = wallet::sign_message(secret, message)?;
+            println!("{signature}");
+            Ok(())
+        }
+    }
+}
+
+fn print_wallet(w: &crate::wallet::GeneratedWallet) {
+    println!("Recovery phrase:");
+    println!("  {}", w.mnemonic);
+    println!("Secret key:      {}", w.secret);
+    println!("Account (G):     {}", w.account);
 }
 
 fn normalize_workspace_root(workspace: &PathBuf) -> PathBuf {
