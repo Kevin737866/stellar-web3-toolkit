@@ -6,7 +6,6 @@ members = [
     "crates/watchtower",
     "crates/channel-simulator",
     "crates/atomic-swap",
-    "crates/stellar-did",
     "contracts/payment-channel-contract",
     "contracts/amm-pool",
     "contracts/amm-factory",

@@ -7,6 +7,10 @@ description = "CLI and tooling for Soroban contracts in stellar-web3-toolkit"
 license.workspace = true
 repository.workspace = true
 
+[lib]
+name = "stellar_toolkit"
+path = "src/lib.rs"
+
 [[bin]]
 name = "stellar-toolkit"
 path = "src/main.rs"
