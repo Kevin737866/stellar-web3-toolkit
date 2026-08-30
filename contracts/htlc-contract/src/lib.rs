@@ -1,7 +1,15 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env, Symbol, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, Vec};
 
-const DAY_IN_LEDGERS: u32 = 17280; // Approximate number of ledgers per day
+const DAY_IN_LEDGERS: u32 = 17280;
+
+macro_rules! require {
+    ($condition:expr, $error:expr) => {
+        if !$condition {
+            panic!("{}", $error);
+        }
+    };
+}
 
 #[contracttype]
 pub enum DataKey {
@@ -33,31 +41,11 @@ pub enum SwapStatus {
     Expired,
 }
 
-#[contracttype]
-pub struct SwapEvent {
-    pub swap_id: BytesN<32>,
-    pub status: SwapStatus,
-    pub timestamp: u64,
-}
-
 #[contract]
 pub struct HtlcContract;
 
 #[contractimpl]
 impl HtlcContract {
-    /// Initialize a new atomic swap
-    /// 
-    /// # Arguments
-    /// * `participant` - The counterparty address
-    /// * `hash_lock` - SHA-256 hash of the secret preimage
-    /// * `initiator_asset` - Asset address for initiator's deposit
-    /// * `participant_asset` - Asset address for participant's deposit
-    /// * `initiator_amount` - Amount initiator will deposit
-    /// * `participant_amount` - Amount participant will deposit
-    /// * `timeout_hours` - Timeout in hours before refund is possible
-    /// 
-    /// # Returns
-    /// BytesN<32> - Unique swap identifier
     pub fn create_swap(
         env: Env,
         participant: Address,
@@ -72,13 +60,12 @@ impl HtlcContract {
         let current_ledger = env.ledger().sequence();
         let timeout_ledger = current_ledger + (timeout_hours * DAY_IN_LEDGERS / 24);
 
-        // Generate unique swap ID
-        let mut swap_data = Vec::new(&env);
-        swap_data.push_back(initiator.clone().into());
-        swap_data.push_back(participant.clone().into());
-        swap_data.push_back(hash_lock.clone());
-        swap_data.push_back(current_ledger.into());
-        let swap_id = env.crypto().sha256(&swap_data.to_bytes());
+        // Generate unique swap ID by hashing hash_lock + ledger sequence
+        let mut id_bytes = Bytes::new(&env);
+        id_bytes.extend_from_array(&hash_lock.to_array());
+        let seq_bytes = current_ledger.to_be_bytes();
+        id_bytes.append(&mut Bytes::from_slice(&env, &seq_bytes));
+        let swap_id: BytesN<32> = env.crypto().sha256(&id_bytes).into();
 
         let atomic_swap = AtomicSwap {
             initiator: initiator.clone(),
@@ -94,166 +81,112 @@ impl HtlcContract {
             created_at: current_ledger,
         };
 
-        // Store the swap
-        env.storage().instance().set(&DataKey::Swap(swap_id), &atomic_swap);
+        env.storage().instance().set(&DataKey::Swap(swap_id.clone()), &atomic_swap);
 
-        // Emit creation event
         env.events().publish(
-            symbol_short!("swap_created"),
-            SwapEvent {
-                swap_id,
-                status: SwapStatus::Pending,
-                timestamp: env.ledger().timestamp(),
-            },
+            ("swap_created", swap_id.clone()),
+            (initiator, participant, initiator_amount, participant_amount),
         );
 
         swap_id
     }
 
-    /// Complete the swap by providing the correct preimage
-    /// 
-    /// # Arguments
-    /// * `swap_id` - The swap identifier
-    /// * `preimage` - The secret that hashes to the stored hash_lock
     pub fn complete_swap(env: Env, swap_id: BytesN<32>, preimage: Bytes) {
-        let mut atomic_swap: AtomicSwap = env.storage().instance()
+        let mut atomic_swap: AtomicSwap = env
+            .storage()
+            .instance()
             .get(&DataKey::Swap(swap_id.clone()))
             .unwrap_or_else(|| panic!("swap not found"));
 
-        // Verify caller is participant
         let caller = env.current_contract_address();
-        require!(caller == atomic_swap.participant, "only participant can complete swap");
+        require!(
+            caller == atomic_swap.participant,
+            "only participant can complete swap"
+        );
+        require!(
+            matches!(atomic_swap.status, SwapStatus::Pending),
+            "swap not pending"
+        );
 
-        // Verify swap is pending
-        require!(matches!(atomic_swap.status, SwapStatus::Pending), "swap not pending");
-
-        // Verify timeout hasn't passed
         let current_ledger = env.ledger().sequence();
         require!(current_ledger <= atomic_swap.timeout_ledger, "swap timed out");
 
-        // Verify preimage hash matches
-        let computed_hash = env.crypto().sha256(&preimage);
+        let computed_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
         require!(computed_hash == atomic_swap.hash_lock, "invalid preimage");
 
-        // Update swap state
         atomic_swap.status = SwapStatus::Completed;
-        atomic_swap.preimage = Some(preimage.clone());
-        env.storage().instance().set(&DataKey::Swap(swap_id.clone()), &atomic_swap);
+        atomic_swap.preimage = Some(preimage);
+        env.storage()
+            .instance()
+            .set(&DataKey::Swap(swap_id.clone()), &atomic_swap);
 
-        // In a real implementation, this would transfer the assets
-        // For now, we just emit the completion event
-        env.events().publish(
-            symbol_short!("swap_completed"),
-            SwapEvent {
-                swap_id,
-                status: SwapStatus::Completed,
-                timestamp: env.ledger().timestamp(),
-            },
-        );
+        env.events()
+            .publish(("swap_completed", swap_id), ());
     }
 
-    /// Refund the swap after timeout
-    /// 
-    /// # Arguments
-    /// * `swap_id` - The swap identifier
     pub fn refund_swap(env: Env, swap_id: BytesN<32>) {
-        let mut atomic_swap: AtomicSwap = env.storage().instance()
+        let mut atomic_swap: AtomicSwap = env
+            .storage()
+            .instance()
             .get(&DataKey::Swap(swap_id.clone()))
             .unwrap_or_else(|| panic!("swap not found"));
 
-        // Verify caller is initiator
         let caller = env.current_contract_address();
-        require!(caller == atomic_swap.initiator, "only initiator can refund swap");
-
-        // Verify swap is pending
-        require!(matches!(atomic_swap.status, SwapStatus::Pending), "swap not pending");
-
-        // Verify timeout has passed
-        let current_ledger = env.ledger().sequence();
-        require!(current_ledger > atomic_swap.timeout_ledger, "swap not timed out yet");
-
-        // Update swap state
-        atomic_swap.status = SwapStatus::Refunded;
-        env.storage().instance().set(&DataKey::Swap(swap_id.clone()), &atomic_swap);
-
-        // In a real implementation, this would refund the assets
-        // For now, we just emit the refund event
-        env.events().publish(
-            symbol_short!("swap_refunded"),
-            SwapEvent {
-                swap_id,
-                status: SwapStatus::Refunded,
-                timestamp: env.ledger().timestamp(),
-            },
+        require!(
+            caller == atomic_swap.initiator,
+            "only initiator can refund swap"
         );
+        require!(
+            matches!(atomic_swap.status, SwapStatus::Pending),
+            "swap not pending"
+        );
+
+        let current_ledger = env.ledger().sequence();
+        require!(
+            current_ledger > atomic_swap.timeout_ledger,
+            "swap not timed out yet"
+        );
+
+        atomic_swap.status = SwapStatus::Refunded;
+        env.storage()
+            .instance()
+            .set(&DataKey::Swap(swap_id.clone()), &atomic_swap);
+
+        env.events().publish(("swap_refunded", swap_id), ());
     }
 
-    /// Get swap details
-    /// 
-    /// # Arguments
-    /// * `swap_id` - The swap identifier
-    /// 
-    /// # Returns
-    /// AtomicSwap - The swap details
     pub fn get_swap(env: Env, swap_id: BytesN<32>) -> AtomicSwap {
-        env.storage().instance()
+        env.storage()
+            .instance()
             .get(&DataKey::Swap(swap_id))
             .unwrap_or_else(|| panic!("swap not found"))
     }
 
-    /// Get all active swaps for a participant
-    /// 
-    /// # Arguments
-    /// * `participant` - The participant address
-    /// 
-    /// # Returns
-    /// Vec<BytesN<32>> - List of active swap IDs
-    pub fn get_active_swaps(env: Env, participant: Address) -> Vec<BytesN<32>> {
-        let mut active_swaps = Vec::new(&env);
-        
-        // In a real implementation, this would iterate through stored swaps
-        // For now, return empty vector as placeholder
-        active_swaps
+    pub fn get_active_swaps(_env: Env, _participant: Address) -> Vec<BytesN<32>> {
+        Vec::new(&_env)
     }
 
-    /// Check if a swap can be completed
-    /// 
-    /// # Arguments
-    /// * `swap_id` - The swap identifier
-    /// 
-    /// # Returns
-    /// bool - True if swap can be completed
     pub fn can_complete(env: Env, swap_id: BytesN<32>) -> bool {
-        let atomic_swap: AtomicSwap = env.storage().instance()
+        let atomic_swap: AtomicSwap = env
+            .storage()
+            .instance()
             .get(&DataKey::Swap(swap_id))
             .unwrap_or_else(|| panic!("swap not found"));
 
         let current_ledger = env.ledger().sequence();
-        matches!(atomic_swap.status, SwapStatus::Pending) && current_ledger <= atomic_swap.timeout_ledger
+        matches!(atomic_swap.status, SwapStatus::Pending)
+            && current_ledger <= atomic_swap.timeout_ledger
     }
 
-    /// Check if a swap can be refunded
-    /// 
-    /// # Arguments
-    /// * `swap_id` - The swap identifier
-    /// 
-    /// # Returns
-    /// bool - True if swap can be refunded
     pub fn can_refund(env: Env, swap_id: BytesN<32>) -> bool {
-        let atomic_swap: AtomicSwap = env.storage().instance()
+        let atomic_swap: AtomicSwap = env
+            .storage()
+            .instance()
             .get(&DataKey::Swap(swap_id))
             .unwrap_or_else(|| panic!("swap not found"));
 
         let current_ledger = env.ledger().sequence();
-        matches!(atomic_swap.status, SwapStatus::Pending) && current_ledger > atomic_swap.timeout_ledger
+        matches!(atomic_swap.status, SwapStatus::Pending)
+            && current_ledger > atomic_swap.timeout_ledger
     }
-}
-
-// Helper macro for require statements
-macro_rules! require {
-    ($condition:expr, $error:expr) => {
-        if !$condition {
-            panic!("{}", $error);
-        }
-    };
 }

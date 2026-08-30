@@ -283,7 +283,13 @@ impl TopologyAnalyzer {
         
         for node in &nodes {
             // Temporarily remove the node
-            let mut test_graph = graph.clone();
+            let mut test_graph = NetworkGraph::new();
+            for (id, n) in graph.nodes.iter() {
+                test_graph.add_node(n.clone());
+            }
+            for c in graph.channels.values() {
+                test_graph.add_channel(c.clone());
+            }
             test_graph.nodes.remove(node);
             
             // Check if graph is still connected

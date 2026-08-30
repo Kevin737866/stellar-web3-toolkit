@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use thiserror::Error;
 use tracing::{info, warn, debug};
 
 /// Channel update from the network
