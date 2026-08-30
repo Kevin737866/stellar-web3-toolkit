@@ -75,7 +75,7 @@ impl Preimage {
     }
 
     /// Compute SHA-256 hash of the preimage data
-    fn compute_hash(data: &[u8]) -> Result<Vec<u8>> {
+    pub fn compute_hash(data: &[u8]) -> Result<Vec<u8>> {
         let mut hasher = Sha256::new();
         hasher.update(data);
         Ok(hasher.finalize().to_vec())
@@ -87,8 +87,8 @@ impl Preimage {
     }
 
     /// Convert to Soroban Bytes
-    pub fn to_soroban_bytes(&self) -> Bytes {
-        Bytes::from_slice(&self.data)
+    pub fn to_soroban_bytes(&self, env: &soroban_sdk::Env) -> Bytes {
+        Bytes::from_slice(env, &self.data)
     }
 
     /// Convert hash to fixed 32-byte array

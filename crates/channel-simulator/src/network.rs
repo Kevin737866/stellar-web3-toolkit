@@ -174,7 +174,7 @@ impl NetworkTopology {
                 if total_degree == 0 {
                     // Fallback to random
                     let j = rng.gen_range(0..i);
-                    targets.insert(j);
+                    targets.insert(node_ids[j].clone());
                 } else {
                     let mut r = rng.gen_range(0..total_degree);
                     for (j, node) in nodes.iter().take(i) {

@@ -59,12 +59,13 @@ impl SwapMonitor {
     }
 
     pub async fn add_swap(&self, swap: AtomicSwap) -> Result<()> {
+        let swap_id = swap.id.clone();
         let mut swaps = self.swaps.write().await;
-        swaps.insert(swap.id.clone(), swap);
+        swaps.insert(swap_id.clone(), swap);
         
         // Emit creation event
         let event = SwapEvent::Created {
-            swap_id: swap.id,
+            swap_id,
             timestamp: chrono::Utc::now().timestamp() as u64,
         };
         self.emit_event(event).await;

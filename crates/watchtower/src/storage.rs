@@ -7,6 +7,7 @@ use crate::monitor::{ChannelMonitorState, ChannelUpdate};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
+use tracing::info;
 
 /// Storage backend trait
 pub trait StorageBackend: Send + Sync {
@@ -206,12 +207,6 @@ pub enum StorageError {
     
     #[error("Query error: {0}")]
     QueryError(String),
-}
-
-/// Import the info! macro
-fn info(msg: &str) {
-    // Placeholder - in production would use tracing
-    let _ = msg;
 }
 
 #[cfg(test)]

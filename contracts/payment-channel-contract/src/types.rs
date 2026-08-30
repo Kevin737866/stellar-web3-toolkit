@@ -1,13 +1,11 @@
 //! # Payment Channel Types
-//! 
+//!
 //! Core data types for the Stellar payment channel system.
 
-use soroban_sdk::{
-    Address, BytesN, Env, Vec, Map, Val,
-    TryFromVal, IntoVal, TryIntoVal,
-};
+use soroban_sdk::{contracttype, Address, BytesN, Env, Map, Val};
 
 /// Represents a payment channel between two participants
+#[contracttype]
 #[derive(Clone)]
 pub struct ChannelState {
     /// Unique identifier for this channel
@@ -65,7 +63,7 @@ impl ChannelState {
             htlcs: Map::new(env),
         }
     }
-    
+
     /// Check if the channel can make a payment of given amount
     pub fn can_pay(&self, amount: i128, from_a: bool) -> bool {
         if from_a {
@@ -74,7 +72,7 @@ impl ChannelState {
             self.balance_b >= amount
         }
     }
-    
+
     /// Execute a payment, updating balances
     pub fn execute_payment(&mut self, amount: i128, from_a: bool) -> Result<(), &'static str> {
         if from_a {
@@ -96,6 +94,7 @@ impl ChannelState {
 }
 
 /// Represents a payment between two parties
+#[contracttype]
 #[derive(Clone)]
 pub struct Payment {
     /// Amount being transferred
@@ -127,12 +126,12 @@ impl Payment {
             sender,
             receiver,
             channel_id,
-            sequence: env.ledger().sequence_number(),
+            sequence: env.ledger().sequence(),
             timestamp: env.ledger().timestamp(),
             memo: None,
         }
     }
-    
+
     /// Create a payment with a memo
     pub fn with_memo(
         env: &Env,
@@ -147,7 +146,7 @@ impl Payment {
             sender,
             receiver,
             channel_id,
-            sequence: env.ledger().sequence_number(),
+            sequence: env.ledger().sequence(),
             timestamp: env.ledger().timestamp(),
             memo: Some(memo),
         }
@@ -155,6 +154,7 @@ impl Payment {
 }
 
 /// Hash Time-Locked Contract information
+#[contracttype]
 #[derive(Clone)]
 pub struct HTLCInfo {
     /// Unique identifier for this HTLC
@@ -186,13 +186,13 @@ impl HTLCInfo {
         receiver: Address,
         sender: Address,
     ) -> Self {
-        let mut htlc_id_bytes = Vec::new(env);
-        htlc_id_bytes.append(&mut hashlock.to_vec());
-        htlc_id_bytes.append(&mut sender.as_val().to_bytes());
-        htlc_id_bytes.append(&mut env.ledger().timestamp().to_be_bytes().to_vec().try_into().unwrap_or_default());
-        
-        let htlc_id = env.crypto().sha256(&htlc_id_bytes);
-        
+        // Generate HTLC ID from hashlock + timestamp
+        let mut id_data = soroban_sdk::Bytes::new(env);
+        id_data.extend_from_slice(&hashlock.to_array());
+        let ts = env.ledger().timestamp();
+        id_data.extend_from_slice(&ts.to_be_bytes());
+        let htlc_id: BytesN<32> = env.crypto().sha256(&id_data).into();
+
         HTLCInfo {
             htlc_id,
             hashlock,
@@ -205,12 +205,12 @@ impl HTLCInfo {
             created_at: env.ledger().timestamp(),
         }
     }
-    
+
     /// Check if HTLC is still active (not claimed or refunded)
     pub fn is_active(&self) -> bool {
         !self.is_claimed && !self.is_refunded
     }
-    
+
     /// Check if HTLC has expired (timelock passed)
     pub fn is_expired(&self, current_block: u32) -> bool {
         current_block >= self.timelock
@@ -218,6 +218,7 @@ impl HTLCInfo {
 }
 
 /// Configuration for a payment channel
+#[contracttype]
 #[derive(Clone)]
 pub struct ChannelConfig {
     /// Maximum number of HTLCs allowed in the channel
@@ -239,8 +240,8 @@ impl Default for ChannelConfig {
         ChannelConfig {
             max_htlcs: 100,
             max_htlc_value: i128::MAX,
-            min_htlc_value: 100, // 100 stroops minimum
-            channel_reserve: 100, // Must maintain minimum balance
+            min_htlc_value: 100,
+            channel_reserve: 100,
             force_push_enabled: false,
             accept_routed_payments: true,
         }
@@ -248,6 +249,7 @@ impl Default for ChannelConfig {
 }
 
 /// Represents a routing hop in a multi-hop payment
+#[contracttype]
 #[derive(Clone)]
 pub struct RouteHop {
     /// Channel ID for this hop
@@ -281,6 +283,7 @@ impl RouteHop {
 }
 
 /// Channel statistics and metrics
+#[contracttype]
 #[derive(Clone)]
 pub struct ChannelStats {
     /// Total payments sent
@@ -324,7 +327,7 @@ impl ChannelStats {
             self.average_payment_size = self.total_value_sent / (self.total_payments_sent as i128);
         }
     }
-    
+
     pub fn update_on_receive(&mut self, amount: i128) {
         self.total_payments_received += 1;
         self.total_value_received += amount;

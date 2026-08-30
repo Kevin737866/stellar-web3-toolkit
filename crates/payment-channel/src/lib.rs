@@ -4,11 +4,6 @@
 //! This library provides a Rust API for creating, managing, and closing
 //! payment channels, as well as executing off-chain payments.
 
-pub mod channel;
-pub mod multi_sig;
-pub mod htlc;
-pub mod client;
-
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use parking_lot::RwLock;
