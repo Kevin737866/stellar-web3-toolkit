@@ -301,7 +301,7 @@ impl AtomicSwapCoordinator {
                     meta.insert("hop_index".to_string(), i.to_string());
                     meta.insert("total_hops".to_string(), intermediary_assets.len().to_string());
                     if is_last_hop {
-                        meta.insert("final_destination".to_string(), participant);
+                        meta.insert("final_destination".to_string(), participant.clone());
                     }
                     meta
                 },
@@ -466,12 +466,13 @@ mod tests {
 
         let response = coordinator.initiate_swap("initiator".to_string(), request).await.unwrap();
         let preimage = response.preimage.unwrap();
+        let swap_id = response.swap_id.clone();
 
         // Complete the swap
         coordinator.complete_swap(response.swap_id, preimage, 101000).await.unwrap();
 
         // Verify swap is completed
-        let swap = coordinator.get_swap(response.swap_id).await.unwrap();
+        let swap = coordinator.get_swap(swap_id).await.unwrap();
         assert!(swap.is_completed());
     }
 }

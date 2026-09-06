@@ -12,11 +12,11 @@
 //! - Alert notification system
 
 pub mod monitor;
-pub mod scanner;
 pub mod justice;
 pub mod storage;
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use std::sync::Arc;
 use parking_lot::RwLock;
 use tracing::{info, warn, error};
@@ -470,6 +470,24 @@ pub enum WatchtowerError {
     
     #[error("Watchtower not running")]
     NotRunning,
+}
+
+impl From<storage::StorageError> for WatchtowerError {
+    fn from(e: storage::StorageError) -> Self {
+        WatchtowerError::StorageError(e.to_string())
+    }
+}
+
+impl From<monitor::MonitorError> for WatchtowerError {
+    fn from(e: monitor::MonitorError) -> Self {
+        WatchtowerError::NetworkError(e.to_string())
+    }
+}
+
+impl From<justice::JusticeError> for WatchtowerError {
+    fn from(e: justice::JusticeError) -> Self {
+        WatchtowerError::JusticeFailed(e.to_string())
+    }
 }
 
 /// Generate a UUID v4

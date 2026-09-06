@@ -74,7 +74,7 @@ impl From<PaymentChannelError> for Error {
     }
 }
 
-impl TryFrom<u32, Error> for PaymentChannelError {
+impl TryFrom<u32> for PaymentChannelError {
     type Error = Error;
     
     fn try_from(value: u32) -> Result<Self, Self::Error> {

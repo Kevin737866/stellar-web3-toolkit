@@ -26,8 +26,8 @@ pub const MAX_ROUTE_AMOUNT: i128 = i128::MAX / 2;
 /// Errors that can occur during routing
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum RoutingError {
-    #[error("No path found from {source} to {destination}")]
-    NoPathFound { source: String, destination: String },
+    #[error("No path found from {origin} to {destination}")]
+    NoPathFound { origin: String, destination: String },
     
     #[error("Source node {node} has no channels")]
     NoChannelsForNode { node: String },
@@ -128,7 +128,7 @@ pub enum Direction {
 }
 
 /// Represents a route through the network
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Route {
     /// The hops in this route
     pub hops: Vec<RouteHop>,
@@ -247,15 +247,15 @@ pub enum PaymentType {
 /// The network graph representing all channels and nodes
 pub struct NetworkGraph {
     /// Map of node ID to Node
-    nodes: FxHashMap<String, Node>,
+    pub nodes: FxHashMap<String, Node>,
     /// Map of channel ID to Channel
-    channels: FxHashMap<String, Channel>,
+    pub channels: FxHashMap<String, Channel>,
     /// Map of node ID to set of channel IDs they're in
-    node_channels: FxHashMap<String, HashSet<String>>,
+    pub node_channels: FxHashMap<String, HashSet<String>>,
     /// Adjacency list: node ID -> (neighbor ID -> channel ID)
-    adjacency: FxHashMap<String, FxHashMap<String, String>>,
+    pub adjacency: FxHashMap<String, FxHashMap<String, String>>,
     /// Graph version for invalidation
-    version: u64,
+    pub version: u64,
 }
 
 impl NetworkGraph {
@@ -272,9 +272,10 @@ impl NetworkGraph {
     
     /// Add a node to the graph
     pub fn add_node(&mut self, node: Node) {
-        self.nodes.insert(node.id.clone(), node);
-        self.node_channels.entry(node.id.clone()).or_insert_with(HashSet::new);
-        self.adjacency.entry(node.id.clone()).or_insert_with(FxHashMap::default);
+        let id = node.id.clone();
+        self.nodes.insert(id.clone(), node);
+        self.node_channels.entry(id.clone()).or_insert_with(HashSet::new);
+        self.adjacency.entry(id).or_insert_with(FxHashMap::default);
     }
     
     /// Add a channel to the graph
@@ -450,7 +451,7 @@ pub fn find_best_route(
     // Dijkstra's algorithm with weighted edges (fees)
     let mut dist: FxHashMap<String, i128> = FxHashMap::default();
     let mut prev: FxHashMap<String, (String, String, i128, i128)> = FxHashMap::default(); // node -> (prev_node, channel_id, amount, fee)
-    let mut pq: PriorityQueue<String, Reverse<i128>, fxhash::FxBuildHasher> = PriorityQueue::new();
+    let mut pq: PriorityQueue<String, Reverse<i128>> = PriorityQueue::new();
     
     dist.insert(request.source.clone(), 0);
     pq.push(request.source.clone(), Reverse(0));
@@ -515,8 +516,8 @@ pub fn find_best_route(
     // Reconstruct route
     if !prev.contains_key(&request.destination) {
         return Err(RoutingError::NoPathFound {
-            source: request.source,
-            destination: request.destination,
+            origin: request.source.clone(),
+            destination: request.destination.clone(),
         });
     }
     
@@ -535,8 +536,8 @@ pub fn find_best_route(
             hops.push(RouteHop::new(
                 channel_id.clone(),
                 node_id,
-                amount,
-                fee,
+                *amount,
+                *fee,
                 channel.cltv_delta,
             ));
             total_fees += fee;
@@ -550,10 +551,12 @@ pub fn find_best_route(
     
     hops.reverse();
     
+    let num_hops = hops.len();
+
     // Check path length
-    if hops.len() > max_hops {
+    if num_hops > max_hops {
         return Err(RoutingError::PathTooLong {
-            length: hops.len(),
+            length: num_hops,
             max: max_hops,
         });
     }
@@ -578,9 +581,9 @@ pub fn find_best_route(
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
-            num_nodes: hops.len(),
+            num_nodes: num_hops,
             estimated_time_ms: 100,
-            is_direct: hops.len() == 1,
+            is_direct: num_hops == 1,
         },
     })
 }

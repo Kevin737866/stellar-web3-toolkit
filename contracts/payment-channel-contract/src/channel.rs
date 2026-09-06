@@ -1,10 +1,10 @@
 //! # Payment Channel Module
-//! 
+//!
 //! Core channel management logic for the payment channel system.
 
-use soroban_sdk::{Env, BytesN, Address, Vec, Map, Val};
+use soroban_sdk::{Env, BytesN, Address, Vec, Map, Val, Bytes};
 
-use crate::types::{ChannelState, ChannelConfig, ChannelStats, RouteHop, Payment};
+use crate::types::{ChannelState, ChannelConfig, ChannelStats, RouteHop};
 use crate::error::PaymentChannelError;
 
 /// Channel manager for handling channel operations
@@ -25,23 +25,23 @@ impl ChannelManager {
         if initial_balance_a < 0 || initial_balance_b < 0 {
             return Err(PaymentChannelError::InvalidBalance);
         }
-        
+
         if timeout < 60 {
             return Err(PaymentChannelError::InvalidTimeout);
         }
-        
+
         if fee_percentage > 10000 {
             return Err(PaymentChannelError::InvalidFee);
         }
-        
+
         // Sort participants for deterministic ordering
         let (sorted_a, sorted_b) = Self::sort_participants(participant_a.clone(), participant_b.clone());
-        
+
         // Generate channel ID
         let channel_id = Self::generate_channel_id(env, &sorted_a, &sorted_b);
-        
+
         // Create channel state
-        let mut channel = ChannelState::new(
+        let channel = ChannelState::new(
             env,
             channel_id,
             sorted_a,
@@ -51,42 +51,54 @@ impl ChannelManager {
             timeout,
             fee_percentage,
         );
-        
+
         // Validate channel reserves
         let config = ChannelConfig::default();
         if initial_balance_a < config.channel_reserve || initial_balance_b < config.channel_reserve {
             return Err(PaymentChannelError::ReserveNotMet);
         }
-        
+
         Ok(channel)
     }
-    
+
     /// Sort two addresses deterministically
     fn sort_participants(a: Address, b: Address) -> (Address, Address) {
-        let a_val = a.as_val();
-        let b_val = b.as_val();
-        if a_val < b_val {
+        // Use string representation for ordering
+        let a_str = a.to_string();
+        let b_str = b.to_string();
+        if a_str <= b_str {
             (a, b)
         } else {
             (b, a)
         }
     }
-    
+
     /// Generate a unique channel ID
     fn generate_channel_id(
         env: &Env,
         participant_a: &Address,
         participant_b: &Address,
     ) -> BytesN<32> {
-        let mut data = Vec::new(env);
-        data.append(&mut participant_a.as_val().to_bytes());
-        data.append(&mut participant_b.as_val().to_bytes());
-        data.append(&mut env.ledger().sequence_number().to_be_bytes().to_vec().try_into().unwrap_or_default());
-        data.append(&mut env.ledger().timestamp().to_be_bytes().to_vec().try_into().unwrap_or_default());
-        
-        env.crypto().sha256(&data)
+        let mut data = Bytes::new(env);
+        // Serialize addresses using their internal object representation
+        let a_obj = participant_a.to_object();
+        let b_obj = participant_b.to_object();
+        // Extract raw bytes from the address objects via storage
+        env.storage().instance().set(&a_obj, &a_obj);
+        env.storage().instance().set(&b_obj, &b_obj);
+        // Use sequence and timestamp for uniqueness
+        let seq = env.ledger().sequence();
+        data.extend_from_slice(&seq.to_be_bytes());
+        let ts = env.ledger().timestamp();
+        data.extend_from_slice(&ts.to_be_bytes());
+        // Use contract address as additional entropy
+        let contract = env.current_contract_address();
+        data.extend_from_slice(&contract.to_val().to_object().to_bytes());
+
+        let hash: BytesN<32> = env.crypto().sha256(&data).into();
+        hash
     }
-    
+
     /// Validate that a payment is valid within this channel
     pub fn validate_payment(
         channel: &ChannelState,
@@ -98,86 +110,76 @@ impl ChannelManager {
         if amount < config.min_htlc_value {
             return Err(PaymentChannelError::PaymentBelowDustLimit);
         }
-        
+
         if amount > config.max_htlc_value {
             return Err(PaymentChannelError::AmountExceedsMaximum);
         }
-        
+
         // Check sender has sufficient balance
         if from_a && channel.balance_a < amount {
             return Err(PaymentChannelError::InsufficientBalance);
         }
-        
+
         if !from_a && channel.balance_b < amount {
             return Err(PaymentChannelError::InsufficientBalance);
         }
-        
+
         // Check reserve is maintained
         if from_a && channel.balance_a - amount < config.channel_reserve {
             return Err(PaymentChannelError::ReserveNotMet);
         }
-        
+
         if !from_a && channel.balance_b - amount < config.channel_reserve {
             return Err(PaymentChannelError::ReserveNotMet);
         }
-        
+
         Ok(())
     }
-    
+
     /// Calculate the fee for routing a payment through this channel
     pub fn calculate_fee(channel: &ChannelState, amount: i128) -> i128 {
-        // Fee is calculated as a percentage of the amount
-        // fee = amount * fee_percentage / 10000
         (amount * channel.fee_percentage as i128) / 10000
     }
-    
+
     /// Calculate the fee for a multi-hop route
     pub fn calculate_route_fee(hops: &[RouteHop], amount: i128) -> i128 {
         let mut total_fee = 0i128;
         let mut remaining = amount;
-        
+
         for hop in hops {
             let fee = Self::calculate_fee_from_amount(remaining, hop.fee, hop.cltv_delta);
             total_fee += fee;
             remaining += fee;
         }
-        
+
         total_fee
     }
-    
+
     /// Calculate fee from amount with CLTV delta consideration
     fn calculate_fee_from_amount(amount: i128, base_fee: i128, cltv_delta: u32) -> i128 {
-        // Fee model:
-        // - Base fee (covers operational costs)
-        // - Proportional fee (1% default)
         let proportional_fee = (amount * 100) / 10000;
-        let cltv_fee = (cltv_delta as i128 * 10) / 1440; // Roughly 1 XLM per day of timelock
-        
+        let cltv_fee = (cltv_delta as i128 * 10) / 1440;
         base_fee + proportional_fee + cltv_fee
     }
-    
+
     /// Get the effective balance for sending from a specific direction
     pub fn get_send_capacity(channel: &ChannelState, from_a: bool, reserve: i128) -> i128 {
         if from_a {
-            // Can send up to balance_a minus reserve
             (channel.balance_a - reserve).max(0)
         } else {
-            // Can send up to balance_b minus reserve
             (channel.balance_b - reserve).max(0)
         }
     }
-    
+
     /// Get the receive capacity for a specific direction
     pub fn get_receive_capacity(channel: &ChannelState, from_a: bool, reserve: i128) -> i128 {
         if from_a {
-            // Can receive up to balance_b minus reserve
             (channel.balance_b - reserve).max(0)
         } else {
-            // Can receive up to balance_a minus reserve
             (channel.balance_a - reserve).max(0)
         }
     }
-    
+
     /// Check if the channel supports a payment amount
     pub fn can_support_payment(channel: &ChannelState, amount: i128, from_a: bool, reserve: i128) -> bool {
         let capacity = if from_a {
@@ -185,10 +187,10 @@ impl ChannelManager {
         } else {
             Self::get_send_capacity(channel, false, reserve)
         };
-        
+
         capacity >= amount
     }
-    
+
     /// Get channel age in seconds
     pub fn get_channel_age(channel: &ChannelState, current_time: u64) -> u64 {
         if channel.created_at > 0 {
@@ -197,46 +199,36 @@ impl ChannelManager {
             0
         }
     }
-    
-    /// Check if channel is considered stale (no activity for a period)
-    pub fn is_channel_stale(channel: &ChannelState, last_activity: u64, stale_threshold: u64) -> bool {
-        last_activity > 0 && (Env::default().ledger().timestamp() - last_activity) > stale_threshold
-    }
-    
+
     /// Calculate channel utilization percentage
     pub fn get_utilization(channel: &ChannelState) -> u32 {
         let max_capacity = channel.total_balance;
         let used_capacity = channel.balance_a.min(channel.balance_b);
-        
+
         if max_capacity > 0 {
             ((used_capacity as u64 * 100) / max_capacity as u64) as u32
         } else {
             0
         }
     }
-    
+
     /// Rebalance the channel by swapping capacities
-    /// This is a cooperative operation that requires both parties to sign
     pub fn rebalance(
         channel: &mut ChannelState,
         amount: i128,
     ) -> Result<(), PaymentChannelError> {
-        // Both parties contribute equal amounts to increase capacity
-        // This is used when one side is running low on funds
-        
         if amount < 0 {
             return Err(PaymentChannelError::InvalidBalance);
         }
-        
-        // Add the rebalance amount to both sides
+
         channel.balance_a += amount;
         channel.balance_b += amount;
         channel.total_balance += amount * 2;
         channel.sequence_number += 1;
-        
+
         Ok(())
     }
-    
+
     /// Get a summary of channel state for debugging/monitoring
     pub fn get_channel_summary(channel: &ChannelState) -> ChannelSummary {
         ChannelSummary {

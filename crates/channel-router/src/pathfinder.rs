@@ -54,7 +54,7 @@ impl Pathfinder {
         request: &RouteRequest,
     ) -> Result<Route, RoutingError> {
         let mut dist: FxHashMap<String, (i128, Vec<RouteHop>)> = FxHashMap::default();
-        let mut pq: PriorityQueue<String, Reverse<i128>, fxhash::FxBuildHasher> = PriorityQueue::new();
+        let mut pq: PriorityQueue<String, Reverse<i128>> = PriorityQueue::new();
         
         dist.insert(request.source.clone(), (0, Vec::new()));
         pq.push(request.source.clone(), Reverse(0));
@@ -102,16 +102,16 @@ impl Pathfinder {
                         
                         let mut new_path = path.clone();
                         new_path.push(RouteHop::new(
-                            channel_id.clone(),
-                            neighbor.clone(),
+                            (*channel_id).clone(),
+                            (*neighbor).clone(),
                             current_amount,
                             fee,
                             channel.cltv_delta,
                         ));
                         
                         if new_cost < *dist.get(neighbor).map(|(c, _)| c).unwrap_or(&i128::MAX) {
-                            dist.insert(neighbor.clone(), (new_cost, new_path));
-                            pq.push(neighbor.clone(), Reverse(new_cost));
+                            dist.insert((*neighbor).clone(), (new_cost, new_path));
+                            pq.push((*neighbor).clone(), Reverse(new_cost));
                         }
                     }
                 }
@@ -119,7 +119,7 @@ impl Pathfinder {
         }
         
         Err(RoutingError::NoPathFound {
-            source: request.source.clone(),
+            origin: request.source.clone(),
             destination: request.destination.clone(),
         })
     }
@@ -130,7 +130,7 @@ impl Pathfinder {
         graph: &NetworkGraph,
         request: &RouteRequest,
     ) -> Result<Route, RoutingError> {
-        let mut open_set: PriorityQueue<String, Reverse<i64>, fxhash::FxBuildHasher> = PriorityQueue::new();
+        let mut open_set: PriorityQueue<String, Reverse<i128>> = PriorityQueue::new();
         let mut g_score: FxHashMap<String, i128> = FxHashMap::default();
         let mut f_score: FxHashMap<String, i128> = FxHashMap::default();
         let mut came_from: FxHashMap<String, (String, RouteHop)> = FxHashMap::default();
@@ -175,24 +175,24 @@ impl Pathfinder {
                     
                     if tentative_g < *g_score.get(neighbor).unwrap_or(&i128::MAX) {
                         let hop = RouteHop::new(
-                            channel_id.clone(),
-                            neighbor.clone(),
+                            (*channel_id).clone(),
+                            (*neighbor).clone(),
                             current_amount,
                             fee,
                             channel.cltv_delta,
                         );
-                        came_from.insert(neighbor.clone(), (current.clone(), hop));
-                        g_score.insert(neighbor.clone(), tentative_g);
+                        came_from.insert((*neighbor).clone(), (current.clone(), hop));
+                        g_score.insert((*neighbor).clone(), tentative_g);
                         let f = tentative_g + heuristic(neighbor);
-                        f_score.insert(neighbor.clone(), f);
-                        open_set.push(neighbor.clone(), Reverse(f));
+                        f_score.insert((*neighbor).clone(), f);
+                        open_set.push((*neighbor).clone(), Reverse(f));
                     }
                 }
             }
         }
         
         Err(RoutingError::NoPathFound {
-            source: request.source.clone(),
+            origin: request.source.clone(),
             destination: request.destination.clone(),
         })
     }
@@ -237,14 +237,14 @@ impl Pathfinder {
                             let fee = self.calculate_fee(channel, current_amount);
                             let mut new_path = path.clone();
                             new_path.push(RouteHop::new(
-                                channel_id.clone(),
-                                neighbor.clone(),
+                                (*channel_id).clone(),
+                                (*neighbor).clone(),
                                 current_amount,
                                 fee,
                                 channel.cltv_delta,
                             ));
-                            queue.push_back((neighbor.clone(), new_path));
-                            visited.insert(neighbor.clone());
+                            queue.push_back(((*neighbor).clone(), new_path));
+                            visited.insert((*neighbor).clone());
                         }
                     }
                 }
@@ -252,7 +252,7 @@ impl Pathfinder {
         }
         
         Err(RoutingError::NoPathFound {
-            source: request.source.clone(),
+            origin: request.source.clone(),
             destination: request.destination.clone(),
         })
     }
@@ -291,7 +291,7 @@ impl Pathfinder {
         visited.insert(current.clone());
         
         while current != request.destination && path.len() < self.max_hops {
-            let neighbors: Vec<_> = graph.adjacency
+            let neighbors: Vec<(&String, &String)> = graph.adjacency
                 .get(&current)
                 .map(|n| n.iter().collect::<Vec<_>>())
                 .unwrap_or_default();
@@ -300,10 +300,10 @@ impl Pathfinder {
             let valid_neighbors: Vec<_> = neighbors
                 .into_iter()
                 .filter(|(node_id, channel_id)| {
-                    if visited.contains(node_id) {
+                    if visited.contains(*node_id) {
                         return false;
                     }
-                    if let Some(channel) = graph.channels.get(channel_id) {
+                    if let Some(channel) = graph.channels.get(*channel_id) {
                         let capacity = if &channel.node_a == *node_id {
                             channel.capacity_a_to_b
                         } else {
@@ -325,7 +325,7 @@ impl Pathfinder {
                 .choose(&mut rand::thread_rng())
                 .unwrap();
             
-            let channel = graph.channels.get(channel_id).unwrap();
+            let channel = graph.channels.get(*channel_id).unwrap();
             let fee = self.calculate_fee(channel, amount);
             
             path.push(RouteHop::new(
@@ -336,14 +336,14 @@ impl Pathfinder {
                 channel.cltv_delta,
             ));
             
-            current = (*next_node).clone();
+            current = (**next_node).clone();
             visited.insert(current.clone());
         }
         
         if current != request.destination {
             return Err(RoutingError::NoPathFound {
-                source: request.source,
-                destination: request.destination,
+                origin: request.source.clone(),
+                destination: request.destination.clone(),
             });
         }
         
@@ -385,7 +385,7 @@ impl Pathfinder {
     fn build_route(&self, path: Vec<RouteHop>, amount: i128) -> Result<Route, RoutingError> {
         if path.is_empty() {
             return Err(RoutingError::NoPathFound {
-                source: "unknown".to_string(),
+                origin: "unknown".to_string(),
                 destination: "unknown".to_string(),
             });
         }
@@ -442,7 +442,7 @@ impl Pathfinder {
         
         if path.is_empty() {
             return Err(RoutingError::NoPathFound {
-                source: source.to_string(),
+                origin: source.to_string(),
                 destination: destination.to_string(),
             });
         }
