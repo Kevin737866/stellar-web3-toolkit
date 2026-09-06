@@ -10,6 +10,8 @@ pub enum ToolkitError {
     ExecutionError(String),
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
+    #[error("wallet error: {0}")]
+    Wallet(String),
 }
 
 pub type Result<T> = std::result::Result<T, ToolkitError>;

@@ -28,6 +28,16 @@ url = "2.4"
 urlencoding = "2.1"
 hex = "0.4"
 
+# Wallet: recovery phrases, keypair derivation, signing, and funding
+bip39 = "2"
+stellar-strkey = "0.0.18"
+ureq = "2"
+ed25519-dalek.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+hex.workspace = true
+rand.workspace = true
+
 [dev-dependencies]
 tempfile = "3.8"
 assert_cmd = "2.0"

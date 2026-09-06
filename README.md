@@ -35,6 +35,12 @@ stellar-toolkit deploy ./contracts/my_contract --network testnet
 
 # Verify deployment
 stellar-toolkit verify <contract_id>
+
+# Wallet commands (end-user onboarding)
+stellar-toolkit wallet generate                # new recovery phrase + keypair
+stellar-toolkit wallet recover "<phrase>"     # restore a keypair from a phrase
+stellar-toolkit wallet fund <G...>            # fund an account on testnet (Friendbot)
+stellar-toolkit wallet sign <S...> <tx_hex>   # sign a message/transaction envelope
 ```
 
 ## Project Structure
@@ -85,6 +91,25 @@ cargo test
 ```bash
 cargo run --example basic_deployment
 ```
+
+## Wallet (End-User Onboarding)
+
+The `wallet` command gives end users a self-contained way to interact with
+toolkit contracts:
+
+- **Recovery phrase backup** – `wallet generate` mints a cryptographically random
+  24-word BIP-39 recovery phrase and shows the derived Stellar secret key (`S…`)
+  and account id (`G…`). Keep the phrase somewhere safe; it is shown only once.
+- **Recovery** – `wallet recover "<phrase>"` re-derives the same keypair from an
+  existing phrase. The phrase checksum is validated first, so a mistyped phrase
+  is rejected before any key is derived.
+- **Key derivation** – keys are derived with BIP-39 plus SLIP-0010 hardened
+  Ed25519 derivation at `m/44'/148'/0'`, the standard Stellar path.
+- **Gas funding** – `wallet fund <G…>` tops up a testnet account through the
+  Friendbot faucet.
+- **Transaction building/signing** – `wallet sign <S…> <hex>` signs a message or
+  Soroban transaction envelope with the account's Ed25519 key and prints the
+  signature.
 
 ## Roadmap
 
