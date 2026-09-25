@@ -30,10 +30,7 @@ pub struct OneClickAirdropClaimer;
 
 impl OneClickAirdropClaimer {
     /// Checks eligibility of an address for a specific airdrop
-    pub fn check_eligibility(
-        claimant_address: &str,
-        airdrop_id: &str,
-    ) -> Result<ClaimStatus> {
+    pub fn check_eligibility(claimant_address: &str, airdrop_id: &str) -> Result<ClaimStatus> {
         if claimant_address.trim().is_empty() {
             return Ok(ClaimStatus::Ineligible {
                 reason: "Empty claimant address".to_string(),
@@ -79,7 +76,10 @@ impl OneClickAirdropClaimer {
     /// Executes single-click claim flow and returns resulting status
     pub fn execute_one_click_claim(request: &AirdropClaimRequest) -> Result<ClaimStatus> {
         let _tx_payload = Self::build_claim_transaction(request)?;
-        let mock_hash = format!("0x{}", hex::encode(&request.claimant_address.as_bytes()[..8]));
+        let mock_hash = format!(
+            "0x{}",
+            hex::encode(&request.claimant_address.as_bytes()[..8])
+        );
 
         Ok(ClaimStatus::Claimed {
             tx_hash: mock_hash,
@@ -109,10 +109,12 @@ mod tests {
 
     #[test]
     fn test_eligibility_check() {
-        let status = OneClickAirdropClaimer::check_eligibility("GCLAIMANT123", "airdrop-1").unwrap();
+        let status =
+            OneClickAirdropClaimer::check_eligibility("GCLAIMANT123", "airdrop-1").unwrap();
         assert!(matches!(status, ClaimStatus::Eligible { amount: 5000000 }));
 
-        let ineligible = OneClickAirdropClaimer::check_eligibility("GREFUSED123", "airdrop-1").unwrap();
+        let ineligible =
+            OneClickAirdropClaimer::check_eligibility("GREFUSED123", "airdrop-1").unwrap();
         assert!(matches!(ineligible, ClaimStatus::Ineligible { .. }));
     }
 
@@ -128,7 +130,8 @@ mod tests {
         let result = OneClickAirdropClaimer::execute_one_click_claim(&req).unwrap();
         assert!(matches!(result, ClaimStatus::Claimed { .. }));
 
-        let recovered = OneClickAirdropClaimer::recover_claim(&req, "sequence_number_out_of_sync").unwrap();
+        let recovered =
+            OneClickAirdropClaimer::recover_claim(&req, "sequence_number_out_of_sync").unwrap();
         assert!(matches!(recovered, ClaimStatus::Claimed { .. }));
     }
 }

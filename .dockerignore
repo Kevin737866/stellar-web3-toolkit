@@ -1,0 +1,9 @@
+target
+.git
+.github
+node_modules
+.DS_Store
+*.log
+.env
+test_snapshots
+monitoring/data

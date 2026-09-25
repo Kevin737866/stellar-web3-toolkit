@@ -1,11 +1,11 @@
 //! # Channel Monitor Module
-//! 
+//!
 //! Monitors payment channels for state changes and breach attempts.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
-use tracing::{info, warn, debug};
+use tracing::{debug, info, warn};
 
 /// Channel update from the network
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,14 +112,17 @@ impl ChannelMonitor {
             cache: std::sync::Arc::new(parking_lot::RwLock::new(HashMap::new())),
         }
     }
-    
+
     /// Check a channel for updates
-    pub async fn check_channel(&self, channel_id: &str) -> Result<Option<ChannelUpdate>, MonitorError> {
+    pub async fn check_channel(
+        &self,
+        channel_id: &str,
+    ) -> Result<Option<ChannelUpdate>, MonitorError> {
         // In production, this would query the Stellar network
         // For now, we simulate the check
-        
+
         debug!("Checking channel: {}", channel_id);
-        
+
         // Check cache first
         {
             let cache = self.cache.read();
@@ -127,10 +130,10 @@ impl ChannelMonitor {
                 return Ok(Some(cached.clone()));
             }
         }
-        
+
         // In production: fetch from Stellar network
         // let update = self.fetch_from_network(channel_id).await?;
-        
+
         // For simulation, return a placeholder
         let update = ChannelUpdate {
             channel_id: channel_id.to_string(),
@@ -142,16 +145,16 @@ impl ChannelMonitor {
             block_height: 0,
             timestamp: current_timestamp(),
         };
-        
+
         // Cache the result
         {
             let mut cache = self.cache.write();
             cache.insert(channel_id.to_string(), update.clone());
         }
-        
+
         Ok(Some(update))
     }
-    
+
     /// Detect if a breach attempt has occurred
     pub fn detect_breach(
         &self,
@@ -159,14 +162,14 @@ impl ChannelMonitor {
         new_update: &ChannelUpdate,
     ) -> Option<BreachAttempt> {
         let cache = self.cache.read();
-        
+
         if let Some(old_update) = cache.get(channel_id) {
             // Check if sequence number increased (valid update)
             if new_update.sequence_number > old_update.sequence_number {
                 // Check if balances changed in a suspicious way
                 // A breach is when someone publishes an OLD state (lower sequence)
                 // to claim more funds
-                
+
                 // For now, detect if someone tries to close with an old sequence
                 if new_update.is_closed && new_update.close_type == Some(CloseType::Forced) {
                     return Some(BreachAttempt {
@@ -183,10 +186,10 @@ impl ChannelMonitor {
                 }
             }
         }
-        
+
         None
     }
-    
+
     /// Check for expiring HTLCs
     pub fn check_expiring_htlcs(
         &self,
@@ -195,22 +198,22 @@ impl ChannelMonitor {
         warning_threshold: u32,
     ) -> Vec<PendingHtlc> {
         let mut expiring = Vec::new();
-        
+
         let cache = self.cache.read();
         if let Some(update) = cache.get(channel_id) {
             // In production, check pending HTLCs
             // For simulation, return empty
         }
-        
+
         expiring
     }
-    
+
     /// Clear the cache for a channel
     pub fn clear_cache(&self, channel_id: &str) {
         let mut cache = self.cache.write();
         cache.remove(channel_id);
     }
-    
+
     /// Clear all cached data
     pub fn clear_all(&self) {
         let mut cache = self.cache.write();
@@ -223,10 +226,10 @@ impl ChannelMonitor {
 pub enum MonitorError {
     #[error("Network error: {0}")]
     NetworkError(String),
-    
+
     #[error("Channel not found: {0}")]
     ChannelNotFound(String),
-    
+
     #[error("Invalid response: {0}")]
     InvalidResponse(String),
 }
@@ -245,11 +248,8 @@ mod tests {
 
     #[test]
     fn test_breach_detection() {
-        let monitor = ChannelMonitor::new(
-            "http://localhost".to_string(),
-            "test".to_string(),
-        );
-        
+        let monitor = ChannelMonitor::new("http://localhost".to_string(), "test".to_string());
+
         let old_update = ChannelUpdate {
             channel_id: "test".to_string(),
             sequence_number: 5,
@@ -260,7 +260,7 @@ mod tests {
             block_height: 100,
             timestamp: 0,
         };
-        
+
         let new_update = ChannelUpdate {
             channel_id: "test".to_string(),
             sequence_number: 3, // Lower sequence - potential breach!
@@ -271,13 +271,13 @@ mod tests {
             block_height: 101,
             timestamp: 1,
         };
-        
+
         // Cache old update
         {
             let mut cache = monitor.cache.write();
             cache.insert("test".to_string(), old_update);
         }
-        
+
         let breach = monitor.detect_breach("test", &new_update);
         // In this case, it won't detect a breach because we check sequence number order
         // In production, breach detection would be more sophisticated

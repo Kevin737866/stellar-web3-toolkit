@@ -1,0 +1,54 @@
+services:
+  builder:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: builder
+    image: stellar-toolkit-builder:1.86
+    volumes:
+      - .:/workspace
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+    working_dir: /workspace
+    command: bash -c "cargo build --workspace --exclude stellar-toolkit --exclude stellar-did --exclude payment-channel --exclude channel-router --exclude channel-simulator --exclude watchtower --exclude atomic-swap --target wasm32-unknown-unknown --release && sha256sum target/wasm32-unknown-unknown/release/*.wasm"
+
+  # Local Stellar quickstart for integration testing (optional)
+  stellar:
+    image: stellar/quickstart:latest
+    ports:
+      - "8000:8000"
+      - "11626:11626"
+      - "8001:8001"
+    command: --testnet --enable-soroban-rpc
+    volumes:
+      - stellar-data:/opt/stellar
+
+  # Monitoring stack for testnet contracts
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command: --config.file=/etc/prometheus/prometheus.yml --storage.tsdb.path=/prometheus
+
+  grafana:
+    image: grafana/grafana:11.2.2
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./monitoring/grafana-dashboard.json:/var/lib/grafana/dashboards/stellar-dashboard.json:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+volumes:
+  cargo-registry:
+  cargo-git:
+  stellar-data:
+  prometheus-data:
+  grafana-data:

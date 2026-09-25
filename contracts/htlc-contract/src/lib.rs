@@ -81,7 +81,9 @@ impl HtlcContract {
             created_at: current_ledger,
         };
 
-        env.storage().instance().set(&DataKey::Swap(swap_id.clone()), &atomic_swap);
+        env.storage()
+            .instance()
+            .set(&DataKey::Swap(swap_id.clone()), &atomic_swap);
 
         env.events().publish(
             ("swap_created", swap_id.clone()),
@@ -109,7 +111,10 @@ impl HtlcContract {
         );
 
         let current_ledger = env.ledger().sequence();
-        require!(current_ledger <= atomic_swap.timeout_ledger, "swap timed out");
+        require!(
+            current_ledger <= atomic_swap.timeout_ledger,
+            "swap timed out"
+        );
 
         let computed_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
         require!(computed_hash == atomic_swap.hash_lock, "invalid preimage");
@@ -120,8 +125,7 @@ impl HtlcContract {
             .instance()
             .set(&DataKey::Swap(swap_id.clone()), &atomic_swap);
 
-        env.events()
-            .publish(("swap_completed", swap_id), ());
+        env.events().publish(("swap_completed", swap_id), ());
     }
 
     pub fn refund_swap(env: Env, swap_id: BytesN<32>) {

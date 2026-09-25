@@ -3,10 +3,8 @@
 mod math;
 
 use math::{amount_out, flash_k_ok, liquidity_amounts_first_deposit, quote};
-use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Env, IntoVal, String,
-};
 use soroban_sdk::token::{TokenClient, TokenInterface};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, IntoVal, String};
 
 #[contracttype]
 #[derive(Clone)]
@@ -103,7 +101,10 @@ fn grow_cumulative(env: &Env) {
 }
 
 fn lp_balance_read(env: &Env, id: &Address) -> i128 {
-    env.storage().instance().get(&DataKey::Bal(id.clone())).unwrap_or(0)
+    env.storage()
+        .instance()
+        .get(&DataKey::Bal(id.clone()))
+        .unwrap_or(0)
 }
 
 fn lp_balance_write(env: &Env, id: Address, v: i128) {
@@ -372,7 +373,10 @@ impl AmmPool {
         let (ta, tb) = get_tokens(&env);
         let (old_a, old_b) = reserves(&env);
         assert!(old_a > 0 && old_b > 0, "liquidity");
-        assert!(amount_a_out < old_a && amount_b_out < old_b, "liquidity out");
+        assert!(
+            amount_a_out < old_a && amount_b_out < old_b,
+            "liquidity out"
+        );
 
         grow_cumulative(&env);
 

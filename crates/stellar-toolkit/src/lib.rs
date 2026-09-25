@@ -6,6 +6,7 @@ pub mod api_reference_gen;
 pub mod cli;
 pub mod error;
 pub mod example_gallery;
+pub mod monitoring_dashboard;
 pub mod one_click_airdrop;
 pub mod p2p_qr_payment;
 pub mod session_keys;

@@ -1,5 +1,5 @@
 //! # Watchtower Service
-//! 
+//!
 //! A service that monitors Stellar payment channels for suspicious activity
 //! and can respond to channel breach attempts by publishing justice
 //! transactions on behalf of channel participants.
@@ -11,15 +11,15 @@
 //! - Automated justice transaction submission
 //! - Alert notification system
 
-pub mod monitor;
 pub mod justice;
+pub mod monitor;
 pub mod storage;
 
-use serde::{Deserialize, Serialize};
-use thiserror::Error;
-use std::sync::Arc;
 use parking_lot::RwLock;
-use tracing::{info, warn, error};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use thiserror::Error;
+use tracing::{error, info, warn};
 
 /// Watchtower configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,20 +87,11 @@ pub enum AlertType {
         blocks_remaining: u32,
     },
     /// Justice transaction submitted
-    JusticeSubmitted {
-        channel_id: String,
-        tx_hash: String,
-    },
+    JusticeSubmitted { channel_id: String, tx_hash: String },
     /// Channel closed unexpectedly
-    UnexpectedClose {
-        channel_id: String,
-        reason: String,
-    },
+    UnexpectedClose { channel_id: String, reason: String },
     /// Watchtower health check failed
-    HealthCheckFailed {
-        component: String,
-        error: String,
-    },
+    HealthCheckFailed { component: String, error: String },
 }
 
 /// Alert message
@@ -120,11 +111,7 @@ pub struct Alert {
 
 impl Alert {
     /// Create a new breach attempt alert
-    pub fn breach_attempt(
-        channel_id: String,
-        old_sequence: u32,
-        new_sequence: u32,
-    ) -> Self {
+    pub fn breach_attempt(channel_id: String, old_sequence: u32, new_sequence: u32) -> Self {
         Alert {
             id: uuid_v4(),
             alert_type: AlertType::BreachAttempt {
@@ -137,7 +124,7 @@ impl Alert {
             context: serde_json::json!({}),
         }
     }
-    
+
     /// Create an HTLC timeout warning
     pub fn htlc_timeout_warning(
         channel_id: String,
@@ -160,34 +147,48 @@ impl Alert {
             context: serde_json::json!({}),
         }
     }
-    
+
     /// Create a justice submitted alert
     pub fn justice_submitted(channel_id: String, tx_hash: String) -> Self {
         Alert {
             id: uuid_v4(),
-            alert_type: AlertType::JusticeSubmitted { channel_id, tx_hash },
+            alert_type: AlertType::JusticeSubmitted {
+                channel_id,
+                tx_hash,
+            },
             severity: AlertSeverity::Info,
             timestamp: current_timestamp(),
             context: serde_json::json!({}),
         }
     }
-    
+
     /// Get the message body for this alert
     pub fn message(&self) -> String {
         match &self.alert_type {
-            AlertType::BreachAttempt { channel_id, old_sequence, new_sequence } => {
+            AlertType::BreachAttempt {
+                channel_id,
+                old_sequence,
+                new_sequence,
+            } => {
                 format!(
                     "BREACH ATTEMPT DETECTED on channel {}! Old seq: {}, New seq: {}",
                     channel_id, old_sequence, new_sequence
                 )
             }
-            AlertType::HtlcTimeoutWarning { channel_id, htlc_id, blocks_remaining } => {
+            AlertType::HtlcTimeoutWarning {
+                channel_id,
+                htlc_id,
+                blocks_remaining,
+            } => {
                 format!(
                     "HTLC {} in channel {} will timeout in {} blocks",
                     htlc_id, channel_id, blocks_remaining
                 )
             }
-            AlertType::JusticeSubmitted { channel_id, tx_hash } => {
+            AlertType::JusticeSubmitted {
+                channel_id,
+                tx_hash,
+            } => {
                 format!(
                     "Justice transaction submitted for channel {}. Tx: {}",
                     channel_id, tx_hash
@@ -255,18 +256,18 @@ impl Watchtower {
             Some(path) => Arc::new(storage::SqliteStorage::new(path)?),
             None => Arc::new(storage::InMemoryStorage::new()),
         };
-        
+
         let monitor = monitor::ChannelMonitor::new(
             config.stellar_rpc_url.clone(),
             config.network_passphrase.clone(),
         );
-        
+
         let justice = justice::JusticeService::new(
             config.stellar_rpc_url.clone(),
             config.network_passphrase.clone(),
             config.justice_fee_budget,
         );
-        
+
         let state = Arc::new(WatchtowerState {
             subscribed_channels: RwLock::new(std::collections::HashSet::new()),
             channel_states: RwLock::new(std::collections::HashMap::new()),
@@ -274,7 +275,7 @@ impl Watchtower {
             is_running: RwLock::new(false),
             stats: RwLock::new(WatchtowerStats::default()),
         });
-        
+
         Ok(Watchtower {
             config,
             state,
@@ -283,35 +284,36 @@ impl Watchtower {
             storage,
         })
     }
-    
+
     /// Start the watchtower service
     pub async fn start(&self) -> Result<(), WatchtowerError> {
         *self.state.is_running.write() = true;
-        
+
         info!("Watchtower service started");
-        
+
         // Start the monitoring loop
         let state = Arc::clone(&self.state);
         let config = self.config.clone();
         let monitor = self.monitor.clone();
         let justice = self.justice.clone();
-        
+
         tokio::spawn(async move {
             loop {
                 if !*state.is_running.read() {
                     break;
                 }
-                
+
                 // Scan subscribed channels
-                let channels: Vec<String> = state.subscribed_channels.read().iter().cloned().collect();
-                
+                let channels: Vec<String> =
+                    state.subscribed_channels.read().iter().cloned().collect();
+
                 for channel_id in channels {
                     match monitor.check_channel(&channel_id).await {
                         Ok(Some(update)) => {
                             // Check for breach attempt
                             if let Some(breach) = monitor.detect_breach(&channel_id, &update) {
                                 warn!("Breach attempt detected on channel {}", channel_id);
-                                
+
                                 // Generate alert
                                 let alert = Alert::breach_attempt(
                                     channel_id.clone(),
@@ -319,7 +321,7 @@ impl Watchtower {
                                     breach.new_sequence,
                                 );
                                 state.add_alert(alert);
-                                
+
                                 // Submit justice if enabled
                                 if config.auto_justice {
                                     if let Err(e) = justice.submit_justice(&breach).await {
@@ -327,7 +329,7 @@ impl Watchtower {
                                     }
                                 }
                             }
-                            
+
                             // Update stored state
                             state.update_channel_state(&channel_id, update);
                         }
@@ -341,31 +343,35 @@ impl Watchtower {
                         }
                     }
                 }
-                
+
                 // Update stats
                 {
                     let mut stats = state.stats.write();
                     stats.last_scan_ts = current_timestamp();
                     stats.channels_monitored = state.subscribed_channels.read().len() as u64;
                 }
-                
-                tokio::time::sleep(tokio::time::Duration::from_secs(config.scan_interval_secs)).await;
+
+                tokio::time::sleep(tokio::time::Duration::from_secs(config.scan_interval_secs))
+                    .await;
             }
         });
-        
+
         Ok(())
     }
-    
+
     /// Stop the watchtower service
     pub fn stop(&self) {
         *self.state.is_running.write() = false;
         info!("Watchtower service stopped");
     }
-    
+
     /// Subscribe to monitor a channel
     pub fn subscribe(&self, channel_id: String) -> Result<(), WatchtowerError> {
-        self.state.subscribed_channels.write().insert(channel_id.clone());
-        
+        self.state
+            .subscribed_channels
+            .write()
+            .insert(channel_id.clone());
+
         // Initialize monitoring state
         let monitor_state = monitor::ChannelMonitorState {
             channel_id: channel_id.clone(),
@@ -374,25 +380,28 @@ impl Watchtower {
             is_closed: false,
             pending_htlcs: Vec::new(),
         };
-        
-        self.state.channel_states.write().insert(channel_id, monitor_state);
-        
+
+        self.state
+            .channel_states
+            .write()
+            .insert(channel_id, monitor_state);
+
         info!("Subscribed to channel");
         Ok(())
     }
-    
+
     /// Unsubscribe from a channel
     pub fn unsubscribe(&self, channel_id: &str) {
         self.state.subscribed_channels.write().remove(channel_id);
         self.state.channel_states.write().remove(channel_id);
         info!("Unsubscribed from channel");
     }
-    
+
     /// Get current watchtower status
     pub fn status(&self) -> WatchtowerStatus {
         let stats = self.state.stats.read();
         let alerts = self.state.recent_alerts.read();
-        
+
         WatchtowerStatus {
             is_running: *self.state.is_running.read(),
             channels_monitored: self.state.subscribed_channels.read().len() as u64,
@@ -401,10 +410,12 @@ impl Watchtower {
             recent_alerts_count: alerts.len(),
         }
     }
-    
+
     /// Get recent alerts
     pub fn get_alerts(&self, limit: usize) -> Vec<Alert> {
-        self.state.recent_alerts.read()
+        self.state
+            .recent_alerts
+            .read()
             .iter()
             .rev()
             .take(limit)
@@ -418,13 +429,13 @@ impl WatchtowerState {
     pub fn add_alert(&self, alert: Alert) {
         let mut alerts = self.recent_alerts.write();
         alerts.push(alert);
-        
+
         // Keep only last 1000 alerts
         if alerts.len() > 1000 {
             alerts.drain(0..500);
         }
     }
-    
+
     /// Update channel state
     pub fn update_channel_state(&self, channel_id: &str, update: monitor::ChannelUpdate) {
         let mut states = self.channel_states.write();
@@ -433,7 +444,7 @@ impl WatchtowerState {
             state.last_update_ts = current_timestamp();
         }
     }
-    
+
     /// Remove a channel
     pub fn remove_channel(&self, channel_id: &str) {
         let mut states = self.channel_states.write();
@@ -458,16 +469,16 @@ pub struct WatchtowerStatus {
 pub enum WatchtowerError {
     #[error("Failed to connect to Stellar network: {0}")]
     NetworkError(String),
-    
+
     #[error("Storage error: {0}")]
     StorageError(String),
-    
+
     #[error("Invalid channel: {0}")]
     InvalidChannel(String),
-    
+
     #[error("Justice transaction failed: {0}")]
     JusticeFailed(String),
-    
+
     #[error("Watchtower not running")]
     NotRunning,
 }
@@ -523,14 +534,10 @@ mod tests {
         assert_eq!(config.scan_interval_secs, 60);
         assert!(config.auto_justice);
     }
-    
+
     #[test]
     fn test_alert_message() {
-        let alert = Alert::breach_attempt(
-            "channel123".to_string(),
-            1,
-            5,
-        );
+        let alert = Alert::breach_attempt("channel123".to_string(), 1, 5);
         assert!(alert.message().contains("BREACH"));
     }
 }

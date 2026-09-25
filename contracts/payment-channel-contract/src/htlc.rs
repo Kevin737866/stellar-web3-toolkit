@@ -2,10 +2,10 @@
 //!
 //! Implementation of HTLC functionality for multi-hop payments.
 
-use soroban_sdk::{Env, BytesN, Address, Vec, Map, Val, Bytes};
+use soroban_sdk::{Address, Bytes, BytesN, Env, Map, Val, Vec};
 
-use crate::types::HTLCInfo;
 use crate::error::PaymentChannelError;
+use crate::types::HTLCInfo;
 
 /// HTLC manager for handling time-locked contracts
 pub struct HTLCManager;

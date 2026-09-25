@@ -1,20 +1,40 @@
+use crate::error::{AtomicSwapError, Result};
+use crate::swap::{AtomicSwap, SwapStatus};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 use uuid::Uuid;
-use crate::swap::{AtomicSwap, SwapStatus};
-use crate::error::{AtomicSwapError, Result};
 
 #[derive(Debug, Clone)]
 pub enum SwapEvent {
-    Created { swap_id: String, timestamp: u64 },
-    Completed { swap_id: String, timestamp: u64 },
-    Refunded { swap_id: String, timestamp: u64 },
-    Expired { swap_id: String, timestamp: u64 },
-    Failed { swap_id: String, error: String, timestamp: u64 },
-    TimeoutWarning { swap_id: String, time_remaining: Duration, timestamp: u64 },
+    Created {
+        swap_id: String,
+        timestamp: u64,
+    },
+    Completed {
+        swap_id: String,
+        timestamp: u64,
+    },
+    Refunded {
+        swap_id: String,
+        timestamp: u64,
+    },
+    Expired {
+        swap_id: String,
+        timestamp: u64,
+    },
+    Failed {
+        swap_id: String,
+        error: String,
+        timestamp: u64,
+    },
+    TimeoutWarning {
+        swap_id: String,
+        time_remaining: Duration,
+        timestamp: u64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -62,14 +82,14 @@ impl SwapMonitor {
         let swap_id = swap.id.clone();
         let mut swaps = self.swaps.write().await;
         swaps.insert(swap_id.clone(), swap);
-        
+
         // Emit creation event
         let event = SwapEvent::Created {
             swap_id,
             timestamp: chrono::Utc::now().timestamp() as u64,
         };
         self.emit_event(event).await;
-        
+
         Ok(())
     }
 
@@ -113,11 +133,11 @@ impl SwapMonitor {
 
     pub async fn start_monitoring(&self) -> Result<()> {
         info!("Starting swap monitoring service");
-        
+
         let monitor = self.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(monitor.config.check_interval);
-            
+
             loop {
                 interval.tick().await;
                 if let Err(e) = monitor.check_swaps().await {
@@ -143,18 +163,18 @@ impl SwapMonitor {
             if current_ledger > swap.timeout_ledger {
                 warn!("Swap {} has expired at ledger {}", swap_id, current_ledger);
                 swap.mark_expired();
-                
+
                 let event = SwapEvent::Expired {
                     swap_id: swap_id.clone(),
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 };
                 swaps_to_update.push((swap_id.clone(), event));
-                
+
                 // Auto-refund if enabled
                 if self.config.enable_auto_refund {
                     info!("Auto-refunding expired swap: {}", swap_id);
                     swap.mark_refunded();
-                    
+
                     let refund_event = SwapEvent::Refunded {
                         swap_id: swap_id.clone(),
                         timestamp: chrono::Utc::now().timestamp() as u64,
@@ -166,10 +186,14 @@ impl SwapMonitor {
             else if self.config.enable_timeout_warnings {
                 let ledgers_remaining = swap.timeout_ledger - current_ledger;
                 let time_remaining = Duration::from_secs(ledgers_remaining as u64 * 5); // ~5 seconds per ledger
-                
+
                 if time_remaining <= self.config.timeout_warning_threshold {
-                    warn!("Swap {} approaching timeout: {} remaining", swap_id, time_remaining.as_secs());
-                    
+                    warn!(
+                        "Swap {} approaching timeout: {} remaining",
+                        swap_id,
+                        time_remaining.as_secs()
+                    );
+
                     let event = SwapEvent::TimeoutWarning {
                         swap_id: swap_id.clone(),
                         time_remaining,
@@ -198,7 +222,7 @@ impl SwapMonitor {
     pub async fn get_statistics(&self) -> MonitoringStats {
         let swaps = self.swaps.read().await;
         let mut stats = MonitoringStats::default();
-        
+
         for swap in swaps.values() {
             stats.total_swaps += 1;
             match swap.status {
@@ -209,7 +233,7 @@ impl SwapMonitor {
                 SwapStatus::Failed => stats.failed_swaps += 1,
             }
         }
-        
+
         stats
     }
 
@@ -217,21 +241,22 @@ impl SwapMonitor {
         let stats = self.get_statistics().await;
         let swaps = self.swaps.read().await;
         let current_ledger = *self.current_ledger.read().await;
-        
+
         let mut expiring_soon = Vec::new();
         let mut failed_swaps = Vec::new();
-        
+
         for swap in swaps.values() {
             if swap.is_pending() {
                 let ledgers_remaining = swap.timeout_ledger - current_ledger;
-                if ledgers_remaining < 1000 { // Within ~5000 seconds
+                if ledgers_remaining < 1000 {
+                    // Within ~5000 seconds
                     expiring_soon.push(swap.clone());
                 }
             } else if matches!(swap.status, SwapStatus::Failed) {
                 failed_swaps.push(swap.clone());
             }
         }
-        
+
         MonitoringReport {
             stats,
             current_ledger,
@@ -289,7 +314,7 @@ mod tests {
     async fn test_swap_monitor() {
         let config = MonitoringConfig::default();
         let monitor = SwapMonitor::new(config);
-        
+
         let swap = AtomicSwap::new(
             "test_swap".to_string(),
             "initiator".to_string(),
@@ -302,13 +327,13 @@ mod tests {
             10000,
             1000,
         );
-        
+
         monitor.add_swap(swap.clone()).await.unwrap();
-        
+
         let retrieved = monitor.get_swap("test_swap").await;
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().id, "test_swap");
-        
+
         let pending = monitor.list_pending_swaps().await;
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id, "test_swap");
@@ -318,7 +343,7 @@ mod tests {
     async fn test_monitoring_stats() {
         let config = MonitoringConfig::default();
         let monitor = SwapMonitor::new(config);
-        
+
         // Add some test swaps
         for i in 0..5 {
             let mut swap = AtomicSwap::new(
@@ -333,7 +358,7 @@ mod tests {
                 10000,
                 1000,
             );
-            
+
             // Set different statuses
             match i {
                 0 => swap.mark_completed("preimage".to_string(), 2000),
@@ -342,10 +367,10 @@ mod tests {
                 3 => swap.mark_failed(),
                 _ => {} // Keep one pending
             }
-            
+
             monitor.add_swap(swap).await.unwrap();
         }
-        
+
         let stats = monitor.get_statistics().await;
         assert_eq!(stats.total_swaps, 5);
         assert_eq!(stats.completed_swaps, 1);

@@ -24,6 +24,37 @@ pub enum ToolkitCommand {
     /// Wallet commands: recovery phrases, keypair derivation, funding, signing
     #[command(subcommand)]
     Wallet(WalletCommand),
+    /// Monitoring dashboard for testnet contracts (Horizon + Soroban health, WASM verification)
+    #[command(subcommand)]
+    Monitoring(MonitoringCommand),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MonitoringCommand {
+    /// Generate a monitoring snapshot (JSON + HTML + Prometheus metrics) for testnet contracts
+    Dashboard {
+        /// Workspace root
+        #[arg(long, default_value = ".")]
+        workspace: PathBuf,
+        /// Output directory for reports
+        #[arg(long, default_value = "target/monitoring")]
+        output: PathBuf,
+        /// Optional checksums file (sha256sum output) to verify WASM hashes
+        #[arg(long)]
+        checksums: Option<PathBuf>,
+        /// Print Prometheus metrics to stdout as well
+        #[arg(long, default_value_t = false)]
+        print_metrics: bool,
+    },
+    /// Check endpoint reachability and WASM hash determinism (CI-friendly, exits non-zero on mismatch)
+    Check {
+        /// Workspace root
+        #[arg(long, default_value = ".")]
+        workspace: PathBuf,
+        /// Optional checksums file
+        #[arg(long)]
+        checksums: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -76,6 +107,7 @@ impl ToolkitCommand {
                 Ok(())
             }
             Self::Wallet(wallet) => run_wallet(wallet),
+            Self::Monitoring(cmd) => run_monitoring(cmd),
         }
     }
 }
@@ -86,9 +118,7 @@ fn run_wallet(wallet: &WalletCommand) -> Result<()> {
         WalletCommand::Generate => {
             let w = wallet::generate_wallet()?;
             print_wallet(&w);
-            println!(
-                "\n⚠  Write down your recovery phrase and store it somewhere safe. "
-            );
+            println!("\n⚠  Write down your recovery phrase and store it somewhere safe. ");
             println!("Anyone with it controls the account. It is shown only once.");
             Ok(())
         }
@@ -111,6 +141,107 @@ fn print_wallet(w: &crate::wallet::GeneratedWallet) {
     println!("  {}", w.mnemonic);
     println!("Secret key:      {}", w.secret);
     println!("Account (G):     {}", w.account);
+}
+
+fn run_monitoring(cmd: &MonitoringCommand) -> Result<()> {
+    use crate::monitoring_dashboard::{MonitorConfig, MonitoringDashboard};
+    match cmd {
+        MonitoringCommand::Dashboard {
+            workspace,
+            output,
+            checksums,
+            print_metrics,
+        } => {
+            let root = normalize_workspace_root(workspace);
+            let mut cfg = MonitorConfig::testnet_default();
+            if let Some(cs) = checksums {
+                let cs_path = if cs.is_absolute() {
+                    cs.clone()
+                } else {
+                    root.join(cs)
+                };
+                if cs_path.exists() {
+                    cfg.load_checksums(&cs_path).map_err(|e| {
+                        ToolkitError::ExecutionError(format!("load checksums: {e}"))
+                    })?;
+                }
+            } else {
+                // auto-detect common locations
+                for cand in [
+                    root.join("wasm-checksums.txt"),
+                    root.join("dist/wasm-checksums.txt"),
+                    root.join("target/reproducible/wasm-checksums.txt"),
+                ] {
+                    if cand.exists() {
+                        let _ = cfg.load_checksums(&cand);
+                        break;
+                    }
+                }
+            }
+            let dash = MonitoringDashboard::new(cfg, root.clone());
+            let out_dir = if output.is_absolute() {
+                output.clone()
+            } else {
+                root.join(output)
+            };
+            let report = dash.generate_report();
+            let (json_path, html_path) = dash
+                .write_reports(&out_dir)
+                .map_err(|e| ToolkitError::ExecutionError(e.to_string()))?;
+            println!("Dashboard report written:");
+            println!("  JSON: {}", json_path.display());
+            println!("  HTML: {}", html_path.display());
+            println!("  Metrics: {}", out_dir.join("metrics.txt").display());
+            println!(
+                "Summary: {}/{} healthy, {} hash mismatches",
+                report.summary.healthy, report.summary.total, report.summary.hash_mismatches
+            );
+            if *print_metrics {
+                println!(
+                    "\n--- Prometheus metrics ---\n{}",
+                    dash.prometheus_metrics(&report)
+                );
+            }
+            if report.summary.hash_mismatches > 0 {
+                eprintln!("WARNING: WASM hash mismatch detected — run scripts/verify-bytecode.sh");
+            }
+            Ok(())
+        }
+        MonitoringCommand::Check {
+            workspace,
+            checksums,
+        } => {
+            let root = normalize_workspace_root(workspace);
+            let mut cfg = MonitorConfig::testnet_default();
+            if let Some(cs) = checksums {
+                let cs_path = if cs.is_absolute() {
+                    cs.clone()
+                } else {
+                    root.join(cs)
+                };
+                cfg.load_checksums(&cs_path)
+                    .map_err(|e| ToolkitError::ExecutionError(format!("load checksums: {e}")))?;
+            }
+            let dash = MonitoringDashboard::new(cfg, root);
+            let report = dash.generate_report();
+            for c in &report.contracts {
+                println!(
+                    "{}: {:?} hash_match={:?} horizon={} soroban={}",
+                    c.name, c.health, c.hash_match, c.horizon_reachable, c.soroban_reachable
+                );
+                for a in &c.alerts {
+                    eprintln!("  ALERT [{:?}] {}: {}", a.severity, a.rule, a.message);
+                }
+            }
+            if report.summary.hash_mismatches > 0 {
+                return Err(ToolkitError::ExecutionError(format!(
+                    "hash mismatch in {} contract(s)",
+                    report.summary.hash_mismatches
+                )));
+            }
+            Ok(())
+        }
+    }
 }
 
 fn normalize_workspace_root(workspace: &PathBuf) -> PathBuf {

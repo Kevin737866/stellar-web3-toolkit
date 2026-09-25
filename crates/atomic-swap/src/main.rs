@@ -1,10 +1,10 @@
-use atomic_swap::{AtomicSwapCoordinator, SwapConfig, SwapRequest};
 use atomic_swap::asset::{Asset, AssetInfo};
 use atomic_swap::monitor::MonitoringConfig;
-use tracing::{info, error};
-use tracing_subscriber;
+use atomic_swap::{AtomicSwapCoordinator, SwapConfig, SwapRequest};
 use std::collections::HashMap;
 use tokio;
+use tracing::{error, info};
+use tracing_subscriber;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -28,11 +28,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Register common assets
     coordinator.register_asset(AssetInfo::xlm()).await?;
-    coordinator.register_asset(AssetInfo::custom(
-        "USDC".to_string(),
-        "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".to_string(),
-        7,
-    )).await?;
+    coordinator
+        .register_asset(AssetInfo::custom(
+            "USDC".to_string(),
+            "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".to_string(),
+            7,
+        ))
+        .await?;
 
     // Start monitoring
     coordinator.start_monitoring().await?;
@@ -42,7 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         participant: "GD5J6QF7GHXQUSWNSKN2UE4XENIH2NQCAQPQZJ56YRCZBKZWD4FAACEF".to_string(),
         initiator_asset: Asset::XLM,
         participant_asset: Asset::Custom("USDC".to_string()),
-        initiator_amount: 10000000, // 1 XLM in stroops
+        initiator_amount: 10000000,  // 1 XLM in stroops
         participant_amount: 9500000, // 0.95 USDC
         timeout_hours: 24,
         metadata: {

@@ -1,0 +1,33 @@
+{
+  "title": "Stellar Web3 Toolkit — Testnet Contracts",
+  "uid": "stellar-toolkit-testnet",
+  "timezone": "browser",
+  "schemaVersion": 38,
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Contracts Monitored",
+      "targets": [{ "expr": "count(stellar_contract_up)" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Invocations / min (by contract)",
+      "targets": [{ "expr": "rate(stellar_contract_invocations_total[5m])" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Failed Invocations",
+      "targets": [{ "expr": "rate(stellar_contract_failed_invocations_total[5m])" }]
+    },
+    {
+      "type": "table",
+      "title": "WASM Hash Verification",
+      "targets": [{ "expr": "stellar_contract_wasm_hash_mismatch" }]
+    },
+    {
+      "type": "stat",
+      "title": "Horizon Up",
+      "targets": [{ "expr": "up{job=\"stellar-horizon-testnet\"}" }]
+    }
+  ]
+}

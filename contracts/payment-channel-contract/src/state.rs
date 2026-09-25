@@ -2,13 +2,10 @@
 //!
 //! Persistent storage for payment channel state on Soroban.
 
-use soroban_sdk::{
-    contracttype, Env, BytesN, Address, Vec, Map, Val,
-    IntoVal, TryFromVal,
-};
+use soroban_sdk::{contracttype, Address, BytesN, Env, IntoVal, Map, TryFromVal, Val, Vec};
 
-use crate::types::{ChannelState, ChannelStats, HTLCInfo};
 use crate::error::PaymentChannelError;
+use crate::types::{ChannelState, ChannelStats, HTLCInfo};
 
 /// Storage key enum for all stored data
 #[contracttype]
@@ -27,12 +24,17 @@ pub fn store_channel_state(env: &Env, channel_id: &BytesN<32>, state: &ChannelSt
 }
 
 /// Retrieve channel state from storage
-pub fn get_channel_state(env: &Env, channel_id: &BytesN<32>) -> Result<ChannelState, PaymentChannelError> {
+pub fn get_channel_state(
+    env: &Env,
+    channel_id: &BytesN<32>,
+) -> Result<ChannelState, PaymentChannelError> {
     let key = StorageKey::Channel(channel_id.clone());
-    let val: Val = env.storage().instance().get(&key.into_val(env))
+    let val: Val = env
+        .storage()
+        .instance()
+        .get(&key.into_val(env))
         .ok_or(PaymentChannelError::ChannelNotFound)?;
-    ChannelState::try_from_val(env, &val)
-        .map_err(|_| PaymentChannelError::InvalidChannelState)
+    ChannelState::try_from_val(env, &val).map_err(|_| PaymentChannelError::InvalidChannelState)
 }
 
 /// Delete channel state from storage
@@ -51,7 +53,8 @@ pub fn store_participant_channels(env: &Env, participant: &Address, channels: &V
 /// Get list of channels for a participant
 pub fn get_participant_channels(env: &Env, participant: &Address) -> Vec<BytesN<32>> {
     let key = StorageKey::ParticipantChannels(participant.clone());
-    env.storage().instance()
+    env.storage()
+        .instance()
         .get::<Val, Val>(&key.into_val(env))
         .map(|val| Vec::<BytesN<32>>::try_from_val(env, &val).unwrap_or_else(|_| Vec::new(env)))
         .unwrap_or_else(|| Vec::new(env))
@@ -67,7 +70,8 @@ pub fn store_channel_stats(env: &Env, channel_id: &BytesN<32>, stats: &ChannelSt
 /// Get channel statistics
 pub fn get_channel_stats(env: &Env, channel_id: &BytesN<32>) -> ChannelStats {
     let key = StorageKey::ChannelStats(channel_id.clone());
-    env.storage().instance()
+    env.storage()
+        .instance()
         .get::<Val, Val>(&key.into_val(env))
         .and_then(|val| ChannelStats::try_from_val(env, &val).ok())
         .unwrap_or_else(|| ChannelStats::default())

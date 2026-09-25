@@ -1,0 +1,32 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 30s
+
+rule_files:
+  - "alert-rules.yml"
+
+scrape_configs:
+  - job_name: "stellar-toolkit-monitor"
+    static_configs:
+      - targets: ["localhost:9091"]
+    metrics_path: /metrics
+    scrape_interval: 30s
+    scrape_timeout: 10s
+
+  - job_name: "stellar-horizon-testnet"
+    static_configs:
+      - targets: ["horizon-testnet.stellar.org:443"]
+    metrics_path: /metrics
+    scheme: https
+    scrape_interval: 60s
+
+  - job_name: "soroban-rpc-testnet"
+    static_configs:
+      - targets: ["soroban-testnet.stellar.org:443"]
+    scheme: https
+    scrape_interval: 60s
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]

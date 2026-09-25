@@ -1,0 +1,18 @@
+# Development environment — local Stellar quickstart + Soroban RPC
+[env]
+name = "dev"
+stellar_network = "local"
+horizon_url = "http://localhost:8000"
+soroban_rpc_url = "http://localhost:8001"
+soroban_network_passphrase = "Standalone Network ; February 2017"
+
+# Contract deployment defaults for dev
+[deploy]
+auto_fund = true
+fee = "100"
+timeout_seconds = 30
+confirmations = 1
+
+[contracts]
+# Override per-contract WASM path if needed
+# amm_pool = "target/wasm32-unknown-unknown/release/amm_pool.wasm"

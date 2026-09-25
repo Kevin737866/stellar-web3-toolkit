@@ -1,5 +1,5 @@
 //! # Channel Router
-//! 
+//!
 //! Multi-hop payment routing for Stellar payment channels.
 //! Implements path-finding algorithms for routing payments through
 //! the payment channel network.
@@ -8,14 +8,14 @@ pub mod graph;
 pub mod pathfinder;
 pub mod policy;
 
+use fxhash::FxHashMap;
+use parking_lot::RwLock;
+use priority_queue::PriorityQueue;
+use serde::{Deserialize, Serialize};
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use parking_lot::RwLock;
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use fxhash::FxHashMap;
-use priority_queue::PriorityQueue;
-use std::cmp::Reverse;
 
 /// Maximum number of hops allowed in a route
 pub const MAX_ROUTE_HOPS: usize = 20;
@@ -28,31 +28,37 @@ pub const MAX_ROUTE_AMOUNT: i128 = i128::MAX / 2;
 pub enum RoutingError {
     #[error("No path found from {origin} to {destination}")]
     NoPathFound { origin: String, destination: String },
-    
+
     #[error("Source node {node} has no channels")]
     NoChannelsForNode { node: String },
-    
-    #[error("Insufficient capacity: needed {needed}, available {available} on channel {channel_id}")]
-    InsufficientCapacity { needed: i128, available: i128, channel_id: String },
-    
+
+    #[error(
+        "Insufficient capacity: needed {needed}, available {available} on channel {channel_id}"
+    )]
+    InsufficientCapacity {
+        needed: i128,
+        available: i128,
+        channel_id: String,
+    },
+
     #[error("Amount below dust limit: {amount} < {dust_limit}")]
     BelowDustLimit { amount: i128, dust_limit: i128 },
-    
+
     #[error("Amount exceeds maximum: {amount} > {max_amount}")]
     AmountExceedsMaximum { amount: i128, max_amount: i128 },
-    
+
     #[error("Path too long: {length} hops, maximum is {max}")]
     PathTooLong { length: usize, max: usize },
-    
+
     #[error("Fee exceeds budget: {fee} > {budget}")]
     FeeExceedsBudget { fee: i128, budget: i128 },
-    
+
     #[error("Node not found: {node}")]
     NodeNotFound { node: String },
-    
+
     #[error("Channel not found: {channel_id}")]
     ChannelNotFound { channel_id: String },
-    
+
     #[error("Invalid node address")]
     InvalidNodeAddress,
 }
@@ -180,7 +186,7 @@ impl RouteHop {
             expiry_height: 0,
         }
     }
-    
+
     /// Calculate the total amount for this hop (forward + fee)
     pub fn total_amount(&self) -> i128 {
         self.amount + self.fee
@@ -269,20 +275,22 @@ impl NetworkGraph {
             version: 0,
         }
     }
-    
+
     /// Add a node to the graph
     pub fn add_node(&mut self, node: Node) {
         let id = node.id.clone();
         self.nodes.insert(id.clone(), node);
-        self.node_channels.entry(id.clone()).or_insert_with(HashSet::new);
+        self.node_channels
+            .entry(id.clone())
+            .or_insert_with(HashSet::new);
         self.adjacency.entry(id).or_insert_with(FxHashMap::default);
     }
-    
+
     /// Add a channel to the graph
     pub fn add_channel(&mut self, channel: Channel) {
         // Add to channels map
         self.channels.insert(channel.id.clone(), channel.clone());
-        
+
         // Update node_channels
         self.node_channels
             .entry(channel.node_a.clone())
@@ -292,7 +300,7 @@ impl NetworkGraph {
             .entry(channel.node_b.clone())
             .or_insert_with(HashSet::new)
             .insert(channel.id.clone());
-        
+
         // Update adjacency
         self.adjacency
             .entry(channel.node_a.clone())
@@ -302,10 +310,10 @@ impl NetworkGraph {
             .entry(channel.node_b.clone())
             .or_insert_with(FxHashMap::default)
             .insert(channel.node_a.clone(), channel.id.clone());
-        
+
         self.version += 1;
     }
-    
+
     /// Remove a channel from the graph
     pub fn remove_channel(&mut self, channel_id: &str) {
         if let Some(channel) = self.channels.remove(channel_id) {
@@ -316,7 +324,7 @@ impl NetworkGraph {
             if let Some(channels) = self.node_channels.get_mut(&channel.node_b) {
                 channels.remove(channel_id);
             }
-            
+
             // Remove from adjacency
             if let Some(neighbors) = self.adjacency.get_mut(&channel.node_a) {
                 neighbors.remove(&channel.node_b);
@@ -324,11 +332,11 @@ impl NetworkGraph {
             if let Some(neighbors) = self.adjacency.get_mut(&channel.node_b) {
                 neighbors.remove(&channel.node_a);
             }
-            
+
             self.version += 1;
         }
     }
-    
+
     /// Update channel capacity
     pub fn update_capacity(&mut self, channel_id: &str, direction: Direction, new_capacity: i128) {
         if let Some(channel) = self.channels.get_mut(channel_id) {
@@ -338,17 +346,17 @@ impl NetworkGraph {
             }
         }
     }
-    
+
     /// Get a node by ID
     pub fn get_node(&self, node_id: &str) -> Option<&Node> {
         self.nodes.get(node_id)
     }
-    
+
     /// Get a channel by ID
     pub fn get_channel(&self, channel_id: &str) -> Option<&Channel> {
         self.channels.get(channel_id)
     }
-    
+
     /// Get channels for a node
     pub fn get_node_channels(&self, node_id: &str) -> Vec<&Channel> {
         self.node_channels
@@ -361,7 +369,7 @@ impl NetworkGraph {
             })
             .unwrap_or_default()
     }
-    
+
     /// Get neighbors of a node
     pub fn get_neighbors(&self, node_id: &str) -> Vec<&Node> {
         self.adjacency
@@ -374,27 +382,27 @@ impl NetworkGraph {
             })
             .unwrap_or_default()
     }
-    
+
     /// Check if a node exists
     pub fn has_node(&self, node_id: &str) -> bool {
         self.nodes.contains_key(node_id)
     }
-    
+
     /// Check if a channel exists
     pub fn has_channel(&self, channel_id: &str) -> bool {
         self.channels.contains_key(channel_id)
     }
-    
+
     /// Get the number of nodes
     pub fn num_nodes(&self) -> usize {
         self.nodes.len()
     }
-    
+
     /// Get the number of channels
     pub fn num_channels(&self) -> usize {
         self.channels.len()
     }
-    
+
     /// Get graph version (for caching)
     pub fn version(&self) -> u64 {
         self.version
@@ -417,7 +425,7 @@ pub fn calculate_channel_fee(
     // Fee = base_fee + (amount * fee_rate_ppm / 1,000,000) + (cltv_delta * time_lock_fee)
     let proportional_fee = (amount as u128 * fee_rate_ppm as u128 / 1_000_000) as i128;
     let time_lock_fee = (cltv_delta as i128 * 10) / 1440; // ~1 XLM per day
-    
+
     base_fee + proportional_fee + time_lock_fee
 }
 
@@ -433,40 +441,40 @@ pub fn find_best_route(
             dust_limit: 1,
         });
     }
-    
+
     if !graph.has_node(&request.source) {
         return Err(RoutingError::NodeNotFound {
-            node: request.source.clone()
+            node: request.source.clone(),
         });
     }
-    
+
     if !graph.has_node(&request.destination) {
         return Err(RoutingError::NodeNotFound {
-            node: request.destination.clone()
+            node: request.destination.clone(),
         });
     }
-    
+
     let max_hops = request.max_hops.unwrap_or(MAX_ROUTE_HOPS);
-    
+
     // Dijkstra's algorithm with weighted edges (fees)
     let mut dist: FxHashMap<String, i128> = FxHashMap::default();
     let mut prev: FxHashMap<String, (String, String, i128, i128)> = FxHashMap::default(); // node -> (prev_node, channel_id, amount, fee)
     let mut pq: PriorityQueue<String, Reverse<i128>> = PriorityQueue::new();
-    
+
     dist.insert(request.source.clone(), 0);
     pq.push(request.source.clone(), Reverse(0));
-    
+
     while let Some((node_id, Reverse(dist_cost))) = pq.pop() {
         // Found destination
         if node_id == request.destination {
             break;
         }
-        
+
         // Skip if we've found a better path
         if dist_cost > *dist.get(&node_id).unwrap_or(&i128::MAX) {
             continue;
         }
-        
+
         // Get current amount being routed (from fees accumulated)
         let current_amount = if node_id == request.source {
             request.amount
@@ -474,7 +482,7 @@ pub fn find_best_route(
             // Calculate the amount at this node based on fees paid so far
             dist_cost
         };
-        
+
         // Check all neighbors
         if let Some(neighbors) = graph.adjacency.get(&node_id) {
             for (neighbor_id, channel_id) in neighbors {
@@ -485,13 +493,13 @@ pub fn find_best_route(
                     } else {
                         (channel.capacity_b_to_a, Direction::BToA)
                     };
-                    
+
                     // Skip if channel doesn't have enough capacity
                     let amount_at_next_hop = current_amount;
                     if available_capacity < amount_at_next_hop {
                         continue;
                     }
-                    
+
                     // Calculate fee for this hop
                     let fee = calculate_channel_fee(
                         amount_at_next_hop,
@@ -499,20 +507,23 @@ pub fn find_best_route(
                         channel.fee_rate,
                         channel.cltv_delta,
                     );
-                    
+
                     let next_dist = dist_cost + fee;
-                    
+
                     // Check if this is a better path
                     if next_dist < *dist.get(neighbor_id).unwrap_or(&i128::MAX) {
                         dist.insert(neighbor_id.clone(), next_dist);
-                        prev.insert(neighbor_id.clone(), (node_id.clone(), channel_id.clone(), current_amount, fee));
+                        prev.insert(
+                            neighbor_id.clone(),
+                            (node_id.clone(), channel_id.clone(), current_amount, fee),
+                        );
                         pq.push(neighbor_id.clone(), Reverse(next_dist));
                     }
                 }
             }
         }
     }
-    
+
     // Reconstruct route
     if !prev.contains_key(&request.destination) {
         return Err(RoutingError::NoPathFound {
@@ -520,11 +531,11 @@ pub fn find_best_route(
             destination: request.destination.clone(),
         });
     }
-    
+
     let mut hops = Vec::new();
     let mut current = request.destination.clone();
     let mut total_fees = 0i128;
-    
+
     while let Some((prev_node, channel_id, amount, fee)) = prev.get(&current) {
         if let Some(channel) = graph.channels.get(channel_id) {
             let node_id = if &channel.node_a == prev_node {
@@ -532,7 +543,7 @@ pub fn find_best_route(
             } else {
                 channel.node_a.clone()
             };
-            
+
             hops.push(RouteHop::new(
                 channel_id.clone(),
                 node_id,
@@ -542,15 +553,15 @@ pub fn find_best_route(
             ));
             total_fees += fee;
         }
-        
+
         if current == request.source {
             break;
         }
         current = prev_node.clone();
     }
-    
+
     hops.reverse();
-    
+
     let num_hops = hops.len();
 
     // Check path length
@@ -560,7 +571,7 @@ pub fn find_best_route(
             max: max_hops,
         });
     }
-    
+
     // Check fee budget
     if let Some(max_fee) = request.max_fee_budget {
         if total_fees > max_fee {
@@ -570,7 +581,7 @@ pub fn find_best_route(
             });
         }
     }
-    
+
     Ok(Route {
         hops,
         total_fees,
@@ -595,7 +606,7 @@ pub fn find_k_routes(
     k: usize,
 ) -> Result<Vec<Route>, RoutingError> {
     let mut routes = Vec::new();
-    
+
     // For simplicity, we find k routes by slightly modifying the request
     // In production, you'd use Yen's k-shortest paths algorithm
     for i in 0..k {
@@ -604,7 +615,7 @@ pub fn find_k_routes(
         if i > 0 {
             modified_request.max_hops = Some(request.max_hops.unwrap_or(MAX_ROUTE_HOPS) + i);
         }
-        
+
         if let Ok(route) = find_best_route(graph, &modified_request) {
             // Avoid duplicates
             if !routes.iter().any(|r: &Route| r.hops == route.hops) {
@@ -612,7 +623,7 @@ pub fn find_k_routes(
             }
         }
     }
-    
+
     Ok(routes)
 }
 
@@ -623,7 +634,7 @@ mod tests {
     #[test]
     fn test_network_graph() {
         let mut graph = NetworkGraph::new();
-        
+
         // Add nodes
         graph.add_node(Node {
             id: "alice".to_string(),
@@ -633,7 +644,7 @@ mod tests {
             last_seen: 1000,
             features: NodeFeatures::default(),
         });
-        
+
         graph.add_node(Node {
             id: "bob".to_string(),
             public_key: vec![4, 5, 6],
@@ -642,7 +653,7 @@ mod tests {
             last_seen: 1000,
             features: NodeFeatures::default(),
         });
-        
+
         // Add channel
         graph.add_channel(Channel {
             id: "ch1".to_string(),
@@ -659,17 +670,17 @@ mod tests {
             enabled: true,
             age_seconds: 3600,
         });
-        
+
         assert_eq!(graph.num_nodes(), 2);
         assert_eq!(graph.num_channels(), 1);
         assert!(graph.has_node("alice"));
         assert!(graph.has_node("bob"));
     }
-    
+
     #[test]
     fn test_route_finding() {
         let mut graph = NetworkGraph::new();
-        
+
         // Create a simple network: alice -> bob -> carol
         for (id, pk) in [("alice", 1), ("bob", 2), ("carol", 3)] {
             graph.add_node(Node {
@@ -681,7 +692,7 @@ mod tests {
                 features: NodeFeatures::default(),
             });
         }
-        
+
         graph.add_channel(Channel {
             id: "ch1".to_string(),
             node_a: "alice".to_string(),
@@ -697,7 +708,7 @@ mod tests {
             enabled: true,
             age_seconds: 3600,
         });
-        
+
         graph.add_channel(Channel {
             id: "ch2".to_string(),
             node_a: "bob".to_string(),
@@ -713,7 +724,7 @@ mod tests {
             enabled: true,
             age_seconds: 3600,
         });
-        
+
         let request = RouteRequest {
             source: "alice".to_string(),
             destination: "carol".to_string(),
@@ -723,7 +734,7 @@ mod tests {
             find_any: false,
             payment_metadata: None,
         };
-        
+
         let route = find_best_route(&graph, &request).unwrap();
         assert_eq!(route.hops.len(), 2);
         assert_eq!(route.total_amount, 100);

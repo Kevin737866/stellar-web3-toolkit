@@ -1,13 +1,13 @@
+use crate::asset::{Asset, AssetInfo, AssetRegistry};
+use crate::error::{AtomicSwapError, Result};
+use crate::monitor::{MonitoringConfig, SwapEvent, SwapMonitor};
+use crate::preimage::{Preimage, PreimageManager};
+use crate::swap::{AtomicSwap, SwapStatus, SwapTemplate};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 use uuid::Uuid;
-use crate::asset::{Asset, AssetRegistry, AssetInfo};
-use crate::preimage::{Preimage, PreimageManager};
-use crate::swap::{AtomicSwap, SwapStatus, SwapTemplate};
-use crate::monitor::{SwapMonitor, MonitoringConfig, SwapEvent};
-use crate::error::{AtomicSwapError, Result};
 
 #[derive(Debug, Clone)]
 pub struct SwapRequest {
@@ -65,7 +65,7 @@ impl AtomicSwapCoordinator {
     pub fn new(config: SwapConfig) -> Self {
         let monitor_config = MonitoringConfig::default();
         let monitor = SwapMonitor::new(monitor_config);
-        
+
         Self {
             swaps: Arc::new(RwLock::new(HashMap::new())),
             templates: Arc::new(RwLock::new(HashMap::new())),
@@ -84,7 +84,7 @@ impl AtomicSwapCoordinator {
     ) -> Result<SwapResponse> {
         // Validate request
         self.validate_swap_request(&request)?;
-        
+
         // Check asset support
         let asset_registry = self.asset_registry.read().await;
         if !asset_registry.is_supported(&request.initiator_asset) {
@@ -107,7 +107,7 @@ impl AtomicSwapCoordinator {
 
         // Generate swap ID
         let swap_id = Uuid::new_v4().to_string();
-        
+
         // Calculate timeout ledger (simplified - in real implementation, get current ledger)
         let current_ledger = 100000u32; // Placeholder
         let timeout_ledger = current_ledger + (request.timeout_hours * 720); // ~720 ledgers per hour
@@ -139,7 +139,10 @@ impl AtomicSwapCoordinator {
         // Add to monitor
         self.monitor.add_swap(swap.clone()).await?;
 
-        info!("Initiated swap {} between {} and {}", swap_id, initiator, request.participant);
+        info!(
+            "Initiated swap {} between {} and {}",
+            swap_id, initiator, request.participant
+        );
 
         Ok(SwapResponse {
             swap_id,
@@ -157,8 +160,11 @@ impl AtomicSwapCoordinator {
         swap_id: String,
     ) -> Result<AtomicSwap> {
         let swaps = self.swaps.read().await;
-        let swap = swaps.get(&swap_id)
-            .ok_or_else(|| AtomicSwapError::SwapNotFound { swap_id: swap_id.clone() })?;
+        let swap = swaps
+            .get(&swap_id)
+            .ok_or_else(|| AtomicSwapError::SwapNotFound {
+                swap_id: swap_id.clone(),
+            })?;
 
         // Verify participant matches
         if swap.participant != participant {
@@ -183,8 +189,11 @@ impl AtomicSwapCoordinator {
         current_ledger: u32,
     ) -> Result<()> {
         let mut swaps = self.swaps.write().await;
-        let swap = swaps.get_mut(&swap_id)
-            .ok_or_else(|| AtomicSwapError::SwapNotFound { swap_id: swap_id.clone() })?;
+        let swap = swaps
+            .get_mut(&swap_id)
+            .ok_or_else(|| AtomicSwapError::SwapNotFound {
+                swap_id: swap_id.clone(),
+            })?;
 
         // Verify swap can be completed
         if !swap.can_complete(current_ledger) {
@@ -196,9 +205,11 @@ impl AtomicSwapCoordinator {
         }
 
         // Verify preimage hash
-        let preimage_bytes = hex::decode(&preimage)
-            .map_err(|_| AtomicSwapError::InvalidPreimage { swap_id: swap_id.clone() })?;
-        
+        let preimage_bytes =
+            hex::decode(&preimage).map_err(|_| AtomicSwapError::InvalidPreimage {
+                swap_id: swap_id.clone(),
+            })?;
+
         let computed_hash = hex::encode(crate::preimage::Preimage::compute_hash(&preimage_bytes)?);
         if computed_hash != swap.hash_lock {
             return Err(AtomicSwapError::InvalidPreimage { swap_id });
@@ -215,14 +226,13 @@ impl AtomicSwapCoordinator {
     }
 
     /// Refund a swap after timeout
-    pub async fn refund_swap(
-        &self,
-        swap_id: String,
-        current_ledger: u32,
-    ) -> Result<()> {
+    pub async fn refund_swap(&self, swap_id: String, current_ledger: u32) -> Result<()> {
         let mut swaps = self.swaps.write().await;
-        let swap = swaps.get_mut(&swap_id)
-            .ok_or_else(|| AtomicSwapError::SwapNotFound { swap_id: swap_id.clone() })?;
+        let swap = swaps
+            .get_mut(&swap_id)
+            .ok_or_else(|| AtomicSwapError::SwapNotFound {
+                swap_id: swap_id.clone(),
+            })?;
 
         // Verify swap can be refunded
         if !swap.can_refund(current_ledger) {
@@ -252,13 +262,15 @@ impl AtomicSwapCoordinator {
     ) -> Result<Vec<SwapResponse>> {
         if !self.config.enable_multi_hop {
             return Err(AtomicSwapError::ConfigError(
-                "Multi-hop swaps are disabled".to_string()
+                "Multi-hop swaps are disabled".to_string(),
             ));
         }
 
         // Find intermediary assets (simplified - in real implementation, use path finding)
-        let intermediary_assets = self.find_intermediary_path(&initiator_asset, &participant_asset).await?;
-        
+        let intermediary_assets = self
+            .find_intermediary_path(&initiator_asset, &participant_asset)
+            .await?;
+
         if intermediary_assets.is_empty() {
             // Direct swap if no intermediary needed
             let request = SwapRequest {
@@ -270,7 +282,7 @@ impl AtomicSwapCoordinator {
                 timeout_hours,
                 metadata: HashMap::new(),
             };
-            
+
             let response = self.initiate_swap(initiator, request).await?;
             return Ok(vec![response]);
         }
@@ -283,11 +295,21 @@ impl AtomicSwapCoordinator {
 
         for (i, intermediary_asset) in intermediary_assets.iter().enumerate() {
             let is_last_hop = i == intermediary_assets.len() - 1;
-            let next_participant = if is_last_hop { participant.clone() } else { format!("hop_{}", i) };
-            let next_asset = if is_last_hop { participant_asset.clone() } else { intermediary_asset.clone() };
-            
+            let next_participant = if is_last_hop {
+                participant.clone()
+            } else {
+                format!("hop_{}", i)
+            };
+            let next_asset = if is_last_hop {
+                participant_asset.clone()
+            } else {
+                intermediary_asset.clone()
+            };
+
             // Calculate exchange rate (simplified)
-            let next_amount = self.calculate_exchange_amount(current_amount, &current_asset, &next_asset).await?;
+            let next_amount = self
+                .calculate_exchange_amount(current_amount, &current_asset, &next_asset)
+                .await?;
 
             let request = SwapRequest {
                 participant: next_participant.clone(),
@@ -299,7 +321,10 @@ impl AtomicSwapCoordinator {
                 metadata: {
                     let mut meta = HashMap::new();
                     meta.insert("hop_index".to_string(), i.to_string());
-                    meta.insert("total_hops".to_string(), intermediary_assets.len().to_string());
+                    meta.insert(
+                        "total_hops".to_string(),
+                        intermediary_assets.len().to_string(),
+                    );
                     if is_last_hop {
                         meta.insert("final_destination".to_string(), participant.clone());
                     }
@@ -307,7 +332,9 @@ impl AtomicSwapCoordinator {
                 },
             };
 
-            let response = self.initiate_swap(current_initiator.clone(), request).await?;
+            let response = self
+                .initiate_swap(current_initiator.clone(), request)
+                .await?;
             responses.push(response);
 
             current_initiator = next_participant;
@@ -321,7 +348,8 @@ impl AtomicSwapCoordinator {
     /// Get swap information
     pub async fn get_swap(&self, swap_id: String) -> Result<AtomicSwap> {
         let swaps = self.swaps.read().await;
-        swaps.get(&swap_id)
+        swaps
+            .get(&swap_id)
             .cloned()
             .ok_or_else(|| AtomicSwapError::SwapNotFound { swap_id })
     }
@@ -390,7 +418,7 @@ impl AtomicSwapCoordinator {
         to_asset: &Asset,
     ) -> Result<Vec<Asset>> {
         let asset_registry = self.asset_registry.read().await;
-        
+
         // Simplified path finding - in real implementation, use graph algorithms
         if from_asset == to_asset {
             return Ok(vec![]);
@@ -431,7 +459,7 @@ mod tests {
     async fn test_swap_initiation() {
         let config = SwapConfig::default();
         let coordinator = AtomicSwapCoordinator::new(config);
-        
+
         let request = SwapRequest {
             participant: "participant".to_string(),
             initiator_asset: Asset::XLM,
@@ -442,7 +470,10 @@ mod tests {
             metadata: HashMap::new(),
         };
 
-        let response = coordinator.initiate_swap("initiator".to_string(), request).await.unwrap();
+        let response = coordinator
+            .initiate_swap("initiator".to_string(), request)
+            .await
+            .unwrap();
         assert!(!response.swap_id.is_empty());
         assert!(!response.hash_lock.is_empty());
         assert!(response.preimage.is_some());
@@ -452,7 +483,7 @@ mod tests {
     async fn test_swap_completion() {
         let config = SwapConfig::default();
         let coordinator = AtomicSwapCoordinator::new(config);
-        
+
         // First initiate a swap
         let request = SwapRequest {
             participant: "participant".to_string(),
@@ -464,12 +495,18 @@ mod tests {
             metadata: HashMap::new(),
         };
 
-        let response = coordinator.initiate_swap("initiator".to_string(), request).await.unwrap();
+        let response = coordinator
+            .initiate_swap("initiator".to_string(), request)
+            .await
+            .unwrap();
         let preimage = response.preimage.unwrap();
         let swap_id = response.swap_id.clone();
 
         // Complete the swap
-        coordinator.complete_swap(response.swap_id, preimage, 101000).await.unwrap();
+        coordinator
+            .complete_swap(response.swap_id, preimage, 101000)
+            .await
+            .unwrap();
 
         // Verify swap is completed
         let swap = coordinator.get_swap(swap_id).await.unwrap();

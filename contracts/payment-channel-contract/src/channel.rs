@@ -2,10 +2,10 @@
 //!
 //! Core channel management logic for the payment channel system.
 
-use soroban_sdk::{Env, BytesN, Address, Vec, Map, Val, Bytes};
+use soroban_sdk::{Address, Bytes, BytesN, Env, Map, Val, Vec};
 
-use crate::types::{ChannelState, ChannelConfig, ChannelStats, RouteHop};
 use crate::error::PaymentChannelError;
+use crate::types::{ChannelConfig, ChannelState, ChannelStats, RouteHop};
 
 /// Channel manager for handling channel operations
 pub struct ChannelManager;
@@ -35,7 +35,8 @@ impl ChannelManager {
         }
 
         // Sort participants for deterministic ordering
-        let (sorted_a, sorted_b) = Self::sort_participants(participant_a.clone(), participant_b.clone());
+        let (sorted_a, sorted_b) =
+            Self::sort_participants(participant_a.clone(), participant_b.clone());
 
         // Generate channel ID
         let channel_id = Self::generate_channel_id(env, &sorted_a, &sorted_b);
@@ -54,7 +55,8 @@ impl ChannelManager {
 
         // Validate channel reserves
         let config = ChannelConfig::default();
-        if initial_balance_a < config.channel_reserve || initial_balance_b < config.channel_reserve {
+        if initial_balance_a < config.channel_reserve || initial_balance_b < config.channel_reserve
+        {
             return Err(PaymentChannelError::ReserveNotMet);
         }
 
@@ -181,7 +183,12 @@ impl ChannelManager {
     }
 
     /// Check if the channel supports a payment amount
-    pub fn can_support_payment(channel: &ChannelState, amount: i128, from_a: bool, reserve: i128) -> bool {
+    pub fn can_support_payment(
+        channel: &ChannelState,
+        amount: i128,
+        from_a: bool,
+        reserve: i128,
+    ) -> bool {
         let capacity = if from_a {
             Self::get_send_capacity(channel, true, reserve)
         } else {
@@ -213,10 +220,7 @@ impl ChannelManager {
     }
 
     /// Rebalance the channel by swapping capacities
-    pub fn rebalance(
-        channel: &mut ChannelState,
-        amount: i128,
-    ) -> Result<(), PaymentChannelError> {
+    pub fn rebalance(channel: &mut ChannelState, amount: i128) -> Result<(), PaymentChannelError> {
         if amount < 0 {
             return Err(PaymentChannelError::InvalidBalance);
         }

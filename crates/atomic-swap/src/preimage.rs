@@ -1,8 +1,8 @@
+use crate::error::{AtomicSwapError, Result};
 use rand::{thread_rng, Rng};
 use sha2::{Digest, Sha256};
 use soroban_sdk::Bytes;
 use std::time::{SystemTime, UNIX_EPOCH};
-use crate::error::{AtomicSwapError, Result};
 
 #[derive(Debug, Clone)]
 pub struct Preimage {
@@ -16,7 +16,7 @@ impl Preimage {
     pub fn generate(size: usize) -> Result<Self> {
         if size == 0 || size > 1024 {
             return Err(AtomicSwapError::PreimageGenerationError(
-                "Invalid preimage size".to_string()
+                "Invalid preimage size".to_string(),
             ));
         }
 
@@ -57,7 +57,7 @@ impl Preimage {
     pub fn from_data(data: Vec<u8>) -> Result<Self> {
         if data.is_empty() {
             return Err(AtomicSwapError::PreimageGenerationError(
-                "Empty preimage data".to_string()
+                "Empty preimage data".to_string(),
             ));
         }
 
@@ -95,7 +95,7 @@ impl Preimage {
     pub fn hash_as_fixed(&self) -> Result<[u8; 32]> {
         if self.hash.len() != 32 {
             return Err(AtomicSwapError::HashComputationError(
-                "Invalid hash length".to_string()
+                "Invalid hash length".to_string(),
             ));
         }
 
@@ -136,9 +136,7 @@ impl PreimageManager {
 
     /// Get a stored preimage by hash
     pub fn get_by_hash(&self, hash: &[u8]) -> Option<&Preimage> {
-        self.generated_preimages
-            .iter()
-            .find(|p| p.hash == hash)
+        self.generated_preimages.iter().find(|p| p.hash == hash)
     }
 
     /// Get a stored preimage by hex hash
@@ -152,10 +150,8 @@ impl PreimageManager {
 
     /// Remove a preimage from storage (for cleanup)
     pub fn remove_by_hash(&mut self, hash: &[u8]) -> bool {
-        let index = self.generated_preimages
-            .iter()
-            .position(|p| p.hash == hash);
-        
+        let index = self.generated_preimages.iter().position(|p| p.hash == hash);
+
         if let Some(index) = index {
             self.generated_preimages.remove(index);
             true
@@ -198,7 +194,7 @@ mod tests {
         let preimage = Preimage::from_seed("test_seed").unwrap();
         assert_eq!(preimage.data, b"test_seed");
         assert_eq!(preimage.hash.len(), 32);
-        
+
         // Verify hash consistency
         let preimage2 = Preimage::from_seed("test_seed").unwrap();
         assert_eq!(preimage.hash, preimage2.hash);
@@ -208,7 +204,7 @@ mod tests {
     fn test_hash_verification() {
         let preimage = Preimage::generate(16).unwrap();
         assert!(preimage.verify_hash(&preimage.hash));
-        
+
         let wrong_hash = vec![0u8; 32];
         assert!(!preimage.verify_hash(&wrong_hash));
     }
@@ -217,14 +213,14 @@ mod tests {
     fn test_preimage_manager() {
         let mut manager = PreimageManager::new();
         assert_eq!(manager.count(), 0);
-        
+
         let preimage = manager.generate(64).unwrap();
         assert_eq!(manager.count(), 1);
-        
+
         let retrieved = manager.get_by_hash(&preimage.hash);
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().data, preimage.data);
-        
+
         let removed = manager.remove_by_hash(&preimage.hash);
         assert!(removed);
         assert_eq!(manager.count(), 0);
