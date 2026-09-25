@@ -1,13 +1,13 @@
-pub mod coordinator;
-pub mod swap;
 pub mod asset;
-pub mod monitor;
+pub mod coordinator;
 pub mod error;
+pub mod monitor;
 pub mod preimage;
+pub mod swap;
 
-pub use coordinator::{AtomicSwapCoordinator, SwapConfig, SwapRequest, SwapResponse};
-pub use swap::{AtomicSwap, SwapStatus, SwapDirection, SwapTemplate};
 pub use asset::{Asset, AssetInfo};
-pub use monitor::{SwapMonitor, MonitoringConfig};
+pub use coordinator::{AtomicSwapCoordinator, SwapConfig, SwapRequest, SwapResponse};
 pub use error::{AtomicSwapError, Result};
+pub use monitor::{MonitoringConfig, SwapMonitor};
 pub use preimage::{Preimage, PreimageManager};
+pub use swap::{AtomicSwap, SwapDirection, SwapStatus, SwapTemplate};

@@ -3,9 +3,7 @@
 extern crate std;
 
 use amm_pool::AmmPoolClient;
-use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Bytes, BytesN, Env,
-};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, BytesN, Env};
 
 /// Counter-based deploy salt (unique per pair); `get_pair` is canonical for routing.
 #[contracttype]
@@ -37,10 +35,14 @@ fn sort_tokens(a: Address, b: Address) -> (Address, Address) {
 
 fn next_salt(env: &Env) -> BytesN<32> {
     let n: u64 = env.storage().instance().get(&DataKey::Nonce).unwrap_or(0);
-    env.storage().instance().set(&DataKey::Nonce, &(n.saturating_add(1)));
+    env.storage()
+        .instance()
+        .set(&DataKey::Nonce, &(n.saturating_add(1)));
     let mut raw = [0u8; 32];
     raw[24..32].copy_from_slice(&n.to_be_bytes());
-    env.crypto().sha256(&Bytes::from_slice(env, &raw)).to_bytes()
+    env.crypto()
+        .sha256(&Bytes::from_slice(env, &raw))
+        .to_bytes()
 }
 
 #[contractimpl]
@@ -49,7 +51,9 @@ impl AmmFactory {
         assert!(!env.storage().instance().has(&DataKey::Admin), "admin set");
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::PoolWasmHash, &pool_wasm_hash);
+        env.storage()
+            .instance()
+            .set(&DataKey::PoolWasmHash, &pool_wasm_hash);
         env.storage().instance().set(&DataKey::Nonce, &0_u64);
     }
 
@@ -61,7 +65,10 @@ impl AmmFactory {
     pub fn create_pair(env: Env, token_a: Address, token_b: Address) -> Address {
         assert!(token_a != token_b, "identical");
         let (t0, t1) = sort_tokens(token_a.clone(), token_b.clone());
-        let pk = PairKey { t0: t0.clone(), t1: t1.clone() };
+        let pk = PairKey {
+            t0: t0.clone(),
+            t1: t1.clone(),
+        };
         assert!(
             !env.storage().instance().has(&DataKey::Pair(pk.clone())),
             "exists"
@@ -98,7 +105,7 @@ impl AmmFactory {
 mod test {
     use super::*;
     use amm_pool::AmmPoolClient;
-    use soroban_sdk::testutils::{Address as _};
+    use soroban_sdk::testutils::Address as _;
     use std::path::Path;
 
     #[test]

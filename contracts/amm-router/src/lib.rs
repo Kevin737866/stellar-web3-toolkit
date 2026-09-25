@@ -54,7 +54,7 @@ impl AmmRouter {
 mod test {
     use super::*;
     use amm_pool::{AmmPool, AmmPoolClient};
-    use soroban_sdk::testutils::{Address as _};
+    use soroban_sdk::testutils::Address as _;
 
     #[test]
     fn router_single_pool_swap() {
@@ -86,14 +86,7 @@ mod test {
         let pools = soroban_sdk::vec![&env, pool_id.clone()];
 
         let before = TokenClient::new(&env, &tb).balance(&u);
-        let out = router.swap_exact_tokens_for_tokens(
-            &u,
-            &path,
-            &pools,
-            &10_000,
-            &1,
-            &u,
-        );
+        let out = router.swap_exact_tokens_for_tokens(&u, &path, &pools, &10_000, &1, &u);
         let after = TokenClient::new(&env, &tb).balance(&u);
         assert_eq!(after.saturating_sub(before), out);
         assert!(out > 9000);

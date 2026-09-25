@@ -273,11 +273,7 @@ impl AccountAbstractionManager {
     }
 
     /// Submit a guardian confirmation for an in-flight recovery request.
-    pub fn confirm_recovery(
-        &mut self,
-        recovery_id: &str,
-        guardian_id: &str,
-    ) -> Result<bool> {
+    pub fn confirm_recovery(&mut self, recovery_id: &str, guardian_id: &str) -> Result<bool> {
         let request = self
             .recovery_requests
             .get_mut(recovery_id)
@@ -294,7 +290,9 @@ impl AccountAbstractionManager {
             .any(|g| g.guardian_id == guardian_id && g.is_active);
 
         if !is_valid {
-            return Err(SessionError::InvalidGuardianSignature(guardian_id.to_string()));
+            return Err(SessionError::InvalidGuardianSignature(
+                guardian_id.to_string(),
+            ));
         }
 
         request.confirmed_guardians.insert(guardian_id.to_string());
@@ -346,10 +344,14 @@ mod tests {
 
         // Call exceeding remaining spend limit (200 + 400 > 500)
         let res = manager.validate_and_record_call("sess_1", "contract_amm", "swap", 400, 500);
-        assert!(matches!(res, Err(SessionError::SpendLimitExceeded(_, 400, 300))));
+        assert!(matches!(
+            res,
+            Err(SessionError::SpendLimitExceeded(_, 400, 300))
+        ));
 
         // Unallowed method
-        let res = manager.validate_and_record_call("sess_1", "contract_amm", "admin_drain", 10, 500);
+        let res =
+            manager.validate_and_record_call("sess_1", "contract_amm", "admin_drain", 10, 500);
         assert!(matches!(res, Err(SessionError::MethodNotAllowed(_, _, _))));
 
         // Expired session

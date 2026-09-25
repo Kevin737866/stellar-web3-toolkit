@@ -1,8 +1,8 @@
 //! # Routing Policy Module
-//! 
+//!
 //! Routing policies and constraints for the payment channel router.
 
-use crate::{NetworkGraph, Channel, Route, RouteRequest, RouteHop, RoutingError, MAX_ROUTE_HOPS};
+use crate::{Channel, NetworkGraph, Route, RouteHop, RouteRequest, RoutingError, MAX_ROUTE_HOPS};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -59,12 +59,12 @@ impl RoutingPolicy {
     pub fn high_value() -> Self {
         RoutingPolicy {
             max_hops: 10,
-            max_fee_bps: 500, // 5% max
+            max_fee_bps: 500,       // 5% max
             prefer_low_cltv: false, // Prefer security over speed
             ..Default::default()
         }
     }
-    
+
     /// Create a policy for micropayments
     pub fn micropayment() -> Self {
         RoutingPolicy {
@@ -74,7 +74,7 @@ impl RoutingPolicy {
             ..Default::default()
         }
     }
-    
+
     /// Create a policy for privacy-focused routing
     pub fn privacy_focused() -> Self {
         RoutingPolicy {
@@ -84,23 +84,25 @@ impl RoutingPolicy {
             ..Default::default()
         }
     }
-    
+
     /// Check if a channel meets the policy requirements
     pub fn channel_meets_requirements(&self, channel: &Channel) -> Result<(), RoutingError> {
         // Check excluded channels
         if self.excluded_channels.contains(&channel.id) {
             return Err(RoutingError::ChannelNotFound {
-                channel_id: channel.id.clone()
+                channel_id: channel.id.clone(),
             });
         }
-        
+
         // Check excluded nodes
-        if self.excluded_nodes.contains(&channel.node_a) || self.excluded_nodes.contains(&channel.node_b) {
+        if self.excluded_nodes.contains(&channel.node_a)
+            || self.excluded_nodes.contains(&channel.node_b)
+        {
             return Err(RoutingError::NodeNotFound {
-                node: "excluded".to_string()
+                node: "excluded".to_string(),
             });
         }
-        
+
         // Check fee rate
         if channel.fee_rate > self.max_fee_rate {
             return Err(RoutingError::FeeExceedsBudget {
@@ -108,7 +110,7 @@ impl RoutingPolicy {
                 budget: self.max_fee_rate as i128,
             });
         }
-        
+
         // Check base fee
         if channel.base_fee > self.max_base_fee {
             return Err(RoutingError::FeeExceedsBudget {
@@ -116,12 +118,16 @@ impl RoutingPolicy {
                 budget: self.max_base_fee,
             });
         }
-        
+
         Ok(())
     }
-    
+
     /// Check if a route meets the policy requirements
-    pub fn route_meets_requirements(&self, route: &Route, request: &RouteRequest) -> Result<(), RoutingError> {
+    pub fn route_meets_requirements(
+        &self,
+        route: &Route,
+        request: &RouteRequest,
+    ) -> Result<(), RoutingError> {
         // Check hop limit
         if route.hops.len() > self.max_hops {
             return Err(RoutingError::PathTooLong {
@@ -129,7 +135,7 @@ impl RoutingPolicy {
                 max: self.max_hops,
             });
         }
-        
+
         // Check fee percentage
         let fee_percent = (route.total_fees as f64 / request.amount as f64 * 10000.0) as u32;
         if fee_percent > self.max_fee_bps {
@@ -138,7 +144,7 @@ impl RoutingPolicy {
                 budget: (request.amount as f64 * self.max_fee_bps as f64 / 10000.0) as i128,
             });
         }
-        
+
         // Check amount limits
         if request.amount < self.min_amount {
             return Err(RoutingError::BelowDustLimit {
@@ -146,76 +152,76 @@ impl RoutingPolicy {
                 dust_limit: self.min_amount,
             });
         }
-        
+
         if request.amount > self.max_amount {
             return Err(RoutingError::AmountExceedsMaximum {
                 amount: request.amount,
                 max_amount: self.max_amount,
             });
         }
-        
+
         // Check excluded nodes
         for hop in &route.hops {
             if self.excluded_nodes.contains(&hop.node_id) {
                 return Err(RoutingError::NodeNotFound {
-                    node: hop.node_id.clone()
+                    node: hop.node_id.clone(),
                 });
             }
         }
-        
+
         // Check excluded channels
         for hop in &route.hops {
             if self.excluded_channels.contains(&hop.channel_id) {
                 return Err(RoutingError::ChannelNotFound {
-                    channel_id: hop.channel_id.clone()
+                    channel_id: hop.channel_id.clone(),
                 });
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Apply policy to a route request
     pub fn apply_to_request(&self, mut request: RouteRequest) -> RouteRequest {
         // Apply hop limit
         if request.max_hops.is_none() || request.max_hops > Some(self.max_hops) {
             request.max_hops = Some(self.max_hops);
         }
-        
+
         // Apply fee budget if not set
         if request.max_fee_budget.is_none() {
             let max_fee = (request.amount as f64 * self.max_fee_bps as f64 / 10000.0) as i128;
             request.max_fee_budget = Some(max_fee);
         }
-        
+
         request
     }
-    
+
     /// Calculate a score for a route (lower is better)
     pub fn score_route(&self, route: &Route) -> f64 {
         let mut score = 0.0;
-        
+
         // Fee score (normalized)
         let fee_score = route.total_fees as f64;
         score += fee_score * 1.0;
-        
+
         // Hop count score
         let hop_score = route.hops.len() as f64 * 10.0;
         score += hop_score;
-        
+
         // CLTV delta score (if preferred)
         if self.prefer_low_cltv {
             let cltv_score: i128 = route.hops.iter().map(|h| h.cltv_delta as i128).sum();
             score += cltv_score as f64 * 0.5;
         }
-        
+
         // Preferred nodes bonus
         for hop in &route.hops {
             if self.preferred_nodes.contains(&hop.node_id) {
                 score -= 5.0;
             }
         }
-        
+
         score
     }
 }
@@ -232,27 +238,29 @@ impl FeeEstimator {
     ) -> Result<i128, RoutingError> {
         let mut total_fee = 0i128;
         let mut remaining = amount;
-        
+
         for hop in hops {
-            let channel = graph.get_channel(&hop.channel_id)
-                .ok_or(RoutingError::ChannelNotFound {
-                    channel_id: hop.channel_id.clone()
-                })?;
-            
+            let channel =
+                graph
+                    .get_channel(&hop.channel_id)
+                    .ok_or(RoutingError::ChannelNotFound {
+                        channel_id: hop.channel_id.clone(),
+                    })?;
+
             let fee = Self::calculate_channel_fee(
                 remaining,
                 channel.base_fee,
                 channel.fee_rate,
                 channel.cltv_delta,
             );
-            
+
             total_fee += fee;
             remaining += fee;
         }
-        
+
         Ok(total_fee)
     }
-    
+
     /// Calculate the fee for a single channel
     pub fn calculate_channel_fee(
         amount: i128,
@@ -263,10 +271,10 @@ impl FeeEstimator {
         // Fee = base_fee + (amount * fee_rate / 1,000,000) + time_lock_fee
         let proportional = (amount as u128 * fee_rate_ppm as u128 / 1_000_000) as i128;
         let time_lock = (cltv_delta as i128 * 10) / 1440; // ~1 XLM per day
-        
+
         base_fee + proportional + time_lock
     }
-    
+
     /// Estimate the fee for routing to a destination
     pub fn estimate_destination_fee(
         graph: &NetworkGraph,
@@ -277,7 +285,7 @@ impl FeeEstimator {
         // In production, you'd use actual pathfinding
         let avg_hops = 3;
         let avg_fee_per_hop = Self::calculate_channel_fee(amount, 1, 1000, 40);
-        
+
         Some(avg_fee_per_hop * avg_hops as i128)
     }
 }
@@ -299,21 +307,13 @@ pub enum SelectionStrategy {
 
 impl SelectionStrategy {
     /// Select the best route according to this strategy
-    pub fn select<'a>(
-        &self,
-        routes: &'a [Route],
-        _policy: &RoutingPolicy,
-    ) -> Option<&'a Route> {
+    pub fn select<'a>(&self, routes: &'a [Route], _policy: &RoutingPolicy) -> Option<&'a Route> {
         match self {
-            SelectionStrategy::Cheapest => {
-                routes.iter().min_by_key(|r| r.total_fees)
-            }
-            SelectionStrategy::Fastest => {
-                routes.iter().min_by_key(|r| r.hops.len())
-            }
-            SelectionStrategy::MostReliable => {
-                routes.iter().max_by_key(|r| (r.success_probability * 1000.0) as i32)
-            }
+            SelectionStrategy::Cheapest => routes.iter().min_by_key(|r| r.total_fees),
+            SelectionStrategy::Fastest => routes.iter().min_by_key(|r| r.hops.len()),
+            SelectionStrategy::MostReliable => routes
+                .iter()
+                .max_by_key(|r| (r.success_probability * 1000.0) as i32),
             SelectionStrategy::Random => {
                 use rand::seq::SliceRandom;
                 routes.choose(&mut rand::thread_rng())
@@ -336,7 +336,7 @@ mod tests {
         assert_eq!(policy.max_hops, MAX_ROUTE_HOPS);
         assert!(policy.allow_mpp);
     }
-    
+
     #[test]
     fn test_high_value_policy() {
         let policy = RoutingPolicy::high_value();

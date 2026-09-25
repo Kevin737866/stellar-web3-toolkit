@@ -1,12 +1,12 @@
 //! # Payment Channel Library
-//! 
+//!
 //! High-level library for managing Stellar payment channels.
 //! This library provides a Rust API for creating, managing, and closing
 //! payment channels, as well as executing off-chain payments.
 
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use parking_lot::RwLock;
 use thiserror::Error;
 
 /// Payment channel errors
@@ -14,25 +14,25 @@ use thiserror::Error;
 pub enum PaymentChannelError {
     #[error("Channel not found: {0}")]
     ChannelNotFound(String),
-    
+
     #[error("Insufficient balance: have {have}, need {need}")]
     InsufficientBalance { have: i128, need: i128 },
-    
+
     #[error("Invalid state: {0}")]
     InvalidState(String),
-    
+
     #[error("Signature error: {0}")]
     SignatureError(String),
-    
+
     #[error("HTLC error: {0}")]
     HtlcError(String),
-    
+
     #[error("Network error: {0}")]
     NetworkError(String),
-    
+
     #[error("Timeout: {0}")]
     Timeout(String),
-    
+
     #[error("Channel closed: {0}")]
     ChannelClosed(String),
 }
@@ -155,10 +155,15 @@ pub struct ChannelManager {
 pub trait SignatureSigner: Send + Sync {
     /// Sign a message
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>, PaymentChannelError>;
-    
+
     /// Verify a signature
-    fn verify(&self, message: &[u8], signature: &[u8], public_key: &[u8]) -> Result<bool, PaymentChannelError>;
-    
+    fn verify(
+        &self,
+        message: &[u8],
+        signature: &[u8],
+        public_key: &[u8],
+    ) -> Result<bool, PaymentChannelError>;
+
     /// Get the public key
     fn public_key(&self) -> Vec<u8>;
 }
@@ -171,7 +176,7 @@ impl ChannelManager {
             signer,
         }
     }
-    
+
     /// Create a new payment channel
     pub async fn create_channel(
         &self,
@@ -184,7 +189,7 @@ impl ChannelManager {
     ) -> Result<LocalChannelState, PaymentChannelError> {
         // Generate channel ID
         let channel_id = Self::generate_channel_id(&our_address, &their_address);
-        
+
         // Create local state
         let state = LocalChannelState {
             channel_id: channel_id.clone(),
@@ -202,13 +207,13 @@ impl ChannelManager {
             local_secret: self.signer.public_key(),
             remote_public_key: Vec::new(), // Will be set during handshake
         };
-        
+
         // Store the channel
         self.channels.write().insert(channel_id, state.clone());
-        
+
         Ok(state)
     }
-    
+
     /// Execute an off-chain payment
     pub fn execute_payment(
         &self,
@@ -217,14 +222,15 @@ impl ChannelManager {
         direction: PaymentDirection,
     ) -> Result<LocalChannelState, PaymentChannelError> {
         let mut channels = self.channels.write();
-        let state = channels.get_mut(channel_id)
+        let state = channels
+            .get_mut(channel_id)
             .ok_or_else(|| PaymentChannelError::ChannelNotFound(channel_id.to_string()))?;
-        
+
         // Check if channel is open
         if state.status != ChannelStatus::Open {
             return Err(PaymentChannelError::ChannelClosed(state.status.to_string()));
         }
-        
+
         // Update balances
         match direction {
             PaymentDirection::ToThem => {
@@ -248,53 +254,56 @@ impl ChannelManager {
                 state.our_balance += amount;
             }
         }
-        
+
         state.sequence_number += 1;
         Ok(state.clone())
     }
-    
+
     /// Get a channel by ID
     pub fn get_channel(&self, channel_id: &str) -> Option<LocalChannelState> {
         self.channels.read().get(channel_id).cloned()
     }
-    
+
     /// Get all channels
     pub fn get_all_channels(&self) -> Vec<LocalChannelState> {
         self.channels.read().values().cloned().collect()
     }
-    
+
     /// Close a channel cooperatively
     pub fn cooperative_close(
         &self,
         channel_id: &str,
     ) -> Result<LocalChannelState, PaymentChannelError> {
         let mut channels = self.channels.write();
-        let state = channels.get_mut(channel_id)
+        let state = channels
+            .get_mut(channel_id)
             .ok_or_else(|| PaymentChannelError::ChannelNotFound(channel_id.to_string()))?;
-        
+
         if state.status != ChannelStatus::Open {
-            return Err(PaymentChannelError::InvalidState(
-                format!("Cannot close channel in state {:?}", state.status)
-            ));
+            return Err(PaymentChannelError::InvalidState(format!(
+                "Cannot close channel in state {:?}",
+                state.status
+            )));
         }
-        
+
         state.status = ChannelStatus::Closing;
         Ok(state.clone())
     }
-    
+
     /// Initiate a unilateral close
     pub fn initiate_unilateral_close(
         &self,
         channel_id: &str,
     ) -> Result<LocalChannelState, PaymentChannelError> {
         let mut channels = self.channels.write();
-        let state = channels.get_mut(channel_id)
+        let state = channels
+            .get_mut(channel_id)
             .ok_or_else(|| PaymentChannelError::ChannelNotFound(channel_id.to_string()))?;
-        
+
         state.status = ChannelStatus::ForceClosed;
         Ok(state.clone())
     }
-    
+
     /// Rebalance a channel
     pub fn rebalance(
         &self,
@@ -302,33 +311,36 @@ impl ChannelManager {
         amount: i128,
     ) -> Result<LocalChannelState, PaymentChannelError> {
         let mut channels = self.channels.write();
-        let state = channels.get_mut(channel_id)
+        let state = channels
+            .get_mut(channel_id)
             .ok_or_else(|| PaymentChannelError::ChannelNotFound(channel_id.to_string()))?;
-        
+
         if state.status != ChannelStatus::Open {
-            return Err(PaymentChannelError::InvalidState("Channel not open".to_string()));
+            return Err(PaymentChannelError::InvalidState(
+                "Channel not open".to_string(),
+            ));
         }
-        
+
         // Add funds to both sides (requires on-chain transaction)
         state.our_balance += amount;
         state.their_balance += amount;
         state.sequence_number += 1;
-        
+
         Ok(state.clone())
     }
-    
+
     /// Generate a deterministic channel ID
     fn generate_channel_id(a: &str, b: &str) -> String {
-        use sha2::{Sha256, Digest};
-        
+        use sha2::{Digest, Sha256};
+
         let mut sorted = [a, b].to_vec();
         sorted.sort();
-        
+
         let mut hasher = Sha256::new();
         hasher.update(sorted[0].as_bytes());
         hasher.update(sorted[1].as_bytes());
         let result = hasher.finalize();
-        
+
         hex::encode(result)
     }
 }
@@ -358,7 +370,7 @@ impl std::fmt::Display for ChannelStatus {
 /// Hex encoding helper
 mod hex {
     const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
-    
+
     pub fn encode(data: impl AsRef<[u8]>) -> String {
         let bytes = data.as_ref();
         let mut result = String::with_capacity(bytes.len() * 2);
@@ -378,11 +390,11 @@ mod tests {
     fn test_channel_id_generation() {
         let id1 = ChannelManager::generate_channel_id("alice", "bob");
         let id2 = ChannelManager::generate_channel_id("bob", "alice");
-        
+
         // Should be the same regardless of order
         assert_eq!(id1, id2);
     }
-    
+
     #[test]
     fn test_hex_encoding() {
         let data = vec![0xde, 0xad, 0xbe, 0xef];

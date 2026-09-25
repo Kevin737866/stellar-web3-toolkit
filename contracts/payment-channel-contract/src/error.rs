@@ -1,5 +1,5 @@
 //! # Payment Channel Errors
-//! 
+//!
 //! Error types for the Stellar payment channel system.
 
 use soroban_sdk::Error;
@@ -76,7 +76,7 @@ impl From<PaymentChannelError> for Error {
 
 impl TryFrom<u32> for PaymentChannelError {
     type Error = Error;
-    
+
     fn try_from(value: u32) -> Result<Self, Self::Error> {
         match value {
             1 => Ok(PaymentChannelError::ChannelNotFound),

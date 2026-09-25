@@ -84,8 +84,10 @@ let tx = claimer.claim_airdrop("GCLAIMANT...", "airdrop-event-2026", &proof)?;
         };
 
         self.examples.insert(amm_example.id.clone(), amm_example);
-        self.examples.insert(payment_channel_example.id.clone(), payment_channel_example);
-        self.examples.insert(airdrop_example.id.clone(), airdrop_example);
+        self.examples
+            .insert(payment_channel_example.id.clone(), payment_channel_example);
+        self.examples
+            .insert(airdrop_example.id.clone(), airdrop_example);
     }
 
     pub fn list_examples(&self) -> Vec<&ContractExample> {
@@ -111,13 +113,21 @@ let tx = claimer.claim_airdrop("GCLAIMANT...", "airdrop-event-2026", &proof)?;
     /// Exports gallery as Markdown site representation
     pub fn export_markdown_gallery(&self) -> String {
         let mut markdown = String::from("# Soroban Contract Example Gallery\n\n");
-        markdown.push_str("Explore runnable smart contract examples and integration code snippets.\n\n");
+        markdown.push_str(
+            "Explore runnable smart contract examples and integration code snippets.\n\n",
+        );
 
         for example in self.list_examples() {
             markdown.push_str(&format!("## {}\n", example.title));
             markdown.push_str(&format!("- **Category**: {}\n", example.category));
-            markdown.push_str(&format!("- **WASM Hash**: `{}`\n", example.contract_wasm_hash));
-            markdown.push_str(&format!("- **Run Command**: `{}`\n\n", example.cli_run_command));
+            markdown.push_str(&format!(
+                "- **WASM Hash**: `{}`\n",
+                example.contract_wasm_hash
+            ));
+            markdown.push_str(&format!(
+                "- **Run Command**: `{}`\n\n",
+                example.cli_run_command
+            ));
             markdown.push_str(&format!("{}\n\n", example.description));
             markdown.push_str("```rust\n");
             markdown.push_str(&example.rust_snippet);

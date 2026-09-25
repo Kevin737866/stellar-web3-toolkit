@@ -1,7 +1,7 @@
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use crate::asset::{Asset, AssetInfo};
 use crate::error::{AtomicSwapError, Result};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SwapStatus {
@@ -27,7 +27,7 @@ pub struct AtomicSwap {
     pub participant_asset: Asset,
     pub initiator_amount: i128,
     pub participant_amount: i128,
-    pub hash_lock: String, // Hex encoded SHA-256 hash
+    pub hash_lock: String,        // Hex encoded SHA-256 hash
     pub preimage: Option<String>, // Hex encoded preimage (revealed after completion)
     pub timeout_ledger: u32,
     pub created_at_ledger: u32,
@@ -155,9 +155,7 @@ impl AtomicSwap {
         }
 
         if self.timeout_ledger <= self.created_at_ledger {
-            return Err(AtomicSwapError::InvalidTimeout {
-                timeout_hours: 0,
-            });
+            return Err(AtomicSwapError::InvalidTimeout { timeout_hours: 0 });
         }
 
         // Validate hash length (should be 64 hex chars for 32 bytes)

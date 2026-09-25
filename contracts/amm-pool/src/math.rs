@@ -83,7 +83,9 @@ pub fn flash_k_ok(
         return false;
     }
 
-    let k_old = reserve_a.saturating_mul(reserve_b).saturating_mul(1_000_000);
+    let k_old = reserve_a
+        .saturating_mul(reserve_b)
+        .saturating_mul(1_000_000);
     balance_a_adj.saturating_mul(balance_b_adj) >= k_old
 }
 

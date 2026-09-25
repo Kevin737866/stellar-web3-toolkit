@@ -1,0 +1,24 @@
+# Production environment — Stellar Public Network (Mainnet)
+[env]
+name = "prod"
+stellar_network = "mainnet"
+horizon_url = "https://horizon.stellar.org"
+soroban_rpc_url = "https://soroban.stellar.org"
+soroban_network_passphrase = "Public Global Stellar Network ; September 2015"
+
+[deploy]
+auto_fund = false
+fee = "10000"
+timeout_seconds = 120
+confirmations = 5
+
+[monitoring]
+enabled = true
+poll_interval_seconds = 15
+alert_on_failure = true
+require_manual_approval = true
+
+[security]
+require_multisig = true
+cold_storage_signing = true
+audit_log_retention_days = 365

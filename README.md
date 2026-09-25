@@ -127,6 +127,9 @@ See [GitHub Issues](https://github.com/Kevin737866/stellar-web3-toolkit/issues) 
 - [Contributor Onboarding Guide](docs/CONTRIBUTING_ONBOARDING.md) - Setup guide, workflow, and testing
 - [Protocol Terms Glossary](docs/GLOSSARY.md) - Reference for Stellar & Soroban terminology
 - [Architecture Decision Records (ADRs)](docs/adr/README.md) - Architectural design rationale
+- [Infrastructure Runbook](docs/INFRA_RUNBOOK.md) - CI, Docker reproducible builds, release & monitoring (Issues #117, #119, #120, #121)
+- [Reproducible Builds](docs/REPRODUCIBLE_BUILDS.md) - Deterministic WASM & Docker verification
+- [Monitoring Dashboard](docs/MONITORING_DASHBOARD.md) - Testnet health, Prometheus/Grafana & alerts
 - [Soroban Documentation](https://soroban.stellar.org/)
 - [Stellar Developers](https://developers.stellar.org/)
 - [Rust Documentation](https://doc.rust-lang.org/)

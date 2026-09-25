@@ -5,23 +5,20 @@
 
 #![no_std]
 
-mod types;
-mod error;
 mod channel;
+mod error;
 mod htlc;
 mod state;
+mod types;
 
+use error::PaymentChannelError;
 use soroban_sdk::{
-    contract, contractimpl, contractmeta, Address, Bytes, BytesN, Env, Vec as SorobanVec,
-    IntoVal, TryFromVal,
+    contract, contractimpl, contractmeta, Address, Bytes, BytesN, Env, IntoVal, TryFromVal,
+    Vec as SorobanVec,
 };
 use types::{ChannelState, HTLCInfo};
-use error::PaymentChannelError;
 
-contractmeta!(
-    key = "name",
-    val = "StellarPaymentChannel"
-);
+contractmeta!(key = "name", val = "StellarPaymentChannel");
 
 /// Payment Channel Contract
 #[contract]
@@ -85,7 +82,10 @@ impl PaymentChannel {
     }
 
     /// Get the current state of a channel
-    pub fn get_channel_state(env: Env, channel_id: BytesN<32>) -> Result<ChannelState, PaymentChannelError> {
+    pub fn get_channel_state(
+        env: Env,
+        channel_id: BytesN<32>,
+    ) -> Result<ChannelState, PaymentChannelError> {
         state::get_channel_state(&env, &channel_id)
     }
 
@@ -114,7 +114,8 @@ impl PaymentChannel {
 
         state::store_channel_state(&env, &channel_id, &state);
 
-        env.events().publish(("channel_update", channel_id), state.sequence_number);
+        env.events()
+            .publish(("channel_update", channel_id), state.sequence_number);
 
         Ok(())
     }
@@ -166,12 +167,15 @@ impl PaymentChannel {
 
         state.balance_a -= amount;
 
-        state.htlcs.set(&env, htlc_id.clone().to_val(), htlc_info.into_val(&env));
+        state
+            .htlcs
+            .set(&env, htlc_id.clone().to_val(), htlc_info.into_val(&env));
 
         state.sequence_number += 1;
         state::store_channel_state(&env, &channel_id, &state);
 
-        env.events().publish(("htlc_created", &htlc_id), (&receiver, amount));
+        env.events()
+            .publish(("htlc_created", &htlc_id), (&receiver, amount));
 
         Ok(htlc_id)
     }
@@ -185,7 +189,9 @@ impl PaymentChannel {
     ) -> Result<(), PaymentChannelError> {
         let mut state = state::get_channel_state(&env, &channel_id)?;
 
-        let htlc_val = state.htlcs.get(&env, htlc_id.clone().to_val())
+        let htlc_val = state
+            .htlcs
+            .get(&env, htlc_id.clone().to_val())
             .ok_or(PaymentChannelError::HtlcNotFound)?;
         let mut htlc: HTLCInfo = HTLCInfo::try_from_val(&env, &htlc_val)
             .map_err(|_| PaymentChannelError::InvalidChannelState)?;
@@ -212,7 +218,9 @@ impl PaymentChannel {
         htlc.is_claimed = true;
         state.balance_b += htlc.amount;
 
-        state.htlcs.set(&env, htlc_id.clone().to_val(), htlc.into_val(&env));
+        state
+            .htlcs
+            .set(&env, htlc_id.clone().to_val(), htlc.into_val(&env));
 
         state.sequence_number += 1;
         state::store_channel_state(&env, &channel_id, &state);
@@ -230,7 +238,9 @@ impl PaymentChannel {
     ) -> Result<(), PaymentChannelError> {
         let mut state = state::get_channel_state(&env, &channel_id)?;
 
-        let htlc_val = state.htlcs.get(&env, htlc_id.clone().to_val())
+        let htlc_val = state
+            .htlcs
+            .get(&env, htlc_id.clone().to_val())
             .ok_or(PaymentChannelError::HtlcNotFound)?;
         let mut htlc: HTLCInfo = HTLCInfo::try_from_val(&env, &htlc_val)
             .map_err(|_| PaymentChannelError::InvalidChannelState)?;
@@ -250,7 +260,9 @@ impl PaymentChannel {
         htlc.is_refunded = true;
         state.balance_a += htlc.amount;
 
-        state.htlcs.set(&env, htlc_id.clone().to_val(), htlc.into_val(&env));
+        state
+            .htlcs
+            .set(&env, htlc_id.clone().to_val(), htlc.into_val(&env));
 
         state.sequence_number += 1;
         state::store_channel_state(&env, &channel_id, &state);
@@ -287,7 +299,10 @@ impl PaymentChannel {
 
         state::store_channel_state(&env, &channel_id, &state);
 
-        env.events().publish(("channel_close", channel_id), ("cooperative", state.close_time));
+        env.events().publish(
+            ("channel_close", channel_id),
+            ("cooperative", state.close_time),
+        );
 
         Ok(())
     }
@@ -316,7 +331,10 @@ impl PaymentChannel {
 
         let withdraw_time = state.close_time + state.timeout as u64;
 
-        env.events().publish(("channel_close_initiated", channel_id), (initiator.to_val(), withdraw_time));
+        env.events().publish(
+            ("channel_close_initiated", channel_id),
+            (initiator.to_val(), withdraw_time),
+        );
 
         Ok(withdraw_time)
     }
@@ -336,7 +354,10 @@ impl PaymentChannel {
             return Err(PaymentChannelError::InvalidSequence);
         }
 
-        env.events().publish(("channel_contested", channel_id), (contest_sequence, env.ledger().timestamp()));
+        env.events().publish(
+            ("channel_contested", channel_id),
+            (contest_sequence, env.ledger().timestamp()),
+        );
 
         Ok(())
     }
@@ -367,7 +388,10 @@ impl PaymentChannel {
 
         state::store_channel_state(&env, &channel_id, &state);
 
-        env.events().publish(("channel_topup", channel_id), (participant.to_val(), top_up_amount));
+        env.events().publish(
+            ("channel_topup", channel_id),
+            (participant.to_val(), top_up_amount),
+        );
 
         Ok(())
     }

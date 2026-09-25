@@ -5,13 +5,18 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod cli;
 mod error;
+mod monitoring_dashboard;
 mod wallet;
 
 use crate::cli::ToolkitCommand;
 use crate::error::Result;
 
 #[derive(Parser)]
-#[command(name = "stellar-toolkit", version, about = "Build and test Soroban AMM contracts")]
+#[command(
+    name = "stellar-toolkit",
+    version,
+    about = "Build and test Soroban AMM contracts"
+)]
 struct App {
     #[command(subcommand)]
     cmd: ToolkitCommand,

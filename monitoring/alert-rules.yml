@@ -1,0 +1,46 @@
+groups:
+  - name: stellar-contracts
+    interval: 30s
+    rules:
+      - alert: ContractNotFound
+        expr: stellar_contract_up == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Contract {{ $labels.contract_id }} not found on {{ $labels.network }}"
+          description: "Horizon/Soroban RPC reports contract missing for 5 minutes."
+
+      - alert: AnomalousTxVolume
+        expr: increase(stellar_contract_invocations_total[5m]) > 1000
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Unusual invocation burst on {{ $labels.contract_id }}"
+          description: "More than 1000 invocations in 5m — possible spam or bot."
+
+      - alert: HorizonDown
+        expr: up{job="stellar-horizon-testnet"} == 0
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Horizon Testnet unreachable"
+
+      - alert: WasmHashMismatch
+        expr: stellar_contract_wasm_hash_mismatch == 1
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Deployed WASM hash != reproducible build hash for {{ $labels.contract_id }}"
+          description: "Bytecode verification failed — possible unreproducible or compromised build."
+
+      - alert: HighFailedTxRate
+        expr: rate(stellar_contract_failed_invocations_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High failed transaction rate on {{ $labels.contract_id }}"

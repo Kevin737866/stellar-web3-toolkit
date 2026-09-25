@@ -71,7 +71,7 @@ impl AssetRegistry {
         let mut registry = Self {
             assets: HashMap::new(),
         };
-        
+
         // Register XLM by default
         registry.register(AssetInfo::xlm());
         registry
@@ -116,10 +116,10 @@ mod tests {
     #[test]
     fn test_asset_registry() {
         let mut registry = AssetRegistry::new();
-        
+
         // Test XLM is registered by default
         assert!(registry.is_supported(&Asset::XLM));
-        
+
         // Test custom asset registration
         let usdc = AssetInfo::custom(
             "USDC".to_string(),
@@ -127,9 +127,9 @@ mod tests {
             7,
         );
         registry.register(usdc.clone());
-        
+
         assert!(registry.is_supported(&Asset::Custom("USDC".to_string())));
-        
+
         // Test retrieval
         let retrieved = registry.get(&Asset::Custom("USDC".to_string()));
         assert!(retrieved.is_some());

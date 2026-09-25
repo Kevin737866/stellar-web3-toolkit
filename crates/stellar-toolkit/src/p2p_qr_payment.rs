@@ -85,13 +85,11 @@ impl P2PQRPaymentFlow {
             }
         }
 
-        let destination = destination.ok_or_else(|| {
-            ToolkitError::Session("Missing destination in QR URI".to_string())
-        })?;
+        let destination = destination
+            .ok_or_else(|| ToolkitError::Session("Missing destination in QR URI".to_string()))?;
 
-        let amount = amount.ok_or_else(|| {
-            ToolkitError::Session("Missing amount in QR URI".to_string())
-        })?;
+        let amount =
+            amount.ok_or_else(|| ToolkitError::Session("Missing amount in QR URI".to_string()))?;
 
         Ok(QRPaymentRequest {
             destination,
@@ -104,12 +102,11 @@ impl P2PQRPaymentFlow {
     }
 
     /// Builds transaction payload for the QR payment
-    pub fn build_payment_transaction(
-        request: &QRPaymentRequest,
-        sender: &str,
-    ) -> Result<String> {
+    pub fn build_payment_transaction(request: &QRPaymentRequest, sender: &str) -> Result<String> {
         if sender.trim().is_empty() {
-            return Err(ToolkitError::Session("Sender address cannot be empty".to_string()));
+            return Err(ToolkitError::Session(
+                "Sender address cannot be empty".to_string(),
+            ));
         }
 
         let tx_payload = serde_json::json!({

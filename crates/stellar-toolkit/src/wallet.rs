@@ -202,16 +202,20 @@ mod tests {
         let sig = Signature::from_slice(&hex::decode(sig_hex).unwrap()).unwrap();
 
         verifying_key.verify(b"hello world", &sig).expect("valid");
-        assert!(verifying_key
-            .verify(b"tampered", &sig)
-            .is_err(), "signature must not verify for a different message");
+        assert!(
+            verifying_key.verify(b"tampered", &sig).is_err(),
+            "signature must not verify for a different message"
+        );
     }
 
     #[test]
     fn slip10_matches_slip_0010_vector_one() {
         // SLIP-0010 test vector 1 for ed25519, chain "m" and "m/0'".
         // The SLIP-0010 master key is derived from the exact seed bytes.
-        let seed = [0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f];
+        let seed = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
+        ];
 
         let master = slip10_derive(&seed, &[]);
         assert_eq!(
@@ -234,5 +238,4 @@ mod tests {
         assert!(wallet.account.starts_with('G'));
         assert_eq!(wallet.account.len(), 56);
     }
-
 }
