@@ -84,12 +84,16 @@ pub struct Summary {
 }
 
 impl MonitorConfig {
+    // Dashboard config helpers; kept as part of the public surface.
+    #[allow(dead_code)]
     pub fn from_toml(path: &Path) -> anyhow::Result<Self> {
         let s = std::fs::read_to_string(path)?;
         let v: toml_value::Table = toml::from_str(&s)?;
         Self::from_table(v)
     }
 
+    // Dashboard config helpers; kept as part of the public surface.
+    #[allow(dead_code)]
     fn from_table(_tbl: toml_value::Table) -> anyhow::Result<Self> {
         // Simplified parser — for production we would map config/test.toml fields.
         // Fallback to defaults that point at testnet.
@@ -200,6 +204,8 @@ impl MonitoringDashboard {
         }
     }
 
+    // Dashboard config helpers; kept as part of the public surface.
+    #[allow(dead_code)]
     pub fn with_testnet_defaults(workspace_root: PathBuf) -> Self {
         Self::new(MonitorConfig::testnet_default(), workspace_root)
     }
@@ -295,6 +301,8 @@ impl MonitoringDashboard {
             .filter(|c| c.hash_match == Some(false))
             .count();
 
+        // `contracts` is moved into the report below, so capture the count first.
+        let total = contracts.len();
         DashboardReport {
             generated_at: chrono_like_now(),
             config: self.config.clone(),
@@ -302,7 +310,7 @@ impl MonitoringDashboard {
             soroban_status,
             contracts,
             summary: Summary {
-                total: contracts.len(),
+                total,
                 healthy,
                 degraded,
                 down,
@@ -388,12 +396,16 @@ fn chrono_like_now() -> String {
 // Minimal toml stub to satisfy compiler when toml feature is absent.
 mod toml_value {
     use std::collections::BTreeMap;
+    // Dashboard config helpers; kept as part of the public surface.
+    #[allow(dead_code)]
     pub type Table = BTreeMap<String, String>;
 }
 
 mod toml {
     use super::toml_value::Table;
     use std::collections::BTreeMap;
+    // Dashboard config helpers; kept as part of the public surface.
+    #[allow(dead_code)]
     pub fn from_str(_s: &str) -> Result<Table, anyhow::Error> {
         // Very small stub — real parsing done via MonitorConfig::testnet_default fallback
         Ok(BTreeMap::new())

@@ -30,7 +30,7 @@ pub struct OneClickAirdropClaimer;
 
 impl OneClickAirdropClaimer {
     /// Checks eligibility of an address for a specific airdrop
-    pub fn check_eligibility(claimant_address: &str, airdrop_id: &str) -> Result<ClaimStatus> {
+    pub fn check_eligibility(claimant_address: &str, _airdrop_id: &str) -> Result<ClaimStatus> {
         if claimant_address.trim().is_empty() {
             return Ok(ClaimStatus::Ineligible {
                 reason: "Empty claimant address".to_string(),

@@ -10,6 +10,7 @@ pub mod monitoring_dashboard;
 pub mod one_click_airdrop;
 pub mod p2p_qr_payment;
 pub mod session_keys;
+pub mod wallet;
 
 pub use api_reference_gen::{ApiFunctionDoc, ApiReferenceGenerator};
 pub use cli::ToolkitCommand;
