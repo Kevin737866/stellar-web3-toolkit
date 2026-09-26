@@ -6,6 +6,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 mod cli;
 mod error;
 mod monitoring_dashboard;
+mod ts_codegen;
 mod wallet;
 
 use crate::cli::ToolkitCommand;

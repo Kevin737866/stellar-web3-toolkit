@@ -1,6 +1,6 @@
 use crate::error::{Result, ToolkitError};
 use clap::Subcommand;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Subcommand, Debug)]
@@ -27,6 +27,28 @@ pub enum ToolkitCommand {
     /// Monitoring dashboard for testnet contracts (Horizon + Soroban health, WASM verification)
     #[command(subcommand)]
     Monitoring(MonitoringCommand),
+    /// Typed TypeScript client codegen for contract interfaces
+    #[command(subcommand)]
+    Codegen(CodegenCommand),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum CodegenCommand {
+    /// Generate the typed TypeScript client (deduplicated imports, bigint-safe types)
+    Ts {
+        /// Contract interface spec in JSON (defaults to the bundled AMM pool spec)
+        #[arg(long)]
+        spec: Option<PathBuf>,
+        /// Output directory for the generated client
+        #[arg(long, default_value = "target/ts-client")]
+        output: PathBuf,
+    },
+    /// Run the codegen checks: duplicate imports and bigint integer mapping
+    Check {
+        /// Contract interface spec in JSON (defaults to the bundled AMM pool spec)
+        #[arg(long)]
+        spec: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -54,6 +76,12 @@ pub enum MonitoringCommand {
         /// Optional checksums file
         #[arg(long)]
         checksums: Option<PathBuf>,
+    },
+    /// Verify a saved snapshot against its sha256 manifest (exits non-zero on mismatch)
+    Restore {
+        /// Snapshot directory containing dashboard.json, metrics.txt, report.html, checksums.sha256
+        #[arg(long, default_value = "target/monitoring")]
+        snapshot: PathBuf,
     },
 }
 
@@ -108,7 +136,68 @@ impl ToolkitCommand {
             }
             Self::Wallet(wallet) => run_wallet(wallet),
             Self::Monitoring(cmd) => run_monitoring(cmd),
+            Self::Codegen(cmd) => run_codegen(cmd),
         }
+    }
+}
+
+impl CodegenCommand {
+    fn spec_path(&self) -> Option<&PathBuf> {
+        match self {
+            Self::Ts { spec, .. } => spec.as_ref(),
+            Self::Check { spec } => spec.as_ref(),
+        }
+    }
+}
+
+fn run_codegen(cmd: &CodegenCommand) -> Result<()> {
+    use crate::ts_codegen::{run_checks, ContractSpec, TsClientGenerator};
+    let root = normalize_workspace_root(&PathBuf::from("."));
+    let spec = match cmd.spec_path() {
+        Some(path) => ContractSpec::from_json_file(&resolve_path(&root, path))
+            .map_err(|e| ToolkitError::ExecutionError(format!("load spec: {e}")))?,
+        None => ContractSpec::amm_pool(),
+    };
+    match cmd {
+        CodegenCommand::Ts { output, .. } => {
+            let generator = TsClientGenerator::new(spec);
+            let dir = resolve_path(&root, output);
+            let paths = generator
+                .write_to_dir(&dir)
+                .map_err(|e| ToolkitError::ExecutionError(e.to_string()))?;
+            println!(
+                "Generated {}Client for {} ({} functions)",
+                generator.spec().name,
+                generator.spec().contract_id,
+                generator.spec().functions.len()
+            );
+            for path in &paths {
+                println!("  {}", path.display());
+            }
+            Ok(())
+        }
+        CodegenCommand::Check { .. } => {
+            let problems = run_checks(&spec);
+            for problem in &problems {
+                eprintln!("codegen check: {problem}");
+            }
+            if problems.is_empty() {
+                println!("codegen check: PASS (imports deduplicated, 64-bit+ integers as bigint)");
+                return Ok(());
+            }
+            Err(ToolkitError::ExecutionError(format!(
+                "{} codegen check problem(s)",
+                problems.len()
+            )))
+        }
+    }
+}
+
+fn resolve_path(root: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
     }
 }
 
@@ -144,7 +233,10 @@ fn print_wallet(w: &crate::wallet::GeneratedWallet) {
 }
 
 fn run_monitoring(cmd: &MonitoringCommand) -> Result<()> {
-    use crate::monitoring_dashboard::{MonitorConfig, MonitoringDashboard};
+    use crate::monitoring_dashboard::{
+        restore_snapshot, MonitorConfig, MonitoringDashboard, SNAPSHOT_CHECKSUMS,
+    };
+    let root = normalize_workspace_root(&PathBuf::from("."));
     match cmd {
         MonitoringCommand::Dashboard {
             workspace,
@@ -193,6 +285,10 @@ fn run_monitoring(cmd: &MonitoringCommand) -> Result<()> {
             println!("  HTML: {}", html_path.display());
             println!("  Metrics: {}", out_dir.join("metrics.txt").display());
             println!(
+                "  Checksums: {}",
+                out_dir.join(SNAPSHOT_CHECKSUMS).display()
+            );
+            println!(
                 "Summary: {}/{} healthy, {} hash mismatches",
                 report.summary.healthy, report.summary.total, report.summary.hash_mismatches
             );
@@ -238,6 +334,33 @@ fn run_monitoring(cmd: &MonitoringCommand) -> Result<()> {
                     "hash mismatch in {} contract(s)",
                     report.summary.hash_mismatches
                 )));
+            }
+            Ok(())
+        }
+        MonitoringCommand::Restore { snapshot } => {
+            let dir = resolve_path(&root, snapshot);
+            let restore =
+                restore_snapshot(&dir).map_err(|e| ToolkitError::ExecutionError(e.to_string()))?;
+            println!(
+                "Snapshot {}: {} verified, {} mismatched, {} missing",
+                restore.snapshot_dir,
+                restore.verified.len(),
+                restore.mismatched.len(),
+                restore.missing.len()
+            );
+            for file in &restore.verified {
+                println!("  OK       {file}");
+            }
+            for file in &restore.mismatched {
+                eprintln!("  MISMATCH {file}");
+            }
+            for file in &restore.missing {
+                eprintln!("  MISSING  {file}");
+            }
+            if !restore.is_clean() {
+                return Err(ToolkitError::ExecutionError(
+                    "snapshot restore failed checksum verification".to_string(),
+                ));
             }
             Ok(())
         }
