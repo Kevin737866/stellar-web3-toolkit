@@ -11,6 +11,8 @@ members = [
     "contracts/amm-factory",
     "contracts/amm-router",
     "contracts/htlc-contract",
+    "contracts/marketplace-contract",
+    "contracts/royalty-splitter",
 ]
 
 resolver = "2"
