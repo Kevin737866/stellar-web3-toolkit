@@ -9,12 +9,10 @@ pub mod pathfinder;
 pub mod policy;
 
 use fxhash::FxHashMap;
-use parking_lot::RwLock;
 use priority_queue::PriorityQueue;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::collections::HashSet;
 use thiserror::Error;
 
 /// Maximum number of hops allowed in a route
@@ -280,10 +278,8 @@ impl NetworkGraph {
     pub fn add_node(&mut self, node: Node) {
         let id = node.id.clone();
         self.nodes.insert(id.clone(), node);
-        self.node_channels
-            .entry(id.clone())
-            .or_insert_with(HashSet::new);
-        self.adjacency.entry(id).or_insert_with(FxHashMap::default);
+        self.node_channels.entry(id.clone()).or_default();
+        self.adjacency.entry(id).or_default();
     }
 
     /// Add a channel to the graph
@@ -294,21 +290,21 @@ impl NetworkGraph {
         // Update node_channels
         self.node_channels
             .entry(channel.node_a.clone())
-            .or_insert_with(HashSet::new)
+            .or_default()
             .insert(channel.id.clone());
         self.node_channels
             .entry(channel.node_b.clone())
-            .or_insert_with(HashSet::new)
+            .or_default()
             .insert(channel.id.clone());
 
         // Update adjacency
         self.adjacency
             .entry(channel.node_a.clone())
-            .or_insert_with(FxHashMap::default)
+            .or_default()
             .insert(channel.node_b.clone(), channel.id.clone());
         self.adjacency
             .entry(channel.node_b.clone())
-            .or_insert_with(FxHashMap::default)
+            .or_default()
             .insert(channel.node_a.clone(), channel.id.clone());
 
         self.version += 1;
@@ -488,7 +484,7 @@ pub fn find_best_route(
             for (neighbor_id, channel_id) in neighbors {
                 if let Some(channel) = graph.channels.get(channel_id) {
                     // Determine direction and available capacity
-                    let (available_capacity, direction) = if &channel.node_a == neighbor_id {
+                    let (available_capacity, _direction) = if &channel.node_a == neighbor_id {
                         (channel.capacity_a_to_b, Direction::AToB)
                     } else {
                         (channel.capacity_b_to_a, Direction::BToA)

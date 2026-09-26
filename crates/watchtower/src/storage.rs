@@ -3,8 +3,7 @@
 //! Persistent storage backends for the watchtower.
 
 use crate::monitor::{ChannelMonitorState, ChannelUpdate};
-use crate::{Alert, WatchtowerConfig};
-use serde::{Deserialize, Serialize};
+use crate::Alert;
 use std::collections::HashMap;
 use thiserror::Error;
 use tracing::info;
@@ -141,6 +140,8 @@ impl StorageBackend for InMemoryStorage {
 
 /// SQLite storage backend (placeholder implementation)
 pub struct SqliteStorage {
+    // Retained for the RPC/storage wiring still to come.
+    #[allow(dead_code)]
     path: String,
 }
 
@@ -158,7 +159,7 @@ impl StorageBackend for SqliteStorage {
     fn store_channel_state(
         &self,
         channel_id: &str,
-        state: &ChannelMonitorState,
+        _state: &ChannelMonitorState,
     ) -> Result<(), StorageError> {
         // In production: INSERT INTO channel_states VALUES (?, ?)
         info!("SQLite: storing channel state for {}", channel_id);

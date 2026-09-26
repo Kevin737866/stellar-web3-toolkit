@@ -64,8 +64,10 @@ mod test {
         let (ta, tb) = {
             let admin = Address::generate(&env);
             (
-                env.register_stellar_asset_contract(admin.clone()),
-                env.register_stellar_asset_contract(admin.clone()),
+                env.register_stellar_asset_contract_v2(admin.clone())
+                    .address(),
+                env.register_stellar_asset_contract_v2(admin.clone())
+                    .address(),
             )
         };
 

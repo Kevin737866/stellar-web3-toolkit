@@ -277,8 +277,8 @@ impl FeeEstimator {
 
     /// Estimate the fee for routing to a destination
     pub fn estimate_destination_fee(
-        graph: &NetworkGraph,
-        destination: &str,
+        _graph: &NetworkGraph,
+        _destination: &str,
         amount: i128,
     ) -> Option<i128> {
         // This is a rough estimate based on typical fees

@@ -2,12 +2,11 @@
 //!
 //! Advanced pathfinding algorithms for payment channel routing.
 
-use crate::graph::GraphView;
 use crate::{NetworkGraph, Route, RouteHop, RouteRequest, RoutingError, MAX_ROUTE_HOPS};
 use fxhash::FxHashMap;
 use priority_queue::PriorityQueue;
 use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 
 /// Pathfinding engine for finding optimal payment routes
 pub struct Pathfinder {
@@ -137,7 +136,7 @@ impl Pathfinder {
 
         let heuristic = |node: &str| -> i128 {
             // Simple heuristic: assume minimum fee per hop
-            let hops = if node == &request.destination { 0 } else { 1 };
+            let hops = if node == request.destination { 0 } else { 1 };
             hops as i128 * 10 // Minimum 10 units per hop
         };
 
@@ -215,7 +214,7 @@ impl Pathfinder {
         queue.push_back((request.source.clone(), Vec::new()));
         visited.insert(request.source.clone());
 
-        while let Some((current, mut path)) = queue.pop_front() {
+        while let Some((current, path)) = queue.pop_front() {
             if current == request.destination {
                 return self.build_route(path, request.amount);
             }
@@ -292,7 +291,7 @@ impl Pathfinder {
         let mut visited: HashSet<String> = HashSet::new();
         let mut path: Vec<RouteHop> = Vec::new();
         let mut current = request.source.clone();
-        let mut amount = request.amount;
+        let amount = request.amount;
 
         visited.insert(current.clone());
 

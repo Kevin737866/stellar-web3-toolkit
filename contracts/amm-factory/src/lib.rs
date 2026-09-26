@@ -145,8 +145,12 @@ mod test {
         let admin = Address::generate(&env);
         factory.init(&admin, &pool_hash);
 
-        let ta = env.register_stellar_asset_contract(admin.clone());
-        let tb = env.register_stellar_asset_contract(admin.clone());
+        let ta = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let tb = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
 
         let pool_addr = factory.create_pair(&ta, &tb);
         let pool = AmmPoolClient::new(&env, &pool_addr);

@@ -2,7 +2,7 @@
 //!
 //! Graph data structures and utilities for the payment channel network.
 
-use crate::{Channel, Direction, NetworkGraph, Node, RouteHop, RoutingError};
+use crate::{Direction, NetworkGraph, RouteHop};
 use fxhash::FxHashMap;
 use std::collections::{HashMap, HashSet};
 
@@ -154,6 +154,9 @@ impl<'a> GraphView<'a> {
         all_paths
     }
 
+    // Recursive DFS needs the walk's full context to avoid re-allocating it per
+    // node.
+    #[allow(clippy::too_many_arguments)]
     fn dfs_paths(
         &self,
         current: &str,
@@ -283,7 +286,7 @@ impl TopologyAnalyzer {
             let current_dist = *distances.get(&node).unwrap();
 
             if let Some(neighbors) = graph.adjacency.get(&node) {
-                for (neighbor, _) in neighbors {
+                for neighbor in neighbors.keys() {
                     if !distances.contains_key(neighbor) {
                         distances.insert(neighbor.clone(), current_dist + 1);
                         queue.push_back(neighbor.clone());
@@ -303,7 +306,7 @@ impl TopologyAnalyzer {
         for node in &nodes {
             // Temporarily remove the node
             let mut test_graph = NetworkGraph::new();
-            for (id, n) in graph.nodes.iter() {
+            for n in graph.nodes.values() {
                 test_graph.add_node(n.clone());
             }
             for c in graph.channels.values() {
