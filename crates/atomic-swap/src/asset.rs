@@ -33,7 +33,7 @@ impl AssetInfo {
             issuer: None,
             decimals: 7,
             is_native: true,
-            minimum_balance: 1_000_0000, // 1 XLM in stroops
+            minimum_balance: 10_000_000, // 1 XLM in stroops
         }
     }
 
@@ -47,7 +47,11 @@ impl AssetInfo {
         }
     }
 
-    pub fn to_string(&self) -> String {
+    /// Human-readable identifier including the issuer, when there is one.
+    ///
+    /// Note this is an inherent method that shadows `ToString`, and it is *not* a
+    /// valid [`AssetRegistry`] key -- see [`AssetRegistry::key`].
+    pub fn display_key(&self) -> String {
         match &self.asset {
             Asset::XLM => "XLM".to_string(),
             Asset::Custom(code) => {
@@ -77,17 +81,28 @@ impl AssetRegistry {
         registry
     }
 
+    /// The key an asset is stored under.
+    ///
+    /// Deliberately the bare asset code. `Asset::Custom` carries only a code, so a
+    /// key that also included the issuer could never be reconstructed by a lookup:
+    /// that mismatch meant every custom asset *with* an issuer was registered under
+    /// `"CODE:ISSUER"` and then never found again, so swaps against such assets
+    /// failed with `UnsupportedAsset`. Deriving the key in one place keeps
+    /// registration and lookup from drifting apart again.
+    fn key(asset: &Asset) -> String {
+        match asset {
+            Asset::XLM => "XLM".to_string(),
+            Asset::Custom(code) => code.clone(),
+        }
+    }
+
     pub fn register(&mut self, asset_info: AssetInfo) {
-        let key = asset_info.to_string();
+        let key = Self::key(&asset_info.asset);
         self.assets.insert(key, asset_info);
     }
 
     pub fn get(&self, asset: &Asset) -> Option<&AssetInfo> {
-        let key = match asset {
-            Asset::XLM => "XLM".to_string(),
-            Asset::Custom(code) => code.clone(),
-        };
-        self.assets.get(&key)
+        self.assets.get(&Self::key(asset))
     }
 
     pub fn get_by_string(&self, asset_str: &str) -> Option<&AssetInfo> {

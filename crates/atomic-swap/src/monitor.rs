@@ -1,11 +1,10 @@
-use crate::error::{AtomicSwapError, Result};
+use crate::error::Result;
 use crate::swap::{AtomicSwap, SwapStatus};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
-use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub enum SwapEvent {
