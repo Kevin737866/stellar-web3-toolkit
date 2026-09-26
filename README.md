@@ -124,6 +124,7 @@ See [GitHub Issues](https://github.com/Kevin737866/stellar-web3-toolkit/issues) 
 ## Documentation & Resources
 
 - [Security Policy](SECURITY.md) - Vulnerability reporting and security SLA
+- [Frequently Asked Questions](docs/FAQ.md) - Building, testing, Soroban storage TTLs, and documentation conventions
 - [Contributor Onboarding Guide](docs/CONTRIBUTING_ONBOARDING.md) - Setup guide, workflow, and testing
 - [Protocol Terms Glossary](docs/GLOSSARY.md) - Reference for Stellar & Soroban terminology
 - [Architecture Decision Records (ADRs)](docs/adr/README.md) - Architectural design rationale

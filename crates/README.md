@@ -280,7 +280,7 @@ The complete method specification is available in:
 
 ## License
 
-MIT License - see [LICENSE](../../LICENSE) file for details.
+MIT License - see [LICENSE](../LICENSE) file for details.
 
 ## Resources
 

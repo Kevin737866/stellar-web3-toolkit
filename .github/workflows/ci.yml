@@ -222,6 +222,19 @@ jobs:
           path: target/doc/
           retention-days: 7
 
+  docs-links:
+    name: Documentation Links
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Check relative links and heading anchors
+        run: python3 scripts/check-doc-links.py
+      - name: Test the link checker itself
+        run: python3 scripts/test_check_doc_links.py
+
   merge-check:
     name: Merge Queue Check
     runs-on: ubuntu-latest

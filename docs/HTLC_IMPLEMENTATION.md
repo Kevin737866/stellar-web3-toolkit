@@ -412,7 +412,7 @@ This project is licensed under the MIT License - see the [LICENSE](../LICENSE) f
 
 ## Support
 
-- **Documentation**: [docs/](./)
+- **Documentation**: [Documentation & Resources](../README.md#documentation--resources)
 - **Issues**: [GitHub Issues](https://github.com/Great-2025/stellar-web3-toolkit/issues)
 - **Discussions**: [GitHub Discussions](https://github.com/Great-2025/stellar-web3-toolkit/discussions)
 - **Security**: security@stellar.org
