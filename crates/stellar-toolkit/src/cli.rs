@@ -1,7 +1,25 @@
 use crate::error::{Result, ToolkitError};
-use clap::Subcommand;
-use std::path::PathBuf;
+use crate::help_text;
+use clap::{Parser, Subcommand};
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// Top level `stellar-toolkit` command line interface.
+///
+/// `disable_help_subcommand` is required because this crate implements `help`
+/// itself (`help_text::render_command_help`): clap must not add its own,
+/// unwrapped, `help` subcommand on top of it.
+#[derive(Parser, Debug)]
+#[command(
+    name = "stellar-toolkit",
+    version,
+    about = "Build and test Soroban AMM contracts",
+    disable_help_subcommand = true
+)]
+pub struct App {
+    #[command(subcommand)]
+    pub cmd: ToolkitCommand,
+}
 
 #[derive(Subcommand, Debug)]
 pub enum ToolkitCommand {
@@ -27,6 +45,116 @@ pub enum ToolkitCommand {
     /// Monitoring dashboard for testnet contracts (Horizon + Soroban health, WASM verification)
     #[command(subcommand)]
     Monitoring(MonitoringCommand),
+    /// Scaffold a Soroban contract project from the built-in template
+    #[command(subcommand)]
+    Scaffold(ScaffoldCommand),
+    /// Estimate Soroban transaction fees and plan fee bumps
+    #[command(subcommand)]
+    Gas(GasCommand),
+    /// Inspect contract state with cursor based pagination
+    #[command(subcommand)]
+    Inspect(InspectCommand),
+    /// Print the command overview wrapped to the terminal width
+    Help {
+        /// Wrap width in columns (defaults to $COLUMNS, otherwise 100)
+        #[arg(long, default_value_t = 0)]
+        width: usize,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ScaffoldCommand {
+    /// Render the contract template, lint it, then write it to disk
+    New {
+        /// Crate name in kebab-case (e.g. amm-pool)
+        name: String,
+        /// Directory that will contain the generated project
+        #[arg(long, default_value = "target/scaffold")]
+        out: PathBuf,
+        /// `description` field of the generated Cargo.toml
+        #[arg(long)]
+        description: Option<String>,
+        /// `authors` field of the generated Cargo.toml
+        #[arg(long)]
+        author: Option<String>,
+        /// Skip the generated test module
+        #[arg(long, default_value_t = false)]
+        no_tests: bool,
+        /// Lint and print the report without writing any file
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Overwrite files that already exist
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
+    /// Lint an existing project directory against the template rules
+    Lint {
+        /// Project directory to lint
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum GasCommand {
+    /// Estimate the fee for a transaction profile and print the fee bump ladder
+    Estimate {
+        /// Number of transaction operations
+        #[arg(long, default_value_t = 1)]
+        operations: u32,
+        /// Soroban instructions executed by the transaction
+        #[arg(long, default_value_t = 100_000)]
+        instructions: u32,
+        /// Ledger entries in the read footprint
+        #[arg(long, default_value_t = 3)]
+        reads: u32,
+        /// Ledger entries in the write footprint
+        #[arg(long, default_value_t = 1)]
+        writes: u32,
+        /// Ledgers to wait for inclusion (inclusion bid)
+        #[arg(long, default_value_t = 1)]
+        bid_ledgers: u32,
+        /// Network base fee in stroops (overrides the default schedule)
+        #[arg(long)]
+        base_fee: Option<u32>,
+        /// Percentage added to the fee on every bump (overrides the default schedule)
+        #[arg(long)]
+        bump_percent: Option<u32>,
+        /// Maximum number of fee bumps (overrides the default schedule)
+        #[arg(long)]
+        max_bumps: Option<u32>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum InspectCommand {
+    /// Print contract state entries page by page
+    State {
+        /// Contract id to inspect (all contracts when omitted)
+        #[arg(long)]
+        contract: Option<String>,
+        /// Only entries whose key starts with this prefix
+        #[arg(long)]
+        key_prefix: Option<String>,
+        /// Include temporary entries (they are restored on ledger rollback)
+        #[arg(long, default_value_t = false)]
+        include_temporary: bool,
+        /// Entries per page (max 200)
+        #[arg(long, default_value_t = 20)]
+        page_size: usize,
+        /// Cursor returned by the previous page
+        #[arg(long, default_value_t = 0)]
+        cursor: usize,
+        /// JSON state export to read instead of the built-in sample
+        #[arg(long)]
+        input: Option<PathBuf>,
+        /// Print every page instead of a single one
+        #[arg(long, default_value_t = false)]
+        all_pages: bool,
+        /// Print the page as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -108,6 +236,18 @@ impl ToolkitCommand {
             }
             Self::Wallet(wallet) => run_wallet(wallet),
             Self::Monitoring(cmd) => run_monitoring(cmd),
+            Self::Scaffold(cmd) => run_scaffold(cmd),
+            Self::Gas(cmd) => run_gas(cmd),
+            Self::Inspect(cmd) => run_inspect(cmd),
+            Self::Help { width } => {
+                let resolved = if *width == 0 {
+                    help_text::help_width()
+                } else {
+                    *width
+                };
+                print!("{}", help_text::render_command_help(resolved));
+                Ok(())
+            }
         }
     }
 }
@@ -242,6 +382,243 @@ fn run_monitoring(cmd: &MonitoringCommand) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn run_scaffold(cmd: &ScaffoldCommand) -> Result<()> {
+    use crate::scaffolder::{lint_directory, ScaffoldOptions, Scaffolder};
+    match cmd {
+        ScaffoldCommand::New {
+            name,
+            out,
+            description,
+            author,
+            no_tests,
+            dry_run,
+            force,
+        } => {
+            let mut options = ScaffoldOptions::new(name.clone()).with_tests(!no_tests);
+            if let Some(description) = description {
+                options = options.with_description(description.clone());
+            }
+            if let Some(author) = author {
+                options = options.with_author(author.clone());
+            }
+            let scaffolder = Scaffolder::new(options);
+            let (files, report) = scaffolder.render_and_lint();
+            print!("{}", report.render());
+            if !report.passed() {
+                return Err(ToolkitError::ExecutionError(format!(
+                    "template lint failed with {} error(s)",
+                    report.errors()
+                )));
+            }
+            if *dry_run {
+                for file in &files {
+                    println!("would write {}", file.path);
+                }
+                return Ok(());
+            }
+            let root = resolve_path(out);
+            for path in scaffolder.write(&root, *force)? {
+                println!("wrote {}", path.display());
+            }
+            println!("project scaffolded in {}", root.display());
+            Ok(())
+        }
+        ScaffoldCommand::Lint { dir } => {
+            let root = resolve_path(dir);
+            let report = lint_directory(&root)?;
+            print!("{}", report.render());
+            if !report.passed() {
+                return Err(ToolkitError::ExecutionError(format!(
+                    "template lint failed with {} error(s)",
+                    report.errors()
+                )));
+            }
+            Ok(())
+        }
+    }
+}
+
+fn run_gas(cmd: &GasCommand) -> Result<()> {
+    use crate::gas_simulator::{format_stroops, FeeSchedule, GasSimulator, TransactionProfile};
+    match cmd {
+        GasCommand::Estimate {
+            operations,
+            instructions,
+            reads,
+            writes,
+            bid_ledgers,
+            base_fee,
+            bump_percent,
+            max_bumps,
+        } => {
+            let mut schedule = FeeSchedule::testnet_default();
+            if let Some(base_fee) = base_fee {
+                schedule.base_fee_stroops = *base_fee;
+            }
+            if let Some(bump_percent) = bump_percent {
+                schedule.bump_percent = *bump_percent;
+            }
+            if let Some(max_bumps) = max_bumps {
+                schedule.max_bumps = *max_bumps;
+            }
+            let base_fee = schedule.base_fee_stroops;
+            let max_fee = schedule.max_fee_stroops;
+
+            let simulator = GasSimulator::new(schedule);
+            let profile = TransactionProfile {
+                operations: *operations,
+                instructions: *instructions,
+                ledger_reads: *reads,
+                ledger_writes: *writes,
+                bid_ledgers: *bid_ledgers,
+            };
+            let estimate = simulator.estimate(&profile);
+            let breakdown = estimate.breakdown;
+            println!("fee estimate for {} operation(s):", profile.operations);
+            println!(
+                "  base fee      {:>10} stroops  ({})",
+                breakdown.base_fee,
+                format_stroops(breakdown.base_fee)
+            );
+            println!(
+                "  resource fee  {:>10} stroops  ({})",
+                breakdown.resource_fee,
+                format_stroops(breakdown.resource_fee)
+            );
+            println!(
+                "  inclusion bid {:>10} stroops  ({}, {} ledger(s))",
+                breakdown.inclusion_bid,
+                format_stroops(breakdown.inclusion_bid),
+                estimate.bid_ledgers
+            );
+            println!(
+                "  per operation {:>10} stroops  ({})",
+                breakdown.per_operation,
+                format_stroops(breakdown.per_operation)
+            );
+            println!(
+                "  total         {:>10} stroops  ({:.7} XLM)",
+                estimate.total_stroops,
+                estimate.total_xlm()
+            );
+
+            let inner = estimate.total_stroops;
+            let bump = simulator.fee_bump(inner, inner, base_fee)?;
+            println!(
+                "resubmission at base fee {base_fee} stroops: outer fee {} stroops ({}), +{}% over the signed fee",
+                bump.fee_source_pays(),
+                format_stroops(bump.fee_source_pays()),
+                bump.percent_over_signed_fee()
+            );
+
+            let ladder = simulator.bump_ladder(inner);
+            if ladder.is_empty() {
+                println!("fee bump ladder: no bump possible below the {max_fee} stroop cap");
+            } else {
+                println!(
+                    "fee bump ladder ({} attempt(s), cap {max_fee} stroops):",
+                    ladder.len()
+                );
+                for (attempt, step) in ladder.iter().enumerate() {
+                    println!(
+                        "  attempt {}: {} -> {} stroops ({}), +{}%",
+                        attempt + 1,
+                        step.inner_fee_stroops,
+                        step.fee_source_pays(),
+                        format_stroops(step.fee_source_pays()),
+                        step.percent_over_signed_fee()
+                    );
+                }
+            }
+            if !simulator.is_bumpable(inner) {
+                println!("warning: current fee already sits on the {max_fee} stroop cap");
+            }
+            Ok(())
+        }
+    }
+}
+
+fn run_inspect(cmd: &InspectCommand) -> Result<()> {
+    use crate::state_inspector::{StateInspector, StateQuery};
+    match cmd {
+        InspectCommand::State {
+            contract,
+            key_prefix,
+            include_temporary,
+            page_size,
+            cursor,
+            input,
+            all_pages,
+            json,
+        } => {
+            let inspector = match input {
+                Some(input) => {
+                    let path = resolve_path(input);
+                    let mut from_file = StateInspector::new();
+                    let added = from_file.load(&path)?;
+                    println!("loaded {added} state entry/entries from {}", path.display());
+                    from_file
+                }
+                None => StateInspector::sample(),
+            };
+            if inspector.is_empty() {
+                return Err(ToolkitError::ExecutionError(
+                    "no state entries to inspect".to_string(),
+                ));
+            }
+
+            let mut query = StateQuery::new()
+                .with_page_size(*page_size)
+                .with_cursor(*cursor)
+                .including_temporary(*include_temporary);
+            if let Some(contract) = contract {
+                query = query.for_contract(contract.clone());
+            }
+            if let Some(prefix) = key_prefix {
+                query = query.with_key_prefix(prefix.clone());
+            }
+            println!(
+                "filter matched {} of {} entries",
+                inspector.total(&query),
+                inspector.len()
+            );
+
+            if *all_pages {
+                for (index, page) in inspector.pages(&query).iter().enumerate() {
+                    if index > 0 {
+                        println!();
+                    }
+                    if *json {
+                        println!("{}", page.to_json());
+                    } else {
+                        print!("{}", page.render());
+                    }
+                }
+                return Ok(());
+            }
+
+            let page = inspector.page(&query);
+            if *json {
+                println!("{}", page.to_json());
+                return Ok(());
+            }
+            print!("{}", page.render());
+            if let Some(next) = page.next_cursor {
+                println!("pass --cursor {next} to continue");
+            }
+            Ok(())
+        }
+    }
+}
+
+fn resolve_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    cwd.join(path)
 }
 
 fn normalize_workspace_root(workspace: &PathBuf) -> PathBuf {
