@@ -15,7 +15,7 @@ Covers the four infra issues assigned to @danieloche635-bit:
 
 **File:** `.github/workflows/ci.yml` · `rust-toolchain.toml`
 
-- **Pinned toolchain:** `rust-toolchain.toml` pins `channel = "1.86.0"` + `wasm32-unknown-unknown`. All CI jobs use `dtolnay/rust-toolchain@master` with `toolchain: 1.86.0` so local and CI produce identical WASM.
+- **Pinned toolchain:** `rust-toolchain.toml` pins `channel = "1.98.1"` + `wasm32v1-none`. All CI jobs use `dtolnay/rust-toolchain@master` with `toolchain: 1.98.1` so local and CI produce identical WASM.
 - **Caching:** `Swatinem/rust-cache@v2` keys on target (`build-wasm`, `build`, `wasm-contracts`) — 2-3× faster.
 - **Jobs:** `fmt` → `clippy` → `build` (matrix `wasm32` + `x86_64`) → `test` → `simulation` → `security` → `wasm` → `wasm-verify` → `docs` → `merge-check`.
 - **Reproducibility guard:** `wasm` builds contracts twice and diffs `wasm-checksums.txt`; artifacts uploaded as `wasm-contracts` (14-day retention) and `wasm-checksums` (30-day).
@@ -27,7 +27,7 @@ Covers the four infra issues assigned to @danieloche635-bit:
 cargo fmt --check
 cargo clippy --all --all-targets --all-features -- -D warnings
 cargo test --all --all-features
-cargo build --workspace --exclude stellar-toolkit --target wasm32-unknown-unknown --release
+cargo build --workspace --exclude stellar-toolkit --target wasm32v1-none --release
 ```
 
 ---
@@ -36,7 +36,7 @@ cargo build --workspace --exclude stellar-toolkit --target wasm32-unknown-unknow
 
 **Files:** `Dockerfile` · `docker-compose.yml` · `.dockerignore` · `scripts/reproducible-build.sh` · `scripts/verify-bytecode.sh`
 
-- **Base:** `rust:1.86-bookworm` with `wasm32-unknown-unknown`, `binaryen`, `wabt`, `soroban-cli 21.5.0`, `wasm-pack`.
+- **Base:** `rust:1.98-bookworm` with `wasm32v1-none`, `binaryen`, `wabt`, `soroban-cli 21.5.0`, `wasm-pack`.
 - **Determinism:** `SOURCE_DATE_EPOCH=0`, `RUSTFLAGS="-C target-feature=-crt-static"`, clean incremental caches, pinned `Cargo.lock`.
 - **Quickstart:**
 

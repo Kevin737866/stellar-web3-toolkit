@@ -4,11 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# The contract derives its own error type with `#[contracterror]` and stores state
+# through `soroban_sdk`, so sha2/hmac/serde/thiserror were never used. Dropping
+# them also keeps the crate buildable for `wasm32v1-none`, which has no `std`:
+# those crates pull in `std` through their default features.
 soroban-sdk = { workspace = true }
-sha2 = { workspace = true }
-hmac = { workspace = true }
-serde = { workspace = true }
-thiserror = { workspace = true }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }

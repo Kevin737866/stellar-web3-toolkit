@@ -7,5 +7,11 @@
 # re-run the full suite -- the lockfile floats, the pin does not.
 channel = "1.98.1"
 components = ["rustfmt", "clippy"]
-targets = ["wasm32-unknown-unknown"]
+# `wasm32v1-none`, not `wasm32-unknown-unknown`. The default wasm32-unknown-unknown
+# target emits the `reference-types` feature, and the Soroban host rejects any
+# module carrying it:
+#     reference-types not enabled: zero byte expected
+# so contracts built for wasm32-unknown-unknown cannot be uploaded, let alone
+# deployed. wasm32v1-none is WASM 1.0, which is what the host accepts.
+targets = ["wasm32v1-none"]
 profile = "minimal"

@@ -8,6 +8,12 @@
 
 Soroban smart contracts compiled to WebAssembly (WASM) must meet strict execution footprint limits and bytecode size constraints on the Stellar network. Unoptimized WASM binaries incur excessive ledger storage costs and execution fees.
 
+> **Amended.** Item 1 below is superseded: the target is now `wasm32v1-none`, not
+> `wasm32-unknown-unknown`. The default `wasm32-unknown-unknown` target emits the
+> `reference-types` feature, and the Soroban host refuses to validate any module
+> carrying it (`reference-types not enabled: zero byte expected`), so contracts
+> built that way cannot be uploaded, let alone deployed. Items 2 and 3 stand.
+
 ## Decision
 
 We establish an automated Rust-to-WASM compilation and optimization pipeline utilizing:

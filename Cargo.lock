@@ -1689,11 +1689,7 @@ dependencies = [
 name = "payment-channel-contract"
 version = "0.1.0"
 dependencies = [
- "hmac",
- "serde",
- "sha2",
  "soroban-sdk",
- "thiserror 1.0.69",
 ]
 
 [[package]]

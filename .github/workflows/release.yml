@@ -42,8 +42,8 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.86.0
-          targets: wasm32-unknown-unknown
+          toolchain: 1.98.1
+          targets: wasm32v1-none
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -64,23 +64,26 @@ jobs:
 
       - name: Build contracts (reproducible, pinned toolchain)
         run: |
-          cargo build --workspace --exclude stellar-toolkit --exclude stellar-did --exclude payment-channel --exclude channel-router --exclude channel-simulator --exclude watchtower --exclude atomic-swap --target wasm32-unknown-unknown --release
-          cargo build -p payment-channel-contract -p htlc-contract -p amm-pool -p amm-factory -p amm-router --target wasm32-unknown-unknown --release 2>/dev/null || true
-          ls -lh target/wasm32-unknown-unknown/release/*.wasm
-          sha256sum target/wasm32-unknown-unknown/release/*.wasm | tee wasm-checksums.txt
+          cargo build --workspace --exclude stellar-toolkit --exclude payment-channel --exclude channel-router --exclude channel-simulator --exclude watchtower --exclude atomic-swap --target wasm32v1-none --release
+          cargo build -p payment-channel-contract -p htlc-contract -p amm-pool -p amm-factory -p amm-router --target wasm32v1-none --release 2>/dev/null || true
+          ls -lh target/wasm32v1-none/release/*.wasm
+          sha256sum target/wasm32v1-none/release/*.wasm | tee wasm-checksums.txt
           # Optional wasm optimization size report
-          for f in target/wasm32-unknown-unknown/release/*.wasm; do echo "$(basename $f): $(wc -c < "$f") bytes"; done
+          for f in target/wasm32v1-none/release/*.wasm; do echo "$(basename $f): $(wc -c < "$f") bytes"; done
 
       - name: Run reproducible-build script
         run: bash scripts/reproducible-build.sh
 
       - name: Verify bytecode determinism (local == reference if exists)
-        run: bash scripts/verify-bytecode.sh || echo "verify-bytecode: no reference yet, skipping strict diff"
+        # Quoted because the value contains ": ", which YAML would otherwise read
+        # as a nested mapping -- the unquoted form made this file invalid YAML, so
+        # the whole release workflow could not run.
+        run: 'bash scripts/verify-bytecode.sh || echo "verify-bytecode: no reference yet, skipping strict diff"'
 
       - name: Package artifacts
         run: |
           mkdir -p dist
-          cp target/wasm32-unknown-unknown/release/*.wasm dist/ || true
+          cp target/wasm32v1-none/release/*.wasm dist/ || true
           cp wasm-checksums.txt dist/ 2>/dev/null || sha256sum dist/*.wasm > dist/wasm-checksums.txt
           cp Cargo.lock dist/ 2>/dev/null || true
           cat dist/wasm-checksums.txt
@@ -114,7 +117,7 @@ jobs:
           ## Stellar Web3 Toolkit Release ${{ needs.build.outputs.version }}
 
           ### Artifacts
-          - Deterministic WASM builds (Rust 1.86, `wasm32-unknown-unknown`, `--release`)
+          - Deterministic WASM builds (Rust 1.98, `wasm32v1-none`, `--release`)
           - `wasm-checksums.txt` — SHA-256 for every contract wasm
           - Reproducibility verified via `scripts/reproducible-build.sh` + Docker (`Dockerfile`)
 
@@ -159,8 +162,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.86.0
-          targets: wasm32-unknown-unknown
+          toolchain: 1.98.1
+          targets: wasm32v1-none
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
