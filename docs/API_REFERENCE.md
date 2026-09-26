@@ -12,6 +12,10 @@ Complete API documentation reference for Soroban contracts and SDK crates in `st
 - [OneClickAirdropClaimer::check_eligibility](#oneclickairdropclaimercheck_eligibility)
 - [ExampleGalleryRegistry::list_examples](#examplegalleryregistrylist_examples)
 - [AmmPool::swap](#ammpoolswap)
+- [MarketplaceContract::create_listing](#marketplacecontractcreate_listing)
+- [MarketplaceContract::buy](#marketplacecontractbuy)
+- [RoyaltySplitter::set_royalty](#royaltysplitterset_royalty)
+- [RoyaltySplitter::distribute](#royaltysplitterdistribute)
 
 ---
 
@@ -117,4 +121,85 @@ Executes a constant-product AMM token swap with slippage protection.
 
 ```rust
 amm_pool_client.swap(&user, &100_i128, &0_i128);
+```
+
+---
+
+### MarketplaceContract::create_listing
+
+*Module/Contract*: `contracts/marketplace-contract`
+
+Escrows a SEP-41 digital asset and creates a marketplace listing priced in a SEP-41 payment token.
+
+**Parameters:**
+- `seller`: `Address`
+- `asset`: `Address` (SEP-41 asset contract)
+- `token_id`: `u128` (`0` for fungible listings)
+- `amount`: `i128`
+- `price`: `i128`
+- `payment_token`: `Address`
+
+**Return Type:** `u64` (listing id)
+
+```rust
+let listing_id = marketplace.create_listing(&seller, &asset, &1_u128, &1_i128, &1_000_i128, &payment_token);
+```
+
+---
+
+### MarketplaceContract::buy
+
+*Module/Contract*: `contracts/marketplace-contract`
+
+Settles an active listing: charges the buyer, pays the seller net of the marketplace fee, and releases the escrowed asset.
+
+**Parameters:**
+- `buyer`: `Address`
+- `listing_id`: `u64`
+
+**Return Type:** `i128` (seller proceeds after fees)
+
+```rust
+let proceeds = marketplace.buy(&buyer, &listing_id);
+```
+
+---
+
+### RoyaltySplitter::set_royalty
+
+*Module/Contract*: `contracts/royalty-splitter`
+
+Registers a multi-receiver royalty split for an asset, called by the admin or the collection contract.
+
+**Parameters:**
+- `caller`: `Address`
+- `collection`: `Address`
+- `token_id`: `u128`
+- `receivers`: `Vec<Receiver>`
+
+**Return Type:** `()`
+
+```rust
+splitter.set_royalty(&admin, &collection, &token_id, &receivers);
+```
+
+---
+
+### RoyaltySplitter::distribute
+
+*Module/Contract*: `contracts/royalty-splitter`
+
+Computes royalty shares for a sale price and transfers each share in a SEP-41 payment token from the payer to its receiver.
+
+**Parameters:**
+- `payer`: `Address`
+- `collection`: `Address`
+- `token_id`: `u128`
+- `sale_price`: `i128`
+- `payment_token`: `Address`
+
+**Return Type:** `Vec<Payout>`
+
+```rust
+let payouts = splitter.distribute(&buyer, &collection, &token_id, &1_000_i128, &payment_token);
 ```
