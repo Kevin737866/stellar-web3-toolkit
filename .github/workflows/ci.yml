@@ -115,7 +115,10 @@ jobs:
       - name: Run simulation tests
         run: cargo test --package channel-simulator -- --nocapture
       - name: Run routing benchmarks
-        run: cargo test --package channel-router --test '*' -- --nocapture
+        # `--test '*'` selects integration-test targets, and channel-router has no
+        # `tests/` directory, so the glob matched nothing and cargo exited non-zero.
+        # Its tests are unit tests inside the crate.
+        run: cargo test --package channel-router --lib -- --nocapture
 
   security:
     name: Security Audit
