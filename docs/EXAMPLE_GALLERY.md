@@ -54,3 +54,22 @@ use stellar_toolkit::OneClickAirdropClaimer;
 let claimer = OneClickAirdropClaimer::new();
 let tx = claimer.claim_airdrop("GCLAIMANT...", "airdrop-event-2026", &proof)?;
 ```
+
+---
+
+## 4. Digital Asset Marketplace & Royalty Splitting
+
+Demonstrates escrowing a SEP-41 digital asset for sale, settling a purchase with a marketplace fee, and paying creator royalties to multiple receivers on the secondary sale.
+
+- **Category**: NFTs / Tokens
+- **Contract WASM Hash**: `d4e5f678901234567890abcdef1234567890abcdef1234567890abcdef123456`
+- **CLI Run Command**: `stellar-toolkit example run --id marketplace-royalty --network testnet`
+
+```rust
+use marketplace_contract::MarketplaceContractClient;
+use royalty_splitter::RoyaltySplitterClient;
+
+let listing_id = market.create_listing(&seller, &asset, &1_u128, &1_i128, &1_000_i128, &payment_token);
+let proceeds = market.buy(&buyer, &listing_id);
+let payouts = splitter.distribute(&buyer, &asset, &1_u128, &1_000_i128, &payment_token);
+```
