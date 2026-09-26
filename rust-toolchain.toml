@@ -1,5 +1,11 @@
 [toolchain]
-channel = "1.86.0"
+# Pinned so local builds and CI resolve identically.
+#
+# This was 1.86.0, which the committed Cargo.lock had drifted past: several locked
+# dependencies now require rustc >= 1.88, so `cargo` refused to resolve the graph
+# and every job that compiled Rust failed before doing any work. When bumping this,
+# re-run the full suite -- the lockfile floats, the pin does not.
+channel = "1.98.1"
 components = ["rustfmt", "clippy"]
 targets = ["wasm32-unknown-unknown"]
 profile = "minimal"
