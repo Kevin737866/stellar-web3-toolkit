@@ -8,6 +8,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 soroban-sdk = { workspace = true }
+soroban-ttl = { path = "../../crates/soroban-ttl" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }

@@ -12,6 +12,7 @@ doctest = false
 [dependencies]
 soroban-sdk = { workspace = true }
 amm-pool = { path = "../amm-pool", default-features = false }
+soroban-ttl = { path = "../../crates/soroban-ttl" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }

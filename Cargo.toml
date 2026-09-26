@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/soroban-ttl",
     "crates/stellar-toolkit",
     "crates/payment-channel",
     "crates/channel-router",

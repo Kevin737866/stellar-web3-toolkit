@@ -9,6 +9,7 @@
 #![allow(dead_code)]
 
 use soroban_sdk::{contracttype, Address, BytesN, Env, Map, TryFromVal, Val, Vec};
+use soroban_ttl::{extend_instance, TtlPolicy};
 
 use crate::error::PaymentChannelError;
 use crate::types::{ChannelState, ChannelStats, HTLCInfo};
@@ -22,6 +23,16 @@ pub enum StorageKey {
     ChannelStats(BytesN<32>),
 }
 
+/// Keep channel state alive.
+///
+/// A channel is a long-lived bilateral relationship: it can sit idle for weeks and
+/// still be closed or challenged afterwards. Channel state therefore gets the
+/// generous policy, and every read or write below keeps the entry alive so a
+/// dormant channel is never silently archived out from under its participants.
+fn touch(env: &Env) {
+    extend_instance(env, TtlPolicy::LONG_LIVED);
+}
+
 /// Store channel state
 ///
 /// `StorageKey` is a `#[contracttype]`, so it already converts into a storage key.
@@ -31,6 +42,7 @@ pub fn store_channel_state(env: &Env, channel_id: &BytesN<32>, state: &ChannelSt
     env.storage()
         .instance()
         .set(&StorageKey::Channel(channel_id.clone()), state);
+    touch(env);
 }
 
 /// Retrieve channel state from storage
@@ -38,10 +50,13 @@ pub fn get_channel_state(
     env: &Env,
     channel_id: &BytesN<32>,
 ) -> Result<ChannelState, PaymentChannelError> {
-    env.storage()
+    let state = env
+        .storage()
         .instance()
         .get(&StorageKey::Channel(channel_id.clone()))
-        .ok_or(PaymentChannelError::ChannelNotFound)
+        .ok_or(PaymentChannelError::ChannelNotFound)?;
+    touch(env);
+    Ok(state)
 }
 
 /// Delete channel state from storage
@@ -57,14 +72,18 @@ pub fn store_participant_channels(env: &Env, participant: &Address, channels: &V
         &StorageKey::ParticipantChannels(participant.clone()),
         channels,
     );
+    touch(env);
 }
 
 /// Get list of channels for a participant
 pub fn get_participant_channels(env: &Env, participant: &Address) -> Vec<BytesN<32>> {
-    env.storage()
+    let channels = env
+        .storage()
         .instance()
         .get(&StorageKey::ParticipantChannels(participant.clone()))
-        .unwrap_or_else(|| Vec::new(env))
+        .unwrap_or_else(|| Vec::new(env));
+    touch(env);
+    channels
 }
 
 /// Store channel statistics
@@ -72,28 +91,38 @@ pub fn store_channel_stats(env: &Env, channel_id: &BytesN<32>, stats: &ChannelSt
     env.storage()
         .instance()
         .set(&StorageKey::ChannelStats(channel_id.clone()), stats);
+    touch(env);
 }
 
 /// Get channel statistics
 pub fn get_channel_stats(env: &Env, channel_id: &BytesN<32>) -> ChannelStats {
-    env.storage()
+    let stats = env
+        .storage()
         .instance()
         .get(&StorageKey::ChannelStats(channel_id.clone()))
-        .unwrap_or_default()
+        .unwrap_or_default();
+    touch(env);
+    stats
 }
 
 /// Check if a channel exists
 pub fn channel_exists(env: &Env, channel_id: &BytesN<32>) -> bool {
-    env.storage()
+    let exists = env
+        .storage()
         .instance()
-        .has(&StorageKey::Channel(channel_id.clone()))
+        .has(&StorageKey::Channel(channel_id.clone()));
+    touch(env);
+    exists
 }
 
 /// Check if a participant exists
 pub fn participant_exists(env: &Env, participant: &Address) -> bool {
-    env.storage()
+    let exists = env
+        .storage()
         .instance()
-        .has(&StorageKey::ParticipantChannels(participant.clone()))
+        .has(&StorageKey::ParticipantChannels(participant.clone()));
+    touch(env);
+    exists
 }
 
 /// Get all channel IDs (for iteration - limited in Soroban)

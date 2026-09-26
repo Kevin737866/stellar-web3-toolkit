@@ -32,6 +32,7 @@ version = "0.1.0"
 dependencies = [
  "amm-pool",
  "soroban-sdk",
+ "soroban-ttl",
 ]
 
 [[package]]
@@ -39,6 +40,7 @@ name = "amm-pool"
 version = "0.1.0"
 dependencies = [
  "soroban-sdk",
+ "soroban-ttl",
 ]
 
 [[package]]
@@ -1096,6 +1098,7 @@ name = "htlc-contract"
 version = "0.1.0"
 dependencies = [
  "soroban-sdk",
+ "soroban-ttl",
 ]
 
 [[package]]
@@ -1690,6 +1693,7 @@ name = "payment-channel-contract"
 version = "0.1.0"
 dependencies = [
  "soroban-sdk",
+ "soroban-ttl",
 ]
 
 [[package]]
@@ -2513,6 +2517,13 @@ dependencies = [
  "stellar-xdr",
  "syn 2.0.119",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "soroban-ttl"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
 ]
 
 [[package]]

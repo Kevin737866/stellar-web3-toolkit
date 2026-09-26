@@ -9,6 +9,7 @@ edition = "2021"
 # them also keeps the crate buildable for `wasm32v1-none`, which has no `std`:
 # those crates pull in `std` through their default features.
 soroban-sdk = { workspace = true }
+soroban-ttl = { path = "../../crates/soroban-ttl" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }

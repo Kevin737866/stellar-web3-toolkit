@@ -4,6 +4,7 @@ extern crate std;
 
 use amm_pool::AmmPoolClient;
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, BytesN, Env};
+use soroban_ttl::{extend_instance, TtlPolicy};
 
 /// Counter-based deploy salt (unique per pair); `get_pair` is canonical for routing.
 #[contracttype]
@@ -24,6 +25,13 @@ pub struct PairKey {
 
 #[contract]
 pub struct AmmFactory;
+
+/// The pair registry is the factory's entire state: without it `get_pair` cannot
+/// route, and every pool it deployed becomes unreachable. Keep it alive whenever
+/// it is read or written.
+fn touch(env: &Env) {
+    extend_instance(env, TtlPolicy::BALANCE);
+}
 
 fn sort_tokens(a: Address, b: Address) -> (Address, Address) {
     if a < b {
@@ -55,6 +63,7 @@ impl AmmFactory {
             .instance()
             .set(&DataKey::PoolWasmHash, &pool_wasm_hash);
         env.storage().instance().set(&DataKey::Nonce, &0_u64);
+        touch(&env);
     }
 
     pub fn admin(env: Env) -> Address {
@@ -83,14 +92,18 @@ impl AmmFactory {
         let pool = env.deployer().with_current_contract(salt).deploy(wasm_hash);
         AmmPoolClient::new(&env, &pool).initialize(&factory, &t0, &t1);
         env.storage().instance().set(&DataKey::Pair(pk), &pool);
+        touch(&env);
         pool
     }
 
     pub fn get_pair(env: Env, token_a: Address, token_b: Address) -> Option<Address> {
         let (t0, t1) = sort_tokens(token_a, token_b);
-        env.storage()
+        let pair = env
+            .storage()
             .instance()
-            .get(&DataKey::Pair(PairKey { t0, t1 }))
+            .get(&DataKey::Pair(PairKey { t0, t1 }));
+        touch(&env);
+        pair
     }
 
     pub fn pool_wasm_hash(env: Env) -> BytesN<32> {

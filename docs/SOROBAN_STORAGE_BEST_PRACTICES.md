@@ -61,6 +61,26 @@ pub fn read_balance_with_ttl(env: &Env, key: &DataKey) -> i128 {
 }
 ```
 
+Note that `extend_ttl` is a **no-op while the entry's remaining lifespan is above the threshold**, so calling it on a read is cheap and does not pay rent unless the entry is genuinely at risk.
+
+#### 2.2.1 Use the Shared `soroban-ttl` Crate
+
+Do not hand-roll these constants in a contract. The toolkit provides `soroban-ttl`, which centralizes the policy and exposes one helper per storage tier. See [ADR-0004](adr/0004-centralize-storage-ttl-management.md) for the rationale and [the FAQ](FAQ.md#how-do-i-auto-extend-a-storage-ttl) for the available presets.
+
+```rust
+use soroban_sdk::Env;
+use soroban_ttl::{extend_persistent, TtlPolicy};
+
+pub fn read_balance_with_ttl(env: &Env, key: &DataKey) -> i128 {
+    let balance = env.storage().persistent().get::<_, i128>(key).unwrap_or(0);
+    // A read is proof the entry is still in use, so renew it here too.
+    extend_persistent(env, key, TtlPolicy::BALANCE);
+    balance
+}
+```
+
+`TtlPolicy::BALANCE` uses exactly the `BALANCE_TTL_THRESHOLD` / `BALANCE_TTL_BUMP` values shown above, and a unit test in the crate asserts they stay in agreement.
+
 ### 2.3 Minimizing Storage Footprint
 
 - Store compact integer types (`u32`, `u64`, `i128`) instead of strings whenever possible.

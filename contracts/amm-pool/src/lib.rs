@@ -5,6 +5,7 @@ mod math;
 use math::{amount_out, flash_k_ok, liquidity_amounts_first_deposit, quote};
 use soroban_sdk::token::{TokenClient, TokenInterface};
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, IntoVal, String};
+use soroban_ttl::{extend_instance, TtlPolicy};
 
 #[contracttype]
 #[derive(Clone)]
@@ -38,6 +39,16 @@ pub struct AllowanceData {
 
 #[contract]
 pub struct AmmPool;
+
+/// Keep the pool's storage entry alive.
+///
+/// Reserves, LP balances and allowances are real balances rather than disposable
+/// cache, and the instance entry is what makes all of them readable. Every
+/// entrypoint that touches them calls this, so an active pool never drifts toward
+/// archival and its depositors never have to pay to restore their balances.
+fn touch(env: &Env) {
+    extend_instance(env, TtlPolicy::BALANCE);
+}
 
 fn read_i128(env: &Env, key: &DataKey) -> i128 {
     env.storage().instance().get(key).unwrap_or(0)
@@ -196,9 +207,11 @@ impl AmmPool {
         write_i128(&env, DataKey::TsLast, env.ledger().timestamp() as i128);
         write_i128(&env, DataKey::CumA, 0);
         write_i128(&env, DataKey::CumB, 0);
+        touch(&env);
     }
 
     pub fn get_reserves(env: Env) -> (i128, i128) {
+        touch(&env);
         reserves(&env)
     }
 
@@ -217,6 +230,7 @@ impl AmmPool {
     /// Spot price oracle helper: cumulative reserves × time (integrator TWAP off-chain).
     pub fn observe(env: Env) -> (i128, i128, u64) {
         grow_cumulative(&env);
+        touch(&env);
         (
             read_i128(&env, &DataKey::CumA),
             read_i128(&env, &DataKey::CumB),
@@ -278,6 +292,7 @@ impl AmmPool {
         set_reserves(&env, new_a, new_b);
         mint_lp(&env, user, liq);
         grow_cumulative(&env);
+        touch(&env);
         liq
     }
 
@@ -318,6 +333,7 @@ impl AmmPool {
             reserve_b.saturating_sub(amount_b),
         );
         grow_cumulative(&env);
+        touch(&env);
         (amount_a, amount_b)
     }
 
@@ -356,6 +372,7 @@ impl AmmPool {
 
         TokenClient::new(&env, &token_out).transfer(&pool, &to, &out);
         grow_cumulative(&env);
+        touch(&env);
         out
     }
 
@@ -401,6 +418,7 @@ impl AmmPool {
         );
         set_reserves(&env, bal_a, bal_b);
         grow_cumulative(&env);
+        touch(&env);
     }
 }
 
@@ -408,7 +426,9 @@ impl AmmPool {
 impl TokenInterface for AmmPool {
     fn allowance(env: Env, from: Address, spender: Address) -> i128 {
         let a = allowance_load(&env, from, spender);
-        allowance_effective(&env, &a)
+        let eff = allowance_effective(&env, &a);
+        touch(&env);
+        eff
     }
 
     fn approve(env: Env, from: Address, spender: Address, amount: i128, expiration_ledger: u32) {
@@ -422,10 +442,13 @@ impl TokenInterface for AmmPool {
                 expiration_ledger,
             },
         );
+        touch(&env);
     }
 
     fn balance(env: Env, id: Address) -> i128 {
-        lp_balance_read(&env, &id)
+        let b = lp_balance_read(&env, &id);
+        touch(&env);
+        b
     }
 
     fn transfer(env: Env, from: Address, to: Address, amount: i128) {
@@ -436,6 +459,7 @@ impl TokenInterface for AmmPool {
         lp_balance_write(&env, from, b - amount);
         let b_to = lp_balance_read(&env, &to);
         lp_balance_write(&env, to, b_to.saturating_add(amount));
+        touch(&env);
     }
 
     fn transfer_from(env: Env, spender: Address, from: Address, to: Address, amount: i128) {
@@ -453,11 +477,13 @@ impl TokenInterface for AmmPool {
         lp_balance_write(&env, from.clone(), b - amount);
         let b_to = lp_balance_read(&env, &to);
         lp_balance_write(&env, to, b_to.saturating_add(amount));
+        touch(&env);
     }
 
     fn burn(env: Env, from: Address, amount: i128) {
         from.require_auth();
         burn_lp_withdraw(&env, from, amount);
+        touch(&env);
     }
 
     fn burn_from(env: Env, spender: Address, from: Address, amount: i128) {
@@ -468,6 +494,7 @@ impl TokenInterface for AmmPool {
         al.amount = eff.saturating_sub(amount);
         allowance_store(&env, from.clone(), spender.clone(), al);
         burn_lp_withdraw(&env, from, amount);
+        touch(&env);
     }
 
     fn decimals(_env: Env) -> u32 {
@@ -486,6 +513,7 @@ impl TokenInterface for AmmPool {
 #[cfg(test)]
 mod test {
     use super::*;
+    use soroban_sdk::testutils::storage::Instance as _;
     use soroban_sdk::testutils::{Address as _, Ledger as _};
     use soroban_sdk::token::{StellarAssetClient, TokenClient};
 
@@ -575,5 +603,106 @@ mod test {
         let _ = pool.swap(&ta, &u, &1);
         let (c1, d1, _) = pool.observe();
         assert!(c1 > c0 || d1 > d0);
+    }
+
+    fn instance_ttl(env: &Env, id: &Address) -> u32 {
+        env.as_contract(id, || env.storage().instance().get_ttl())
+    }
+
+    fn setup_pool(env: &Env) -> (Address, Address, Address, AmmPoolClient<'static>) {
+        let (ta, tb) = setup_tokens(env);
+        let pool_id = env.register_contract(None, AmmPool);
+        let factory = Address::generate(env);
+        AmmPoolClient::new(env, &pool_id).initialize(&factory, &ta, &tb);
+        let client = AmmPoolClient::new(env, &pool_id);
+        (ta, tb, pool_id, client)
+    }
+
+    /// Age the pool's storage entry down to exactly the policy threshold, which is
+    /// the point at which the next interaction has to pay for another TTL window.
+    fn age_pool_to_threshold(env: &Env, pool_id: &Address) {
+        let full = instance_ttl(env, pool_id);
+        let target = TtlPolicy::BALANCE.threshold;
+        env.ledger().with_mut(|li| {
+            li.sequence_number = li.sequence_number.saturating_add(full - target);
+        });
+        assert_eq!(target, instance_ttl(env, pool_id));
+    }
+
+    #[test]
+    fn adding_liquidity_revives_an_aged_pool_entry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (ta, tb, pool_id, pool) = setup_pool(&env);
+
+        age_pool_to_threshold(&env, &pool_id);
+
+        let u = Address::generate(&env);
+        mint(&env, ta, u.clone(), 1_000_000);
+        mint(&env, tb, u.clone(), 1_000_000);
+        pool.add_liquidity(&u, &1_000_000, &1_000_000, &1, &1);
+
+        let after = instance_ttl(&env, &pool_id);
+        assert!(
+            after >= TtlPolicy::BALANCE.extend_to.saturating_sub(1),
+            "add_liquidity should have revived the pool, ttl was {after}"
+        );
+    }
+
+    #[test]
+    fn a_read_only_quote_also_keeps_the_pool_alive() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_ta, _tb, pool_id, pool) = setup_pool(&env);
+
+        age_pool_to_threshold(&env, &pool_id);
+
+        // Routers and integrators poll reserves without mutating anything; that
+        // dependence on the entry should still hold off archival.
+        let _ = pool.get_reserves();
+
+        let after = instance_ttl(&env, &pool_id);
+        assert!(
+            after >= TtlPolicy::BALANCE.extend_to.saturating_sub(1),
+            "get_reserves should have revived the pool, ttl was {after}"
+        );
+    }
+
+    #[test]
+    fn depositor_balances_survive_the_full_policy_window() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (ta, tb, pool_id, pool) = setup_pool(&env);
+
+        let u = Address::generate(&env);
+        mint(&env, ta, u.clone(), 10_000_000);
+        mint(&env, tb, u.clone(), 10_000_000);
+        let lp = pool.add_liquidity(&u, &1_000_000, &1_000_000, &1, &1);
+        assert!(lp > 0);
+
+        // Age the pool to the policy threshold and interact with it once, which is
+        // what buys the full BALANCE window (~100k ledgers, roughly 138 days).
+        age_pool_to_threshold(&env, &pool_id);
+        let _ = pool.get_reserves();
+        assert!(
+            instance_ttl(&env, &pool_id) >= TtlPolicy::BALANCE.extend_to.saturating_sub(1),
+            "interaction should have renewed the full policy window"
+        );
+
+        // Now go almost the entire distance that window promises, touching nothing.
+        env.ledger().with_mut(|li| {
+            li.sequence_number = li
+                .sequence_number
+                .saturating_add(TtlPolicy::BALANCE.extend_to - 1_000);
+        });
+        assert!(
+            instance_ttl(&env, &pool_id) > 0,
+            "the entry must stay alive for the whole policy window"
+        );
+
+        // The depositor returns and can still read and move their position.
+        assert_eq!(TokenClient::new(&env, &pool_id).balance(&u), lp);
+        pool.remove_liquidity(&u, &lp, &1, &1);
+        assert_eq!(TokenClient::new(&env, &pool_id).balance(&u), 0);
     }
 }

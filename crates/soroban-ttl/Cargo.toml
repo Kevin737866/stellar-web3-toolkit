@@ -1,17 +1,17 @@
 [package]
-name = "amm-pool"
+name = "soroban-ttl"
 version.workspace = true
 edition.workspace = true
 publish = false
-rust-version = "1.74.0"
+description = "Reusable Soroban storage TTL (time-to-live) auto-extension helpers for the Stellar Web3 Toolkit"
+license.workspace = true
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
 doctest = false
 
 [dependencies]
 soroban-sdk = { workspace = true }
-soroban-ttl = { path = "../../crates/soroban-ttl" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }

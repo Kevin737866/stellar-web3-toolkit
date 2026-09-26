@@ -16,6 +16,7 @@ This directory contains Architecture Decision Records (ADRs) for the **Stellar W
 | [ADR-0001](0001-record-architecture-decisions.md) | Record Architecture Decisions | Accepted | 2026-08-29 |
 | [ADR-0002](0002-soroban-wasm-compilation-pipeline.md) | Soroban WASM Compilation & Optimization Pipeline | Accepted | 2026-08-29 |
 | [ADR-0003](0003-htlc-swap-verification-engine.md) | HTLC Atomic Swap State Verification Engine | Accepted | 2026-08-29 |
+| [ADR-0004](0004-centralize-storage-ttl-management.md) | Centralize Storage TTL Management in a Shared Crate | Accepted | 2026-09-26 |
 
 ## How to Propose a New ADR
 
