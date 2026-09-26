@@ -2,10 +2,15 @@
 //!
 //! Core channel management logic for the payment channel system.
 
-use soroban_sdk::{Address, Bytes, BytesN, Env, Map, Val, Vec};
+// Parts of this module are a complete API that the contract entrypoints in
+// `lib.rs` do not call yet. They are kept (and exercised by tests) rather than
+// deleted, so the allow is scoped to this module instead of the whole crate.
+#![allow(dead_code)]
+
+use soroban_sdk::{Address, Bytes, BytesN, Env};
 
 use crate::error::PaymentChannelError;
-use crate::types::{ChannelConfig, ChannelState, ChannelStats, RouteHop};
+use crate::types::{ChannelConfig, ChannelState, RouteHop};
 
 /// Channel manager for handling channel operations
 pub struct ChannelManager;
@@ -95,7 +100,7 @@ impl ChannelManager {
         data.extend_from_slice(&ts.to_be_bytes());
         // Use contract address as additional entropy
         let contract = env.current_contract_address();
-        data.extend_from_slice(&contract.to_val().to_object().to_bytes());
+        crate::append_address(&mut data, &contract);
 
         let hash: BytesN<32> = env.crypto().sha256(&data).into();
         hash
@@ -244,7 +249,7 @@ impl ChannelManager {
             balance_b: channel.balance_b,
             utilization: Self::get_utilization(channel),
             is_open: channel.close_time == 0,
-            num_htlcs: channel.htlcs.len() as u32,
+            num_htlcs: channel.htlcs.len(),
         }
     }
 }

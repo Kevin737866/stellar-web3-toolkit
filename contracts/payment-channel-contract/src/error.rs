@@ -2,9 +2,14 @@
 //!
 //! Error types for the Stellar payment channel system.
 
-use soroban_sdk::Error;
+use soroban_sdk::{contracterror, Error};
 
 /// Payment channel specific errors
+///
+/// `#[contracterror]` is what lets `?` convert this into `soroban_sdk::Error`
+/// inside a `#[contractimpl]`, and what makes the discriminants part of the
+/// contract interface.
+#[contracterror]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(u32)]
 pub enum PaymentChannelError {
@@ -66,12 +71,6 @@ pub enum PaymentChannelError {
     PathTooLong = 28,
     /// Amount exceeds maximum
     AmountExceedsMaximum = 29,
-}
-
-impl From<PaymentChannelError> for Error {
-    fn from(e: PaymentChannelError) -> Self {
-        Error::from_contract_error(e as u32)
-    }
 }
 
 impl TryFrom<u32> for PaymentChannelError {
