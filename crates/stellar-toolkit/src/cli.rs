@@ -137,10 +137,10 @@ fn run_wallet(wallet: &WalletCommand) -> Result<()> {
 }
 
 fn print_wallet(w: &crate::wallet::GeneratedWallet) {
-    println!("Recovery phrase:");
-    println!("  {}", w.mnemonic);
-    println!("Secret key:      {}", w.secret);
-    println!("Account (G):     {}", w.account);
+    print!(
+        "{}",
+        crate::wallet::format_wallet_summary(w, &crate::theme::Theme::from_env())
+    );
 }
 
 fn run_monitoring(cmd: &MonitoringCommand) -> Result<()> {
