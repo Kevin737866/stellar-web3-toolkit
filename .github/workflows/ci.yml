@@ -204,6 +204,26 @@ jobs:
           path: target/doc/
           retention-days: 7
 
+  automated-checks:
+    name: "Codegen & Snapshot Checks"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.86.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev
+      - name: TypeScript client codegen checks (import dedup, bigint mapping)
+        run: cargo run -p stellar-toolkit -- codegen check
+      - name: Monitoring snapshot + restore checksum verification
+        run: |
+          cargo run -p stellar-toolkit -- monitoring dashboard --output target/monitoring
+          cargo run -p stellar-toolkit -- monitoring restore --snapshot target/monitoring
+
   merge-check:
     name: Merge Queue Check
     runs-on: ubuntu-latest
