@@ -294,6 +294,8 @@ impl MonitoringDashboard {
             .iter()
             .filter(|c| c.hash_match == Some(false))
             .count();
+        // `contracts` is moved into the report below, so capture the count first.
+        let total = contracts.len();
 
         DashboardReport {
             generated_at: chrono_like_now(),
@@ -302,7 +304,7 @@ impl MonitoringDashboard {
             soroban_status,
             contracts,
             summary: Summary {
-                total: contracts.len(),
+                total,
                 healthy,
                 degraded,
                 down,
