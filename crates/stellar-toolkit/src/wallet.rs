@@ -8,6 +8,7 @@
 //! account on testnet, and sign (build) transactions.
 
 use crate::error::{Result, ToolkitError};
+use crate::theme::{Style, Theme};
 use ed25519_dalek::{Signature, Signer, SigningKey};
 use hmac::{Hmac, Mac};
 use sha2::Sha512;
@@ -127,6 +128,35 @@ fn encode_account(public_key: &[u8; 32]) -> String {
     format!("{}", stellar_strkey::ed25519::PublicKey(*public_key))
 }
 
+/// Render a wallet for terminal display, honouring the active colour theme.
+///
+/// Only the *labels* are themed. The recovery phrase and the secret key are
+/// printed verbatim: styling a secret risks a dimmed or recoloured value
+/// reading as "less important", and in `off` mode this function returns the
+/// same text the CLI printed before theming existed, with no escape sequences
+/// at all.
+pub fn format_wallet_summary(wallet: &GeneratedWallet, theme: &Theme) -> String {
+    let mut out = String::new();
+    out.push_str(&theme.heading("Wallet"));
+    out.push('\n');
+    out.push_str(&format!(
+        "  {}\n{}\n",
+        theme.key("Recovery phrase:"),
+        wallet.mnemonic
+    ));
+    out.push_str(&format!(
+        "  {}\n{}\n",
+        theme.paint(Style::Secret, "Secret key:"),
+        wallet.secret
+    ));
+    out.push_str(&format!(
+        "  {}\n{}\n",
+        theme.key("Account (G):"),
+        wallet.account
+    ));
+    out
+}
+
 /// Fund an account on the Stellar testnet using the Friendbot faucet.
 pub fn fund_account(account: &str) -> Result<()> {
     let url = format!("https://friendbot.stellar.org?addr={account}");
@@ -237,5 +267,36 @@ mod tests {
         assert_eq!(wallet.secret.len(), 56);
         assert!(wallet.account.starts_with('G'));
         assert_eq!(wallet.account.len(), 56);
+    }
+
+    #[test]
+    fn wallet_summary_is_plain_text_when_colour_is_off() {
+        let wallet = generate_wallet().expect("generate");
+        let theme = Theme::resolve(
+            crate::theme::ThemeMode::Off,
+            crate::theme::ThemeEnv::detect(),
+        );
+        let out = format_wallet_summary(&wallet, &theme);
+        assert!(!out.contains('\x1b'), "off mode must emit no escapes");
+        assert!(out.contains(&wallet.account));
+        assert!(out.contains(&wallet.secret));
+        assert!(out.contains("Recovery phrase:"));
+    }
+
+    #[test]
+    fn wallet_summary_themes_labels_but_not_the_secret() {
+        let wallet = generate_wallet().expect("generate");
+        let theme = Theme::resolve(
+            crate::theme::ThemeMode::Dark,
+            crate::theme::ThemeEnv {
+                clicolor_force: true,
+                ..crate::theme::ThemeEnv::default()
+            },
+        );
+        let out = format_wallet_summary(&wallet, &theme);
+        assert!(out.contains('\x1b'), "colour must be emitted when forced");
+        // The secret is highlighted, never dimmed or recoloured as a value.
+        assert!(out.contains("\x1b[1;35m"));
+        assert!(out.contains(&format!("\n{}\n", wallet.secret)));
     }
 }

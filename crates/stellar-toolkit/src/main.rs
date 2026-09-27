@@ -5,7 +5,10 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod cli;
 mod error;
+mod glossary;
+mod migration_diff;
 mod monitoring_dashboard;
+mod theme;
 mod wallet;
 
 use crate::cli::ToolkitCommand;
