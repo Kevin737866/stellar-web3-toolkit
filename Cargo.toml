@@ -11,6 +11,10 @@ members = [
     "contracts/amm-factory",
     "contracts/amm-router",
     "contracts/htlc-contract",
+    "contracts/nft-sft-contract",
+    "contracts/rwa-fractionalizer",
+    "contracts/airdrop-merkle",
+    "contracts/token-locker",
 ]
 
 resolver = "2"

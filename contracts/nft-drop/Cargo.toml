@@ -1,0 +1,21 @@
+[package]
+name = "nft-drop"
+version.workspace = true
+edition.workspace = true
+publish = false
+rust-version = "1.74.0"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+doctest = false
+
+[dependencies]
+soroban-sdk = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+collection-access-control = { path = "../collection-access-control" }
+
+[features]
+default = []
+testutils = ["soroban-sdk/testutils"]
