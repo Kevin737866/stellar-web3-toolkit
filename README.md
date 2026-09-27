@@ -128,6 +128,8 @@ See [GitHub Issues](https://github.com/Kevin737866/stellar-web3-toolkit/issues) 
 - [Protocol Terms Glossary](docs/GLOSSARY.md) - Reference for Stellar & Soroban terminology
 - [Architecture Decision Records (ADRs)](docs/adr/README.md) - Architectural design rationale
 - [Marketplace Listings & Royalty Splitting](docs/MARKETPLACE_ROYALTY.md) - SEP-41 marketplace contract and royalty splitter (Issues #146, #147)
+- [Collection Access Control](docs/COLLECTION_ACCESS_CONTROL.md) - Per-collection roles and permission bitmasks (Issue #148)
+- [Blind-Mint NFT Drop](docs/NFT_DROP.md) - Phased NFT drop with blind minting and reveal (Issue #149)
 - [Infrastructure Runbook](docs/INFRA_RUNBOOK.md) - CI, Docker reproducible builds, release & monitoring (Issues #117, #119, #120, #121)
 - [Reproducible Builds](docs/REPRODUCIBLE_BUILDS.md) - Deterministic WASM & Docker verification
 - [Monitoring Dashboard](docs/MONITORING_DASHBOARD.md) - Testnet health, Prometheus/Grafana & alerts

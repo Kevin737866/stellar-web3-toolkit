@@ -203,3 +203,140 @@ Computes royalty shares for a sale price and transfers each share in a SEP-41 pa
 ```rust
 let payouts = splitter.distribute(&buyer, &collection, &token_id, &1_000_i128, &payment_token);
 ```
+
+---
+
+### CollectionAccessControl::initialize
+
+*Module/Contract*: `contracts/collection-access-control`
+
+One-time configuration of the collection permission registry with a contract-wide admin.
+
+**Parameters:**
+- `admin`: `Address`
+
+**Return Type:** `()`
+
+```rust
+acl.initialize(&admin);
+```
+
+---
+
+### CollectionAccessControl::register_collection
+
+*Module/Contract*: `contracts/collection-access-control`
+
+Registers a collection contract and names its owner. Admin only, once per collection.
+
+**Parameters:**
+- `caller`: `Address`
+- `collection`: `Address`
+- `owner`: `Address`
+
+**Return Type:** `()`
+
+```rust
+acl.register_collection(&admin, &collection, &owner);
+```
+
+---
+
+### CollectionAccessControl::grant_permissions
+
+*Module/Contract*: `contracts/collection-access-control`
+
+Adds permission bits to an account without disturbing existing grants. Caller must hold `PERM_ADMIN` for the collection.
+
+**Parameters:**
+- `caller`: `Address`
+- `collection`: `Address`
+- `account`: `Address`
+- `permissions`: `u32`
+
+**Return Type:** `()`
+
+```rust
+acl.grant_permissions(&owner, &collection, &artist, &(PERM_MINTER | PERM_METADATA));
+```
+
+---
+
+### CollectionAccessControl::has_permission
+
+*Module/Contract*: `contracts/collection-access-control`
+
+Returns `true` when the account holds every bit in `permission`, including default permissions and the owner's implicit `PERM_ALL`.
+
+**Parameters:**
+- `collection`: `Address`
+- `account`: `Address`
+- `permission`: `u32`
+
+**Return Type:** `bool`
+
+```rust
+if acl.has_permission(&collection, &artist, &PERM_MINTER) { /* mint */ }
+```
+
+---
+
+### NftDropContract::configure
+
+*Module/Contract*: `contracts/nft-drop`
+
+One-time configuration of a blind-mint NFT drop: admin, payment token, phase prices, supply caps, sale window, reveal time and optional access-control contract.
+
+**Parameters:**
+- `admin`: `Address`
+- `payment_token`: `Address`
+- `allowlist_price`: `i128`
+- `public_price`: `i128`
+- `max_supply`: `u32`
+- `per_address_limit`: `u32`
+- `start_time`: `u64`
+- `end_time`: `u64`
+- `reveal_time`: `u64`
+- `access_control`: `Option<Address>`
+
+**Return Type:** `()`
+
+```rust
+drop.configure(&admin, &payment, &40, &200, &1_000, &2, &0, &0, &1_800_000_000, &None);
+```
+
+---
+
+### NftDropContract::blind_mint
+
+*Module/Contract*: `contracts/nft-drop`
+
+Mints the next asset to the buyer at the current phase's price while keeping its metadata hidden until revealed. Returns the new token id.
+
+**Parameters:**
+- `buyer`: `Address`
+
+**Return Type:** `u64`
+
+```rust
+let token_id = drop.blind_mint(&buyer);
+```
+
+---
+
+### NftDropContract::reveal
+
+*Module/Contract*: `contracts/nft-drop`
+
+Publishes the metadata URI for a blind-minted asset at/after `reveal_time`. Admin (or a `PERM_ADMIN` holder when access control is configured) only.
+
+**Parameters:**
+- `caller`: `Address`
+- `token_id`: `u64`
+- `uri`: `String`
+
+**Return Type:** `()`
+
+```rust
+drop.reveal(&admin, &token_id, &String::from_str(&env, "ipfs://nft-drop/0"));
+```
