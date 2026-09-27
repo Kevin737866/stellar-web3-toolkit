@@ -32,3 +32,5 @@ pub use session_keys::{
 pub use treasury_stream::{
     StreamCancellation, StreamRelease, StreamStatus, Treasury, TreasuryStream,
 };
+pub use theme::{Style, Theme, ThemeEnv, ThemeMode};
+pub use wallet::GeneratedWallet;
