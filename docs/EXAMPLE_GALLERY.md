@@ -57,43 +57,105 @@ let tx = claimer.claim_airdrop("GCLAIMANT...", "airdrop-event-2026", &proof)?;
 
 ---
 
-## 4. Digital Asset Marketplace & Royalty Splitting
+## 4. NFT / SFT Asset Contract
 
-Demonstrates escrowing a SEP-41 digital asset for sale, settling a purchase with a marketplace fee, and paying creator royalties to multiple receivers on the secondary sale.
+Mints non-fungible and semi-fungible tokens under one collection, tracks sole
+ownership, and gates metadata updates on the holder's own signature.
 
-- **Category**: NFTs / Tokens
-- **Contract WASM Hash**: `d4e5f678901234567890abcdef1234567890abcdef1234567890abcdef123456`
-- **CLI Run Command**: `stellar-toolkit example run --id marketplace-royalty --network testnet`
+- **Category**: Assets / NFTs
+- **Docs**: [`docs/NFT_SFT_CONTRACT.md`](./NFT_SFT_CONTRACT.md)
+- **CLI Run Command**: `stellar-toolkit example run --id nft-sft-metadata --network testnet`
 
 ```rust
-use marketplace_contract::MarketplaceContractClient;
-use royalty_splitter::RoyaltySplitterClient;
+use soroban_sdk::{Env, String};
+use nft_sft_contract::NftSftContractClient;
 
-let listing_id = market.create_listing(&seller, &asset, &1_u128, &1_i128, &1_000_i128, &payment_token);
-let proceeds = market.buy(&buyer, &listing_id);
-let payouts = splitter.distribute(&buyer, &asset, &1_u128, &1_000_i128, &payment_token);
+let client = NftSftContractClient::new(&env, &contract_id);
+client.initialize(&admin, &name, &symbol, &0, &base_uri, &0);
+
+// One-of-a-kind: owner_of reports the holder.
+client.mint(&alice, &1, &1, &String::from_str(&env, "Genesis"), &uri);
+
+// Divisible: no owner until the whole supply sits with one address.
+client.mint(&alice, &2, &10, &String::from_str(&env, "Tickets"), &uri);
+client.transfer(&alice, &bob, &2, &4);   // divided  -> owner_of is None
+client.transfer(&bob, &alice, &2, &6);   // whole    -> owner_of is Some(alice)
 ```
 
 ---
 
-## 5. Phased Blind-Mint NFT Drop with Collection Roles
+## 5. Real-World Asset Fractionalization
 
-Runs a phased NFT drop where buyers blind mint before metadata is revealed, with privileged drop operations delegated to a collection role registry.
+Escrows a whole asset and issues a SEP-41 share token for it, with full-supply
+redemption.
 
-- **Category**: NFTs / Tokens
-- **Contract WASM Hash**: `e5f678901234567890abcdef1234567890abcdef1234567890abcdef1234567890`
-- **CLI Run Command**: `stellar-toolkit example run --id nft-drop --network testnet`
+- **Category**: Assets / RWA
+- **Docs**: [`docs/RWA_FRACTIONALIZATION.md`](./RWA_FRACTIONALIZATION.md)
+- **CLI Run Command**: `stellar-toolkit example run --id rwa-fractionalize --network testnet`
 
 ```rust
-use collection_access_control::{CollectionAccessControlClient, PERM_ADMIN};
-use nft_drop::{NftDropContractClient, SalePhase};
+use rwa_fractionalizer::RwaFractionalizerClient;
 
-// Grant a curator admin rights over the drop's collection...
-acl.register_collection(&admin, &drop_id, &admin);
-acl.grant_permissions(&admin, &drop_id, &curator, &PERM_ADMIN);
+let client = RwaFractionalizerClient::new(&env, &contract_id);
+client.initialize(&admin, &underlying_token);
 
-// ...so the curator can open the sale and reveal metadata.
-drop.set_phase(&curator, &SalePhase::Public);
-let token_id = drop.blind_mint(&collector);
-drop.reveal(&curator, &token_id, &uri);
+// Escrow the issuer's asset, mint shares.
+client.fractionalize(&issuer, &10_000, &2, &String::from_str(&env, "ipfs://rwa/1"));
+client.transfer(&issuer, &alice, &5_000);
+
+// Redemption needs the whole outstanding supply in one hand.
+client.transfer(&alice, &issuer, &5_000);
+client.redeem(&issuer, &issuer);
+```
+
+---
+
+## 6. Merkle-Proof Airdrop
+
+Runs an airdrop for thousands of recipients at constant cost per claim, using an
+off-chain Merkle root and on-chain sibling proofs.
+
+- **Category**: Token Distribution
+- **Docs**: [`docs/AIRDROP_MERKLE.md`](./AIRDROP_MERKLE.md)
+- **CLI Run Command**: `stellar-toolkit example run --id merkle-airdrop-claim --network testnet`
+
+```rust
+use airdrop_merkle::AirdropMerkleClient;
+
+let client = AirdropMerkleClient::new(&env, &contract_id);
+client.initialize(&admin, &airdrop_token, &0);
+client.set_merkle_root(&root, &total);
+client.fund(&funder, &total);
+
+// The recipient supplies only the siblings on their own branch.
+client.claim(&alice, &allocation, &to_proof(&alice));
+assert!(client.is_claimed(&alice, &allocation));
+```
+
+---
+
+## 7. Token Locker with Delegates
+
+Custodies SEP-41 tokens so they can be vested to a recipient or spent by a
+capped, expiring delegate.
+
+- **Category**: Assets / Custody
+- **Docs**: [`docs/TOKEN_LOCKERS.md`](./TOKEN_LOCKERS.md)
+- **CLI Run Command**: `stellar-toolkit example run --id token-locker-vest --network testnet`
+
+```rust
+use token_locker::TokenLockerClient;
+
+let client = TokenLockerClient::new(&env, &contract_id);
+client.initialize(&admin, &name, &symbol);
+client.deposit(&holder, &token, &3_000);
+
+// Irrevocable vest of 500 units, releasable from ledger 100.
+let id = client.lock(&holder, &token, &recipient, &500, &100);
+env.ledger().set_sequence_number(100);
+client.release(&id);                                 // credited to the recipient
+
+// Delegated spending, capped and expiring.
+client.set_delegate(&holder, &delegate, &token, &800, &500);
+client.move_from(&holder, &token, &delegate, &payee, &300);
 ```
