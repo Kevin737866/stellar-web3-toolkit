@@ -6,8 +6,8 @@ This document describes how the toolkit guarantees byte-for-byte deterministic S
 
 ## Pinning
 
-- **Rust:** `rust-toolchain.toml` → `1.86.0` + `wasm32-unknown-unknown` + `rustfmt`/`clippy`.
-- **System:** `Dockerfile` → `rust:1.86-bookworm` + `binaryen` + `wabt` + `soroban-cli 21.5.0`.
+- **Rust:** `rust-toolchain.toml` → `1.98.1` + `wasm32v1-none` + `rustfmt`/`clippy`.
+- **System:** `Dockerfile` → `rust:1.98-bookworm` + `binaryen` + `wabt` + `soroban-cli 21.5.0`.
 - **Dependencies:** `Cargo.lock` is committed; `cargo build` uses locked versions.
 - **Env:** `SOURCE_DATE_EPOCH=0`, `RUSTFLAGS="-C target-feature=-crt-static"` in both CI and scripts.
 
@@ -16,7 +16,7 @@ This document describes how the toolkit guarantees byte-for-byte deterministic S
 | Script | Purpose |
 |--------|---------|
 | `scripts/reproducible-build.sh` | Native reproducible build + double-build diff + `target/reproducible/wasm-checksums.txt` |
-| `scripts/reproducible-build.sh --docker` | Same inside `stellar-toolkit-builder:1.86` |
+| `scripts/reproducible-build.sh --docker` | Same inside `stellar-toolkit-builder:1.98` |
 | `scripts/verify-bytecode.sh --reference <file>` | Compare local WASM against a release's `wasm-checksums.txt` |
 | `scripts/verify-bytecode.sh --docker` | Compare local WASM against Docker build |
 
@@ -29,7 +29,7 @@ This document describes how the toolkit guarantees byte-for-byte deterministic S
 ```bash
 ./scripts/reproducible-build.sh
 cat target/reproducible/wasm-checksums.txt
-sha256sum target/wasm32-unknown-unknown/release/*.wasm
+sha256sum target/wasm32v1-none/release/*.wasm
 
 # Against a release
 gh release download v0.1.0 --pattern wasm-checksums.txt

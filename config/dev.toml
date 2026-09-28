@@ -15,4 +15,4 @@ confirmations = 1
 
 [contracts]
 # Override per-contract WASM path if needed
-# amm_pool = "target/wasm32-unknown-unknown/release/amm_pool.wasm"
+# amm_pool = "target/wasm32v1-none/release/amm_pool.wasm"

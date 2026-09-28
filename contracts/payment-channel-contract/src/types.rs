@@ -2,11 +2,11 @@
 //!
 //! Core data types for the Stellar payment channel system.
 
-use soroban_sdk::{contracttype, Address, BytesN, Env, Map, Val};
+use soroban_sdk::{contracttype, Address, Bytes, BytesN, Env, Map, Val, Vec};
 
 /// Represents a payment channel between two participants
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChannelState {
     /// Unique identifier for this channel
     pub channel_id: BytesN<32>,
@@ -37,6 +37,8 @@ pub struct ChannelState {
 }
 
 impl ChannelState {
+    // Mirrors the on-chain channel fields one-for-one.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         env: &Env,
         channel_id: BytesN<32>,
@@ -95,7 +97,7 @@ impl ChannelState {
 
 /// Represents a payment between two parties
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Payment {
     /// Amount being transferred
     pub amount: i128,
@@ -110,7 +112,7 @@ pub struct Payment {
     /// Timestamp of the payment
     pub timestamp: u64,
     /// Optional memo for the payment
-    pub memo: Option<BytesN<32>>,
+    pub memo: Option<Bytes>,
 }
 
 impl Payment {
@@ -139,7 +141,7 @@ impl Payment {
         sender: Address,
         receiver: Address,
         channel_id: BytesN<32>,
-        memo: BytesN<32>,
+        memo: Bytes,
     ) -> Self {
         Payment {
             amount,
@@ -155,7 +157,7 @@ impl Payment {
 
 /// Hash Time-Locked Contract information
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HTLCInfo {
     /// Unique identifier for this HTLC
     pub htlc_id: BytesN<32>,
@@ -284,7 +286,7 @@ impl RouteHop {
 
 /// Channel statistics and metrics
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct ChannelStats {
     /// Total payments sent
     pub total_payments_sent: u64,
@@ -304,21 +306,6 @@ pub struct ChannelStats {
     pub htlcs_expired: u32,
 }
 
-impl Default for ChannelStats {
-    fn default() -> Self {
-        ChannelStats {
-            total_payments_sent: 0,
-            total_payments_received: 0,
-            total_value_sent: 0,
-            total_value_received: 0,
-            average_payment_size: 0,
-            uptime_seconds: 0,
-            htlcs_fulfilled: 0,
-            htlcs_expired: 0,
-        }
-    }
-}
-
 impl ChannelStats {
     pub fn update_on_send(&mut self, amount: i128) {
         self.total_payments_sent += 1;
@@ -332,4 +319,15 @@ impl ChannelStats {
         self.total_payments_received += 1;
         self.total_value_received += amount;
     }
+}
+
+/// A channel's HTLCs, in a shape a contract entrypoint can return.
+///
+/// Soroban rejects generic types such as `Vec<T>` in contract function
+/// signatures, so the collection is wrapped in a `#[contracttype]` struct.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HtlcList {
+    /// Every HTLC recorded on the channel, claimed or not.
+    pub entries: Vec<HTLCInfo>,
 }

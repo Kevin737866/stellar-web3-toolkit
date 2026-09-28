@@ -5,7 +5,7 @@
 use crate::SimulationStats;
 use channel_router::NetworkGraph;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// Network statistics
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,7 +155,7 @@ impl StatisticsCalculator {
 
         let mut sorted = degrees.clone();
         sorted.sort();
-        let median = if sorted.len() % 2 == 0 {
+        let median = if sorted.len().is_multiple_of(2) {
             (sorted[sorted.len() / 2 - 1] + sorted[sorted.len() / 2]) as f64 / 2.0
         } else {
             sorted[sorted.len() / 2] as f64
@@ -267,7 +267,7 @@ impl StatisticsCalculator {
             }
 
             if let Some(neighbors) = graph.adjacency.get(&node) {
-                for (neighbor, _) in neighbors {
+                for neighbor in neighbors.keys() {
                     if !visited.contains(neighbor) {
                         visited.insert(neighbor.clone());
                         queue.push_back((neighbor.clone(), dist + 1));
@@ -332,7 +332,7 @@ impl StatisticsCalculator {
                 .iter()
                 .filter(|c| {
                     let cap = c.capacity_a_to_b + c.capacity_b_to_a;
-                    cap >= 10_000_000 && cap < 1_000_000_000
+                    (10_000_000..1_000_000_000).contains(&cap)
                 })
                 .count(),
         );
@@ -342,7 +342,7 @@ impl StatisticsCalculator {
                 .iter()
                 .filter(|c| {
                     let cap = c.capacity_a_to_b + c.capacity_b_to_a;
-                    cap >= 1_000_000_000 && cap < 10_000_000_000
+                    (1_000_000_000..10_000_000_000).contains(&cap)
                 })
                 .count(),
         );

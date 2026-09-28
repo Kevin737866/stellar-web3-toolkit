@@ -5,7 +5,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::debug;
 
 /// Channel update from the network
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,8 +96,12 @@ pub struct PendingHtlc {
 #[derive(Clone)]
 pub struct ChannelMonitor {
     /// RPC endpoint
+    // Retained for the RPC/storage wiring still to come.
+    #[allow(dead_code)]
     rpc_url: String,
     /// Network passphrase
+    // Retained for the RPC/storage wiring still to come.
+    #[allow(dead_code)]
     network_passphrase: String,
     /// Cached channel states
     cache: std::sync::Arc<parking_lot::RwLock<HashMap<String, ChannelUpdate>>>,
@@ -194,13 +198,13 @@ impl ChannelMonitor {
     pub fn check_expiring_htlcs(
         &self,
         channel_id: &str,
-        current_block: u32,
-        warning_threshold: u32,
+        _current_block: u32,
+        _warning_threshold: u32,
     ) -> Vec<PendingHtlc> {
-        let mut expiring = Vec::new();
+        let expiring = Vec::new();
 
         let cache = self.cache.read();
-        if let Some(update) = cache.get(channel_id) {
+        if let Some(_update) = cache.get(channel_id) {
             // In production, check pending HTLCs
             // For simulation, return empty
         }
@@ -278,7 +282,7 @@ mod tests {
             cache.insert("test".to_string(), old_update);
         }
 
-        let breach = monitor.detect_breach("test", &new_update);
+        let _breach = monitor.detect_breach("test", &new_update);
         // In this case, it won't detect a breach because we check sequence number order
         // In production, breach detection would be more sophisticated
     }

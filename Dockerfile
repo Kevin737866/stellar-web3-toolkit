@@ -2,10 +2,10 @@
 # Pins Rust toolchain, Soroban dependencies and system libs for deterministic WASM output.
 # Usage:
 #   docker build -t stellar-toolkit-builder .
-#   docker run --rm -v "$PWD":/workspace -w /workspace stellar-toolkit-builder cargo build --target wasm32-unknown-unknown --release
+#   docker run --rm -v "$PWD":/workspace -w /workspace stellar-toolkit-builder cargo build --target wasm32v1-none --release
 #   ./scripts/reproducible-build.sh
 
-FROM rust:1.86-bookworm AS builder
+FROM rust:1.98-bookworm AS builder
 
 LABEL org.opencontainers.image.title="stellar-web3-toolkit reproducible builder"
 LABEL org.opencontainers.image.description="Pinned Rust + WASM toolchain for deterministic Soroban contract builds"
@@ -28,7 +28,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Pin wasm target and tools
 RUN rustup component add rustfmt clippy && \
-    rustup target add wasm32-unknown-unknown && \
+    rustup target add wasm32v1-none && \
     cargo install --locked soroban-cli --version 21.5.0 || echo "soroban-cli install skipped" && \
     cargo install --locked wasm-pack || true
 
@@ -48,7 +48,7 @@ COPY scripts/ scripts/
 RUN chmod +x scripts/*.sh || true
 
 # Verify build determinism by default when run
-CMD ["bash", "-c", "cargo build --workspace --exclude stellar-toolkit --exclude stellar-did --exclude payment-channel --exclude channel-router --exclude channel-simulator --exclude watchtower --exclude atomic-swap --target wasm32-unknown-unknown --release && sha256sum target/wasm32-unknown-unknown/release/*.wasm && ls -lh target/wasm32-unknown-unknown/release/*.wasm"]
+CMD ["bash", "-c", "cargo build --workspace --exclude stellar-toolkit --exclude stellar-did --exclude payment-channel --exclude channel-router --exclude channel-simulator --exclude watchtower --exclude atomic-swap --target wasm32v1-none --release && sha256sum target/wasm32v1-none/release/*.wasm && ls -lh target/wasm32v1-none/release/*.wasm"]
 
 # Stage for minimal runtime (optional, for verification)
 FROM builder AS verifier

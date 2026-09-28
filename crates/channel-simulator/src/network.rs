@@ -191,22 +191,37 @@ impl NetworkTopology {
             let mut targets = HashSet::new();
 
             while targets.len() < m {
-                // Select target with probability proportional to degree
-                let total_degree: usize = nodes.values().map(|n| n.channels.len()).sum();
+                // Select target with probability proportional to degree.
+                //
+                // Only the first `i` nodes are eligible, so the degrees being
+                // weighed have to cover the same set the walk below does --
+                // otherwise the draw can fall past the end of the walk.
+                let total_degree: usize = nodes.values().take(i).map(|n| n.channels.len()).sum();
 
                 if total_degree == 0 {
                     // Fallback to random
                     let j = rng.gen_range(0..i);
                     targets.insert(node_ids[j].clone());
                 } else {
+                    // Walk the eligible nodes in order and take the one whose
+                    // slice contains the draw. The bound must be tested *before*
+                    // subtracting: `r` is unsigned, so the previous
+                    // `r -= degree; if r < 0` underflowed and its `< 0` test could
+                    // never be true, leaving this branch a guaranteed panic in
+                    // debug builds and a silently biased choice in release.
                     let mut r = rng.gen_range(0..total_degree);
-                    for (j, node) in nodes.iter().take(i) {
-                        r -= node.channels.len();
-                        if r < 0 {
-                            targets.insert(j.clone());
+                    let mut picked = None;
+                    for (id, node) in nodes.iter().take(i) {
+                        if r < node.channels.len() {
+                            picked = Some(id.clone());
                             break;
                         }
+                        r -= node.channels.len();
                     }
+                    // Defensive: a node with degree 0 in the last position cannot
+                    // absorb the draw, so fall back instead of spinning forever.
+                    let chosen = picked.unwrap_or_else(|| node_ids[rng.gen_range(0..i)].clone());
+                    targets.insert(chosen);
                 }
             }
 

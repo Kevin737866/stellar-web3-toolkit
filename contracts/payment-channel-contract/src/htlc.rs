@@ -2,7 +2,12 @@
 //!
 //! Implementation of HTLC functionality for multi-hop payments.
 
-use soroban_sdk::{Address, Bytes, BytesN, Env, Map, Val, Vec};
+// Parts of this module are a complete API that the contract entrypoints in
+// `lib.rs` do not call yet. They are kept (and exercised by tests) rather than
+// deleted, so the allow is scoped to this module instead of the whole crate.
+#![allow(dead_code)]
+
+use soroban_sdk::{Address, Bytes, BytesN, Env};
 
 use crate::error::PaymentChannelError;
 use crate::types::HTLCInfo;
@@ -12,6 +17,8 @@ pub struct HTLCManager;
 
 impl HTLCManager {
     /// Create a new HTLC
+    // Mirrors the on-chain HTLC fields one-for-one.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_htlc(
         env: &Env,
         channel_id: &BytesN<32>,
@@ -54,7 +61,7 @@ impl HTLCManager {
     fn generate_htlc_id(
         env: &Env,
         channel_id: &BytesN<32>,
-        sender: &Address,
+        _sender: &Address,
         sequence: u32,
     ) -> BytesN<32> {
         let mut data = Bytes::new(env);

@@ -15,7 +15,7 @@ Ensure you have Rust, Cargo, and the WebAssembly target installed:
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 # 2. Add Wasm target for Soroban contract compilation
-rustup target add wasm32-unknown-unknown
+rustup target add wasm32v1-none
 
 # 3. Install Stellar CLI
 cargo install --locked stellar-cli --features opt
@@ -136,13 +136,13 @@ Build release Wasm binaries for all contracts:
 
 ```bash
 # Using cargo directly
-cargo build --target wasm32-unknown-unknown --release
+cargo build --target wasm32v1-none --release
 
 # Or using the stellar-toolkit CLI helper
 cargo run -p stellar-toolkit -- compile
 ```
 
-The compiled binaries will be output to `target/wasm32-unknown-unknown/release/`.
+The compiled binaries will be output to `target/wasm32v1-none/release/`.
 
 ---
 
@@ -163,7 +163,7 @@ stellar keys fund Alice --network testnet
 ```bash
 # 1. Install contract Wasm code on-chain
 WASMHASH=$(stellar contract install \
-  --wasm target/wasm32-unknown-unknown/release/amm_pool.wasm \
+  --wasm target/wasm32v1-none/release/amm_pool.wasm \
   --source Alice \
   --network testnet)
 

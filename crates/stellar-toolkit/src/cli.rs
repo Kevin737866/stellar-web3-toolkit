@@ -23,7 +23,7 @@ pub struct App {
 
 #[derive(Subcommand, Debug)]
 pub enum ToolkitCommand {
-    /// Build all Soroban contract crates (wasm32-unknown-unknown release)
+    /// Build all Soroban contract crates (wasm32v1-none release)
     Compile {
         /// Workspace root (directory containing workspace Cargo.toml)
         #[arg(long, default_value = ".")]
@@ -225,16 +225,16 @@ impl ToolkitCommand {
                     "--exclude",
                     "stellar-toolkit",
                     "--target",
-                    "wasm32-unknown-unknown",
+                    "wasm32v1-none",
                     "--release",
                 ],
             ),
             Self::Test { workspace } => run_cargo(workspace, &["test", "--workspace"]),
             Self::Contracts { workspace } => {
                 let root = normalize_workspace_root(workspace);
-                let pool = root.join("target/wasm32-unknown-unknown/release/amm_pool.wasm");
-                let factory = root.join("target/wasm32-unknown-unknown/release/amm_factory.wasm");
-                let router = root.join("target/wasm32-unknown-unknown/release/amm_router.wasm");
+                let pool = root.join("target/wasm32v1-none/release/amm_pool.wasm");
+                let factory = root.join("target/wasm32v1-none/release/amm_factory.wasm");
+                let router = root.join("target/wasm32v1-none/release/amm_router.wasm");
                 println!("amm_pool:    {}", pool.display());
                 println!("amm_factory: {}", factory.display());
                 println!("amm_router:  {}", router.display());

@@ -7,7 +7,7 @@ pub mod network;
 pub mod statistics;
 
 use channel_router::pathfinder::Pathfinder;
-use channel_router::{Channel, NetworkGraph, Node, RouteRequest, RoutingError};
+use channel_router::{Channel, NetworkGraph, Node, RouteRequest};
 use parking_lot::RwLock;
 use rand::Rng;
 use rand::SeedableRng;
@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// Simulator configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -260,7 +260,7 @@ impl Simulator {
         let mut payments = Vec::new();
 
         // Generate random payments
-        for i in 0..self.config.num_payments {
+        for _i in 0..self.config.num_payments {
             let source_idx = rng.gen_range(0..node_ids.len());
             let dest_idx = rng.gen_range(0..node_ids.len());
 
@@ -556,6 +556,6 @@ mod tests {
 
         let network = simulator.get_network();
         let graph = network.read();
-        assert_eq!(graph.num_channels() > 0, true);
+        assert!(graph.num_channels() > 0);
     }
 }

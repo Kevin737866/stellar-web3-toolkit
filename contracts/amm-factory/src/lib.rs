@@ -124,13 +124,25 @@ mod test {
 
     #[test]
     fn create_pair_deploys_pool() {
+        // This is the only test that proves a built contract is actually
+        // *loadable* by the Soroban host, not merely that it compiles: the host
+        // validates the module before running it. That is what catches a contract
+        // built for the wrong WASM target, which every other test is blind to.
+        //
+        // The target must match `rust-toolchain.toml`; a module built for
+        // wasm32-unknown-unknown carries `reference-types` and the host rejects it
+        // with "reference-types not enabled: zero byte expected".
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/wasm32-unknown-unknown/release/amm_pool.wasm");
+            .join("../../target/wasm32v1-none/release/amm_pool.wasm");
         let pool_wasm: std::vec::Vec<u8> = match std::fs::read(&path) {
             Ok(w) => w,
             Err(_) => {
+                // Skipping rather than failing keeps `cargo test` usable without a
+                // prior WASM build, but it also means this test proves nothing
+                // unless the build ran first. The CI `wasm` job therefore builds
+                // and then runs this test explicitly.
                 std::eprintln!(
-                    "skip create_pair_deploys_pool: run `cargo build -p amm-pool --target wasm32-unknown-unknown --release` first"
+                    "skip create_pair_deploys_pool: run `cargo build -p amm-pool --target wasm32v1-none --release` first"
                 );
                 return;
             }
@@ -145,8 +157,12 @@ mod test {
         let admin = Address::generate(&env);
         factory.init(&admin, &pool_hash);
 
-        let ta = env.register_stellar_asset_contract(admin.clone());
-        let tb = env.register_stellar_asset_contract(admin.clone());
+        let ta = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let tb = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
 
         let pool_addr = factory.create_pair(&ta, &tb);
         let pool = AmmPoolClient::new(&env, &pool_addr);

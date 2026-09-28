@@ -16,7 +16,27 @@ use soroban_sdk::{
     contract, contractimpl, contractmeta, Address, Bytes, BytesN, Env, IntoVal, TryFromVal,
     Vec as SorobanVec,
 };
-use types::{ChannelState, HTLCInfo};
+use types::{ChannelState, HTLCInfo, HtlcList};
+
+/// Append an address's canonical strkey encoding to `out`.
+///
+/// `soroban-sdk` 21 exposes no accessor for an `Address`'s raw 32 bytes, so the
+/// deterministic-id preimages below are built from the strkey form instead. That
+/// is equally deterministic and equally unique per address. A strkey-encoded
+/// `Address` is 'G' followed by 55 base32 characters, so 56 bytes; the buffer is
+/// sized with headroom and the bound is asserted rather than assumed.
+pub(crate) fn append_address(out: &mut Bytes, address: &Address) {
+    const STRKEY_BUF: usize = 64;
+
+    let encoded = address.to_string();
+    let len = encoded.len() as usize;
+    assert!(len <= STRKEY_BUF, "address strkey exceeds buffer");
+
+    // `copy_into_slice` panics unless the slice length matches exactly.
+    let mut buf = [0u8; STRKEY_BUF];
+    encoded.copy_into_slice(&mut buf[..len]);
+    out.extend_from_slice(&buf[..len]);
+}
 
 contractmeta!(key = "name", val = "StellarPaymentChannel");
 
@@ -48,14 +68,14 @@ impl PaymentChannel {
 
         // Generate channel ID using both participant addresses
         let mut data = Bytes::new(&env);
-        data.extend_from_slice(&participant_a.to_val().to_object().to_bytes());
-        data.extend_from_slice(&participant_b.to_val().to_object().to_bytes());
+        append_address(&mut data, &participant_a);
+        append_address(&mut data, &participant_b);
         let nonce = env.ledger().sequence();
         data.extend_from_slice(&nonce.to_be_bytes());
 
         let channel_id: BytesN<32> = env.crypto().sha256(&data).into();
 
-        let total_balance = initial_balance_a + initial_balance_b;
+        let _total_balance = initial_balance_a + initial_balance_b;
         let state = ChannelState::new(
             &env,
             channel_id.clone(),
@@ -71,11 +91,11 @@ impl PaymentChannel {
 
         // Store channel IDs for each participant
         let mut a_channels = state::get_participant_channels(&env, &participant_a);
-        a_channels.push_back(&env, channel_id.clone());
+        a_channels.push_back(channel_id.clone());
         state::store_participant_channels(&env, &participant_a, &a_channels);
 
         let mut b_channels = state::get_participant_channels(&env, &participant_b);
-        b_channels.push_back(&env, channel_id.clone());
+        b_channels.push_back(channel_id.clone());
         state::store_participant_channels(&env, &participant_b, &b_channels);
 
         Ok(channel_id)
@@ -167,15 +187,13 @@ impl PaymentChannel {
 
         state.balance_a -= amount;
 
-        state
-            .htlcs
-            .set(&env, htlc_id.clone().to_val(), htlc_info.into_val(&env));
+        state.htlcs.set(htlc_id.to_val(), htlc_info.into_val(&env));
 
         state.sequence_number += 1;
         state::store_channel_state(&env, &channel_id, &state);
 
         env.events()
-            .publish(("htlc_created", &htlc_id), (&receiver, amount));
+            .publish(("htlc_created", htlc_id.clone()), (&receiver, amount));
 
         Ok(htlc_id)
     }
@@ -191,7 +209,7 @@ impl PaymentChannel {
 
         let htlc_val = state
             .htlcs
-            .get(&env, htlc_id.clone().to_val())
+            .get(htlc_id.clone().to_val())
             .ok_or(PaymentChannelError::HtlcNotFound)?;
         let mut htlc: HTLCInfo = HTLCInfo::try_from_val(&env, &htlc_val)
             .map_err(|_| PaymentChannelError::InvalidChannelState)?;
@@ -218,9 +236,7 @@ impl PaymentChannel {
         htlc.is_claimed = true;
         state.balance_b += htlc.amount;
 
-        state
-            .htlcs
-            .set(&env, htlc_id.clone().to_val(), htlc.into_val(&env));
+        state.htlcs.set(htlc_id.to_val(), htlc.into_val(&env));
 
         state.sequence_number += 1;
         state::store_channel_state(&env, &channel_id, &state);
@@ -240,7 +256,7 @@ impl PaymentChannel {
 
         let htlc_val = state
             .htlcs
-            .get(&env, htlc_id.clone().to_val())
+            .get(htlc_id.clone().to_val())
             .ok_or(PaymentChannelError::HtlcNotFound)?;
         let mut htlc: HTLCInfo = HTLCInfo::try_from_val(&env, &htlc_val)
             .map_err(|_| PaymentChannelError::InvalidChannelState)?;
@@ -260,9 +276,7 @@ impl PaymentChannel {
         htlc.is_refunded = true;
         state.balance_a += htlc.amount;
 
-        state
-            .htlcs
-            .set(&env, htlc_id.clone().to_val(), htlc.into_val(&env));
+        state.htlcs.set(htlc_id.to_val(), htlc.into_val(&env));
 
         state.sequence_number += 1;
         state::store_channel_state(&env, &channel_id, &state);
@@ -397,17 +411,21 @@ impl PaymentChannel {
     }
 
     /// Get all HTLCs for a channel
-    pub fn get_htlcs(
-        env: Env,
-        channel_id: BytesN<32>,
-    ) -> Result<SorobanVec<Val>, PaymentChannelError> {
-        let state = state::get_channel_state(&env, &channel_id)?;
-        let mut result = SorobanVec::new(&env);
+    ///
+    /// A contract entrypoint cannot return `Result<Vec<T>, E>`, so this returns
+    /// the vector directly and propagates a missing channel as a panic, matching
+    /// the other getters in this contract.
+    pub fn get_htlcs(env: Env, channel_id: BytesN<32>) -> HtlcList {
+        let state = state::get_channel_state(&env, &channel_id)
+            .expect("channel not found: use get_channel_state to distinguish this");
+        let mut entries = SorobanVec::new(&env);
 
-        for (key, val) in state.htlcs.iter() {
-            result.push_back(&val);
+        for (_key, val) in state.htlcs.iter() {
+            if let Ok(htlc) = HTLCInfo::try_from_val(&env, &val) {
+                entries.push_back(htlc);
+            }
         }
 
-        Ok(result)
+        HtlcList { entries }
     }
 }

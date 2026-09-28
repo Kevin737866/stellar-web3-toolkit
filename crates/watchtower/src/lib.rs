@@ -246,6 +246,8 @@ pub struct Watchtower {
     /// Justice service
     justice: justice::JusticeService,
     /// Storage backend
+    // Retained for the RPC/storage wiring still to come.
+    #[allow(dead_code)]
     storage: Arc<dyn storage::StorageBackend>,
 }
 

@@ -46,6 +46,9 @@ pub struct HtlcContract;
 
 #[contractimpl]
 impl HtlcContract {
+    // The argument list *is* the contract interface for creating a swap; there is no
+    // sensible parameter object to collapse it into.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_swap(
         env: Env,
         participant: Address,
@@ -64,7 +67,7 @@ impl HtlcContract {
         let mut id_bytes = Bytes::new(&env);
         id_bytes.extend_from_array(&hash_lock.to_array());
         let seq_bytes = current_ledger.to_be_bytes();
-        id_bytes.append(&mut Bytes::from_slice(&env, &seq_bytes));
+        id_bytes.append(&Bytes::from_slice(&env, &seq_bytes));
         let swap_id: BytesN<32> = env.crypto().sha256(&id_bytes).into();
 
         let atomic_swap = AtomicSwap {

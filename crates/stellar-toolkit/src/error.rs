@@ -5,6 +5,8 @@ pub enum ToolkitError {
     #[error("compilation failed: {0}")]
     CompilationFailed(String),
     #[error("session error: {0}")]
+    // Reserved for session-key errors; not raised yet.
+    #[allow(dead_code)]
     Session(String),
     #[error("execution error: {0}")]
     ExecutionError(String),

@@ -14,7 +14,7 @@ To build, test, and contribute to Stellar Web3 Toolkit, install the following:
   ```
 - **WASM Target**:
   ```bash
-  rustup target add wasm32-unknown-unknown
+  rustup target add wasm32v1-none
   ```
 - **Cargo Tools & Formatters**:
   ```bash

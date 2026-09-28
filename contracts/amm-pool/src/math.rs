@@ -63,6 +63,11 @@ pub fn sqrt_u128(n: u128) -> u128 {
     if n < 2 {
         return n;
     }
+    let mut x = n;
+    let mut y = x.div_ceil(2);
+    while y < x {
+        x = y;
+        y = (x + n / x) / 2;
     let mut rem = n;
     let mut root = 0u128;
     let mut bit = 1u128 << 126;

@@ -1,12 +1,12 @@
 use crate::asset::{Asset, AssetInfo, AssetRegistry};
 use crate::error::{AtomicSwapError, Result};
-use crate::monitor::{MonitoringConfig, SwapEvent, SwapMonitor};
-use crate::preimage::{Preimage, PreimageManager};
-use crate::swap::{AtomicSwap, SwapStatus, SwapTemplate};
+use crate::monitor::{MonitoringConfig, SwapMonitor};
+use crate::preimage::PreimageManager;
+use crate::swap::{AtomicSwap, SwapTemplate};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::info;
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -250,6 +250,8 @@ impl AtomicSwapCoordinator {
     }
 
     /// Create a multi-hop swap through intermediary assets
+    // A multi-hop route legitimately carries one set of arguments per hop.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_multi_hop_swap(
         &self,
         initiator: String,
@@ -417,7 +419,7 @@ impl AtomicSwapCoordinator {
         from_asset: &Asset,
         to_asset: &Asset,
     ) -> Result<Vec<Asset>> {
-        let asset_registry = self.asset_registry.read().await;
+        let _asset_registry = self.asset_registry.read().await;
 
         // Simplified path finding - in real implementation, use graph algorithms
         if from_asset == to_asset {
@@ -460,6 +462,15 @@ mod tests {
         let config = SwapConfig::default();
         let coordinator = AtomicSwapCoordinator::new(config);
 
+        coordinator
+            .register_asset(AssetInfo::custom(
+                "USDC".to_string(),
+                "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".to_string(),
+                7,
+            ))
+            .await
+            .expect("registering USDC should succeed");
+
         let request = SwapRequest {
             participant: "participant".to_string(),
             initiator_asset: Asset::XLM,
@@ -483,6 +494,17 @@ mod tests {
     async fn test_swap_completion() {
         let config = SwapConfig::default();
         let coordinator = AtomicSwapCoordinator::new(config);
+
+        // Only XLM is registered by default, so USDC has to be added before it can
+        // be swapped against.
+        coordinator
+            .register_asset(AssetInfo::custom(
+                "USDC".to_string(),
+                "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".to_string(),
+                7,
+            ))
+            .await
+            .expect("registering USDC should succeed");
 
         // First initiate a swap
         let request = SwapRequest {

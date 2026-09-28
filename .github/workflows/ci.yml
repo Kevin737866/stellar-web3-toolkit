@@ -25,7 +25,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.86.0
+          toolchain: 1.98.1
           components: rustfmt
       - uses: Swatinem/rust-cache@v2
       - name: Check formatting
@@ -38,7 +38,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.86.0
+          toolchain: 1.98.1
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Install dependencies
@@ -53,14 +53,23 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        target:
-          - wasm32-unknown-unknown
-          - x86_64-unknown-linux-gnu
+        include:
+          # wasm32v1-none has no std, so the host-only crates cannot be built for it;
+          # only the deployable contracts are.
+          - target: wasm32v1-none
+            command: >-
+              cargo build --workspace
+              --exclude stellar-toolkit --exclude payment-channel
+              --exclude channel-router --exclude channel-simulator
+              --exclude watchtower --exclude atomic-swap
+              --target wasm32v1-none --release
+          - target: x86_64-unknown-linux-gnu
+            command: cargo build --all --release --target x86_64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.86.0
+          toolchain: 1.98.1
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
@@ -70,7 +79,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y pkg-config libssl-dev
       - name: Build
-        run: cargo build --all --release --target ${{ matrix.target }}
+        run: ${{ matrix.command }}
 
   test:
     name: Tests
@@ -79,7 +88,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.86.0
+          toolchain: 1.98.1
       - uses: Swatinem/rust-cache@v2
       - name: Install dependencies
         run: |
@@ -97,7 +106,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.86.0
+          toolchain: 1.98.1
       - uses: Swatinem/rust-cache@v2
       - name: Install dependencies
         run: |
@@ -106,7 +115,10 @@ jobs:
       - name: Run simulation tests
         run: cargo test --package channel-simulator -- --nocapture
       - name: Run routing benchmarks
-        run: cargo test --package channel-router --test '*' -- --nocapture
+        # `--test '*'` selects integration-test targets, and channel-router has no
+        # `tests/` directory, so the glob matched nothing and cargo exited non-zero.
+        # Its tests are unit tests inside the crate.
+        run: cargo test --package channel-router --lib -- --nocapture
 
   security:
     name: Security Audit
@@ -115,7 +127,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.86.0
+          toolchain: 1.98.1
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-audit
         run: cargo install cargo-audit || true
@@ -129,39 +141,46 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.86.0
-          targets: wasm32-unknown-unknown
-          components: wasm-pack
+          toolchain: 1.98.1
+          targets: wasm32v1-none
       - uses: Swatinem/rust-cache@v2
         with:
           key: wasm-contracts
-      - name: Install wasm-pack
-        run: |
-          if ! command -v wasm-pack >/dev/null 2>&1; then
-            curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
-            echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-          fi
       - name: Build all contracts (reproducible)
         run: |
           echo "Building all Soroban contracts to WASM (release, reproducible)..."
-          cargo build --workspace --exclude stellar-toolkit --exclude stellar-did --exclude payment-channel --exclude channel-router --exclude channel-simulator --exclude watchtower --exclude atomic-swap --target wasm32-unknown-unknown --release
+          cargo build --workspace --exclude stellar-toolkit --exclude payment-channel --exclude channel-router --exclude channel-simulator --exclude watchtower --exclude atomic-swap --target wasm32v1-none --release
           # Fallback: ensure explicit contract packages built
-          cargo build -p payment-channel-contract -p htlc-contract -p amm-pool -p amm-factory -p amm-router --target wasm32-unknown-unknown --release || true
-          ls -lh target/wasm32-unknown-unknown/release/*.wasm || echo "No wasm artifacts found in target"
-          sha256sum target/wasm32-unknown-unknown/release/*.wasm > wasm-checksums.txt || true
+          cargo build -p payment-channel-contract -p htlc-contract -p amm-pool -p amm-factory -p amm-router --target wasm32v1-none --release || true
+          ls -lh target/wasm32v1-none/release/*.wasm || echo "No wasm artifacts found in target"
+          sha256sum target/wasm32v1-none/release/*.wasm > wasm-checksums.txt || true
           cat wasm-checksums.txt
+      - name: Verify the built WASM loads in the Soroban host
+        run: |
+          # The only check that exercises module *validation* rather than
+          # compilation. Without it this job would happily ship contracts that the
+          # Soroban host rejects, which is exactly what a wrong WASM target does.
+          set -o pipefail
+          out="$(cargo test -p amm-factory --lib create_pair_deploys_pool -- --nocapture 2>&1)"
+          echo "$out"
+          # The test self-skips when the artifact is missing; treat that as a failure
+          # here, because by this point in the job the artifact must exist.
+          if grep -q "skip create_pair_deploys_pool" <<<"$out"; then
+            echo "::error::amm_pool.wasm was not found or the test self-skipped"
+            exit 1
+          fi
       - name: Verify reproducibility (second build hash check)
         run: |
           cp wasm-checksums.txt wasm-checksums-1.txt
-          cargo build --workspace --exclude stellar-toolkit --exclude stellar-did --exclude payment-channel --exclude channel-router --exclude channel-simulator --exclude watchtower --exclude atomic-swap --target wasm32-unknown-unknown --release
-          sha256sum target/wasm32-unknown-unknown/release/*.wasm > wasm-checksums-2.txt || true
+          cargo build --workspace --exclude stellar-toolkit --exclude payment-channel --exclude channel-router --exclude channel-simulator --exclude watchtower --exclude atomic-swap --target wasm32v1-none --release
+          sha256sum target/wasm32v1-none/release/*.wasm > wasm-checksums-2.txt || true
           diff -u wasm-checksums-1.txt wasm-checksums-2.txt && echo "Reproducibility check passed" || echo "Reproducibility drift detected (check build determinism)"
       - name: Upload WASM artifacts
         uses: actions/upload-artifact@v4
         with:
           name: wasm-contracts
           path: |
-            target/wasm32-unknown-unknown/release/*.wasm
+            target/wasm32v1-none/release/*.wasm
             wasm-checksums.txt
           retention-days: 14
       - name: Upload WASM checksums for verification
@@ -191,8 +210,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.86.0
-          components: rustdoc
+          toolchain: 1.98.1
       - uses: Swatinem/rust-cache@v2
       - name: Generate documentation
         run: cargo doc --all --no-deps
@@ -234,7 +252,7 @@ jobs:
           ref: ${{ github.event.merge_group.base_sha }}
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.86.0
+          toolchain: 1.98.1
       - uses: Swatinem/rust-cache@v2
       - name: Install dependencies
         run: |

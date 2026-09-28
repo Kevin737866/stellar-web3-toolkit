@@ -5,7 +5,7 @@
 use crate::monitor::BreachAttempt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::{error, info, warn};
+use tracing::info;
 
 /// Justice transaction details
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,8 +41,12 @@ pub enum JusticeTxStatus {
 #[derive(Clone)]
 pub struct JusticeService {
     /// RPC endpoint
+    // Retained for the RPC/storage wiring still to come.
+    #[allow(dead_code)]
     rpc_url: String,
     /// Network passphrase
+    // Retained for the RPC/storage wiring still to come.
+    #[allow(dead_code)]
     network_passphrase: String,
     /// Maximum fee budget
     max_fee: i128,
@@ -178,10 +182,10 @@ mod tests {
 
     #[test]
     fn test_justice_transaction_creation() {
-        let service =
+        let _service =
             JusticeService::new("http://localhost".to_string(), "test".to_string(), 100_000);
 
-        let breach = BreachAttempt {
+        let _breach = BreachAttempt {
             channel_id: "test_channel".to_string(),
             old_sequence: 1,
             new_sequence: 5,

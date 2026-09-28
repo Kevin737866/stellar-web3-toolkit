@@ -1,4 +1,4 @@
-use crate::asset::{Asset, AssetInfo};
+use crate::asset::Asset;
 use crate::error::{AtomicSwapError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -39,6 +39,9 @@ pub struct AtomicSwap {
 }
 
 impl AtomicSwap {
+    // A swap is defined by its full parameter set; grouping them would only move
+    // the same list somewhere less readable.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: String,
         initiator: String,
@@ -244,7 +247,7 @@ mod tests {
             Asset::Custom("USDC".to_string()),
             1000,
             500,
-            "abcd1234567890abcdef1234567890abcdef1234567890abcdef1234567890".to_string(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
             10000,
             1000,
         );
@@ -265,7 +268,7 @@ mod tests {
             Asset::Custom("USDC".to_string()),
             1000,
             500,
-            "abcd1234567890abcdef1234567890abcdef1234567890abcdef1234567890".to_string(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
             10000,
             1000,
         );

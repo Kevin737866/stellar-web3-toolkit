@@ -492,8 +492,12 @@ mod test {
     fn setup_tokens(env: &Env) -> (Address, Address) {
         let admin = Address::generate(env);
         env.mock_all_auths();
-        let a = env.register_stellar_asset_contract(admin.clone());
-        let b = env.register_stellar_asset_contract(admin.clone());
+        let a = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let b = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
         (a, b)
     }
 

@@ -1707,7 +1707,6 @@ dependencies = [
  "serde",
  "sha2",
  "soroban-sdk",
- "thiserror 1.0.69",
 ]
 
 [[package]]
