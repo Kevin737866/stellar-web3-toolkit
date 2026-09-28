@@ -5,25 +5,15 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod cli;
 mod error;
-mod glossary;
-mod migration_diff;
+mod gas_simulator;
+mod help_text;
 mod monitoring_dashboard;
-mod ts_codegen;
+mod scaffolder;
+mod state_inspector;
 mod wallet;
 
-use crate::cli::ToolkitCommand;
+use crate::cli::App;
 use crate::error::Result;
-
-#[derive(Parser)]
-#[command(
-    name = "stellar-toolkit",
-    version,
-    about = "Build and test Soroban AMM contracts"
-)]
-struct App {
-    #[command(subcommand)]
-    cmd: ToolkitCommand,
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {

@@ -12,6 +12,9 @@ Covers the four infra issues assigned to @danieloche635-bit:
 | #247 | Automated check #58 — TypeScript client bigint mapping |
 | #248 | Automated check #59 — monitoring snapshot restore checksum |
 
+It also documents the `stellar-toolkit` CLI tooling issues (#240, #242, #243,
+#244) in §5.
+
 ---
 
 ## 1. CI Pipeline (Issue #117)
@@ -155,46 +158,79 @@ cargo test -p stellar-toolkit monitoring_dashboard
 
 ---
 
-## 5. Automated Codegen & Snapshot Checks (#246, #247, #248)
+## 5. CLI Tooling (Issues #240, #242, #243, #244)
 
-**Files:** `crates/stellar-toolkit/src/ts_codegen.rs` · `crates/stellar-toolkit/src/monitoring_dashboard.rs` · `.github/workflows/ci.yml` (`automated-checks` job)
+**Files:** `crates/stellar-toolkit/src/help_text.rs` · `scaffolder.rs` · `gas_simulator.rs` · `state_inspector.rs` · `cli.rs`
 
-### TypeScript client codegen (#246 import dedup, #247 bigint)
+### Wrapped command overview (Issue #240)
 
-```bash
-# Generate a typed TS client (defaults to the bundled AMM pool interface)
-cargo run -p stellar-toolkit -- codegen ts --output target/ts-client
-# → target/ts-client/amm-pool.ts + target/ts-client/scval.ts
-
-# From a custom interface spec
-cargo run -p stellar-toolkit -- codegen ts --spec specs/my-contract.json
-
-# Run the checks (CI-friendly, exits non-zero on any problem)
-cargo run -p stellar-toolkit -- codegen check
-```
-
-- **Import dedup (#246):** `ImportSet` merges repeated import requests and emits exactly one
-  `import { .. } from "..";` per module in sorted order, so the shared `./scval` helpers and
-  `stellar-sdk` symbols are never imported twice. `audit_imports` fails the check if a module is
-  imported by several statements or a symbol is repeated inside one statement.
-- **Bigint mapping (#247):** `i64`/`u64`/`i128`/`u128` map to `bigint` (not `number`) and are passed
-  to `nativeToScVal` with the matching hint, so pool amounts such as `min_out: i128` never lose
-  precision. `audit_bigint` cross-checks every `toScVal(x, "i128")` call against the declared
-  TypeScript type of `x`, and `audit_type_map` guards the type table itself.
-
-### Snapshot restore checksum (#248)
+`clap` is built without terminal-size detection, so long descriptions used to
+overflow narrow terminals. `stellar-toolkit help` renders the *real* command
+tree (via `clap::CommandFactory`) and wraps every line, including tokens longer
+than the wrap width (paths, URLs).
 
 ```bash
-# Save a snapshot (JSON + HTML + metrics + checksums.sha256)
-cargo run -p stellar-toolkit -- monitoring dashboard --output target/monitoring
-
-# Verify the snapshot is intact before trusting/reusing it
-cargo run -p stellar-toolkit -- monitoring restore --snapshot target/monitoring
+cargo run -p stellar-toolkit -- help             # width from $COLUMNS, otherwise 100
+COLUMNS=72 cargo run -p stellar-toolkit -- help   # narrower layout
+cargo run -p stellar-toolkit -- help --width 100
 ```
 
-`restore` re-hashes every file listed in `checksums.sha256` and exits non-zero when a file was
-altered (`MISMATCH`) or removed (`MISSING`), so a tampered or truncated snapshot can never be
-restored silently.
+### Scaffolder + template lint (Issue #242)
+
+```bash
+# Render the built-in contract template, lint it, then write it out
+cargo run -p stellar-toolkit -- scaffold new amm-pool --out target/scaffold/amm-pool
+cargo run -p stellar-toolkit -- scaffold new amm-pool --out target/scaffold/amm-pool --dry-run
+
+# Lint an existing project directory (CI gate: exits non-zero on error findings)
+cargo run -p stellar-toolkit -- scaffold lint --dir contracts/amm-pool
+```
+
+Lint rules: required files (`Cargo.toml`, `src/lib.rs`, `README.md`), kebab-case
+crate name, edition 2021 (or `edition.workspace = true`), `cdylib` crate type,
+`soroban-sdk` dependency, `#![no_std]`, a test module, README heading/build
+command, plus trailing-whitespace and final-newline hygiene. Errors fail the
+command; warnings are reported without failing it.
+
+### Gas / fee simulation (Issue #243)
+
+```bash
+cargo run -p stellar-toolkit -- gas estimate
+cargo run -p stellar-toolkit -- gas estimate --instructions 250000 --writes 3 --bid-ledgers 2
+cargo run -p stellar-toolkit -- gas estimate --base-fee 5000 --bump-percent 100 --max-bumps 5
+```
+
+Prints the fee breakdown (base fee, resource fee, inclusion bid, per-operation)
+in stroops and XLM, the single fee bump required by the protocol rule
+`outer_fee = ceil(inner_fee * base_fee / fee_at_signing)`, and an escalating
+fee-bump ladder that stops at `--max-bumps` or the `max_fee_stroops` cap.
+
+### Contract state inspection (Issue #244)
+
+```bash
+# First page of the built-in sample export
+cargo run -p stellar-toolkit -- inspect state
+
+# Filter, page and serialize
+cargo run -p stellar-toolkit -- inspect state --contract CDEMO7POOLCONTRACTID --key-prefix Reserves/
+cargo run -p stellar-toolkit -- inspect state --page-size 2 --cursor 2
+cargo run -p stellar-toolkit -- inspect state --all-pages --include-temporary
+cargo run -p stellar-toolkit -- inspect state --input state-export.json --json
+```
+
+Entries are ordered by (durability, key, contract), temporary entries are hidden
+unless `--include-temporary` is passed, `--page-size` is clamped to `1..=200`, and
+each page prints the cursor for the next one (or `end of results`). `--input`
+reads a JSON array of state entries instead of the built-in sample.
+
+### Tests
+
+```bash
+cargo test -p stellar-toolkit help_text
+cargo test -p stellar-toolkit scaffolder
+cargo test -p stellar-toolkit gas_simulator
+cargo test -p stellar-toolkit state_inspector
+```
 
 ---
 

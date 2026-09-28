@@ -43,6 +43,23 @@ stellar-toolkit wallet fund <G...>            # fund an account on testnet (Frie
 stellar-toolkit wallet sign <S...> <tx_hex>   # sign a message/transaction envelope
 ```
 
+```bash
+# Wrapped command overview (respects $COLUMNS)
+stellar-toolkit help
+
+# Scaffold a contract project, then lint it (CI friendly)
+stellar-toolkit scaffold new amm-pool --out target/scaffold/amm-pool
+stellar-toolkit scaffold lint --dir contracts/amm-pool
+
+# Estimate Soroban fees and plan fee bumps
+stellar-toolkit gas estimate --instructions 250000 --bump-percent 100
+
+# Inspect contract state page by page
+stellar-toolkit inspect state --contract <C...> --page-size 20
+```
+
+See the [CLI tooling runbook](docs/INFRA_RUNBOOK.md#5-cli-tooling-issues-240-242-243-244) for the full flag reference.
+
 ## Project Structure
 
 ```
@@ -131,6 +148,7 @@ See [GitHub Issues](https://github.com/Kevin737866/stellar-web3-toolkit/issues) 
 - [Collection Access Control](docs/COLLECTION_ACCESS_CONTROL.md) - Per-collection roles and permission bitmasks (Issue #148)
 - [Blind-Mint NFT Drop](docs/NFT_DROP.md) - Phased NFT drop with blind minting and reveal (Issue #149)
 - [Infrastructure Runbook](docs/INFRA_RUNBOOK.md) - CI, Docker reproducible builds, release & monitoring (Issues #117, #119, #120, #121)
+- [CLI tooling](docs/INFRA_RUNBOOK.md#5-cli-tooling-issues-240-242-243-244) - Wrapped help, project scaffolder + template lint, gas/fee simulation, paginated state inspection (Issues #240, #242, #243, #244)
 - [Reproducible Builds](docs/REPRODUCIBLE_BUILDS.md) - Deterministic WASM & Docker verification
 - [Monitoring Dashboard](docs/MONITORING_DASHBOARD.md) - Testnet health, Prometheus/Grafana & alerts
 - [Soroban Documentation](https://soroban.stellar.org/)
