@@ -183,6 +183,12 @@ pub enum MonitoringCommand {
         #[arg(long)]
         checksums: Option<PathBuf>,
     },
+    /// Verify a saved snapshot against its sha256 manifest (exits non-zero on mismatch)
+    Restore {
+        /// Snapshot directory containing dashboard.json, metrics.txt, report.html, checksums.sha256
+        #[arg(long, default_value = "target/monitoring")]
+        snapshot: PathBuf,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -249,6 +255,28 @@ impl ToolkitCommand {
                 Ok(())
             }
         }
+        CodegenCommand::Check { .. } => {
+            let problems = run_checks(&spec);
+            for problem in &problems {
+                eprintln!("codegen check: {problem}");
+            }
+            if problems.is_empty() {
+                println!("codegen check: PASS (imports deduplicated, 64-bit+ integers as bigint)");
+                return Ok(());
+            }
+            Err(ToolkitError::ExecutionError(format!(
+                "{} codegen check problem(s)",
+                problems.len()
+            )))
+        }
+    }
+}
+
+fn resolve_path(root: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
     }
 }
 
@@ -277,14 +305,17 @@ fn run_wallet(wallet: &WalletCommand) -> Result<()> {
 }
 
 fn print_wallet(w: &crate::wallet::GeneratedWallet) {
-    println!("Recovery phrase:");
-    println!("  {}", w.mnemonic);
-    println!("Secret key:      {}", w.secret);
-    println!("Account (G):     {}", w.account);
+    print!(
+        "{}",
+        crate::wallet::format_wallet_summary(w, &crate::theme::Theme::from_env())
+    );
 }
 
 fn run_monitoring(cmd: &MonitoringCommand) -> Result<()> {
-    use crate::monitoring_dashboard::{MonitorConfig, MonitoringDashboard};
+    use crate::monitoring_dashboard::{
+        restore_snapshot, MonitorConfig, MonitoringDashboard, SNAPSHOT_CHECKSUMS,
+    };
+    let root = normalize_workspace_root(&PathBuf::from("."));
     match cmd {
         MonitoringCommand::Dashboard {
             workspace,
@@ -333,6 +364,10 @@ fn run_monitoring(cmd: &MonitoringCommand) -> Result<()> {
             println!("  HTML: {}", html_path.display());
             println!("  Metrics: {}", out_dir.join("metrics.txt").display());
             println!(
+                "  Checksums: {}",
+                out_dir.join(SNAPSHOT_CHECKSUMS).display()
+            );
+            println!(
                 "Summary: {}/{} healthy, {} hash mismatches",
                 report.summary.healthy, report.summary.total, report.summary.hash_mismatches
             );
@@ -377,6 +412,176 @@ fn run_monitoring(cmd: &MonitoringCommand) -> Result<()> {
                 return Err(ToolkitError::ExecutionError(format!(
                     "hash mismatch in {} contract(s)",
                     report.summary.hash_mismatches
+                )));
+            }
+            Ok(())
+        }
+        MonitoringCommand::Restore { snapshot } => {
+            let dir = resolve_path(&root, snapshot);
+            let restore =
+                restore_snapshot(&dir).map_err(|e| ToolkitError::ExecutionError(e.to_string()))?;
+            println!(
+                "Snapshot {}: {} verified, {} mismatched, {} missing",
+                restore.snapshot_dir,
+                restore.verified.len(),
+                restore.mismatched.len(),
+                restore.missing.len()
+            );
+            for file in &restore.verified {
+                println!("  OK       {file}");
+            }
+            for file in &restore.mismatched {
+                eprintln!("  MISMATCH {file}");
+            }
+            for file in &restore.missing {
+                eprintln!("  MISSING  {file}");
+            }
+            if !restore.is_clean() {
+                return Err(ToolkitError::ExecutionError(
+                    "snapshot restore failed checksum verification".to_string(),
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+fn run_glossary(cmd: &GlossaryCommand) -> Result<()> {
+    use crate::glossary::{self, Glossary, GlossaryEntry, Lookup};
+    use std::io::IsTerminal;
+
+    let (glossary_path, term, format) = match cmd {
+        GlossaryCommand::Lookup {
+            term,
+            glossary: path,
+            format,
+        } => (path, Some(term.as_str()), *format),
+        GlossaryCommand::List {
+            glossary: path,
+            format,
+        } => (path, None, *format),
+    };
+
+    let path = glossary::discover(glossary_path.as_deref())?;
+    let book = Glossary::from_path(&path)?;
+
+    // Decorate only when a human is actually looking at the terminal; the
+    // moment stdout is a pipe or a file, drop to plain so `grep` and `jq` work.
+    let stdout = std::io::stdout();
+    let format = format.unwrap_or(if stdout.is_terminal() {
+        GlossaryFormat::Human
+    } else {
+        GlossaryFormat::Plain
+    });
+
+    match term {
+        Some(term) => {
+            let Lookup {
+                entry,
+                kind,
+                also_matches,
+            } = book.lookup(term).ok_or_else(|| {
+                // A miss is a failure, not an empty success. Suggestions go to
+                // stderr so stdout stays clean for the caller.
+                let suggestions = book.suggestions(term, 3);
+                if !suggestions.is_empty() {
+                    let names: Vec<&str> = suggestions.iter().map(|e| e.term.as_str()).collect();
+                    eprintln!("No glossary term matches `{term}`.");
+                    eprintln!("Did you mean: {}?", names.join(", "));
+                    eprintln!("Try `stellar-toolkit glossary list` for all terms.");
+                } else {
+                    eprintln!("No glossary term matches `{term}`.");
+                    eprintln!("Try `stellar-toolkit glossary list` for all terms.");
+                }
+                ToolkitError::Glossary(format!("no glossary term matches `{term}`"))
+            })?;
+
+            match format {
+                GlossaryFormat::Json => {
+                    let payload = serde_json::json!({
+                        "query": term,
+                        "match": kind.label(),
+                        "entry": entry,
+                        "also_matches": also_matches,
+                    });
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&payload)
+                            .map_err(|e| ToolkitError::Glossary(e.to_string()))?
+                    );
+                }
+                GlossaryFormat::Plain => {
+                    println!("{}: {}", entry.term, entry.definition);
+                    for other in &also_matches {
+                        println!("{}: {}", other.term, other.definition);
+                    }
+                }
+                GlossaryFormat::Human => {
+                    println!("{}", entry.term);
+                    println!("{}", "=".repeat(entry.term.chars().count()));
+                    println!("{}", entry.definition);
+                    println!();
+                    println!("anchor: #{}", entry.anchor);
+                    if kind != crate::glossary::MatchKind::Exact {
+                        println!("matched by: {} (for `{term}`)", kind.label());
+                    }
+                    if !also_matches.is_empty() {
+                        let names: Vec<&str> =
+                            also_matches.iter().map(|e| e.term.as_str()).collect();
+                        println!("see also: {}", names.join(", "));
+                    }
+                }
+            }
+            Ok(())
+        }
+        None => {
+            let entries: Vec<&GlossaryEntry> = book.entries.iter().collect();
+            match format {
+                GlossaryFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&book.entries)
+                            .map_err(|e| ToolkitError::Glossary(e.to_string()))?
+                    );
+                }
+                GlossaryFormat::Plain => {
+                    for e in entries {
+                        println!("{}: {}", e.term, e.definition);
+                    }
+                }
+                GlossaryFormat::Human => {
+                    println!("Glossary terms ({}):", entries.len());
+                    for e in entries {
+                        println!("  {:<40} #{}", e.term, e.anchor);
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn run_migration(cmd: &MigrationCommand) -> Result<()> {
+    use crate::migration_diff;
+
+    match cmd {
+        MigrationCommand::Diff {
+            before,
+            after,
+            format,
+            fail_on_breaking,
+        } => {
+            let diff = migration_diff::diff_files(before, after)?;
+            match format {
+                MigrationFormat::Json => println!("{}", migration_diff::render_json(&diff)?),
+                MigrationFormat::Text => print!("{}", migration_diff::render_text(&diff)),
+            }
+            if *fail_on_breaking && diff.is_breaking() {
+                return Err(ToolkitError::ExecutionError(format!(
+                    "{} breaking change(s) detected between {} and {}",
+                    diff.breaking_lines().len(),
+                    before.display(),
+                    after.display()
                 )));
             }
             Ok(())

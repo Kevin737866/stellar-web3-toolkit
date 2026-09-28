@@ -1,11 +1,18 @@
 //! Monitoring dashboard for testnet contracts.
 //! Polls Horizon / Soroban RPC, verifies WASM hashes, and emits Prometheus metrics.
 //! Used by infra issues #121 (monitoring dashboard) and #120/#119 (bytecode verification).
+//! Saved snapshots carry a sha256 manifest so a restore can prove it is intact (#248).
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+/// Files written by a monitoring snapshot, in write order.
+pub const SNAPSHOT_FILES: [&str; 3] = ["dashboard.json", "metrics.txt", "report.html"];
+
+/// sha256sum-format manifest written next to every snapshot.
+pub const SNAPSHOT_CHECKSUMS: &str = "checksums.sha256";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MonitorConfig {
@@ -81,6 +88,33 @@ pub struct Summary {
     pub degraded: usize,
     pub down: usize,
     pub hash_mismatches: usize,
+}
+
+/// Outcome of verifying a snapshot directory against its sha256 manifest.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RestoreReport {
+    pub snapshot_dir: String,
+    /// Files whose sha256 matches the manifest.
+    pub verified: Vec<String>,
+    /// Files present but modified (name, expected hash, observed hash).
+    pub mismatched: Vec<String>,
+    /// Files listed in the manifest but absent from the snapshot.
+    pub missing: Vec<String>,
+}
+
+impl RestoreReport {
+    /// True when the snapshot can be trusted (nothing missing, nothing altered).
+    pub fn is_clean(&self) -> bool {
+        self.mismatched.is_empty() && self.missing.is_empty()
+    }
+}
+
+/// sha256 of `bytes` as lowercase hex.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
 }
 
 impl MonitorConfig {
@@ -218,12 +252,7 @@ impl MonitoringDashboard {
     pub fn check_contract(&self, cref: &ContractRef) -> ContractStatus {
         let observed = cref.wasm_path.as_ref().and_then(|rel| {
             let p = self.workspace_root.join(rel);
-            std::fs::read(&p).ok().map(|bytes| {
-                use sha2::{Digest, Sha256};
-                let mut h = Sha256::new();
-                h.update(&bytes);
-                hex::encode(h.finalize())
-            })
+            std::fs::read(&p).ok().map(|bytes| sha256_hex(&bytes))
         });
 
         let hash_match = match (&cref.expected_sha256, &observed) {
@@ -294,6 +323,8 @@ impl MonitoringDashboard {
             .iter()
             .filter(|c| c.hash_match == Some(false))
             .count();
+        // `contracts` is moved into the report below, so capture the count first.
+        let total = contracts.len();
 
         DashboardReport {
             generated_at: chrono_like_now(),
@@ -302,7 +333,7 @@ impl MonitoringDashboard {
             soroban_status,
             contracts,
             summary: Summary {
-                total: contracts.len(),
+                total,
                 healthy,
                 degraded,
                 down,
@@ -355,23 +386,98 @@ impl MonitoringDashboard {
 
     /// Write JSON + HTML report to output dir
     pub fn write_reports(&self, out_dir: &Path) -> anyhow::Result<(PathBuf, PathBuf)> {
-        std::fs::create_dir_all(out_dir)?;
         let report = self.generate_report();
+        self.write_snapshot(out_dir, &report)
+    }
+
+    /// Write a restorable snapshot: `dashboard.json`, `metrics.txt`,
+    /// `report.html` and the sha256 manifest `checksums.sha256`.
+    pub fn write_snapshot(
+        &self,
+        out_dir: &Path,
+        report: &DashboardReport,
+    ) -> anyhow::Result<(PathBuf, PathBuf)> {
+        std::fs::create_dir_all(out_dir)?;
         let json_path = out_dir.join("dashboard.json");
-        std::fs::write(&json_path, serde_json::to_string_pretty(&report)?)?;
-        let metrics = self.prometheus_metrics(&report);
-        std::fs::write(out_dir.join("metrics.txt"), metrics)?;
+        std::fs::write(&json_path, serde_json::to_string_pretty(report)?)?;
+        let metrics = self.prometheus_metrics(report);
+        std::fs::write(out_dir.join("metrics.txt"), &metrics)?;
         // Minimal HTML snapshot
         let html = format!(
             r#"<!doctype html><html><head><meta charset="utf-8"><title>Stellar Toolkit — Monitoring Snapshot</title></head>
 <body><h1>Monitoring snapshot {}</h1><pre>{}</pre><p><a href="metrics.txt">metrics.txt (Prometheus)</a></p></body></html>"#,
             report.generated_at,
-            serde_json::to_string_pretty(&report)?
+            serde_json::to_string_pretty(report)?
         );
         let html_path = out_dir.join("report.html");
         std::fs::write(&html_path, html)?;
+
+        // sha256 manifest so `restore_snapshot` can prove the snapshot is intact.
+        let mut manifest = String::new();
+        for name in SNAPSHOT_FILES {
+            let bytes = std::fs::read(out_dir.join(name))?;
+            manifest.push_str(&format!("{}  {}\n", sha256_hex(&bytes), name));
+        }
+        std::fs::write(out_dir.join(SNAPSHOT_CHECKSUMS), manifest)?;
         Ok((json_path, html_path))
     }
+}
+
+/// Verify a snapshot directory against its `checksums.sha256` manifest.
+///
+/// Returns an error only when the manifest itself cannot be read; altered or
+/// missing files are reported in [`RestoreReport`] so callers can surface them
+/// and fail the restore.
+pub fn restore_snapshot(snapshot_dir: &Path) -> anyhow::Result<RestoreReport> {
+    let manifest_path = snapshot_dir.join(SNAPSHOT_CHECKSUMS);
+    let manifest = std::fs::read_to_string(&manifest_path).map_err(|e| {
+        anyhow::anyhow!(
+            "snapshot manifest {} unreadable: {e}",
+            manifest_path.display()
+        )
+    })?;
+
+    let mut expected: BTreeMap<String, String> = BTreeMap::new();
+    for line in manifest.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 2 {
+            let name = Path::new(parts[1])
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            expected.insert(name, parts[0].to_lowercase());
+        }
+    }
+    if expected.is_empty() {
+        return Err(anyhow::anyhow!(
+            "snapshot manifest {} is empty",
+            manifest_path.display()
+        ));
+    }
+
+    let mut report = RestoreReport {
+        snapshot_dir: snapshot_dir.display().to_string(),
+        verified: Vec::new(),
+        mismatched: Vec::new(),
+        missing: Vec::new(),
+    };
+    for (name, want) in &expected {
+        match std::fs::read(snapshot_dir.join(name)) {
+            Ok(bytes) => {
+                let got = sha256_hex(&bytes);
+                if &got == want {
+                    report.verified.push(name.clone());
+                } else {
+                    report
+                        .mismatched
+                        .push(format!("{name}: manifest {want}, snapshot {got}"));
+                }
+            }
+            Err(_) => report.missing.push(name.clone()),
+        }
+    }
+    Ok(report)
 }
 
 fn chrono_like_now() -> String {
@@ -458,5 +564,53 @@ mod tests {
         let m = dash.prometheus_metrics(&report);
         assert!(m.contains("# HELP"));
         assert!(m.contains("# TYPE"));
+    }
+
+    fn offline_report() -> DashboardReport {
+        DashboardReport {
+            generated_at: "0".to_string(),
+            config: MonitorConfig::testnet_default(),
+            horizon_status: Health::Unknown,
+            soroban_status: Health::Unknown,
+            contracts: Vec::new(),
+            summary: Summary {
+                total: 0,
+                healthy: 0,
+                degraded: 0,
+                down: 0,
+                hash_mismatches: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn test_snapshot_restore_checksums() {
+        let dir = tempfile::tempdir().unwrap();
+        let dash = MonitoringDashboard::with_testnet_defaults(dir.path().to_path_buf());
+        dash.write_snapshot(dir.path(), &offline_report()).unwrap();
+
+        let manifest = std::fs::read_to_string(dir.path().join(SNAPSHOT_CHECKSUMS)).unwrap();
+        assert_eq!(manifest.lines().count(), SNAPSHOT_FILES.len());
+
+        let clean = restore_snapshot(dir.path()).unwrap();
+        assert!(clean.is_clean());
+        assert_eq!(clean.verified.len(), SNAPSHOT_FILES.len());
+
+        std::fs::write(dir.path().join("metrics.txt"), b"tampered").unwrap();
+        let tampered = restore_snapshot(dir.path()).unwrap();
+        assert!(!tampered.is_clean());
+        assert_eq!(tampered.mismatched.len(), 1);
+        assert!(tampered.mismatched[0].starts_with("metrics.txt"));
+
+        std::fs::remove_file(dir.path().join("report.html")).unwrap();
+        let missing = restore_snapshot(dir.path()).unwrap();
+        assert_eq!(missing.missing, vec!["report.html".to_string()]);
+    }
+
+    #[test]
+    fn test_restore_requires_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = restore_snapshot(dir.path()).unwrap_err();
+        assert!(err.to_string().contains(SNAPSHOT_CHECKSUMS));
     }
 }

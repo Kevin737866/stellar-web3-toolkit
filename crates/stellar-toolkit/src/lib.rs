@@ -26,6 +26,10 @@ pub use one_click_airdrop::{AirdropClaimRequest, ClaimStatus, OneClickAirdropCla
 pub use p2p_qr_payment::{P2PQRPaymentFlow, PaymentStatus, QRPaymentRequest};
 pub use scaffolder::{LintFinding, LintReport, LintSeverity, ScaffoldOptions, Scaffolder};
 pub use session_keys::{
-    AccountAbstractionManager, Guardian, RecoveryRequest, SessionError, SessionKey, SessionPolicy,
+    AccountAbstractionManager, Guardian, RecoveryRequest, RecoveryVeto, SessionError, SessionKey,
+    SessionPolicy, VetoGuardian,
+};
+pub use treasury_stream::{
+    StreamCancellation, StreamRelease, StreamStatus, Treasury, TreasuryStream,
 };
 pub use state_inspector::{Durability, StateEntry, StateInspector, StatePage, StateQuery};

@@ -8,6 +8,9 @@ Covers the four infra issues assigned to @danieloche635-bit:
 | #119 | Create Dockerized build environment for reproducible WASM |
 | #120 | Add GitHub Actions workflow for release of contracts |
 | #121 | Build monitoring dashboard for testnet contracts |
+| #246 | Automated check #57 — TypeScript codegen import dedup |
+| #247 | Automated check #58 — TypeScript client bigint mapping |
+| #248 | Automated check #59 — monitoring snapshot restore checksum |
 
 It also documents the `stellar-toolkit` CLI tooling issues (#240, #242, #243,
 #244) in §5.
@@ -20,7 +23,7 @@ It also documents the `stellar-toolkit` CLI tooling issues (#240, #242, #243,
 
 - **Pinned toolchain:** `rust-toolchain.toml` pins `channel = "1.86.0"` + `wasm32-unknown-unknown`. All CI jobs use `dtolnay/rust-toolchain@master` with `toolchain: 1.86.0` so local and CI produce identical WASM.
 - **Caching:** `Swatinem/rust-cache@v2` keys on target (`build-wasm`, `build`, `wasm-contracts`) — 2-3× faster.
-- **Jobs:** `fmt` → `clippy` → `build` (matrix `wasm32` + `x86_64`) → `test` → `simulation` → `security` → `wasm` → `wasm-verify` → `docs` → `merge-check`.
+- **Jobs:** `fmt` → `clippy` → `build` (matrix `wasm32` + `x86_64`) → `test` → `simulation` → `security` → `wasm` → `wasm-verify` → `docs` → `automated-checks` → `merge-check`.
 - **Reproducibility guard:** `wasm` builds contracts twice and diffs `wasm-checksums.txt`; artifacts uploaded as `wasm-contracts` (14-day retention) and `wasm-checksums` (30-day).
 - **Concurrency:** `cancel-in-progress: true` per ref.
 
@@ -128,6 +131,7 @@ Outputs:
 - `target/monitoring/dashboard.json` — full `DashboardReport` (health, hash_match, alerts, summary)
 - `target/monitoring/report.html` — static snapshot
 - `target/monitoring/metrics.txt` — Prometheus text format (`stellar_contract_up`, `stellar_contract_wasm_hash_mismatch`, `stellar_horizon_up`, `stellar_soroban_up`)
+- `target/monitoring/checksums.sha256` — sha256 manifest of the three files above
 
 ### Static dashboard
 
@@ -239,6 +243,8 @@ cargo test -p stellar-toolkit state_inspector
 - [ ] `config/<env>.toml` reviewed; secrets set in GitHub Environment `dev`/`test`/`prod`
 - [ ] Prod deploy requires manual approval in GitHub Environments
 - [ ] Monitoring snapshot: `cargo run -p stellar-toolkit -- monitoring dashboard` → no hash mismatches
+- [ ] Snapshot restore verified: `cargo run -p stellar-toolkit -- monitoring restore` → all files `OK`
+- [ ] Codegen checks green: `cargo run -p stellar-toolkit -- codegen check`
 - [ ] Prometheus + Grafana up, `WasmHashMismatch` alert not firing
 - [ ] `logs/deployment-audit.log` appended on every deploy (audit trail)
 
