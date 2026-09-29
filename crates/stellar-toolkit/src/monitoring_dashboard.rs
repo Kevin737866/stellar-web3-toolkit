@@ -322,9 +322,6 @@ impl MonitoringDashboard {
             .count();
         // `contracts` is moved into the report below, so capture the count first.
         let total = contracts.len();
-
-        // `contracts` is moved into the report below, so capture the count first.
-        let total = contracts.len();
         DashboardReport {
             generated_at: chrono_like_now(),
             config: self.config.clone(),

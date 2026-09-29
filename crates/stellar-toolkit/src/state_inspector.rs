@@ -230,7 +230,11 @@ impl StateInspector {
     /// Inserts an entry, replacing an existing one with the same contract,
     /// durability and key. Returns `true` when an entry was replaced.
     pub fn insert(&mut self, entry: StateEntry) -> bool {
-        let key = (entry.durability, entry.key.clone(), entry.contract_id.clone());
+        let key = (
+            entry.durability,
+            entry.key.clone(),
+            entry.contract_id.clone(),
+        );
         self.entries.insert(key, entry).is_some()
     }
 
@@ -286,13 +290,22 @@ impl StateInspector {
         let mut pages = Vec::new();
         let mut cursor = query.cursor();
         loop {
-            let page = self.page(&query.with_cursor(cursor));
+            // `with_cursor` takes the builder by value, and `query` is borrowed.
+            let page = self.page(&query.clone().with_cursor(cursor));
+            if page.entries.is_empty() {
+                return pages;
+            }
             match page.next_cursor {
-                Some(next) if !page.entries.is_empty() => {
-                    pages.push(page);
+                Some(next) => {
                     cursor = next;
+                    pages.push(page);
                 }
-                _ => return pages,
+                // The last page has no cursor of its own, so it has to be
+                // pushed here: returning on `None` dropped it entirely.
+                None => {
+                    pages.push(page);
+                    return pages;
+                }
             }
         }
     }
@@ -444,7 +457,12 @@ mod tests {
         let cursor = first.next_cursor.unwrap();
         let second = inspector.page(&StateQuery::new().with_page_size(2).with_cursor(cursor));
         assert_eq!(second.page_index, 1);
-        assert_eq!(second.entries[0].key, "Reserves/A");
+        // Pages are cut from the (durability, key, contract) order pinned by
+        // `test_sample_orders_entries_by_durability_then_key`. Temporary entries
+        // are excluded by default, which leaves
+        // `Config`, `Lp/Balance/GTRADER`, `Pool/CDEMO7POOLCONTRC`, ... — so the
+        // second page of two starts at the factory's pool pointer.
+        assert_eq!(second.entries[0].key, "Pool/CDEMO7POOLCONTRC");
         assert_eq!(second.next_cursor, Some(4));
     }
 

@@ -108,10 +108,7 @@ fn write_config(env: &Env, config: &DropConfig) {
 }
 
 fn read_minted(env: &Env) -> u32 {
-    env.storage()
-        .instance()
-        .get(&DataKey::Minted)
-        .unwrap_or(0)
+    env.storage().instance().get(&DataKey::Minted).unwrap_or(0)
 }
 
 fn write_minted(env: &Env, minted: u32) {
@@ -303,13 +300,7 @@ impl NftDropContract {
     }
 
     /// Updates the sale window and reveal time. Admin only.
-    pub fn set_times(
-        env: Env,
-        caller: Address,
-        start_time: u64,
-        end_time: u64,
-        reveal_time: u64,
-    ) {
+    pub fn set_times(env: Env, caller: Address, start_time: u64, end_time: u64, reveal_time: u64) {
         require_admin(&env, &caller);
         if start_time > 0 && end_time > 0 {
             assert!(end_time >= start_time, "invalid sale window");
@@ -430,8 +421,10 @@ impl NftDropContract {
         env.storage().persistent().set(&key, &uri);
         bump(&env, &key);
 
-        env.events()
-            .publish((symbol_short!("reveal"), env.current_contract_address()), token_id);
+        env.events().publish(
+            (symbol_short!("reveal"), env.current_contract_address()),
+            token_id,
+        );
     }
 
     /// Transfers an asset between accounts. Only the current owner may
@@ -444,10 +437,8 @@ impl NftDropContract {
         write_balance(&env, &from, balance_of(&env, &from) - 1);
         write_balance(&env, &to, balance_of(&env, &to) + 1);
 
-        env.events().publish(
-            (symbol_short!("transfer"), from),
-            (to, token_id),
-        );
+        env.events()
+            .publish((symbol_short!("transfer"), from), (to, token_id));
     }
 
     /// Withdraws collected mint proceeds to the admin. Admin only.
@@ -460,8 +451,10 @@ impl NftDropContract {
             &config.admin,
             &amount,
         );
-        env.events()
-            .publish((symbol_short!("withdraw"), env.current_contract_address()), amount);
+        env.events().publish(
+            (symbol_short!("withdraw"), env.current_contract_address()),
+            amount,
+        );
     }
 
     // --- Read helpers -----------------------------------------------------
@@ -503,9 +496,7 @@ impl NftDropContract {
 
     /// Whether an asset's metadata has been revealed.
     pub fn is_revealed(env: Env, token_id: u64) -> bool {
-        env.storage()
-            .persistent()
-            .has(&DataKey::TokenUri(token_id))
+        env.storage().persistent().has(&DataKey::TokenUri(token_id))
     }
 
     /// Metadata URI for an asset, or an empty string while still hidden.
@@ -525,9 +516,16 @@ mod test {
     use soroban_sdk::testutils::Ledger as _;
     use soroban_sdk::token::StellarAssetClient;
 
-    fn setup(env: &Env, price: i128, max_supply: u32, limit: u32) -> (Address, Address, Address, NftDropContractClient) {
+    fn setup(
+        env: &Env,
+        price: i128,
+        max_supply: u32,
+        limit: u32,
+    ) -> (Address, Address, Address, NftDropContractClient<'_>) {
         let admin = Address::generate(env);
-        let payment = env.register_stellar_asset_contract(admin.clone());
+        let payment = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
         let drop_id = env.register_contract(None, NftDropContract);
         let client = NftDropContractClient::new(env, &drop_id);
         client.configure(
@@ -605,12 +603,23 @@ mod test {
         env.mock_all_auths();
 
         let admin = Address::generate(&env);
-        let payment = env.register_stellar_asset_contract(admin.clone());
+        let payment = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
         let drop_id = env.register_contract(None, NftDropContract);
         let drop = NftDropContractClient::new(&env, &drop_id);
         // allowlist 40, public 200.
         drop.configure(
-            &admin, &payment, &40, &200, &10, &0, &0_u64, &10_000_u64, &0_u64, &None,
+            &admin,
+            &payment,
+            &40,
+            &200,
+            &10,
+            &0,
+            &0_u64,
+            &10_000_u64,
+            &0_u64,
+            &None,
         );
         drop.set_phase(&admin, &SalePhase::Allowlist);
 
@@ -674,11 +683,22 @@ mod test {
         env.mock_all_auths();
 
         let admin = Address::generate(&env);
-        let payment = env.register_stellar_asset_contract(admin.clone());
+        let payment = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
         let drop_id = env.register_contract(None, NftDropContract);
         let drop = NftDropContractClient::new(&env, &drop_id);
         drop.configure(
-            &admin, &payment, &0, &0, &10, &0, &0_u64, &10_000_u64, &500_u64, &None,
+            &admin,
+            &payment,
+            &0,
+            &0,
+            &10,
+            &0,
+            &0_u64,
+            &10_000_u64,
+            &500_u64,
+            &None,
         );
         drop.set_phase(&admin, &SalePhase::Public);
 
@@ -687,7 +707,9 @@ mod test {
 
         // Too early to reveal.
         env.ledger().set_timestamp(100);
-        assert!(drop.try_reveal(&admin, &token_id, &String::from_str(&env, "ipfs://a")).is_err());
+        assert!(drop
+            .try_reveal(&admin, &token_id, &String::from_str(&env, "ipfs://a"))
+            .is_err());
 
         env.ledger().set_timestamp(500);
         let uri = String::from_str(&env, "ipfs://asset-0");
@@ -755,7 +777,16 @@ mod test {
 
         let (admin, payment, _drop_id, drop) = setup(&env, 0, 10, 0);
         drop.configure(
-            &admin, &payment, &0, &0, &10, &0, &0_u64, &10_000_u64, &0_u64, &None,
+            &admin,
+            &payment,
+            &0,
+            &0,
+            &10,
+            &0,
+            &0_u64,
+            &10_000_u64,
+            &0_u64,
+            &None,
         );
     }
 }

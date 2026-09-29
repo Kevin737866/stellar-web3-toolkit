@@ -146,7 +146,7 @@ fn read_account(env: &Env, holder: &Address, token: &Address) -> Account {
         .storage()
         .persistent()
         .get(&key)
-        .unwrap_or_else(|| Account::empty());
+        .unwrap_or_else(Account::empty);
     if account.total() > 0 {
         env.storage()
             .persistent()

@@ -535,7 +535,13 @@ fn split_top_level(inner: &str) -> Vec<String> {
                 depth = depth.saturating_sub(1);
                 current.push(ch);
             }
-            ',' if depth == 0 => parts.push(current.trim().to_string()),
+            // The accumulator has to be emptied after each element, otherwise
+            // the next element is appended to the previous one and
+            // `Map<String, i128>` splits into `["String", "String i128"]`.
+            ',' if depth == 0 => {
+                parts.push(current.trim().to_string());
+                current.clear();
+            }
             _ => current.push(ch),
         }
     }
@@ -557,7 +563,7 @@ const RESERVED_IDENTIFIERS: [&str; 5] = ["contract", "rpc", "rpcclient", "constr
 /// client member or a reserved word.
 fn ts_identifier(name: &str) -> String {
     let mut out = String::new();
-    for part in name.split(|c: char| c == '_' || c == '-' || c == ' ') {
+    for part in name.split(['_', '-', ' ']) {
         if part.is_empty() {
             continue;
         }
@@ -693,7 +699,7 @@ pub fn run_checks(spec: &ContractSpec) -> Vec<String> {
 
 fn import_module(line: &str) -> Option<String> {
     let (_, after_from) = line.split_once(" from ")?;
-    let start = after_from.find(|c: char| c == '"' || c == '\'')?;
+    let start = after_from.find(['"', '\''])?;
     let quote = after_from[start..].chars().next()?;
     let rest = &after_from[start + quote.len_utf8()..];
     let end = rest.find(quote)?;

@@ -269,6 +269,11 @@ impl RwaFractionalizer {
 
     /// Escrows `underlying_amount` of the underlying token from `issuer` and
     /// mints the whole `total_shares` supply to them. Callable once per asset.
+    ///
+    /// The eight parameters are the public contract ABI (amounts plus the
+    /// SEP-41 metadata of the share token), so they are fixed by the interface
+    /// rather than by this implementation.
+    #[allow(clippy::too_many_arguments)]
     pub fn fractionalize(
         env: Env,
         issuer: Address,
@@ -453,7 +458,11 @@ mod test {
         env.ledger().set_max_entry_ttl(1_000_000);
         let admin = Address::generate(&env);
         let issuer = Address::generate(&env);
-        let underlying = env.register_stellar_asset_contract(admin.clone());
+        // `register_stellar_asset_contract` is deprecated in soroban-sdk 21;
+        // the v2 form returns the asset contract's address.
+        let underlying = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
         StellarAssetClient::new(&env, &underlying).mint(&issuer, &UNDERLYING_UNITS);
 
         let id = env.register_contract(None, RwaFractionalizer);

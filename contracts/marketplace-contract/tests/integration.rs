@@ -33,8 +33,12 @@ fn secondary_sale_settles_marketplace_fee_and_royalties() {
     let creator = Address::generate(&env);
     let platform = Address::generate(&env);
 
-    let asset = env.register_stellar_asset_contract(admin.clone());
-    let payment = env.register_stellar_asset_contract(admin.clone());
+    let asset = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let payment = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
 
     // Marketplace charges a 2.5% fee to the platform.
     let market_id = env.register_contract(None, MarketplaceContract);
@@ -60,14 +64,8 @@ fn secondary_sale_settles_marketplace_fee_and_royalties() {
 
     // The seller deposits the asset into marketplace escrow.
     mint(&env, &asset, &seller, 1);
-    let listing_id = market.create_listing(
-        &seller,
-        &asset,
-        &1_u128,
-        &1_i128,
-        &1_000_i128,
-        &payment,
-    );
+    let listing_id =
+        market.create_listing(&seller, &asset, &1_u128, &1_i128, &1_000_i128, &payment);
     assert_eq!(balance(&env, &asset, &market_id), 1);
 
     // The buyer funds the purchase and settles it.

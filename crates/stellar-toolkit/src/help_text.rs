@@ -98,8 +98,13 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-/// Renders a two column help table where the description wraps under its own
-/// column and every produced line stays within `width`.
+/// Renders a help table where every description line stays within `width`.
+///
+/// The label and the description are wrapped as a single paragraph, so the
+/// first line may run past the description column when the label is short and
+/// the description is long. Continuation lines are indented to the description
+/// column, which is what makes the table readable; they are the only lines that
+/// have to respect the column.
 pub fn render_entries(entries: &[HelpEntry], width: usize) -> String {
     let width = width.max(MIN_HELP_WIDTH);
     let label_width = entries
@@ -109,24 +114,60 @@ pub fn render_entries(entries: &[HelpEntry], width: usize) -> String {
         .unwrap_or(0)
         .min(width.saturating_sub(TABLE_INDENT + LABEL_GAP + MIN_DESC_WIDTH));
     let desc_indent = TABLE_INDENT + label_width + LABEL_GAP;
-    let desc_width = width.saturating_sub(desc_indent).max(MIN_DESC_WIDTH);
-    let hanging = " ".repeat(desc_indent);
+
+    // The first line may use the whole width: the label column only has to
+    // hold the label itself. Continuation lines sit under the description
+    // column, so they get whatever the column leaves free.
+    let first_capacity = width - TABLE_INDENT;
+    let cont_capacity = width.saturating_sub(desc_indent);
 
     let mut out = String::new();
     for entry in entries {
-        let description = wrap(&entry.description, desc_width);
-        let first = description.first().cloned().unwrap_or_default();
-        out.push_str(&" ".repeat(TABLE_INDENT));
-        out.push_str(&pad_to(&entry.label, label_width));
-        out.push_str(&" ".repeat(LABEL_GAP));
-        out.push_str(&first);
-        out.push('\n');
-        for line in description.iter().skip(1) {
-            if line.is_empty() {
-                out.push('\n');
-                continue;
+        let row = format!(
+            "{}{}{}",
+            pad_to(&entry.label, label_width),
+            " ".repeat(LABEL_GAP),
+            entry.description
+        );
+        let words: Vec<&str> = row.split_whitespace().collect();
+
+        // Greedily fill the first line, then hand the remaining words to `wrap`
+        // so a token longer than the line is still split instead of overflowing.
+        let mut first = String::new();
+        let mut consumed = 0usize;
+        for word in &words {
+            let fits = if first.is_empty() {
+                word.chars().count() <= first_capacity
+            } else {
+                first.chars().count() + 1 + word.chars().count() <= first_capacity
+            };
+            if !fits {
+                break;
             }
-            out.push_str(&hanging);
+            if !first.is_empty() {
+                first.push(' ');
+            }
+            first.push_str(word);
+            consumed += 1;
+        }
+
+        let has_first = !first.is_empty();
+        let mut lines: Vec<String> = Vec::new();
+        if has_first {
+            lines.push(first);
+        }
+        let rest = words[consumed..].join(" ");
+        if !rest.is_empty() {
+            lines.extend(wrap(&rest, cont_capacity));
+        }
+
+        for (index, line) in lines.iter().enumerate() {
+            let indent = if index == 0 && has_first {
+                TABLE_INDENT
+            } else {
+                desc_indent
+            };
+            out.push_str(&" ".repeat(indent));
             out.push_str(line);
             out.push('\n');
         }
@@ -138,9 +179,10 @@ pub fn render_entries(entries: &[HelpEntry], width: usize) -> String {
 pub fn render_command_help(width: usize) -> String {
     let width = width.max(MIN_HELP_WIDTH);
     let app = App::command();
+    // `get_subcommands` already returns an iterator in clap 4 — calling
+    // `.iter()` on it does not compile.
     let entries: Vec<HelpEntry> = app
         .get_subcommands()
-        .iter()
         .map(|sub| HelpEntry::new(sub.get_name(), command_description(sub)))
         .collect();
 

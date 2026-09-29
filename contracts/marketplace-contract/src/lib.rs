@@ -146,11 +146,7 @@ impl MarketplaceContract {
         assert!(price > 0, "price must be positive");
 
         // Escrow the digital asset (SEP-41 transfer into the marketplace).
-        TokenClient::new(&env, &asset).transfer(
-            &seller,
-            &env.current_contract_address(),
-            &amount,
-        );
+        TokenClient::new(&env, &asset).transfer(&seller, &env.current_contract_address(), &amount);
 
         let id = read_next_listing_id(&env);
         write_next_listing_id(&env, id.saturating_add(1));
@@ -168,10 +164,8 @@ impl MarketplaceContract {
         };
         write_listing(&env, &listing);
 
-        env.events().publish(
-            (symbol_short!("listed"), seller),
-            (id, amount, price),
-        );
+        env.events()
+            .publish((symbol_short!("listed"), seller), (id, amount, price));
 
         id
     }
@@ -184,7 +178,10 @@ impl MarketplaceContract {
         buyer.require_auth();
         let mut listing = read_listing(&env, listing_id);
 
-        assert!(listing.status == ListingStatus::Active, "listing not active");
+        assert!(
+            listing.status == ListingStatus::Active,
+            "listing not active"
+        );
         assert!(listing.seller != buyer, "seller cannot buy own listing");
 
         let fee = listing
@@ -223,7 +220,10 @@ impl MarketplaceContract {
         seller.require_auth();
         let mut listing = read_listing(&env, listing_id);
 
-        assert!(listing.status == ListingStatus::Active, "listing not active");
+        assert!(
+            listing.status == ListingStatus::Active,
+            "listing not active"
+        );
         assert!(listing.seller == seller, "only seller can cancel");
 
         TokenClient::new(&env, &listing.asset).transfer(
@@ -244,7 +244,10 @@ impl MarketplaceContract {
         seller.require_auth();
         let mut listing = read_listing(&env, listing_id);
 
-        assert!(listing.status == ListingStatus::Active, "listing not active");
+        assert!(
+            listing.status == ListingStatus::Active,
+            "listing not active"
+        );
         assert!(listing.seller == seller, "only seller can update");
         assert!(new_price > 0, "price must be positive");
 
@@ -308,7 +311,8 @@ mod test {
     use soroban_sdk::token::{StellarAssetClient, TokenClient};
 
     fn setup_token(env: &Env, admin: &Address) -> Address {
-        env.register_stellar_asset_contract(admin.clone())
+        env.register_stellar_asset_contract_v2(admin.clone())
+            .address()
     }
 
     fn mint(env: &Env, token: &Address, to: &Address, amount: i128) {

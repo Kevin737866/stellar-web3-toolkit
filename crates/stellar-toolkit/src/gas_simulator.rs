@@ -125,7 +125,11 @@ impl FeeBump {
         if self.inner_fee_at_signing_stroops == 0 {
             return 0;
         }
-        u64::from(self.outer_fee_stroops) * 100 / u64::from(self.inner_fee_at_signing_stroops)
+        // Computed in `u64` so the multiply cannot overflow at the top of the
+        // fee range, then narrowed: the result is a percentage, so it always
+        // fits back into `u32`.
+        ((u64::from(self.outer_fee_stroops) * 100) / u64::from(self.inner_fee_at_signing_stroops))
+            as u32
     }
 }
 
@@ -145,8 +149,16 @@ impl GasSimulator {
         let resource_fee = profile
             .instructions
             .saturating_mul(schedule.per_instruction_stroops)
-            .saturating_add(profile.ledger_reads.saturating_mul(schedule.read_entry_stroops))
-            .saturating_add(profile.ledger_writes.saturating_mul(schedule.write_entry_stroops));
+            .saturating_add(
+                profile
+                    .ledger_reads
+                    .saturating_mul(schedule.read_entry_stroops),
+            )
+            .saturating_add(
+                profile
+                    .ledger_writes
+                    .saturating_mul(schedule.write_entry_stroops),
+            );
         let inclusion_bid = profile
             .bid_ledgers
             .saturating_mul(schedule.bid_per_ledger_stroops);
@@ -330,7 +342,9 @@ mod tests {
         let ladder = simulator.bump_ladder(1_000);
         let fees: Vec<u32> = ladder.iter().map(|b| b.outer_fee_stroops).collect();
         assert_eq!(fees, vec![1_500, 2_250, 3_375]);
-        assert!(ladder.iter().all(|b| b.inner_fee_at_signing_stroops == 1_000));
+        assert!(ladder
+            .iter()
+            .all(|b| b.inner_fee_at_signing_stroops == 1_000));
         assert_eq!(ladder[0].percent_over_signed_fee(), 150);
         assert_eq!(ladder[2].percent_over_signed_fee(), 337);
     }

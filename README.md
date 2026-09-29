@@ -56,6 +56,16 @@ stellar-toolkit gas estimate --instructions 250000 --bump-percent 100
 
 # Inspect contract state page by page
 stellar-toolkit inspect state --contract <C...> --page-size 20
+
+# Validate the dev/test/prod deploy configs against their contract
+stellar-toolkit env validate
+stellar-toolkit env list
+
+# Fail the build when a secret key, recovery phrase or .env was committed
+stellar-toolkit security secrets
+
+# Sample randomised inputs looking for a counterexample to an invariant
+stellar-toolkit verify invariants --iterations 512
 ```
 
 See the [CLI tooling runbook](docs/INFRA_RUNBOOK.md#5-cli-tooling-issues-240-242-243-244) for the full flag reference.
@@ -150,6 +160,10 @@ See [GitHub Issues](https://github.com/Kevin737866/stellar-web3-toolkit/issues) 
 - [Infrastructure Runbook](docs/INFRA_RUNBOOK.md) - CI, Docker reproducible builds, release & monitoring (Issues #117, #119, #120, #121)
 - [CLI tooling](docs/INFRA_RUNBOOK.md#5-cli-tooling-issues-240-242-243-244) - Wrapped help, project scaffolder + template lint, gas/fee simulation, paginated state inspection (Issues #240, #242, #243, #244)
 - [Reproducible Builds](docs/REPRODUCIBLE_BUILDS.md) - Deterministic WASM & Docker verification
+- [Key Management & Cold Storage](docs/KEY_MANAGEMENT.md) - Key tiers, cold-storage signing, rotation runbook (Issue #115)
+- [Threat Model](docs/THREAT_MODEL.md) - Attack surface, mitigations and the automated check for each (Issue #116)
+- [Informal Verification](docs/INFORMAL_VERIFICATION.md) - Property harness, invariant catalogue, how to add one (Issue #116)
+- [Environment Configs](config/README.md) - dev/test/prod config contract and validation rules (Issue #118)
 - [Monitoring Dashboard](docs/MONITORING_DASHBOARD.md) - Testnet health, Prometheus/Grafana & alerts
 - [Soroban Documentation](https://soroban.stellar.org/)
 - [Stellar Developers](https://developers.stellar.org/)

@@ -9,7 +9,9 @@
 //!
 //! Run with: `cargo test -p nft-drop --test integration`
 
-use collection_access_control::{CollectionAccessControl, CollectionAccessControlClient, PERM_ADMIN};
+use collection_access_control::{
+    CollectionAccessControl, CollectionAccessControlClient, PERM_ADMIN,
+};
 use nft_drop::{NftDropContract, NftDropContractClient, SalePhase};
 use soroban_sdk::testutils::Address as _;
 use soroban_sdk::token::{StellarAssetClient, TokenClient};
@@ -25,7 +27,9 @@ fn access_control_delegates_drop_administration() {
     let collector = Address::generate(&env);
     let stranger = Address::generate(&env);
 
-    let payment = env.register_stellar_asset_contract(admin.clone());
+    let payment = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
 
     // 1. Deploy the collection access-control registry.
     let acl_id = env.register_contract(None, CollectionAccessControl);

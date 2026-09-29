@@ -199,10 +199,19 @@ impl RoyaltySplitter {
         assert!(is_admin || is_collection, "unauthorized");
 
         let info = validate_receivers(&env, &receivers);
-        store_royalty(&env, &AssetKey { collection: collection.clone(), token_id }, &info);
+        store_royalty(
+            &env,
+            &AssetKey {
+                collection: collection.clone(),
+                token_id,
+            },
+            &info,
+        );
 
-        env.events()
-            .publish((symbol_short!("royalty"), collection), (token_id, info.total_bps));
+        env.events().publish(
+            (symbol_short!("royalty"), collection),
+            (token_id, info.total_bps),
+        );
     }
 
     /// Registers a fallback royalty used when an asset has no explicit entry.
@@ -260,12 +269,7 @@ impl RoyaltySplitter {
     }
 
     /// Computes the per-receiver split for a sale without transferring funds.
-    pub fn preview(
-        env: Env,
-        collection: Address,
-        token_id: u128,
-        sale_price: i128,
-    ) -> Vec<Payout> {
+    pub fn preview(env: Env, collection: Address, token_id: u128, sale_price: i128) -> Vec<Payout> {
         assert!(sale_price >= 0, "sale price must be non-negative");
         let info = load_royalty(&env, &collection, token_id);
         compute_payouts(&env, &info, sale_price)
@@ -323,7 +327,8 @@ mod test {
     use soroban_sdk::token::{StellarAssetClient, TokenClient};
 
     fn setup_token(env: &Env, admin: &Address) -> Address {
-        env.register_stellar_asset_contract(admin.clone())
+        env.register_stellar_asset_contract_v2(admin.clone())
+            .address()
     }
 
     fn receiver(address: &Address, bps: u32) -> Receiver {
@@ -387,7 +392,10 @@ mod test {
         assert_eq!(payouts.get(1).unwrap().amount, 25);
         assert_eq!(payouts.get(2).unwrap().recipient, platform);
         assert_eq!(payouts.get(2).unwrap().amount, 25);
-        assert_eq!(splitter.total_royalty(&collection, &1_u128, &1_000_i128), 100);
+        assert_eq!(
+            splitter.total_royalty(&collection, &1_u128, &1_000_i128),
+            100
+        );
     }
 
     #[test]
@@ -522,7 +530,10 @@ mod test {
             recipient: dup.clone(),
             bps: 100,
         });
-        list.push_back(Receiver { recipient: dup, bps: 200 });
+        list.push_back(Receiver {
+            recipient: dup,
+            bps: 200,
+        });
         splitter.set_royalty(&admin, &collection, &1_u128, &list);
     }
 
