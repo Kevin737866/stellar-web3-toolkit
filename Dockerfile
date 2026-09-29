@@ -48,7 +48,7 @@ COPY scripts/ scripts/
 RUN chmod +x scripts/*.sh || true
 
 # Verify build determinism by default when run
-CMD ["bash", "-c", "cargo build --workspace --exclude stellar-toolkit --exclude stellar-did --exclude payment-channel --exclude channel-router --exclude channel-simulator --exclude watchtower --exclude atomic-swap --target wasm32v1-none --release && sha256sum target/wasm32v1-none/release/*.wasm && ls -lh target/wasm32v1-none/release/*.wasm"]
+CMD ["bash", "-c", "cargo build --workspace --exclude stellar-toolkit --exclude stellar-did --exclude payment-channel --exclude channel-router --exclude channel-simulator --exclude watchtower --exclude atomic-swap --exclude contract-proptests --target wasm32v1-none --release && sha256sum target/wasm32v1-none/release/*.wasm && ls -lh target/wasm32v1-none/release/*.wasm"]
 
 # Stage for minimal runtime (optional, for verification)
 FROM builder AS verifier

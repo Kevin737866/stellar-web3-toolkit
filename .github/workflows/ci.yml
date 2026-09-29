@@ -56,7 +56,8 @@ jobs:
         include:
           # wasm32v1-none has no std, so the host-only crates cannot be built for it;
           # only the deployable contracts are. `stellar-did` is a host crate too
-          # (axum/tokio), so it is excluded alongside the others.
+          # (axum/tokio), and `contract-proptests` is a std test harness, so both
+          # are excluded alongside the others.
           - target: wasm32v1-none
             command: >-
               cargo build --workspace
@@ -64,6 +65,7 @@ jobs:
               --exclude payment-channel
               --exclude channel-router --exclude channel-simulator
               --exclude watchtower --exclude atomic-swap
+              --exclude contract-proptests
               --target wasm32v1-none --release
           - target: x86_64-unknown-linux-gnu
             command: cargo build --all --release --target x86_64-unknown-linux-gnu
@@ -100,6 +102,34 @@ jobs:
         run: cargo test --all --all-features -- --nocapture
       - name: Run doc tests
         run: cargo test --doc --all
+
+  proptest:
+    name: Property Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev
+      - name: Contract property suite (seeded)
+        # `contract-proptests` is a std harness the wasm builds exclude; it carries
+        # the randomized operation-sequence invariants for the contracts.
+        env:
+          PROPERTY_CASES: "1024"
+          PROPERTY_SEED: "20260929"
+        run: cargo test -p contract-proptests --all-features -- --nocapture
+      - name: Contract property suite (second seed)
+        # A different seed explores a different slice of the input space; a
+        # property that only holds for one stream is not a property.
+        env:
+          PROPERTY_CASES: "512"
+          PROPERTY_SEED: "1"
+        run: cargo test -p contract-proptests --all-features -- --nocapture
 
   simulation:
     name: Network Simulation
@@ -151,7 +181,7 @@ jobs:
       - name: Build all contracts (reproducible)
         run: |
           echo "Building all Soroban contracts to WASM (release, reproducible)..."
-          cargo build --workspace --exclude stellar-toolkit --exclude stellar-did --exclude payment-channel --exclude channel-router --exclude channel-simulator --exclude watchtower --exclude atomic-swap --target wasm32v1-none --release
+          cargo build --workspace --exclude stellar-toolkit --exclude stellar-did --exclude payment-channel --exclude channel-router --exclude channel-simulator --exclude watchtower --exclude atomic-swap --exclude contract-proptests --target wasm32v1-none --release
           # Fallback: ensure explicit contract packages built
           cargo build -p payment-channel-contract -p htlc-contract -p amm-pool -p amm-factory -p amm-router --target wasm32v1-none --release || true
           ls -lh target/wasm32v1-none/release/*.wasm || echo "No wasm artifacts found in target"
@@ -174,7 +204,7 @@ jobs:
       - name: Verify reproducibility (second build hash check)
         run: |
           cp wasm-checksums.txt wasm-checksums-1.txt
-          cargo build --workspace --exclude stellar-toolkit --exclude stellar-did --exclude payment-channel --exclude channel-router --exclude channel-simulator --exclude watchtower --exclude atomic-swap --target wasm32v1-none --release
+          cargo build --workspace --exclude stellar-toolkit --exclude stellar-did --exclude payment-channel --exclude channel-router --exclude channel-simulator --exclude watchtower --exclude atomic-swap --exclude contract-proptests --target wasm32v1-none --release
           sha256sum target/wasm32v1-none/release/*.wasm > wasm-checksums-2.txt || true
           diff -u wasm-checksums-1.txt wasm-checksums-2.txt && echo "Reproducibility check passed" || echo "Reproducibility drift detected (check build determinism)"
       - name: Upload WASM artifacts

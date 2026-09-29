@@ -1,0 +1,14 @@
+[package]
+name = "contract-proptests"
+version.workspace = true
+edition.workspace = true
+publish = false
+rust-version = "1.74.0"
+
+[lib]
+# The harness examples are illustrative snippets, not compiled documentation.
+doctest = false
+
+[dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+amm-pool = { path = "../../contracts/amm-pool", features = ["testutils"] }

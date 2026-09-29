@@ -202,7 +202,7 @@ if [[ "$USE_DOCKER" == true ]]; then
   echo ">> Verifying via Docker reproducible builder..."
   docker build -t stellar-toolkit-builder:1.98 -f Dockerfile . >/dev/null
   docker run --rm -v "$ROOT":/workspace -w /workspace stellar-toolkit-builder:1.98 \
-    bash -c "cargo build --workspace --exclude stellar-toolkit --exclude payment-channel --exclude channel-router --exclude channel-simulator --exclude watchtower --exclude atomic-swap --target wasm32v1-none --release && sha256sum target/wasm32v1-none/release/*.wasm" > /tmp/docker-checksums.txt
+    bash -c "cargo build --workspace --exclude stellar-toolkit --exclude payment-channel --exclude channel-router --exclude channel-simulator --exclude watchtower --exclude atomic-swap --exclude contract-proptests --target wasm32v1-none --release && sha256sum target/wasm32v1-none/release/*.wasm" > /tmp/docker-checksums.txt
   echo "Docker checksums:"
   cat /tmp/docker-checksums.txt
   echo ""

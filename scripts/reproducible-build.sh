@@ -25,7 +25,7 @@ if [[ "${1:-}" == "--docker" ]]; then
   echo ">> Building inside Docker (stellar-toolkit-builder:1.86)..."
   docker build -t stellar-toolkit-builder:1.86 -f Dockerfile .
   docker run --rm -v "$ROOT":/workspace -w /workspace stellar-toolkit-builder:1.86 \
-    bash -c "cargo build --workspace --exclude stellar-toolkit --exclude stellar-did --exclude payment-channel --exclude channel-router --exclude channel-simulator --exclude watchtower --exclude atomic-swap --target wasm32v1-none --release && sha256sum target/wasm32v1-none/release/*.wasm"
+    bash -c "cargo build --workspace --exclude stellar-toolkit --exclude stellar-did --exclude payment-channel --exclude channel-router --exclude channel-simulator --exclude watchtower --exclude atomic-swap --exclude contract-proptests --target wasm32v1-none --release && sha256sum target/wasm32v1-none/release/*.wasm"
   exit 0
 fi
 
@@ -38,6 +38,7 @@ cargo build --workspace \
   --exclude channel-simulator \
   --exclude watchtower \
   --exclude atomic-swap \
+  --exclude contract-proptests \
   --target wasm32v1-none --release
 
 # Explicit contract packages (handles future renames)
@@ -58,7 +59,7 @@ echo "Checksums written to target/reproducible/wasm-checksums.txt"
 # Second build for drift detection
 echo ""
 echo ">> Verifying reproducibility (second build)..."
-cargo build --workspace --exclude stellar-toolkit --exclude stellar-did --exclude payment-channel --exclude channel-router --exclude channel-simulator --exclude watchtower --exclude atomic-swap --target wasm32v1-none --release >/dev/null
+cargo build --workspace --exclude stellar-toolkit --exclude stellar-did --exclude payment-channel --exclude channel-router --exclude channel-simulator --exclude watchtower --exclude atomic-swap --exclude contract-proptests --target wasm32v1-none --release >/dev/null
 sha256sum target/wasm32v1-none/release/*.wasm > target/reproducible/wasm-checksums-2.txt
 if diff -u target/reproducible/wasm-checksums.txt target/reproducible/wasm-checksums-2.txt; then
   echo "Reproducibility: OK (hashes identical across two builds)"
