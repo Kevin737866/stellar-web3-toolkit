@@ -11,6 +11,7 @@ members = [
     "contracts/amm-pool",
     "contracts/amm-factory",
     "contracts/amm-router",
+    "contracts/delegated-staking",
     "contracts/htlc-contract",
     "contracts/nft-sft-contract",
     "contracts/collection-access-control",
