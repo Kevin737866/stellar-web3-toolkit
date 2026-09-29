@@ -20,6 +20,7 @@ members = [
     "contracts/rwa-fractionalizer",
     "contracts/airdrop-merkle",
     "contracts/token-locker",
+    "contracts/yield-farm",
 ]
 
 resolver = "2"
