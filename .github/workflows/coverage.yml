@@ -1,0 +1,68 @@
+name: Coverage
+
+on:
+  push:
+    branches: [ main, develop, 'feature/**', 'fix/**', 'feat/**' ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Line-coverage gate, in percent. `0` reports without failing, which is the
+  # starting point until a baseline is agreed: see docs/COVERAGE.md for how to
+  # read the current number out of the job summary and ratchet this up. Lowering
+  # it below the last agreed value needs a reason in the PR description.
+  COVERAGE_MIN_LINES: "0"
+
+jobs:
+  coverage:
+    name: Line Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+          # cargo-llvm-cov drives llvm-cov/llvm-profdata from this component.
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: coverage
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev
+      - name: Install cargo-llvm-cov
+        # Pinned to the locked graph so a tool release cannot change the numbers
+        # under us mid-review. `--locked` fails loudly instead of floating.
+        run: cargo install cargo-llvm-cov --locked
+      - name: Generate the coverage report
+        run: bash scripts/coverage.sh
+      - name: Write the job summary
+        # `always()` so a failing gate still surfaces the table that explains it.
+        if: always()
+        run: |
+          {
+            echo "### Line coverage"
+            echo ""
+            echo '```'
+            cat target/coverage/summary.txt 2>/dev/null || echo "no summary produced"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload the LCOV report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: target/coverage/lcov.info
+          retention-days: 14
+      - name: Upload the HTML report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: target/coverage/html/
+          retention-days: 14
