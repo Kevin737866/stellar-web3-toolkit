@@ -205,10 +205,8 @@ impl CollectionAccessControl {
         let current = explicit_permissions(&env, &collection, &account);
         write_permissions(&env, &collection, &account, current | permissions);
 
-        env.events().publish(
-            (symbol_short!("grant"), collection),
-            (account, permissions),
-        );
+        env.events()
+            .publish((symbol_short!("grant"), collection), (account, permissions));
     }
 
     /// Removes `permissions` from an account's grant, leaving other bits
@@ -303,9 +301,7 @@ impl CollectionAccessControl {
 
     /// Whether a collection has been registered.
     pub fn is_registered(env: Env, collection: Address) -> bool {
-        env.storage()
-            .persistent()
-            .has(&DataKey::Owner(collection))
+        env.storage().persistent().has(&DataKey::Owner(collection))
     }
 
     /// The contract-wide admin.
@@ -319,7 +315,7 @@ mod test {
     use super::*;
     use soroban_sdk::testutils::Address as _;
 
-    fn setup(env: &Env) -> (Address, Address, CollectionAccessControlClient) {
+    fn setup(env: &Env) -> (Address, Address, CollectionAccessControlClient<'_>) {
         let admin = Address::generate(env);
         let collection = Address::generate(env);
         let id = env.register_contract(None, CollectionAccessControl);

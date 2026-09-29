@@ -464,7 +464,11 @@ pub fn lint_template(files: &[GeneratedFile]) -> LintReport {
                 "file does not end with a newline",
             ));
         } else if file.contents.ends_with("\n\n") {
-            findings.push(warning("final-newline", &file.path, "file ends with a blank line"));
+            findings.push(warning(
+                "final-newline",
+                &file.path,
+                "file ends with a blank line",
+            ));
         }
     }
 
@@ -480,7 +484,10 @@ pub fn is_valid_crate_name(name: &str) -> bool {
     if name.is_empty() || name.len() > 64 {
         return false;
     }
-    if !name.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-') {
+    if !name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+    {
         return false;
     }
     if name.starts_with('-') || name.ends_with('-') || name.contains("--") {
@@ -572,7 +579,9 @@ mod tests {
         let (_, report) = Scaffolder::new(ScaffoldOptions::new("amm-pool")).render_and_lint();
         assert!(report.passed(), "unexpected findings: {report:?}");
         assert!(report.warnings() == 0, "unexpected warnings: {report:?}");
-        assert!(report.render().contains("ok: template satisfies every rule"));
+        assert!(report
+            .render()
+            .contains("ok: template satisfies every rule"));
     }
 
     #[test]

@@ -64,7 +64,7 @@ jobs:
 
       - name: Build contracts (reproducible, pinned toolchain)
         run: |
-          cargo build --workspace --exclude stellar-toolkit --exclude payment-channel --exclude channel-router --exclude channel-simulator --exclude watchtower --exclude atomic-swap --target wasm32v1-none --release
+          cargo build --workspace --exclude stellar-toolkit --exclude stellar-did --exclude payment-channel --exclude channel-router --exclude channel-simulator --exclude watchtower --exclude atomic-swap --target wasm32v1-none --release
           cargo build -p payment-channel-contract -p htlc-contract -p amm-pool -p amm-factory -p amm-router --target wasm32v1-none --release 2>/dev/null || true
           ls -lh target/wasm32v1-none/release/*.wasm
           sha256sum target/wasm32v1-none/release/*.wasm | tee wasm-checksums.txt

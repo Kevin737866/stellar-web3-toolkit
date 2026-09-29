@@ -55,11 +55,13 @@ jobs:
       matrix:
         include:
           # wasm32v1-none has no std, so the host-only crates cannot be built for it;
-          # only the deployable contracts are.
+          # only the deployable contracts are. `stellar-did` is a host crate too
+          # (axum/tokio), so it is excluded alongside the others.
           - target: wasm32v1-none
             command: >-
               cargo build --workspace
-              --exclude stellar-toolkit --exclude payment-channel
+              --exclude stellar-toolkit --exclude stellar-did
+              --exclude payment-channel
               --exclude channel-router --exclude channel-simulator
               --exclude watchtower --exclude atomic-swap
               --target wasm32v1-none --release
@@ -149,7 +151,7 @@ jobs:
       - name: Build all contracts (reproducible)
         run: |
           echo "Building all Soroban contracts to WASM (release, reproducible)..."
-          cargo build --workspace --exclude stellar-toolkit --exclude payment-channel --exclude channel-router --exclude channel-simulator --exclude watchtower --exclude atomic-swap --target wasm32v1-none --release
+          cargo build --workspace --exclude stellar-toolkit --exclude stellar-did --exclude payment-channel --exclude channel-router --exclude channel-simulator --exclude watchtower --exclude atomic-swap --target wasm32v1-none --release
           # Fallback: ensure explicit contract packages built
           cargo build -p payment-channel-contract -p htlc-contract -p amm-pool -p amm-factory -p amm-router --target wasm32v1-none --release || true
           ls -lh target/wasm32v1-none/release/*.wasm || echo "No wasm artifacts found in target"
@@ -172,7 +174,7 @@ jobs:
       - name: Verify reproducibility (second build hash check)
         run: |
           cp wasm-checksums.txt wasm-checksums-1.txt
-          cargo build --workspace --exclude stellar-toolkit --exclude payment-channel --exclude channel-router --exclude channel-simulator --exclude watchtower --exclude atomic-swap --target wasm32v1-none --release
+          cargo build --workspace --exclude stellar-toolkit --exclude stellar-did --exclude payment-channel --exclude channel-router --exclude channel-simulator --exclude watchtower --exclude atomic-swap --target wasm32v1-none --release
           sha256sum target/wasm32v1-none/release/*.wasm > wasm-checksums-2.txt || true
           diff -u wasm-checksums-1.txt wasm-checksums-2.txt && echo "Reproducibility check passed" || echo "Reproducibility drift detected (check build determinism)"
       - name: Upload WASM artifacts
@@ -223,13 +225,15 @@ jobs:
           retention-days: 7
 
   automated-checks:
-    name: "Codegen & Snapshot Checks"
+    name: "Codegen, Env, Security & Invariant Checks"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.86.0
+          # Pinned to the workspace toolchain: 1.86.0 could not resolve the
+          # committed lockfile, so this job failed before running anything.
+          toolchain: 1.98.1
       - uses: Swatinem/rust-cache@v2
       - name: Install dependencies
         run: |
@@ -241,6 +245,18 @@ jobs:
         run: |
           cargo run -p stellar-toolkit -- monitoring dashboard --output target/monitoring
           cargo run -p stellar-toolkit -- monitoring restore --snapshot target/monitoring
+      - name: Environment configs (dev/test/prod) validate
+        # Issue #118: refuses a config whose passphrase, endpoints and safety
+        # flags disagree with each other or with the environment it names.
+        run: cargo run -p stellar-toolkit -- env validate
+      - name: Secret material scan
+        # Issue #115: fails when a secret key, recovery phrase or real .env is
+        # committed. Findings are masked, so the log cannot leak what it found.
+        run: cargo run -p stellar-toolkit -- security secrets
+      - name: Informal verification invariants
+        # Issue #116: sampled search for counterexamples to the stated
+        # invariants; the seed is pinned so a failure is reproducible.
+        run: cargo run -p stellar-toolkit -- verify invariants --iterations 512
 
   merge-check:
     name: Merge Queue Check

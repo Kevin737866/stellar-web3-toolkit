@@ -54,6 +54,24 @@ pub enum ToolkitCommand {
     /// Inspect contract state with cursor based pagination
     #[command(subcommand)]
     Inspect(InspectCommand),
+    /// Look up a term in docs/GLOSSARY.md
+    #[command(subcommand)]
+    Glossary(GlossaryCommand),
+    /// Migration tooling for contract interface changes
+    #[command(subcommand)]
+    Migration(MigrationCommand),
+    /// Typed TypeScript client codegen for contract interfaces
+    #[command(subcommand)]
+    Codegen(CodegenCommand),
+    /// Multi-environment deploy configuration (dev/test/prod)
+    #[command(subcommand)]
+    Env(EnvCommand),
+    /// Key-material hygiene: find material that must not be committed
+    #[command(subcommand)]
+    Security(SecurityCommand),
+    /// Informal verification: search for counterexamples to stated invariants
+    #[command(subcommand)]
+    Verify(VerifyCommand),
     /// Print the command overview wrapped to the terminal width
     Help {
         /// Wrap width in columns (defaults to $COLUMNS, otherwise 100)
@@ -126,6 +144,86 @@ pub enum GasCommand {
     },
 }
 
+/// Output shape for `migration diff`.
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationFormat {
+    /// Human-readable report.
+    Text,
+    /// Machine-readable JSON.
+    Json,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MigrationCommand {
+    /// Diff two contract interface snapshots and report what changed
+    Diff {
+        /// The "before" contract spec JSON
+        before: PathBuf,
+        /// The "after" contract spec JSON
+        after: PathBuf,
+        /// Output format
+        #[arg(long, value_enum, default_value = "text")]
+        format: MigrationFormat,
+        /// Exit non-zero when a breaking change is found
+        #[arg(long, default_value_t = false)]
+        fail_on_breaking: bool,
+    },
+}
+
+/// Output shape for `glossary lookup`.
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlossaryFormat {
+    /// Decorated block, meant for a terminal. The default when stdout is a TTY.
+    Human,
+    /// One `Term: definition` line per match, for grep and scripts.
+    Plain,
+    /// Machine-readable JSON.
+    Json,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum GlossaryCommand {
+    /// Show the definition of a glossary term
+    Lookup {
+        /// The term to look up (quote multi-word terms)
+        term: String,
+        /// Path to the glossary Markdown (default: auto-discover docs/GLOSSARY.md)
+        #[arg(long)]
+        glossary: Option<PathBuf>,
+        /// Output format (default: human on a terminal, plain when piped)
+        #[arg(long, value_enum)]
+        format: Option<GlossaryFormat>,
+    },
+    /// List every glossary term with its anchor
+    List {
+        /// Path to the glossary Markdown (default: auto-discover docs/GLOSSARY.md)
+        #[arg(long)]
+        glossary: Option<PathBuf>,
+        /// Output format
+        #[arg(long, value_enum)]
+        format: Option<GlossaryFormat>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum CodegenCommand {
+    /// Generate the typed TypeScript client (deduplicated imports, bigint-safe types)
+    Ts {
+        /// Contract interface spec in JSON (defaults to the bundled AMM pool spec)
+        #[arg(long)]
+        spec: Option<PathBuf>,
+        /// Output directory for the generated client
+        #[arg(long, default_value = "target/ts-client")]
+        output: PathBuf,
+    },
+    /// Run the codegen checks: duplicate imports and bigint integer mapping
+    Check {
+        /// Contract interface spec in JSON (defaults to the bundled AMM pool spec)
+        #[arg(long)]
+        spec: Option<PathBuf>,
+    },
+}
+
 #[derive(Subcommand, Debug)]
 pub enum InspectCommand {
     /// Print contract state entries page by page
@@ -192,6 +290,65 @@ pub enum MonitoringCommand {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum EnvCommand {
+    /// List the environments and the endpoints each one targets
+    List {
+        /// Directory holding the environment configs
+        #[arg(long, default_value = "config")]
+        dir: PathBuf,
+    },
+    /// Validate the environment configs (exits non-zero on any error finding)
+    Validate {
+        /// Directory holding the environment configs
+        #[arg(long, default_value = "config")]
+        dir: PathBuf,
+        /// Validate only this environment (defaults to all of them)
+        #[arg(long)]
+        env: Option<String>,
+        /// Print the report as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Print one environment's resolved configuration as JSON
+    Show {
+        /// Environment name: dev, test or prod
+        name: String,
+        /// Directory holding the environment configs
+        #[arg(long, default_value = "config")]
+        dir: PathBuf,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SecurityCommand {
+    /// Scan a tree for committed secret material (exits non-zero on findings)
+    Secrets {
+        /// Roots to scan; defaults to the workspace root
+        #[arg(long = "path")]
+        paths: Vec<PathBuf>,
+        /// Print the report as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum VerifyCommand {
+    /// Search for a counterexample to each built-in invariant
+    Invariants {
+        /// PRNG seed; defaults to the fixed suite seed so CI is deterministic
+        #[arg(long)]
+        seed: Option<u64>,
+        /// Iterations per invariant
+        #[arg(long, default_value_t = crate::invariants::DEFAULT_ITERATIONS)]
+        iterations: u64,
+        /// Print the report as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum WalletCommand {
     /// Generate a 24-word recovery phrase and derive a Stellar keypair
     Generate,
@@ -212,6 +369,28 @@ pub enum WalletCommand {
         /// Message / transaction envelope as hex
         message: String,
     },
+}
+
+/// Redacting `Debug` (issue #115).
+///
+/// `main` logs the parsed command at info level, so a derived `Debug` here
+/// writes the recovery phrase (`recover`) and the secret key (`sign`) into
+/// whatever log sink the operator attached — a build log, a CI transcript, a
+/// shell history capture. Only the two variants that carry key material are
+/// redacted; everything else stays debuggable.
+impl std::fmt::Debug for WalletCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Generate => f.write_str("Generate"),
+            Self::Recover { .. } => f.write_str("Recover { phrase: \"<redacted>\" }"),
+            Self::Fund { account } => f.debug_struct("Fund").field("account", account).finish(),
+            Self::Sign { message, .. } => f
+                .debug_struct("Sign")
+                .field("secret", &"<redacted>")
+                .field("message", message)
+                .finish(),
+        }
+    }
 }
 
 impl ToolkitCommand {
@@ -245,6 +424,12 @@ impl ToolkitCommand {
             Self::Scaffold(cmd) => run_scaffold(cmd),
             Self::Gas(cmd) => run_gas(cmd),
             Self::Inspect(cmd) => run_inspect(cmd),
+            Self::Glossary(cmd) => run_glossary(cmd),
+            Self::Migration(cmd) => run_migration(cmd),
+            Self::Codegen(cmd) => run_codegen(cmd),
+            Self::Env(cmd) => run_env(cmd),
+            Self::Security(cmd) => run_security(cmd),
+            Self::Verify(cmd) => run_verify(cmd),
             Self::Help { width } => {
                 let resolved = if *width == 0 {
                     help_text::help_width()
@@ -254,6 +439,44 @@ impl ToolkitCommand {
                 print!("{}", help_text::render_command_help(resolved));
                 Ok(())
             }
+        }
+    }
+}
+
+impl CodegenCommand {
+    fn spec_path(&self) -> Option<&PathBuf> {
+        match self {
+            Self::Ts { spec, .. } => spec.as_ref(),
+            Self::Check { spec } => spec.as_ref(),
+        }
+    }
+}
+
+fn run_codegen(cmd: &CodegenCommand) -> Result<()> {
+    use crate::ts_codegen::{run_checks, ContractSpec, TsClientGenerator};
+    let root = normalize_workspace_root(&PathBuf::from("."));
+    let spec = match cmd.spec_path() {
+        Some(path) => ContractSpec::from_json_file(&resolve_path(&root, path))
+            .map_err(|e| ToolkitError::ExecutionError(format!("load spec: {e}")))?,
+        None => ContractSpec::amm_pool(),
+    };
+    match cmd {
+        CodegenCommand::Ts { output, .. } => {
+            let generator = TsClientGenerator::new(spec);
+            let dir = resolve_path(&root, output);
+            let paths = generator
+                .write_to_dir(&dir)
+                .map_err(|e| ToolkitError::ExecutionError(e.to_string()))?;
+            println!(
+                "Generated {}Client for {} ({} functions)",
+                generator.spec().name,
+                generator.spec().contract_id,
+                generator.spec().functions.len()
+            );
+            for path in &paths {
+                println!("  {}", path.display());
+            }
+            Ok(())
         }
         CodegenCommand::Check { .. } => {
             let problems = run_checks(&spec);
@@ -623,7 +846,7 @@ fn run_scaffold(cmd: &ScaffoldCommand) -> Result<()> {
                 }
                 return Ok(());
             }
-            let root = resolve_path(out);
+            let root = resolve_path(&cwd_root(), out);
             for path in scaffolder.write(&root, *force)? {
                 println!("wrote {}", path.display());
             }
@@ -631,7 +854,7 @@ fn run_scaffold(cmd: &ScaffoldCommand) -> Result<()> {
             Ok(())
         }
         ScaffoldCommand::Lint { dir } => {
-            let root = resolve_path(dir);
+            let root = resolve_path(&cwd_root(), dir);
             let report = lint_directory(&root)?;
             print!("{}", report.render());
             if !report.passed() {
@@ -760,7 +983,7 @@ fn run_inspect(cmd: &InspectCommand) -> Result<()> {
         } => {
             let inspector = match input {
                 Some(input) => {
-                    let path = resolve_path(input);
+                    let path = resolve_path(&cwd_root(), input);
                     let mut from_file = StateInspector::new();
                     let added = from_file.load(&path)?;
                     println!("loaded {added} state entry/entries from {}", path.display());
@@ -818,12 +1041,123 @@ fn run_inspect(cmd: &InspectCommand) -> Result<()> {
     }
 }
 
-fn resolve_path(path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        return path.to_path_buf();
+fn run_env(cmd: &EnvCommand) -> Result<()> {
+    use crate::env_config::{self, EnvConfig};
+    match cmd {
+        EnvCommand::List { dir } => {
+            let root = resolve_path(&cwd_root(), dir);
+            println!("{:<6} {:<10} {:<12} endpoint", "env", "network", "config");
+            for name in env_config::ENVIRONMENTS {
+                match EnvConfig::load(&root, name) {
+                    Ok(config) => println!(
+                        "{:<6} {:<10} {:<12} {}",
+                        name,
+                        config.env.stellar_network,
+                        root.join(format!("{name}.toml")).display(),
+                        config.env.soroban_rpc_url
+                    ),
+                    Err(e) => println!("{:<6} {}", name, e),
+                }
+            }
+            Ok(())
+        }
+        EnvCommand::Validate { dir, env, json } => {
+            let root = resolve_path(&cwd_root(), dir);
+            let report = env_config::validate_directory(&root, env.as_deref())?;
+            if *json {
+                println!("{}", report.to_json());
+            } else {
+                print!("{}", report.render());
+            }
+            if !report.passed() {
+                return Err(ToolkitError::ExecutionError(format!(
+                    "{} environment config error(s)",
+                    report.errors()
+                )));
+            }
+            Ok(())
+        }
+        EnvCommand::Show { name, dir } => {
+            let root = resolve_path(&cwd_root(), dir);
+            let config = EnvConfig::load(&root, name)?;
+            let findings = config.validate();
+            let payload = serde_json::json!({
+                "name": config.env.name,
+                "stellar_network": config.env.stellar_network,
+                "horizon_url": config.env.horizon_url,
+                "soroban_rpc_url": config.env.soroban_rpc_url,
+                "soroban_network_passphrase": config.env.soroban_network_passphrase,
+                "deploy": config.deploy,
+                "monitoring": config.monitoring,
+                "security": config.security,
+                "findings": findings,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&payload)
+                    .map_err(|e| ToolkitError::ExecutionError(e.to_string()))?
+            );
+            Ok(())
+        }
     }
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    cwd.join(path)
+}
+
+fn run_security(cmd: &SecurityCommand) -> Result<()> {
+    use crate::key_hygiene;
+    match cmd {
+        SecurityCommand::Secrets { paths, json } => {
+            let roots: Vec<PathBuf> = if paths.is_empty() {
+                vec![normalize_workspace_root(&PathBuf::from("."))]
+            } else {
+                paths.iter().map(|p| resolve_path(&cwd_root(), p)).collect()
+            };
+            let report = key_hygiene::scan_paths(&roots);
+            if *json {
+                println!("{}", report.to_json());
+            } else {
+                print!("{}", report.render());
+            }
+            if !report.passed() {
+                return Err(ToolkitError::ExecutionError(format!(
+                    "{} finding(s) of committed secret material",
+                    report.errors()
+                )));
+            }
+            Ok(())
+        }
+    }
+}
+
+fn run_verify(cmd: &VerifyCommand) -> Result<()> {
+    use crate::invariants;
+    match cmd {
+        VerifyCommand::Invariants {
+            seed,
+            iterations,
+            json,
+        } => {
+            let seed = seed.unwrap_or(invariants::DEFAULT_SEED);
+            let report = invariants::run_suite(seed, *iterations);
+            if *json {
+                println!("{}", report.to_json());
+            } else {
+                print!("{}", report.render());
+            }
+            if !report.passed() {
+                return Err(ToolkitError::ExecutionError(format!(
+                    "{} invariant(s) violated under seed {seed}",
+                    report.failed()
+                )));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Root for paths that are not tied to a workspace argument (`--input`,
+/// `--dir`, `--out`): the process working directory.
+fn cwd_root() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 fn normalize_workspace_root(workspace: &PathBuf) -> PathBuf {

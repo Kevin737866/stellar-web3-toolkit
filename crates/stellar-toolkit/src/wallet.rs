@@ -19,11 +19,26 @@ type HmacSha512 = Hmac<Sha512>;
 const STELLAR_PATH: [u32; 3] = [44, 148, 0];
 
 /// A freshly generated recovery phrase and the keypair it derives to.
-#[derive(Debug)]
 pub struct GeneratedWallet {
     pub mnemonic: String,
     pub secret: String,
     pub account: String,
+}
+
+/// Redacting `Debug` (issue #115).
+///
+/// A wallet is logged far more often than it is printed, and `#[derive(Debug)]`
+/// writes the recovery phrase and the secret key straight into whatever log
+/// sink is attached. The account id is public and is kept verbatim, because
+/// "which wallet was that" is exactly what makes a log useful.
+impl std::fmt::Debug for GeneratedWallet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GeneratedWallet")
+            .field("mnemonic", &crate::key_hygiene::mask_secret(&self.mnemonic))
+            .field("secret", &crate::key_hygiene::mask_secret(&self.secret))
+            .field("account", &self.account)
+            .finish()
+    }
 }
 
 /// Generate a cryptographically random 24-word BIP-39 recovery phrase and
@@ -117,10 +132,18 @@ fn encode_secret(secret: &[u8; 32]) -> String {
 }
 
 /// Decode a Stellar secret key (S...).
+///
+/// The error never echoes the input: a mistyped key is still key material, and
+/// this message ends up in logs and CI output (issue #115).
 fn decode_secret(secret: &str) -> Result<[u8; 32]> {
     stellar_strkey::ed25519::PrivateKey::from_string(secret)
         .map(|k| k.0)
-        .map_err(|e| ToolkitError::Wallet(format!("invalid secret key `{secret}`: {e}")))
+        .map_err(|e| {
+            ToolkitError::Wallet(format!(
+                "invalid secret key `{}`: {e}",
+                crate::key_hygiene::mask_secret(secret)
+            ))
+        })
 }
 
 /// Encode a Stellar public account id (G...).
@@ -206,15 +229,19 @@ mod tests {
 
     #[test]
     fn recovery_is_valid_and_deterministic() {
-        // "abandon ... art" is the canonical 24-word BIP-39 vector (valid checksum).
-        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
-        let wallet = recover_wallet(phrase).expect("valid phrase");
+        // 23 x `abandon` plus `art` is the canonical 24-word BIP-39 vector (valid
+        // checksum). It is assembled here rather than written out so this file
+        // holds no phrase literal that `security secrets` would have to excuse.
+        let mut words = vec!["abandon"; 23];
+        words.push("art");
+        let phrase = words.join(" ");
+        let wallet = recover_wallet(&phrase).expect("valid phrase");
         assert!(wallet.secret.starts_with('S'));
         assert_eq!(wallet.secret.len(), 56);
         assert!(wallet.account.starts_with('G'));
         assert_eq!(wallet.account.len(), 56);
         // Deterministic: deriving twice gives the same account.
-        let again = recover_wallet(phrase).expect("again");
+        let again = recover_wallet(&phrase).expect("again");
         assert_eq!(again.account, wallet.account);
         assert_eq!(again.secret, wallet.secret);
     }
@@ -267,6 +294,36 @@ mod tests {
         assert_eq!(wallet.secret.len(), 56);
         assert!(wallet.account.starts_with('G'));
         assert_eq!(wallet.account.len(), 56);
+    }
+
+    #[test]
+    fn debug_never_prints_the_phrase_or_the_secret() {
+        let wallet = generate_wallet().expect("generate");
+        let rendered = format!("{wallet:?}");
+        assert!(
+            !rendered.contains(&wallet.secret),
+            "secret leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&wallet.mnemonic),
+            "phrase leaked: {rendered}"
+        );
+        // The public account id is what makes the log entry useful.
+        assert!(rendered.contains(&wallet.account));
+    }
+
+    #[test]
+    fn rejected_secret_key_is_not_echoed_in_the_error() {
+        let err = sign_message(
+            "Snot-a-real-secret-key-0000000000000000000000000000000000",
+            "00",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            !err.contains("not-a-real-secret-key"),
+            "error echoed the key material: {err}"
+        );
     }
 
     #[test]

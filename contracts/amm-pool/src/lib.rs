@@ -1,6 +1,9 @@
 #![no_std]
 
-mod math;
+// Public so the quorum/quorum-status helpers and `sqrt_u128` are part of the
+// crate's reachable API: as a private module their `pub` items tripped
+// `dead_code` under `clippy -D warnings`.
+pub mod math;
 
 use math::{amount_out, flash_k_ok, liquidity_amounts_first_deposit, quote};
 use soroban_sdk::token::{TokenClient, TokenInterface};

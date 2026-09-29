@@ -22,10 +22,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short,
-    token::{StellarAssetClient, TokenClient},
-    xdr::ToXdr,
-    Address, Bytes, BytesN, Env, Vec,
+    contract, contractimpl, contracttype, symbol_short, token::TokenClient, xdr::ToXdr, Address,
+    Bytes, BytesN, Env, Vec,
 };
 
 /// Domain separator mixed into every leaf pre-image.
@@ -311,6 +309,9 @@ mod test {
 
     use super::*;
     use soroban_sdk::testutils::{Address as _, Events as _, Ledger as _};
+    // Only the tests mint, so this import belongs here rather than at the top of
+    // the file where the non-test build reported it as unused.
+    use soroban_sdk::token::StellarAssetClient;
     use soroban_sdk::{Symbol, TryFromVal};
 
     /// Builds the same tree the contract verifies against, returning the root
@@ -467,7 +468,7 @@ mod test {
         let amount = 500i128;
 
         let leaf = claim_leaf(&env, &alice, amount);
-        let (root, paths) = build_tree(&env, &[leaf.clone()]);
+        let (root, paths) = build_tree(&env, core::slice::from_ref(&leaf));
         assert_eq!(paths[0].len(), 0);
 
         client.set_merkle_root(&root, &amount);

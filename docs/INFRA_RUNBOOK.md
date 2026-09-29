@@ -13,7 +13,14 @@ Covers the four infra issues assigned to @danieloche635-bit:
 | #248 | Automated check #59 — monitoring snapshot restore checksum |
 
 It also documents the `stellar-toolkit` CLI tooling issues (#240, #242, #243,
-#244) in §5.
+#244) in §5, and the environment-config, key-hygiene and informal-verification
+work in §6:
+
+| Issue | Title |
+|-------|-------|
+| #115 | Implement key management and cold-storage guidance |
+| #116 | Add informal-verification test framework |
+| #118 | Add multi-environment deploy (dev/test/prod) configs |
 
 ---
 
@@ -95,6 +102,25 @@ CI's `wasm` job mirrors `scripts/reproducible-build.sh` exactly, so a green CI m
 | prod | `config/prod.toml` | mainnet | `horizon.stellar.org` | `soroban.stellar.org` |
 
 Secrets (`STELLAR_SECRET_KEY_*`) are never committed — use GitHub `secrets` per environment.
+
+### Validating the configs (Issue #118)
+
+The configs are checked against an explicit contract rather than trusted:
+
+```bash
+cargo run -p stellar-toolkit -- env list                 # what each env resolves to
+cargo run -p stellar-toolkit -- env validate              # all environments (CI gate)
+cargo run -p stellar-toolkit -- env validate --env prod --json
+cargo run -p stellar-toolkit -- env show test
+```
+
+`env validate` fails on any error finding: an unknown key, a passphrase that
+does not belong to the declared network, a mainnet config pointing at a testnet
+endpoint, `auto_fund = true` on mainnet, a missing `[security]` block, a
+non-stroop fee, or a file whose `[env] name` does not match its filename.
+Warnings (no alerting configured, zero confirmations, a manual-approval gate on
+a non-production environment) are reported without failing. The full rule table
+lives in [`config/README.md`](../config/README.md).
 
 **Manual release:**
 
@@ -234,7 +260,58 @@ cargo test -p stellar-toolkit state_inspector
 
 ---
 
-## 6. Runbook Checklist
+## 6. Security, Env & Invariant Checks (Issues #115, #116, #118)
+
+**Files:** `crates/stellar-toolkit/src/env_config.rs` · `key_hygiene.rs` ·
+`invariants.rs` · `docs/KEY_MANAGEMENT.md` · `docs/THREAT_MODEL.md` ·
+`docs/INFORMAL_VERIFICATION.md`
+
+Three checks run in the CI `automated-checks` job, each exiting non-zero on a
+finding. All three are also usable locally and are covered by unit tests, so a
+regression fails `cargo test` before it reaches CI.
+
+### Environment configs (Issue #118)
+
+```bash
+cargo run -p stellar-toolkit -- env validate
+```
+
+Parses `config/{dev,test,prod}.toml` with `deny_unknown_fields` and validates the
+passphrase/network/endpoint triple, fee sanity, and the production safety flags.
+See §3 above and `config/README.md`.
+
+### Secret material (Issue #115)
+
+```bash
+cargo run -p stellar-toolkit -- security secrets
+cargo run -p stellar-toolkit -- security secrets --path crates --path contracts --json
+```
+
+Detects `S…` secret keys, checksum-valid BIP-39 recovery phrases, literal
+assignments to secret-named fields, and committed `.env` files. Findings are
+**masked** (`S…AB12`), so running the scan cannot leak a key into a CI log.
+Placeholders are ignored, and `// key-hygiene: allow` suppresses a line that has
+to show a real shape. The unit tests include one that scans this repository, so
+a committed key fails `cargo test` as well. Guidance and the rotation runbook
+are in [`docs/KEY_MANAGEMENT.md`](KEY_MANAGEMENT.md).
+
+### Informal verification (Issue #116)
+
+```bash
+cargo run -p stellar-toolkit -- verify invariants               # fixed seed, CI gate
+cargo run -p stellar-toolkit -- verify invariants --iterations 5000 --seed 12345
+```
+
+Samples randomised inputs against stated invariants (Merkle inclusion and
+non-forgery, fee-ladder escalation, pagination totality, wrapper width, and the
+secret scanner itself) and prints the seed that reproduces any counterexample.
+The seed is fixed by default so a CI failure is reproducible locally. See
+[`docs/INFORMAL_VERIFICATION.md`](INFORMAL_VERIFICATION.md) and
+[`docs/THREAT_MODEL.md`](THREAT_MODEL.md).
+
+---
+
+## 7. Runbook Checklist
 
 - [ ] CI green on PR (`fmt`, `clippy`, `build`, `test`, `wasm` reproducibility diff = 0)
 - [ ] `./scripts/reproducible-build.sh` → `wasm-checksums.txt` committed or attached to Release
@@ -247,6 +324,9 @@ cargo test -p stellar-toolkit state_inspector
 - [ ] Codegen checks green: `cargo run -p stellar-toolkit -- codegen check`
 - [ ] Prometheus + Grafana up, `WasmHashMismatch` alert not firing
 - [ ] `logs/deployment-audit.log` appended on every deploy (audit trail)
+- [ ] `cargo run -p stellar-toolkit -- env validate` → no errors
+- [ ] `cargo run -p stellar-toolkit -- security secrets` → no findings
+- [ ] `cargo run -p stellar-toolkit -- verify invariants` → all invariants pass
 
 ---
 
@@ -254,4 +334,8 @@ cargo test -p stellar-toolkit state_inspector
 
 - ADR-0002: Soroban WASM compilation pipeline
 - `SECURITY.md` — disclosure & cold-storage guidance
+- `docs/KEY_MANAGEMENT.md` — key tiers, cold-storage signing, rotation runbook
+- `docs/THREAT_MODEL.md` — attack surface, mitigations, automated checks
+- `docs/INFORMAL_VERIFICATION.md` — the property harness and its invariants
+- `config/README.md` — environment config contract
 - `SPEC.md` §9 Watchtower + §13 Security

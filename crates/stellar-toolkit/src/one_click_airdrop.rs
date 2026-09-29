@@ -114,9 +114,6 @@ impl AirdropDistribution {
 pub struct OneClickAirdropClaimer;
 
 impl OneClickAirdropClaimer {
-    /// Checks eligibility of an address for a specific airdrop
-    pub fn check_eligibility(claimant_address: &str, _airdrop_id: &str) -> Result<ClaimStatus> {
-        if claimant_address.trim().is_empty() {
     /// Checks eligibility of a claim request against a published distribution.
     ///
     /// A request is [`ClaimStatus::Eligible`] only when all of the following
