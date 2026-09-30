@@ -3,7 +3,7 @@
 Implements issue [#256](https://github.com/Kevin737866/stellar-web3-toolkit/issues/256)
 (retry of #69) in `contracts/airdrop-merkle`.
 
-## Overview
+## Overview.
 
 Storing one on-chain entry per recipient makes a large airdrop prohibitively
 expensive. Instead the admin commits to a **Merkle root** off-chain and stores
