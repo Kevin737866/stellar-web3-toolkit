@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/contract-proptests",
     "crates/stellar-toolkit",
     "crates/stellar-did",
     "crates/payment-channel",
