@@ -1,6 +1,6 @@
 # Monitoring Dashboard — Testnet Contracts
 
-**Issue:** #121 Build monitoring dashboard for testnet contracts
+**Issue:** #121 Build monitoring dashboard for testnet contracts.
 
 ## Overview
 
