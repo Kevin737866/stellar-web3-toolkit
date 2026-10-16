@@ -109,9 +109,7 @@ Each payment channel uses a 2-of-2 multi-signature setup:
 ### 3.2 Channel ID Generation
 
 Channel IDs are deterministically generated using:
-```
-ChannelID = SHA256(sorted(PubKey_A) || sorted(PubKey_B) || nonce)
-```
+
 
 ### 3.3 State Storage
 
