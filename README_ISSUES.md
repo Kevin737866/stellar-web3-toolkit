@@ -54,33 +54,7 @@ Copy and paste each issue content below into the GitHub web interface.
 
 **Body:**
 ```markdown
-## Description
-Build a complete deployment pipeline for Soroban smart contracts on Stellar. Automates the build, test, and deployment process for WASM contracts using Rust.
 
-## Complexity
-High (200 points)
-
-## Acceptance Criteria
-- [ ] Create CLI tool for contract compilation to WASM in Rust
-- [ ] Implement local testing environment with Soroban sandbox
-- [ ] Build deployment script for Stellar Testnet with transaction signing
-- [ ] Add contract state verification post-deployment
-- [ ] Implement error handling for failed deployments
-- [ ] Write comprehensive tests (unit + integration)
-- [ ] Document usage with examples
-
-## Technical Requirements
-- Rust/Soroban SDK
-- Stellar Testnet integration
-- WASM compilation pipeline
-- Environment-based configuration (dev/test/prod)
-
-## Resources
-- https://soroban.stellar.org/
-- https://developers.stellar.org/docs/smart-contracts
-```
-
----
 
 ## Issue 2: Build Stellar cross-asset atomic swap with HTLC
 
