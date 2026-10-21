@@ -147,6 +147,49 @@ pub fn split_commission(gross: i128, commission_bps: u32) -> (i128, i128) {
     (gross - commission, commission)
 }
 
+/// Detects whether adding the directed delegation edge `delegator -> operator`
+/// would create a cycle in `edges` (#209).
+///
+/// Covers direct self-delegation (`A -> A`), two-hop mutual delegation
+/// (`A -> B -> A`), and arbitrary multi-hop cycles (`A -> B -> C -> A`), even
+/// when a delegator splits stake across multiple operators.
+pub fn detect_delegation_loop(edges: &[(u32, u32)], delegator: u32, operator: u32) -> bool {
+    if delegator == operator {
+        return true;
+    }
+    const MAX_NODES: usize = 64;
+    let mut visited = [0u32; MAX_NODES];
+    let mut visited_len = 0usize;
+    let mut stack = [0u32; MAX_NODES];
+    let mut stack_len = 0usize;
+
+    visited[0] = operator;
+    visited_len += 1;
+    stack[0] = operator;
+    stack_len += 1;
+
+    while stack_len > 0 {
+        stack_len -= 1;
+        let current = stack[stack_len];
+        for &(from, to) in edges {
+            if from != current {
+                continue;
+            }
+            if to == delegator {
+                return true;
+            }
+            let already_seen = visited[..visited_len].iter().any(|&v| v == to);
+            if !already_seen && visited_len < MAX_NODES && stack_len < MAX_NODES {
+                visited[visited_len] = to;
+                visited_len += 1;
+                stack[stack_len] = to;
+                stack_len += 1;
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod math_tests {
     use super::*;
@@ -256,5 +299,19 @@ mod math_tests {
     #[should_panic(expected = "commission exceeds the maximum")]
     fn commission_above_the_cap_is_rejected() {
         let _ = split_commission(1_000, MAX_COMMISSION_BPS + 1);
+    }
+
+    #[test]
+    fn delegation_loop_detection_covers_self_two_hop_and_multi_hop() {
+        let edges = [(1, 2), (2, 3), (2, 4)];
+        // Direct self-delegation is always a loop.
+        assert!(detect_delegation_loop(&edges, 5, 5));
+        // 2-hop loop: 2 -> 1 when 1 -> 2 exists.
+        assert!(detect_delegation_loop(&edges, 2, 1));
+        // 3-hop loop: 3 -> 1 when 1 -> 2 -> 3 exists.
+        assert!(detect_delegation_loop(&edges, 3, 1));
+        // Branching acyclic edge: 4 -> 5 or 1 -> 4 is not a loop.
+        assert!(!detect_delegation_loop(&edges, 4, 5));
+        assert!(!detect_delegation_loop(&edges, 1, 4));
     }
 }
