@@ -19,6 +19,7 @@ pub mod merkle;
 pub mod migration_diff;
 pub mod monitoring_dashboard;
 pub mod one_click_airdrop;
+pub mod oracle_resilience;
 pub mod p2p_qr_payment;
 pub mod scaffolder;
 pub mod session_keys;
@@ -55,6 +56,7 @@ pub use key_hygiene::{
     ScanReport, SecretKind,
 };
 pub use one_click_airdrop::{AirdropClaimRequest, ClaimStatus, OneClickAirdropClaimer};
+pub use oracle_resilience::{assess_quorum_liveness, LivenessError, QuorumLiveness};
 pub use p2p_qr_payment::{P2PQRPaymentFlow, PaymentStatus, QRPaymentRequest};
 pub use scaffolder::{LintFinding, LintReport, LintSeverity, ScaffoldOptions, Scaffolder};
 pub use session_keys::{
