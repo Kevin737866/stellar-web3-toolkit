@@ -22,6 +22,7 @@ pub mod one_click_airdrop;
 pub mod p2p_qr_payment;
 pub mod scaffolder;
 pub mod session_keys;
+pub mod signal_sync;
 pub mod state_inspector;
 pub mod theme;
 pub mod timelock;
@@ -57,6 +58,7 @@ pub use session_keys::{
     AccountAbstractionManager, Guardian, RecoveryRequest, RecoveryVeto, SessionError, SessionKey,
     SessionPolicy, VetoGuardian,
 };
+pub use signal_sync::{Signal, SignalSnapshot, SyncError, SyncReport, SNAPSHOT_VERSION};
 pub use state_inspector::{Durability, StateEntry, StateInspector, StatePage, StateQuery};
 pub use timelock::{DelayKind, TimelockError, TimelockPolicy, MAX_PAUSE_DELAY, MIN_PAUSE_DELAY};
 pub use treasury_stream::{
