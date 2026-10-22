@@ -1,16 +1,17 @@
 use crate::asset::{Asset, AssetInfo, AssetRegistry};
 use crate::error::{AtomicSwapError, Result};
+use crate::idempotency::{IdempotencyKey, IdempotencyStore};
 use crate::monitor::{MonitoringConfig, SwapMonitor};
 use crate::preimage::PreimageManager;
 use crate::replay::{ReplayError, ReplayGuard, ReplayStats};
 use crate::swap::{AtomicSwap, SwapTemplate};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::info;
 use uuid::Uuid;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SwapRequest {
     pub participant: String,
     pub initiator_asset: Asset,
@@ -28,7 +29,7 @@ pub struct SwapRequest {
     pub metadata: HashMap<String, String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SwapResponse {
     pub swap_id: String,
     pub hash_lock: String,
@@ -122,6 +123,8 @@ pub struct AtomicSwapCoordinator {
     replay: Arc<RwLock<ReplayGuard>>,
     /// Bounded retry budget per swap coordination flow (#215).
     retry_budget: Arc<RwLock<RetryBudget>>,
+    /// Caller-chosen keys bound to the initiation they first produced (#212).
+    idempotency: Arc<Mutex<IdempotencyStore>>,
     monitor: SwapMonitor,
     config: SwapConfig,
 }
@@ -142,6 +145,7 @@ impl AtomicSwapCoordinator {
             preimage_manager: Arc::new(RwLock::new(PreimageManager::new())),
             replay: Arc::new(RwLock::new(ReplayGuard::new())),
             retry_budget: Arc::new(RwLock::new(RetryBudget::new(max_retries))),
+            idempotency: Arc::new(Mutex::new(IdempotencyStore::new())),
             monitor,
             config,
         }
@@ -437,6 +441,57 @@ impl AtomicSwapCoordinator {
         }
 
         Ok(responses)
+    }
+
+    /// Initiate a swap at most once for `key` (#212).
+    ///
+    /// The first successful call with a given key behaves exactly like
+    /// [`AtomicSwapCoordinator::initiate_swap`] and records its response under
+    /// the key. Presenting the same key again with the same initiator and the
+    /// same request returns that recorded response — same swap id, same hash
+    /// lock, same preimage — without creating or funding a second swap.
+    ///
+    /// A key already bound to a different initiator or a different request is
+    /// refused with [`AtomicSwapError::IdempotencyConflict`]. A failed
+    /// initiation records nothing, so the caller may retry the same key with a
+    /// corrected request.
+    ///
+    /// The key lock is held across initiation, which serialises idempotent
+    /// initiation calls: two concurrent retries of the same key cannot both
+    /// miss the store and create a swap. Initiation is in-memory work (plus the
+    /// monitor fan-out), so the critical section stays bounded; non-idempotent
+    /// [`AtomicSwapCoordinator::initiate_swap`] calls are unaffected.
+    pub async fn initiate_swap_idempotent(
+        &self,
+        initiator: String,
+        request: SwapRequest,
+        key: IdempotencyKey,
+    ) -> Result<SwapResponse> {
+        let mut store = self.idempotency.lock().await;
+
+        if let Some(result) = store.lookup(&key, &initiator, &request) {
+            return result;
+        }
+
+        let response = self
+            .initiate_swap(initiator.clone(), request.clone())
+            .await?;
+        store.record(&key, initiator, request, response.clone());
+        Ok(response)
+    }
+
+    /// Number of idempotency keys bound to an initiation (#212).
+    pub async fn idempotency_entries(&self) -> usize {
+        self.idempotency.lock().await.len()
+    }
+
+    /// Forget a key, returning whether it was bound (#212).
+    ///
+    /// Only safe once the caller has independently established that the
+    /// original swap will never be used: after this, the same key initiates a
+    /// new swap.
+    pub async fn forget_idempotency_key(&self, key: &IdempotencyKey) -> bool {
+        self.idempotency.lock().await.forget(key)
     }
 
     /// Get swap information
@@ -827,6 +882,177 @@ mod tests {
                 missing: "origin chain"
             })
         ));
+    }
+
+    fn idempotency_key(value: &str) -> IdempotencyKey {
+        IdempotencyKey::new(value).expect("test key should be valid")
+    }
+
+    #[tokio::test]
+    async fn retrying_an_idempotent_initiation_replays_the_first_swap() {
+        let coordinator = coordinator_with_usdc().await;
+        let request = request_with_origin(None);
+
+        let first = coordinator
+            .initiate_swap_idempotent(
+                "initiator".to_string(),
+                request.clone(),
+                idempotency_key("retry-1"),
+            )
+            .await
+            .expect("the first attempt must succeed");
+        let second = coordinator
+            .initiate_swap_idempotent("initiator".to_string(), request, idempotency_key("retry-1"))
+            .await
+            .expect("a retry with the same key and request must succeed");
+
+        assert_eq!(first, second, "the retry must replay the original response");
+        assert_eq!(
+            coordinator
+                .list_swaps_for_participant("initiator".to_string())
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "a retry must not fund a second swap"
+        );
+        assert_eq!(coordinator.idempotency_entries().await, 1);
+    }
+
+    #[tokio::test]
+    async fn the_same_key_with_a_different_request_conflicts_and_creates_nothing() {
+        let coordinator = coordinator_with_usdc().await;
+        let key = idempotency_key("retry-1");
+        let original = request_with_origin(None);
+
+        let first = coordinator
+            .initiate_swap_idempotent("initiator".to_string(), original.clone(), key.clone())
+            .await
+            .expect("the first attempt must succeed");
+
+        let mut different = original.clone();
+        different.initiator_amount = 2_000;
+        let error = coordinator
+            .initiate_swap_idempotent("initiator".to_string(), different, key.clone())
+            .await
+            .expect_err("reusing a key for a different intent must be refused");
+        assert!(matches!(error, AtomicSwapError::IdempotencyConflict { .. }));
+
+        // The conflict did not create a swap, and the original is still
+        // reachable through its key.
+        assert_eq!(
+            coordinator
+                .list_swaps_for_participant("initiator".to_string())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let replayed = coordinator
+            .initiate_swap_idempotent("initiator".to_string(), original, key)
+            .await
+            .unwrap();
+        assert_eq!(replayed.swap_id, first.swap_id);
+    }
+
+    #[tokio::test]
+    async fn a_failed_initiation_does_not_consume_the_key() {
+        let coordinator = coordinator_with_usdc().await;
+        let key = idempotency_key("retry-1");
+
+        let mut invalid = request_with_origin(None);
+        invalid.timeout_hours = 0;
+        let error = coordinator
+            .initiate_swap_idempotent("initiator".to_string(), invalid, key.clone())
+            .await
+            .expect_err("a zero timeout is rejected");
+        assert!(matches!(
+            error,
+            AtomicSwapError::InvalidTimeout { timeout_hours: 0 }
+        ));
+        assert_eq!(
+            coordinator.idempotency_entries().await,
+            0,
+            "a rejected initiation must not bind its key"
+        );
+
+        // Fixing the request and retrying with the same key must now be
+        // allowed: the failed attempt created nothing to replay.
+        let accepted = coordinator
+            .initiate_swap_idempotent("initiator".to_string(), request_with_origin(None), key)
+            .await
+            .expect("a corrected request may reuse the key");
+        assert!(!accepted.swap_id.is_empty());
+        assert_eq!(coordinator.idempotency_entries().await, 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_retries_of_the_same_key_create_one_swap() {
+        let coordinator = coordinator_with_usdc().await;
+
+        let (first, second) = tokio::join!(
+            coordinator.initiate_swap_idempotent(
+                "initiator".to_string(),
+                request_with_origin(None),
+                idempotency_key("retry-1"),
+            ),
+            coordinator.initiate_swap_idempotent(
+                "initiator".to_string(),
+                request_with_origin(None),
+                idempotency_key("retry-1"),
+            ),
+        );
+        let (first, second) = (
+            first.expect("the first concurrent attempt must succeed"),
+            second.expect("the second concurrent attempt must replay it"),
+        );
+        assert_eq!(first, second);
+        assert_eq!(
+            coordinator
+                .list_swaps_for_participant("initiator".to_string())
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "only one of the concurrent attempts may create a swap"
+        );
+    }
+
+    #[tokio::test]
+    async fn forgetting_a_key_allows_a_new_initiation() {
+        let coordinator = coordinator_with_usdc().await;
+        let key = idempotency_key("retry-1");
+
+        let first = coordinator
+            .initiate_swap_idempotent(
+                "initiator".to_string(),
+                request_with_origin(None),
+                key.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(coordinator.forget_idempotency_key(&key).await);
+
+        let second = coordinator
+            .initiate_swap_idempotent(
+                "initiator".to_string(),
+                request_with_origin(None),
+                key.clone(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            first.swap_id, second.swap_id,
+            "a forgotten key may initiate again"
+        );
+        assert!(
+            coordinator.forget_idempotency_key(&key).await,
+            "the second initiation bound the key again"
+        );
+        assert!(
+            !coordinator.forget_idempotency_key(&key).await,
+            "forgetting a key twice reports the second call as a no-op"
+        );
     }
 
     #[tokio::test]
