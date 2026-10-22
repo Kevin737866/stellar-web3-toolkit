@@ -4,6 +4,7 @@
 
 pub mod anomaly;
 pub mod api_reference_gen;
+pub mod bridge_oracle;
 pub mod cli;
 pub mod compliance;
 pub mod env_config;
@@ -35,6 +36,9 @@ pub use anomaly::{
     MetricVerdict, Series,
 };
 pub use api_reference_gen::{ApiFunctionDoc, ApiReferenceGenerator};
+pub use bridge_oracle::{
+    OracleConfirmation, OracleQuorumError, OracleSet, QuorumReport, QuorumVerdict, MAX_ORACLES,
+};
 pub use cli::{App, ToolkitCommand};
 pub use compliance::{
     ComplianceCategory, ComplianceChecklist, ComplianceItem, VerificationHarness,
