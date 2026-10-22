@@ -168,6 +168,7 @@ See [GitHub Issues](https://github.com/Kevin737866/stellar-web3-toolkit/issues) 
 - [Environment Configs](config/README.md) - dev/test/prod config contract and validation rules (Issue #118)
 - [Anomaly Alerting](docs/ANOMALY_ALERTING.md) - Baseline-relative alerts for drains, bursts and replays, with the triage runbook (Issue #124)
 - [Monitoring Dashboard](docs/MONITORING_DASHBOARD.md) - Testnet health, Prometheus/Grafana & alerts
+- [Conviction Voting Curve](docs/CONVICTION_VOTING.md) - Integer-only quadratic vote weight, decay and its limits (Issue #205)
 - [Cross-Chain Replay Protection](docs/CROSS_CHAIN_REPLAY.md) - Chain-bound intent digests, per-domain nonce windows and the replay runbook (Issue #238)
 - [Soroban Documentation](https://soroban.stellar.org/)
 - [Stellar Developers](https://developers.stellar.org/)
