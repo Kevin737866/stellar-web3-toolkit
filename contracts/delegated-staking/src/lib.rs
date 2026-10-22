@@ -244,6 +244,34 @@ fn list_contains(list: &Vec<Address>, needle: &Address) -> bool {
     false
 }
 
+/// Checks whether delegating from `delegator` to `operator` would form a direct
+/// or transitive delegation loop (`delegator -> operator -> ... -> delegator`).
+fn has_delegation_loop(env: &Env, delegator: &Address, operator: &Address) -> bool {
+    if delegator == operator {
+        return true;
+    }
+    let mut visited: Vec<Address> = Vec::new(env);
+    let mut frontier: Vec<Address> = Vec::new(env);
+    visited.push_back(operator.clone());
+    frontier.push_back(operator.clone());
+
+    while !frontier.is_empty() {
+        let current = frontier.pop_back_unchecked();
+        let next_ops = delegator_operator_list(env, &current);
+        for i in 0..next_ops.len() {
+            let next_op = next_ops.get_unchecked(i);
+            if next_op == *delegator {
+                return true;
+            }
+            if !list_contains(&visited, &next_op) {
+                visited.push_back(next_op.clone());
+                frontier.push_back(next_op);
+            }
+        }
+    }
+    false
+}
+
 fn track_delegator_operator(env: &Env, delegator: &Address, operator: &Address) {
     let list = delegator_operator_list(env, delegator);
     if list_contains(&list, operator) {
@@ -498,6 +526,12 @@ impl DelegatedStaking {
         delegator_operator_list(&env, &delegator)
     }
 
+    /// True when delegating from `delegator` to `operator` would create a
+    /// direct or transitive delegation loop (#209).
+    pub fn would_create_loop(env: Env, delegator: Address, operator: Address) -> bool {
+        has_delegation_loop(&env, &delegator, &operator)
+    }
+
     /// The stored position for `(delegator, operator)`.
     pub fn position(env: Env, delegator: Address, operator: Address) -> Position {
         let cfg = config(&env);
@@ -651,6 +685,10 @@ impl DelegatedStaking {
     pub fn delegate(env: Env, delegator: Address, operator: Address, amount: i128) -> i128 {
         delegator.require_auth();
         assert!(amount > 0, "amount must be positive");
+        assert!(
+            !has_delegation_loop(&env, &delegator, &operator),
+            "delegation loop detected"
+        );
 
         let mut cfg = config(&env);
         assert!(!cfg.paused, "contract is paused");
@@ -1207,7 +1245,7 @@ mod test {
         // Exits stay open.
         assert_eq!(f.client.claim(&f.alice, &f.operator, &0), 95 * ONE);
         f.client.undelegate(&f.alice, &f.operator, &(100 * ONE));
-        assert_eq!(f.balance(&f.alice), 95 * ONE + 100 * ONE);
+        assert_eq!(f.balance(&f.alice), 95 * ONE + 200 * ONE);
     }
 
     #[test]
@@ -1423,5 +1461,31 @@ mod test {
         ] {
             assert!(names.contains(&expected), "missing {expected:?}");
         }
+    }
+
+    #[test]
+    fn delegation_rejects_self_and_transitive_loops() {
+        let f = Fixture::new();
+        f.mint(&f.operator, 100 * ONE);
+        f.mint(&f.other_operator, 100 * ONE);
+
+        // Self-delegation is rejected immediately.
+        assert!(f.client.would_create_loop(&f.operator, &f.operator));
+        assert!(f
+            .client
+            .try_delegate(&f.operator, &f.operator, &(10 * ONE))
+            .is_err());
+
+        // `operator` delegates to `other_operator` (acyclic).
+        assert!(!f.client.would_create_loop(&f.operator, &f.other_operator));
+        f.client
+            .delegate(&f.operator, &f.other_operator, &(10 * ONE));
+
+        // Now `other_operator -> operator` would close a 2-hop cycle and must fail.
+        assert!(f.client.would_create_loop(&f.other_operator, &f.operator));
+        assert!(f
+            .client
+            .try_delegate(&f.other_operator, &f.operator, &(10 * ONE))
+            .is_err());
     }
 }

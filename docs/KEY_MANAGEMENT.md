@@ -112,6 +112,45 @@ from a non-manual trigger, and GitHub Environment protection requires an
 approver who is not the requester. Between them, no single person can deploy to
 mainnet alone.
 
+### The signer boundary in code (issue #201)
+
+The flow above is a protocol between two machines, and `stellar_toolkit::hsm` is
+its typed form. The online side builds a `SignRequest` — network, contract id,
+sha256 of the wasm, and a sequence number from the deploy log — and computes its
+digest:
+
+```rust
+use stellar_toolkit::hsm::{ColdSigner, SignRequest, StubHsm};
+
+let request = SignRequest::new("pubnet", contract_id, wasm_sha256, sequence);
+println!("{}", request.digest_hex()); // carried to the offline machine
+```
+
+The offline machine approves exactly that digest (`approve_digest` for a hash
+pasted in by an operator, or `approve` when the request itself was carried over),
+then unlocks and signs:
+
+```rust
+signer.approve_digest(digest);
+signer.unlock();
+let signature = signer.sign(&request)?; // 64 bytes, or an HsmError
+```
+
+Four rules are enforced by the signer rather than by the operator's discipline:
+
+| Rule | Failure it prevents |
+| --- | --- |
+| Only an approved digest signs | A compromised online host turning "sign this deployment" into "sign anything" |
+| An approval is spent by its signature | Replaying the reviewed request for a second signature |
+| Sequences must strictly increase | Re-signing an older request after the operator has moved on |
+| The secret has no accessor and no `Debug` rendering | Accidentally logging or serialising the deploy key |
+
+`StubHsm` is a **stub, not a hardware-backed signer**: it keeps the key in
+process memory, which is precisely what an HSM exists to avoid. Use it to
+exercise the review/replay protocol in tests today; implement the `ColdSigner`
+trait for the real PKCS#11 or cloud-KMS backend and callers do not change. The
+trait is the seam, so nothing in the deploy path needs to know which one it has.
+
 ### Multisig
 
 For a production account, `require_multisig = true` means the deployer account
