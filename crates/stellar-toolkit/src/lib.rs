@@ -22,6 +22,7 @@ pub mod scaffolder;
 pub mod session_keys;
 pub mod state_inspector;
 pub mod theme;
+pub mod timelock;
 pub mod treasury_stream;
 pub mod ts_codegen;
 pub mod wallet;
@@ -50,6 +51,7 @@ pub use session_keys::{
     SessionPolicy, VetoGuardian,
 };
 pub use state_inspector::{Durability, StateEntry, StateInspector, StatePage, StateQuery};
+pub use timelock::{DelayKind, TimelockError, TimelockPolicy, MAX_PAUSE_DELAY, MIN_PAUSE_DELAY};
 pub use treasury_stream::{
     StreamCancellation, StreamRelease, StreamStatus, Treasury, TreasuryStream,
 };

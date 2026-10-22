@@ -75,6 +75,41 @@ Since the guardian set is capped at `MAX_GUARDIANS` (10) and duplicates are
 rejected at `initialize`, the set stays small enough to name, and a guardian
 cannot be counted twice by `remove_guardian`.
 
+### Checking a delay policy before deploying (issue #208)
+
+`initialize` enforces these bounds, so a bad pair is caught on-chain — but only
+when the deployment transaction runs. The deployer, the release config and the
+runbook all need the same answer *before* that point, which is what
+`stellar_toolkit::timelock` provides:
+
+```rust
+use stellar_toolkit::timelock::{DelayKind, TimelockPolicy};
+
+let policy = TimelockPolicy::new(pause_delay, unpause_delay)?; // same rules as initialize
+let effective = policy.effective_ledger(requested_ledger, DelayKind::Pause);
+
+assert!(!policy.is_effective(requested_ledger, DelayKind::Pause, requested_ledger));
+assert!(policy.is_effective(requested_ledger, DelayKind::Pause, effective));
+```
+
+Construction is validation: a `TimelockPolicy` value always satisfies
+`MIN_PAUSE_DELAY <= pause <= resume <= MAX_PAUSE_DELAY`, so a caller cannot
+forget the check. `effective_ledger` saturates instead of wrapping — near the
+top of the ledger range a request must become never-actionable, not
+immediately-actionable.
+
+The constants are duplicated because the contract is `no_std` and the tooling
+crate does not link it. Both sides pin them in tests (`the_constants_match_the_bridge_contract`
+and the install-validation tests), so a change on one side fails the other.
+
+`verify invariants` — the CI gate in `automated-checks` — runs two checks over
+sampled delay pairs and request ledgers:
+
+| Check | What it proves |
+| --- | --- |
+| `timelock::pause_never_lands_in_its_request_ledger` | Every accepted policy pauses and resumes strictly after the request ledger, one ledger early is still refused, the effective ledger is actionable, and the resume is never faster than the pause |
+| `timelock::resume_is_never_faster_than_pause` | `TimelockPolicy::new` accepts exactly the pairs `initialize` accepts — no missing bound, no extra one |
+
 ## Using the gate from a bridge
 
 ```rust
