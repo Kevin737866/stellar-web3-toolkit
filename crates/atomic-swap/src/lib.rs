@@ -7,7 +7,10 @@ pub mod replay;
 pub mod swap;
 
 pub use asset::{Asset, AssetInfo};
-pub use coordinator::{AtomicSwapCoordinator, SwapConfig, SwapRequest, SwapResponse};
+pub use coordinator::{
+    AtomicSwapCoordinator, RetryBudget, SwapConfig, SwapRequest, SwapResponse,
+    DEFAULT_MAX_COORDINATION_RETRIES,
+};
 pub use error::{AtomicSwapError, Result};
 pub use monitor::{MonitoringConfig, SwapMonitor};
 pub use preimage::{Preimage, PreimageManager};

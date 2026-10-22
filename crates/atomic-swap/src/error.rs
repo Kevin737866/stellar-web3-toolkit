@@ -60,4 +60,15 @@ pub enum AtomicSwapError {
     /// mismatch without parsing the message.
     #[error(transparent)]
     Replay(#[from] crate::replay::ReplayError),
+
+    /// Bounded coordination retry budget exhausted for a swap operation (#215).
+    #[error(
+        "Retry budget exhausted for {operation} on swap {swap_id}: {attempts}/{max_retries} attempts used"
+    )]
+    RetryBudgetExhausted {
+        swap_id: String,
+        operation: String,
+        attempts: u32,
+        max_retries: u32,
+    },
 }

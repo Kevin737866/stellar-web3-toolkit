@@ -50,7 +50,10 @@ pub use gas_simulator::{FeeBump, FeeEstimate, FeeSchedule, GasSimulator, Transac
 pub use help_text::{help_width, render_command_help, wrap, HelpEntry};
 pub use hsm::{ColdSigner, HsmError, SignRequest, StubHsm};
 pub use invariants::{run_suite, InvariantReport, Prng, SuiteReport};
-pub use key_hygiene::{scan_paths, scan_text, Finding as SecretFinding, ScanReport, SecretKind};
+pub use key_hygiene::{
+    scan_paths, scan_text, Finding as SecretFinding, SarifLog, SarifResult, SarifRule, SarifRun,
+    ScanReport, SecretKind,
+};
 pub use one_click_airdrop::{AirdropClaimRequest, ClaimStatus, OneClickAirdropClaimer};
 pub use p2p_qr_payment::{P2PQRPaymentFlow, PaymentStatus, QRPaymentRequest};
 pub use scaffolder::{LintFinding, LintReport, LintSeverity, ScaffoldOptions, Scaffolder};

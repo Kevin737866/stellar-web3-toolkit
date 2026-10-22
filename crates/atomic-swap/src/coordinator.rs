@@ -37,6 +37,9 @@ pub struct SwapResponse {
     pub contract_address: Option<String>,
 }
 
+/// Default maximum number of coordination retries allowed per swap (#215).
+pub const DEFAULT_MAX_COORDINATION_RETRIES: u32 = 3;
+
 #[derive(Debug, Clone)]
 pub struct SwapConfig {
     pub default_timeout_hours: u32,
@@ -60,6 +63,56 @@ impl Default for SwapConfig {
     }
 }
 
+/// Bounded retry budget tracker for swap coordination operations (#215).
+#[derive(Debug, Clone)]
+pub struct RetryBudget {
+    max_retries: u32,
+    attempts_by_swap: HashMap<String, u32>,
+}
+
+impl RetryBudget {
+    pub fn new(max_retries: u32) -> Self {
+        Self {
+            max_retries,
+            attempts_by_swap: HashMap::new(),
+        }
+    }
+
+    pub fn max_retries(&self) -> u32 {
+        self.max_retries
+    }
+
+    pub fn attempts(&self, swap_id: &str) -> u32 {
+        self.attempts_by_swap.get(swap_id).copied().unwrap_or(0)
+    }
+
+    pub fn remaining(&self, swap_id: &str) -> u32 {
+        self.max_retries.saturating_sub(self.attempts(swap_id))
+    }
+
+    /// Consume one retry attempt for `(swap_id, operation)`, returning the
+    /// 1-based attempt number or [`AtomicSwapError::RetryBudgetExhausted`] once
+    /// the budget is depleted.
+    pub fn try_consume(&mut self, swap_id: &str, operation: &str) -> Result<u32> {
+        let used = self.attempts(swap_id);
+        if used >= self.max_retries {
+            return Err(AtomicSwapError::RetryBudgetExhausted {
+                swap_id: swap_id.to_string(),
+                operation: operation.to_string(),
+                attempts: used,
+                max_retries: self.max_retries,
+            });
+        }
+        let next = used + 1;
+        self.attempts_by_swap.insert(swap_id.to_string(), next);
+        Ok(next)
+    }
+
+    pub fn reset(&mut self, swap_id: &str) {
+        self.attempts_by_swap.remove(swap_id);
+    }
+}
+
 pub struct AtomicSwapCoordinator {
     swaps: Arc<RwLock<HashMap<String, AtomicSwap>>>,
     templates: Arc<RwLock<HashMap<String, SwapTemplate>>>,
@@ -67,12 +120,18 @@ pub struct AtomicSwapCoordinator {
     preimage_manager: Arc<RwLock<PreimageManager>>,
     /// Consumes cross-chain `(chain, sender, nonce)` triples once each (#238).
     replay: Arc<RwLock<ReplayGuard>>,
+    /// Bounded retry budget per swap coordination flow (#215).
+    retry_budget: Arc<RwLock<RetryBudget>>,
     monitor: SwapMonitor,
     config: SwapConfig,
 }
 
 impl AtomicSwapCoordinator {
     pub fn new(config: SwapConfig) -> Self {
+        Self::with_retry_budget(config, DEFAULT_MAX_COORDINATION_RETRIES)
+    }
+
+    pub fn with_retry_budget(config: SwapConfig, max_retries: u32) -> Self {
         let monitor_config = MonitoringConfig::default();
         let monitor = SwapMonitor::new(monitor_config);
 
@@ -82,6 +141,7 @@ impl AtomicSwapCoordinator {
             asset_registry: Arc::new(RwLock::new(AssetRegistry::new())),
             preimage_manager: Arc::new(RwLock::new(PreimageManager::new())),
             replay: Arc::new(RwLock::new(ReplayGuard::new())),
+            retry_budget: Arc::new(RwLock::new(RetryBudget::new(max_retries))),
             monitor,
             config,
         }
@@ -412,6 +472,24 @@ impl AtomicSwapCoordinator {
     /// True when this `(chain, sender, nonce)` triple has been consumed.
     pub async fn nonce_is_recorded(&self, chain: &str, sender: &str, nonce: u64) -> bool {
         self.replay.read().await.is_recorded(chain, sender, nonce)
+    }
+
+    /// Consume one retry from the swap's coordination retry budget (#215).
+    pub async fn record_coordination_retry(&self, swap_id: &str, operation: &str) -> Result<u32> {
+        self.retry_budget
+            .write()
+            .await
+            .try_consume(swap_id, operation)
+    }
+
+    /// Remaining retry attempts available for `swap_id` (#215).
+    pub async fn remaining_retries(&self, swap_id: &str) -> u32 {
+        self.retry_budget.read().await.remaining(swap_id)
+    }
+
+    /// Clear recorded retry attempts for `swap_id` (#215).
+    pub async fn reset_retry_budget(&self, swap_id: &str) {
+        self.retry_budget.write().await.reset(swap_id);
     }
 
     /// Register a new asset
@@ -749,5 +827,45 @@ mod tests {
                 missing: "origin chain"
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn coordination_retry_budget_enforces_cap_and_resets() {
+        let coordinator = AtomicSwapCoordinator::with_retry_budget(SwapConfig::default(), 2);
+        let swap_id = "swap-budget-test";
+
+        assert_eq!(coordinator.remaining_retries(swap_id).await, 2);
+        assert_eq!(
+            coordinator
+                .record_coordination_retry(swap_id, "submit_htlc")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(coordinator.remaining_retries(swap_id).await, 1);
+        assert_eq!(
+            coordinator
+                .record_coordination_retry(swap_id, "submit_htlc")
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(coordinator.remaining_retries(swap_id).await, 0);
+
+        let err = coordinator
+            .record_coordination_retry(swap_id, "submit_htlc")
+            .await
+            .expect_err("3rd retry must exceed budget of 2");
+        assert!(matches!(
+            err,
+            AtomicSwapError::RetryBudgetExhausted {
+                attempts: 2,
+                max_retries: 2,
+                ..
+            }
+        ));
+
+        coordinator.reset_retry_budget(swap_id).await;
+        assert_eq!(coordinator.remaining_retries(swap_id).await, 2);
     }
 }

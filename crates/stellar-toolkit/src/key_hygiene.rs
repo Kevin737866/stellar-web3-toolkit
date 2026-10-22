@@ -139,6 +139,19 @@ impl ScanReport {
         serde_json::to_string_pretty(self).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
     }
 
+    /// Convert the scan report into a SARIF v2.1.0 log structure (#204).
+    ///
+    /// Secret values remain masked in every SARIF result message and property bag.
+    pub fn to_sarif(&self) -> SarifLog {
+        SarifLog::from_scan_report(self)
+    }
+
+    /// Serialize the scan report as a pretty-printed SARIF v2.1.0 JSON document (#204).
+    pub fn to_sarif_json(&self) -> String {
+        serde_json::to_string_pretty(&self.to_sarif())
+            .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+    }
+
     pub fn render(&self) -> String {
         let mut out = String::new();
         for finding in &self.findings {
@@ -165,6 +178,180 @@ impl ScanReport {
             out.push_str("no secret material found\n");
         }
         out
+    }
+}
+
+/// SARIF v2.1.0 schema URI.
+pub const SARIF_SCHEMA: &str = "https://json.schemastore.org/sarif-2.1.0.json";
+/// SARIF specification version.
+pub const SARIF_VERSION: &str = "2.1.0";
+
+/// Top-level SARIF v2.1.0 log (#204).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SarifLog {
+    #[serde(rename = "$schema")]
+    pub schema: String,
+    pub version: String,
+    pub runs: Vec<SarifRun>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SarifRun {
+    pub tool: SarifTool,
+    pub results: Vec<SarifResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SarifTool {
+    pub driver: SarifDriver,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SarifDriver {
+    pub name: String,
+    pub information_uri: String,
+    pub rules: Vec<SarifRule>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SarifRule {
+    pub id: String,
+    pub name: String,
+    pub short_description: SarifMessage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SarifResult {
+    pub rule_id: String,
+    pub level: String,
+    pub message: SarifMessage,
+    pub locations: Vec<SarifLocation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SarifMessage {
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SarifLocation {
+    pub physical_location: SarifPhysicalLocation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SarifPhysicalLocation {
+    pub artifact_location: SarifArtifactLocation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<SarifRegion>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SarifArtifactLocation {
+    pub uri: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SarifRegion {
+    pub start_line: usize,
+}
+
+impl SecretKind {
+    /// Stable SARIF rule identifier for this finding kind.
+    pub fn rule_id(&self) -> &'static str {
+        match self {
+            Self::StellarSecretKey => "KH001",
+            Self::RecoveryPhrase => "KH002",
+            Self::RecoveryPhraseCandidate => "KH003",
+            Self::SecretAssignment => "KH004",
+            Self::EnvFile => "KH005",
+        }
+    }
+}
+
+impl SarifLog {
+    pub fn from_scan_report(report: &ScanReport) -> Self {
+        let rules = [
+            (
+                SecretKind::StellarSecretKey,
+                "StellarSecretKey",
+                "Hardcoded Stellar Ed25519 secret key (S...)",
+            ),
+            (
+                SecretKind::RecoveryPhrase,
+                "RecoveryPhrase",
+                "Checksum-valid BIP-39 recovery phrase",
+            ),
+            (
+                SecretKind::RecoveryPhraseCandidate,
+                "RecoveryPhraseCandidate",
+                "Phrase-shaped multi-word string",
+            ),
+            (
+                SecretKind::SecretAssignment,
+                "SecretAssignment",
+                "Literal assignment to a secret or private key field",
+            ),
+            (
+                SecretKind::EnvFile,
+                "EnvFile",
+                "Committed .env file containing environment secrets",
+            ),
+        ]
+        .into_iter()
+        .map(|(kind, name, desc)| SarifRule {
+            id: kind.rule_id().to_string(),
+            name: name.to_string(),
+            short_description: SarifMessage {
+                text: desc.to_string(),
+            },
+        })
+        .collect();
+
+        let results = report
+            .findings
+            .iter()
+            .map(|finding| SarifResult {
+                rule_id: finding.kind.rule_id().to_string(),
+                level: if finding.is_error() {
+                    "error".to_string()
+                } else {
+                    "warning".to_string()
+                },
+                message: SarifMessage {
+                    text: format!("{} (masked: {})", finding.message, finding.masked),
+                },
+                locations: vec![SarifLocation {
+                    physical_location: SarifPhysicalLocation {
+                        artifact_location: SarifArtifactLocation {
+                            uri: finding.path.clone(),
+                        },
+                        region: finding.line.map(|start_line| SarifRegion { start_line }),
+                    },
+                }],
+            })
+            .collect();
+
+        Self {
+            schema: SARIF_SCHEMA.to_string(),
+            version: SARIF_VERSION.to_string(),
+            runs: vec![SarifRun {
+                tool: SarifTool {
+                    driver: SarifDriver {
+                        name: "stellar-toolkit-key-hygiene".to_string(),
+                        information_uri: "https://github.com/Kevin737866/stellar-web3-toolkit"
+                            .to_string(),
+                        rules,
+                    },
+                },
+                results,
+            }],
+        }
     }
 }
 
@@ -647,5 +834,43 @@ mod tests {
             "secret material found in the repository:\n{}",
             report.render()
         );
+    }
+
+    #[test]
+    fn sarif_report_formats_findings_and_never_leaks_secrets() {
+        let key = secret_fixture();
+        let phrase = phrase_shaped_candidate();
+        let findings = scan_text(
+            Path::new("src/leak.rs"),
+            &format!("let k = \"{key}\";\nlet p = \"{phrase}\";"),
+        );
+        let report = ScanReport {
+            roots: vec!["src".to_string()],
+            files_scanned: 1,
+            files_skipped: 0,
+            findings,
+        };
+
+        let sarif = report.to_sarif();
+        assert_eq!(sarif.version, SARIF_VERSION);
+        assert_eq!(sarif.runs.len(), 1);
+        assert_eq!(sarif.runs[0].results.len(), 2);
+        assert_eq!(sarif.runs[0].results[0].rule_id, "KH001");
+        assert_eq!(sarif.runs[0].results[0].level, "error");
+        assert_eq!(
+            sarif.runs[0].results[0].locations[0]
+                .physical_location
+                .region
+                .as_ref()
+                .unwrap()
+                .start_line,
+            1
+        );
+        assert_eq!(sarif.runs[0].results[1].rule_id, "KH003");
+        assert_eq!(sarif.runs[0].results[1].level, "warning");
+
+        let json = report.to_sarif_json();
+        assert!(json.contains("\"version\": \"2.1.0\""));
+        assert!(!json.contains(&key), "SARIF output must never contain raw secret");
     }
 }

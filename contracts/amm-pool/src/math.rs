@@ -12,28 +12,66 @@
 pub const FEE_NUM: i128 = 997;
 pub const FEE_DEN: i128 = 1000;
 
+/// Exact 128x128 -> 256-bit unsigned multiplication returning `(high, low)` (#216).
+///
+/// Used as an overflow fallback so constant-product ratios and invariant checks
+/// remain exact even when intermediate products exceed `i128::MAX`.
+pub fn mul_u128_wide(a: u128, b: u128) -> (u128, u128) {
+    let mask = u64::MAX as u128;
+    let a_lo = a & mask;
+    let a_hi = a >> 64;
+    let b_lo = b & mask;
+    let b_hi = b >> 64;
+
+    let p0 = a_lo * b_lo;
+    let p1 = a_lo * b_hi;
+    let p2 = a_hi * b_lo;
+    let p3 = a_hi * b_hi;
+
+    let mid = (p0 >> 64) + (p1 & mask) + (p2 & mask);
+    let lo = (p0 & mask) | (mid << 64);
+    let hi = p3 + (p1 >> 64) + (p2 >> 64) + (mid >> 64);
+    (hi, lo)
+}
+
+/// Checked constant-product output calculation (#216).
+///
+/// Returns `None` when any input is non-positive or when intermediate or
+/// denominator arithmetic overflows `i128`.
+pub fn checked_amount_out(amount_in: i128, reserve_in: i128, reserve_out: i128) -> Option<i128> {
+    if amount_in <= 0 || reserve_in <= 0 || reserve_out <= 0 {
+        return None;
+    }
+    let amount_in_with_fee = amount_in.checked_mul(FEE_NUM)?.checked_div(FEE_DEN)?;
+    let denominator = reserve_in.checked_add(amount_in_with_fee)?;
+    if denominator <= 0 {
+        return None;
+    }
+    let numerator = amount_in_with_fee.checked_mul(reserve_out)?;
+    numerator.checked_div(denominator)
+}
+
 pub fn amount_out(amount_in: i128, reserve_in: i128, reserve_out: i128) -> i128 {
     assert!(amount_in > 0, "amount_in");
     assert!(reserve_in > 0 && reserve_out > 0, "reserves");
-    let amount_in_with_fee = amount_in
-        .checked_mul(FEE_NUM)
-        .unwrap()
-        .checked_div(FEE_DEN)
-        .unwrap();
-    let numerator = amount_in_with_fee.checked_mul(reserve_out).unwrap();
-    let denominator = reserve_in.checked_add(amount_in_with_fee).unwrap();
-    assert!(denominator > 0, "denominator");
-    numerator.checked_div(denominator).unwrap()
+    checked_amount_out(amount_in, reserve_in, reserve_out).expect("amount_out overflow")
+}
+
+/// Checked proportional quote without fee (#216).
+///
+/// Returns `None` when any input is non-positive or when `amount_a * reserve_b`
+/// overflows `i128`.
+pub fn checked_quote(amount_a: i128, reserve_a: i128, reserve_b: i128) -> Option<i128> {
+    if amount_a <= 0 || reserve_a <= 0 || reserve_b <= 0 {
+        return None;
+    }
+    amount_a.checked_mul(reserve_b)?.checked_div(reserve_a)
 }
 
 /// For addition/removal: quote token B needed for exact A (no fee).
 pub fn quote(amount_a: i128, reserve_a: i128, reserve_b: i128) -> i128 {
     assert!(amount_a > 0 && reserve_a > 0 && reserve_b > 0, "quote");
-    amount_a
-        .checked_mul(reserve_b)
-        .unwrap()
-        .checked_div(reserve_a)
-        .unwrap()
+    checked_quote(amount_a, reserve_a, reserve_b).expect("quote overflow")
 }
 
 /// Floor of the square root of `n`.
@@ -191,6 +229,7 @@ pub fn count_distinct_voters(voters: &[u32], n: u32) -> u32 {
 }
 
 pub fn liquidity_amounts_first_deposit(amount_a: i128, amount_b: i128) -> i128 {
+    assert!(amount_a > 0 && amount_b > 0, "deposit amounts must be positive");
     let p = (amount_a as u128)
         .checked_mul(amount_b as u128)
         .expect("product overflow");
@@ -198,6 +237,10 @@ pub fn liquidity_amounts_first_deposit(amount_a: i128, amount_b: i128) -> i128 {
 }
 
 /// Uniswap V2–style K check after flash repayment (`balance*` are live token balances of the pool).
+///
+/// Uses checked pre-scaling plus exact 256-bit product comparison (#216) so
+/// large reserves cannot saturate both sides to `i128::MAX` and falsely pass an
+/// under-repaid flash loan.
 pub fn flash_k_ok(
     balance_a: i128,
     balance_b: i128,
@@ -206,13 +249,32 @@ pub fn flash_k_ok(
     amount_a_out: i128,
     amount_b_out: i128,
 ) -> bool {
-    let amount_a_in = if balance_a > reserve_a.saturating_sub(amount_a_out) {
-        balance_a.saturating_sub(reserve_a.saturating_sub(amount_a_out))
+    if balance_a <= 0
+        || balance_b <= 0
+        || reserve_a <= 0
+        || reserve_b <= 0
+        || amount_a_out < 0
+        || amount_b_out < 0
+    {
+        return false;
+    }
+
+    let post_out_a = match reserve_a.checked_sub(amount_a_out) {
+        Some(v) if v >= 0 => v,
+        _ => return false,
+    };
+    let post_out_b = match reserve_b.checked_sub(amount_b_out) {
+        Some(v) if v >= 0 => v,
+        _ => return false,
+    };
+
+    let amount_a_in = if balance_a > post_out_a {
+        balance_a - post_out_a
     } else {
         0
     };
-    let amount_b_in = if balance_b > reserve_b.saturating_sub(amount_b_out) {
-        balance_b.saturating_sub(reserve_b.saturating_sub(amount_b_out))
+    let amount_b_in = if balance_b > post_out_b {
+        balance_b - post_out_b
     } else {
         0
     };
@@ -221,21 +283,40 @@ pub fn flash_k_ok(
         return false;
     }
 
-    let balance_a_adj = balance_a
-        .saturating_mul(1000)
-        .saturating_sub(amount_a_in.saturating_mul(3));
-    let balance_b_adj = balance_b
-        .saturating_mul(1000)
-        .saturating_sub(amount_b_in.saturating_mul(3));
+    let Some(balance_a_scaled) = balance_a.checked_mul(FEE_DEN) else {
+        return false;
+    };
+    let Some(fee_a) = amount_a_in.checked_mul(3) else {
+        return false;
+    };
+    let Some(balance_a_adj) = balance_a_scaled.checked_sub(fee_a) else {
+        return false;
+    };
+
+    let Some(balance_b_scaled) = balance_b.checked_mul(FEE_DEN) else {
+        return false;
+    };
+    let Some(fee_b) = amount_b_in.checked_mul(3) else {
+        return false;
+    };
+    let Some(balance_b_adj) = balance_b_scaled.checked_sub(fee_b) else {
+        return false;
+    };
 
     if balance_a_adj <= 0 || balance_b_adj <= 0 {
         return false;
     }
 
-    let k_old = reserve_a
-        .saturating_mul(reserve_b)
-        .saturating_mul(1_000_000);
-    balance_a_adj.saturating_mul(balance_b_adj) >= k_old
+    let Some(reserve_a_scaled) = reserve_a.checked_mul(FEE_DEN) else {
+        return false;
+    };
+    let Some(reserve_b_scaled) = reserve_b.checked_mul(FEE_DEN) else {
+        return false;
+    };
+
+    let lhs = mul_u128_wide(balance_a_adj as u128, balance_b_adj as u128);
+    let rhs = mul_u128_wide(reserve_a_scaled as u128, reserve_b_scaled as u128);
+    lhs >= rhs
 }
 
 #[cfg(test)]
@@ -504,5 +585,54 @@ mod math_tests {
         assert_eq!(count_distinct_voters(&votes, 100), 98);
         assert!(quorum_status(60, 100, count_distinct_voters(&votes, 100)).is_met());
         assert!(!quorum_status(99, 100, count_distinct_voters(&votes, 100)).is_met());
+    }
+
+    #[test]
+    fn checked_amm_math_rejects_overflow_and_invalid_inputs() {
+        use super::{checked_amount_out, checked_quote, mul_u128_wide};
+
+        assert_eq!(checked_amount_out(0, 1_000, 1_000), None);
+        assert_eq!(checked_amount_out(100, 0, 1_000), None);
+        assert_eq!(checked_amount_out(i128::MAX, 1_000, 1_000), None);
+        assert_eq!(checked_amount_out(1_000, 10_000, i128::MAX), None);
+        assert!(checked_amount_out(1_000, 10_000, 10_000).is_some());
+
+        assert_eq!(checked_quote(0, 1_000, 1_000), None);
+        assert_eq!(checked_quote(i128::MAX, 1_000, 1_000), None);
+        assert_eq!(checked_quote(500, 1_000, 2_000), Some(1_000));
+
+        // 2^64 * 2^64 = 2^128 => hi = 1, lo = 0
+        assert_eq!(mul_u128_wide(1u128 << 64, 1u128 << 64), (1, 0));
+    }
+
+    #[test]
+    fn flash_k_ok_does_not_falsely_pass_via_saturation_on_large_reserves() {
+        // Large reserves where `reserve_a * reserve_b * 1_000_000` exceeds `i128::MAX`.
+        let reserve_a: i128 = 1_000_000_000_000_000_000_000; // 1e21
+        let reserve_b: i128 = 1_000_000_000_000_000_000_000; // 1e21
+        let amount_a_out: i128 = 1_000_000_000_000;
+        let amount_b_out: i128 = 0;
+
+        // Under-repaid flash loan on large reserves must be rejected, not saturated to true.
+        let underpaid_balance_a = reserve_a - 100;
+        assert!(!flash_k_ok(
+            underpaid_balance_a,
+            reserve_b + 1,
+            reserve_a,
+            reserve_b,
+            amount_a_out,
+            amount_b_out,
+        ));
+
+        // Properly repaid flash loan (with 0.3%+ fee) passes the 256-bit K check.
+        let repaid_balance_a = reserve_a + 4_000_000_000;
+        assert!(flash_k_ok(
+            repaid_balance_a,
+            reserve_b,
+            reserve_a,
+            reserve_b,
+            amount_a_out,
+            amount_b_out,
+        ));
     }
 }
