@@ -5,7 +5,7 @@
 pub mod anomaly;
 pub mod api_reference_gen;
 pub mod cli;
-pub mod conviction;
+pub mod compliance;
 pub mod env_config;
 pub mod error;
 pub mod example_gallery;
@@ -35,7 +35,10 @@ pub use anomaly::{
 };
 pub use api_reference_gen::{ApiFunctionDoc, ApiReferenceGenerator};
 pub use cli::{App, ToolkitCommand};
-pub use conviction::{conviction_weight, decayed_weight, isqrt, MAX_LOCK_LEDGERS, WEIGHT_SCALE};
+pub use compliance::{
+    ComplianceCategory, ComplianceChecklist, ComplianceItem, VerificationHarness,
+    VerificationHarnessReport, VerificationStep,
+};
 pub use env_config::{
     validate_directory, EnvConfig, EnvValidation, EnvValidationReport, Finding as EnvFinding,
     Severity as EnvSeverity, ENVIRONMENTS,

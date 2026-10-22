@@ -113,6 +113,31 @@ impl Preimage {
     pub fn data_hex(&self) -> String {
         hex::encode(&self.data)
     }
+
+    /// Overwrite the secret preimage bytes in place with zeros (#214).
+    ///
+    /// Uses volatile writes plus a sequentially consistent compiler fence so
+    /// dead-store elimination cannot elide the scrub before deallocation.
+    pub fn zeroize(&mut self) {
+        for byte in self.data.iter_mut() {
+            // SAFETY: `byte` is a valid, aligned mutable reference into `self.data`.
+            unsafe {
+                std::ptr::write_volatile(byte as *mut u8, 0u8);
+            }
+        }
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// True when all preimage secret bytes have been overwritten with zero.
+    pub fn is_zeroized(&self) -> bool {
+        self.data.iter().all(|&b| b == 0)
+    }
+}
+
+impl Drop for Preimage {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
 }
 
 #[derive(Debug)]
@@ -148,20 +173,24 @@ impl PreimageManager {
         }
     }
 
-    /// Remove a preimage from storage (for cleanup)
+    /// Remove a preimage from storage and explicitly zeroize its secret bytes (#214)
     pub fn remove_by_hash(&mut self, hash: &[u8]) -> bool {
         let index = self.generated_preimages.iter().position(|p| p.hash == hash);
 
         if let Some(index) = index {
-            self.generated_preimages.remove(index);
+            let mut removed = self.generated_preimages.remove(index);
+            removed.zeroize();
             true
         } else {
             false
         }
     }
 
-    /// Clear all stored preimages
+    /// Zeroize and clear all stored preimages (#214)
     pub fn clear(&mut self) {
+        for preimage in self.generated_preimages.iter_mut() {
+            preimage.zeroize();
+        }
         self.generated_preimages.clear();
     }
 
@@ -224,5 +253,32 @@ mod tests {
         let removed = manager.remove_by_hash(&preimage.hash);
         assert!(removed);
         assert_eq!(manager.count(), 0);
+    }
+
+    #[test]
+    fn test_preimage_explicit_zeroize_scrubs_secret_bytes() {
+        let mut preimage = Preimage::from_seed("super_secret_atomic_swap_preimage").unwrap();
+        let original_hash = preimage.hash.clone();
+        assert!(!preimage.is_zeroized());
+
+        preimage.zeroize();
+
+        assert!(preimage.is_zeroized());
+        assert!(preimage.data.iter().all(|&b| b == 0));
+        // Public commitment hash remains intact for audit reference.
+        assert_eq!(preimage.hash, original_hash);
+    }
+
+    #[test]
+    fn test_preimage_manager_clear_zeroizes_and_empties_store() {
+        let mut manager = PreimageManager::new();
+        let p1 = manager.generate(32).unwrap();
+        let p2 = manager.generate(32).unwrap();
+        assert_eq!(manager.count(), 2);
+
+        manager.clear();
+        assert_eq!(manager.count(), 0);
+        assert!(manager.get_by_hash(&p1.hash).is_none());
+        assert!(manager.get_by_hash(&p2.hash).is_none());
     }
 }
