@@ -228,8 +228,212 @@ pub fn count_distinct_voters(voters: &[u32], n: u32) -> u32 {
     }
 }
 
+/// Fixed-point scale for [`solve_quadratic_scaled`] roots: six decimal places.
+pub const ROOT_SCALE: i128 = 1_000_000;
+
+/// Most integer steps [`amount_in_for_price`] will walk after the closed-form
+/// estimate before giving up.
+///
+/// The closed form is off by at most `ROOT_SCALE / (2a)` scaled units, and `a`
+/// is at least `997 * target_num`, so the residue is far below one input unit
+/// for any realistic pool. A handful of steps is a correctness backstop, not
+/// the normal path.
+const MAX_PRICING_STEPS: u32 = 8;
+
+/// Real roots of `a*x^2 + b*x + c = 0`, in units of `1 / ROOT_SCALE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuadraticSolution {
+    /// Two distinct real roots, smaller first.
+    Two { smaller: i128, larger: i128 },
+    /// One repeated real root (the discriminant is zero).
+    Repeated { root: i128 },
+    /// No real roots (the discriminant is negative).
+    None,
+}
+
+/// Solve `a*x^2 + b*x + c = 0` and return the roots scaled by [`ROOT_SCALE`].
+///
+/// Returns `None` when `a == 0` (the equation is not quadratic) or when any
+/// intermediate `i128` operation overflows, so a wrapped coefficient can never
+/// surface as a plausible-looking root. The discriminant is computed exactly;
+/// the square root is floored by [`sqrt_u128`], and each root is then truncated
+/// toward zero by integer division.
+///
+/// # Precision
+///
+/// When the discriminant is a perfect square and both divisions are exact, the
+/// returned roots are exact to `1 / ROOT_SCALE`. Otherwise a returned root `r`
+/// satisfies
+///
+/// ```text
+/// |r / ROOT_SCALE - true_root| < 1 / (2 * |a|) + 1 / ROOT_SCALE
+/// ```
+///
+/// The first term is the floor on `sqrt(discriminant)` propagated through the
+/// `2a` denominator; the second is the truncation to the fixed-point grid. A
+/// caller that needs a guaranteed bound on one side (for example, "never swap
+/// less than needed") must verify the result against its own predicate rather
+/// than trusting the approximation — [`amount_in_for_price`] does exactly that.
+///
+/// Negative roots are truncated toward zero, so they round *up*; root ordering is
+/// restored after the sign-dependent division, which is why a negative `a` still
+/// returns `smaller <= larger`.
+pub fn solve_quadratic_scaled(a: i128, b: i128, c: i128) -> Option<QuadraticSolution> {
+    if a == 0 {
+        return None;
+    }
+
+    let b_squared = b.checked_mul(b)?;
+    let four_ac = a.checked_mul(c)?.checked_mul(4)?;
+    let discriminant = b_squared.checked_sub(four_ac)?;
+    if discriminant < 0 {
+        return Some(QuadraticSolution::None);
+    }
+
+    let neg_b = b.checked_neg()?;
+    let denominator = a.checked_mul(2)?;
+
+    if discriminant == 0 {
+        let root = neg_b.checked_mul(ROOT_SCALE)?.checked_div(denominator)?;
+        return Some(QuadraticSolution::Repeated { root });
+    }
+
+    // `discriminant` is non-negative, so the cast is lossless and the floor is
+    // the integer square root defined in this module.
+    let sqrt_discriminant = sqrt_u128(discriminant as u128) as i128;
+    let plus = neg_b
+        .checked_add(sqrt_discriminant)?
+        .checked_mul(ROOT_SCALE)?
+        .checked_div(denominator)?;
+    let minus = neg_b
+        .checked_sub(sqrt_discriminant)?
+        .checked_mul(ROOT_SCALE)?
+        .checked_div(denominator)?;
+
+    let (smaller, larger) = if plus <= minus {
+        (plus, minus)
+    } else {
+        (minus, plus)
+    };
+    Some(QuadraticSolution::Two { smaller, larger })
+}
+
+/// Price of `reserve_in` in units of `reserve_out` after adding `amount_in` to
+/// the input reserve, as the exact rational `(numerator, denominator)`.
+///
+/// The 0.3% fee is applied on the input, so
+///
+/// ```text
+/// price = 1000 * reserve_in * reserve_out
+///       / ( (reserve_in + amount_in) * (1000 * reserve_in + 997 * amount_in) )
+/// ```
+///
+/// which is exactly the pool's `amount_out` ratio without any rounding. Returns
+/// `None` when the products overflow `i128`; comparing two such rationals by
+/// cross-multiplication keeps the comparison exact, which matters at a price
+/// boundary where a one-unit error flips the branch.
+fn price_after_in(reserve_in: i128, reserve_out: i128, amount_in: i128) -> Option<(i128, i128)> {
+    if reserve_in <= 0 || reserve_out <= 0 || amount_in < 0 {
+        return None;
+    }
+    let numerator = 1000i128.checked_mul(reserve_in)?.checked_mul(reserve_out)?;
+    let left = reserve_in.checked_add(amount_in)?;
+    let right = 1000i128
+        .checked_mul(reserve_in)?
+        .checked_add(997i128.checked_mul(amount_in)?)?;
+    let denominator = left.checked_mul(right)?;
+    Some((numerator, denominator))
+}
+
+/// Smallest input that moves the pool's spot price to `target_num / target_den`
+/// or below.
+///
+/// The pool's price after an input of `dx` is
+///
+/// ```text
+/// p(dx) = 1000 * R_in * R_out / ((R_in + dx) * (1000 * R_in + 997 * dx))
+/// ```
+///
+/// which is strictly decreasing in `dx`. Requiring `p(dx) = T` (with
+/// `T = target_num / target_den`) and clearing the denominator gives
+///
+/// ```text
+/// 997*T * dx^2 + 1997*R_in*T * dx + (1000*R_in^2*T - 1000*R_in*R_out) = 0
+/// ```
+///
+/// so the answer is the positive root of a quadratic with a **negative**
+/// constant term (which holds precisely when the target is below the current
+/// spot), solved with [`solve_quadratic_scaled`]. The closed-form estimate is
+/// then checked against `p` itself and stepped up until the target is actually
+/// met, so the returned `dx` is always the first integer input that meets it —
+/// rounding in the square root cannot return a `dx` that overshoots the target
+/// and under-delivers on price.
+///
+/// Returns `Some(0)` when the target is at or above the current spot price (no
+/// input is needed), and `None` for non-positive reserves or target components,
+/// or when intermediate arithmetic overflows `i128`. No negative price is
+/// reachable: a swap can only push the price down.
+pub fn amount_in_for_price(
+    reserve_in: i128,
+    reserve_out: i128,
+    target_num: i128,
+    target_den: i128,
+) -> Option<i128> {
+    if reserve_in <= 0 || reserve_out <= 0 || target_num <= 0 || target_den <= 0 {
+        return None;
+    }
+
+    // Target at or above the spot price: the pool already satisfies it.
+    let target_at_or_above_spot =
+        target_num.checked_mul(reserve_in)? >= reserve_out.checked_mul(target_den)?;
+    if target_at_or_above_spot {
+        return Some(0);
+    }
+
+    // Coefficients of the quadratic in `dx`.
+    let a = 997i128.checked_mul(target_num)?;
+    let b = 1997i128.checked_mul(target_num)?.checked_mul(reserve_in)?;
+    let constant_at_spot = 1000i128
+        .checked_mul(target_num)?
+        .checked_mul(reserve_in)?
+        .checked_mul(reserve_in)?;
+    let constant_at_target = 1000i128
+        .checked_mul(reserve_in)?
+        .checked_mul(reserve_out)?
+        .checked_mul(target_den)?;
+    let c = constant_at_spot.checked_sub(constant_at_target)?;
+
+    let estimate = match solve_quadratic_scaled(a, b, c)? {
+        QuadraticSolution::Two { larger, .. } => larger,
+        QuadraticSolution::Repeated { root } => root,
+        // A target below the spot price makes the constant term negative, so
+        // the discriminant is positive and this arm is unreachable in exact
+        // arithmetic. Refuse rather than guess if it is ever reached.
+        QuadraticSolution::None => return None,
+    };
+    if estimate < 0 {
+        return None;
+    }
+
+    let mut amount_in = estimate / ROOT_SCALE;
+    for _ in 0..MAX_PRICING_STEPS {
+        let (num, den) = price_after_in(reserve_in, reserve_out, amount_in)?;
+        // price <= target  <=>  num * target_den <= target_num * den
+        let lhs = num.checked_mul(target_den)?;
+        let rhs = target_num.checked_mul(den)?;
+        if lhs <= rhs {
+            return Some(amount_in);
+        }
+        amount_in = amount_in.checked_add(1)?;
+    }
+    None
+}
+
 pub fn liquidity_amounts_first_deposit(amount_a: i128, amount_b: i128) -> i128 {
-    assert!(amount_a > 0 && amount_b > 0, "deposit amounts must be positive");
+    assert!(
+        amount_a > 0 && amount_b > 0,
+        "deposit amounts must be positive"
+    );
     let p = (amount_a as u128)
         .checked_mul(amount_b as u128)
         .expect("product overflow");
@@ -322,7 +526,10 @@ pub fn flash_k_ok(
 #[cfg(test)]
 mod math_tests {
     use super::flash_k_ok;
-    use super::{count_distinct_voters, quorum_status, sqrt_u128, QuorumStatus};
+    use super::{
+        amount_in_for_price, count_distinct_voters, price_after_in, quorum_status,
+        solve_quadratic_scaled, sqrt_u128, QuadraticSolution, QuorumStatus, ROOT_SCALE,
+    };
 
     /// Assert the *defining* property of a floor square root, `r^2 <= n` and
     /// `(r + 1)^2 > n`, without ever computing a square that overflows `u128`.
@@ -634,5 +841,203 @@ mod math_tests {
             amount_a_out,
             amount_b_out,
         ));
+    }
+
+    fn scaled(root: i128) -> i128 {
+        root.checked_mul(ROOT_SCALE).expect("test root scale")
+    }
+
+    #[test]
+    fn quadratic_perfect_squares_are_exact() {
+        // x^2 - 5x + 6 = 0 -> x = 2, 3
+        assert_eq!(
+            solve_quadratic_scaled(1, -5, 6),
+            Some(QuadraticSolution::Two {
+                smaller: scaled(2),
+                larger: scaled(3),
+            })
+        );
+        // (x - 1)^2 = 0 -> x = 1 (repeated)
+        assert_eq!(
+            solve_quadratic_scaled(1, -2, 1),
+            Some(QuadraticSolution::Repeated { root: scaled(1) })
+        );
+        // 2x^2 + 3x - 2 = 0 -> x = -2, 0.5
+        assert_eq!(
+            solve_quadratic_scaled(2, 3, -2),
+            Some(QuadraticSolution::Two {
+                smaller: scaled(-2),
+                larger: ROOT_SCALE / 2,
+            })
+        );
+    }
+
+    #[test]
+    fn quadratic_negative_roots_are_ordered_and_truncated_toward_zero() {
+        // x^2 + 3x + 2 = 0 -> x = -2, -1
+        assert_eq!(
+            solve_quadratic_scaled(1, 3, 2),
+            Some(QuadraticSolution::Two {
+                smaller: scaled(-2),
+                larger: scaled(-1),
+            })
+        );
+    }
+
+    #[test]
+    fn quadratic_handles_a_negative_leading_coefficient() {
+        // -x^2 + 5x - 6 = 0 is the same parabola mirrored: x = 2, 3.
+        assert_eq!(
+            solve_quadratic_scaled(-1, 5, -6),
+            Some(QuadraticSolution::Two {
+                smaller: scaled(2),
+                larger: scaled(3),
+            })
+        );
+    }
+
+    #[test]
+    fn quadratic_reports_no_real_roots() {
+        // x^2 + 1 = 0
+        assert_eq!(
+            solve_quadratic_scaled(1, 0, 1),
+            Some(QuadraticSolution::None)
+        );
+    }
+
+    #[test]
+    fn quadratic_irrational_roots_stay_within_the_documented_bound() {
+        // x^2 - 2x - 1 = 0 -> x = 1 +/- sqrt(2) = -0.414213..., 2.414213...
+        //
+        // sqrt(8) is not a perfect square, so the floor in sqrt_u128 moves each
+        // root by less than 1 / (2|a|) = 0.5. The fixed-point values below are
+        // the exact truncations of the true roots at six decimal places, and
+        // the assertion pins the bound from the function's documentation.
+        let solution = solve_quadratic_scaled(1, -2, -1).expect("representable");
+        assert_eq!(
+            solution,
+            QuadraticSolution::Two {
+                smaller: 0,
+                larger: scaled(2),
+            }
+        );
+
+        let bound = ROOT_SCALE / 2 + 1;
+        let (smaller, larger) = match solution {
+            QuadraticSolution::Two { smaller, larger } => (smaller, larger),
+            other => panic!("expected two roots, got {other:?}"),
+        };
+        // True roots in fixed point: -414_213.56... and 2_414_213.56...
+        assert!((smaller - (-414_214)).abs() <= bound);
+        assert!((larger - 2_414_214).abs() <= bound);
+    }
+
+    #[test]
+    fn quadratic_rejects_linear_and_overflowing_inputs() {
+        // No quadratic term: the formula would divide by zero.
+        assert_eq!(solve_quadratic_scaled(0, 2, 1), None);
+        // b^2 overflows i128.
+        assert_eq!(
+            solve_quadratic_scaled(i128::MAX, i128::MAX, i128::MAX),
+            None
+        );
+        // 4ac overflows i128.
+        assert_eq!(solve_quadratic_scaled(1, 0, i128::MAX), None);
+    }
+
+    /// Assert that `amount_in` meets the target and that one unit less does
+    /// not, which is what makes it the *smallest* input that reaches it.
+    fn assert_smallest_input_meeting_target(
+        reserve_in: i128,
+        reserve_out: i128,
+        target_num: i128,
+        target_den: i128,
+        amount_in: i128,
+    ) {
+        let at_or_below = |amount: i128| {
+            let (num, den) = price_after_in(reserve_in, reserve_out, amount)
+                .expect("test price must be representable");
+            num.checked_mul(target_den).expect("cross product")
+                <= target_num.checked_mul(den).expect("cross product")
+        };
+
+        assert!(
+            at_or_below(amount_in),
+            "price after {amount_in} is still above the target"
+        );
+        if amount_in > 0 {
+            assert!(
+                !at_or_below(amount_in - 1),
+                "{amount_in} is not the smallest input that reaches the target"
+            );
+        }
+    }
+
+    #[test]
+    fn price_targeting_returns_the_first_input_that_meets_the_target() {
+        // Reserves price XLM at 4 USDC; push it down to 3.
+        let amount_in = amount_in_for_price(1_000_000, 4_000_000, 3, 1)
+            .expect("the target is below the spot price");
+        assert!(
+            (150_000..160_000).contains(&amount_in),
+            "expected roughly 155k units in, got {amount_in}"
+        );
+        assert_smallest_input_meeting_target(1_000_000, 4_000_000, 3, 1, amount_in);
+    }
+
+    #[test]
+    fn price_targeting_needs_no_input_at_or_above_the_spot_price() {
+        // Current price is 4/1.
+        assert_eq!(amount_in_for_price(1_000_000, 4_000_000, 4, 1), Some(0));
+        assert_eq!(amount_in_for_price(1_000_000, 4_000_000, 5, 1), Some(0));
+        // The same spot price written as an unreduced fraction.
+        assert_eq!(amount_in_for_price(1_000_000, 4_000_000, 8, 2), Some(0));
+    }
+
+    #[test]
+    fn price_targeting_is_minimal_across_pool_shapes() {
+        let pools = [
+            (1_000, 1_000),
+            (1_000_000, 4_000_000),
+            (7, 13),
+            (123_456, 987_654),
+        ];
+        let targets = [(1, 2), (3, 4), (1, 10), (9, 10)];
+
+        for (reserve_in, reserve_out) in pools {
+            for (target_num, target_den) in targets {
+                // Every listed target is below every listed spot price, so an
+                // input must be found.
+                let amount_in = amount_in_for_price(
+                    reserve_in,
+                    reserve_out,
+                    target_num,
+                    target_den,
+                )
+                .unwrap_or_else(|| {
+                    panic!("no input for {reserve_in}/{reserve_out} -> {target_num}/{target_den}")
+                });
+                assert!(amount_in > 0, "a lower price needs a positive input");
+                assert_smallest_input_meeting_target(
+                    reserve_in,
+                    reserve_out,
+                    target_num,
+                    target_den,
+                    amount_in,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn price_targeting_rejects_invalid_and_overflowing_inputs() {
+        assert_eq!(amount_in_for_price(0, 1_000, 1, 2), None);
+        assert_eq!(amount_in_for_price(1_000, 0, 1, 2), None);
+        assert_eq!(amount_in_for_price(-1, 1_000, 1, 2), None);
+        assert_eq!(amount_in_for_price(1_000, 1_000, 0, 1), None);
+        assert_eq!(amount_in_for_price(1_000, 1_000, 1, 0), None);
+        assert_eq!(amount_in_for_price(1_000, 1_000, -1, 2), None);
+        // 1997 * target_num * reserve_in does not fit in i128.
+        assert_eq!(amount_in_for_price(i128::MAX, i128::MAX, 1, 2), None);
     }
 }
