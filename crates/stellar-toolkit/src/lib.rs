@@ -12,6 +12,7 @@ pub mod example_gallery;
 pub mod gas_simulator;
 pub mod glossary;
 pub mod help_text;
+pub mod hsm;
 pub mod invariants;
 pub mod key_hygiene;
 pub mod merkle;
@@ -23,6 +24,7 @@ pub mod scaffolder;
 pub mod session_keys;
 pub mod state_inspector;
 pub mod theme;
+pub mod timelock;
 pub mod treasury_stream;
 pub mod ts_codegen;
 pub mod wallet;
@@ -45,6 +47,7 @@ pub use error::{Result, ToolkitError};
 pub use example_gallery::{ContractExample, ExampleGalleryRegistry};
 pub use gas_simulator::{FeeBump, FeeEstimate, FeeSchedule, GasSimulator, TransactionProfile};
 pub use help_text::{help_width, render_command_help, wrap, HelpEntry};
+pub use hsm::{ColdSigner, HsmError, SignRequest, StubHsm};
 pub use invariants::{run_suite, InvariantReport, Prng, SuiteReport};
 pub use key_hygiene::{scan_paths, scan_text, Finding as SecretFinding, ScanReport, SecretKind};
 pub use one_click_airdrop::{AirdropClaimRequest, ClaimStatus, OneClickAirdropClaimer};
@@ -55,6 +58,7 @@ pub use session_keys::{
     SessionPolicy, VetoGuardian,
 };
 pub use state_inspector::{Durability, StateEntry, StateInspector, StatePage, StateQuery};
+pub use timelock::{DelayKind, TimelockError, TimelockPolicy, MAX_PAUSE_DELAY, MIN_PAUSE_DELAY};
 pub use treasury_stream::{
     StreamCancellation, StreamRelease, StreamStatus, Treasury, TreasuryStream,
 };

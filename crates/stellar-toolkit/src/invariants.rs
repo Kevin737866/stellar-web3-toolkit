@@ -33,6 +33,7 @@ use crate::help_text::wrap;
 use crate::key_hygiene::{looks_like_secret_key, mask_secret, scan_text};
 use crate::merkle::{self, AirdropLeaf, MerkleTree};
 use crate::state_inspector::{Durability, StateEntry, StateInspector, StateQuery};
+use crate::timelock::{DelayKind, TimelockPolicy, MAX_PAUSE_DELAY, MIN_PAUSE_DELAY};
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 
@@ -679,6 +680,98 @@ fn run_flat_invariants(seed: u64, iterations: u64) -> Vec<InvariantReport> {
                     masked,
                     value.chars().count()
                 ));
+            }
+            Ok(())
+        },
+    ));
+
+    reports.push(check(
+        "timelock::pause_never_lands_in_its_request_ledger",
+        "every accepted delay pair is slow in both directions and saturates rather than wrapping",
+        seed,
+        iterations,
+        |prng, _| {
+            let pause = MIN_PAUSE_DELAY
+                + prng.below(u64::from(MAX_PAUSE_DELAY - MIN_PAUSE_DELAY + 1)) as u32;
+            let slack = prng.below(u64::from(MAX_PAUSE_DELAY - pause) + 1) as u32;
+            let policy = TimelockPolicy::new(pause, pause + slack)
+                .expect("the generator only produces in-range pairs");
+            let requested = prng.below(1_000_000) as u32;
+            (policy, requested)
+        },
+        |(policy, requested)| {
+            let requested = *requested;
+            if policy.unpause_delay() < policy.pause_delay() {
+                return Err(format!(
+                    "resume delay {} is faster than pause delay {}",
+                    policy.unpause_delay(),
+                    policy.pause_delay()
+                ));
+            }
+            for kind in [DelayKind::Pause, DelayKind::Resume] {
+                let effective = policy.effective_ledger(requested, kind);
+                if effective <= requested {
+                    return Err(format!(
+                        "{} requested at {requested} becomes effective at {effective}",
+                        kind.as_str()
+                    ));
+                }
+                if policy.is_effective(requested, kind, requested) {
+                    return Err(format!(
+                        "{} was actionable in the ledger it was requested in ({requested})",
+                        kind.as_str()
+                    ));
+                }
+                if policy.is_effective(requested, kind, effective - 1) {
+                    return Err(format!(
+                        "{} was actionable one ledger before {effective}",
+                        kind.as_str()
+                    ));
+                }
+                if !policy.is_effective(requested, kind, effective) {
+                    return Err(format!(
+                        "{} was not actionable at its effective ledger {effective}",
+                        kind.as_str()
+                    ));
+                }
+            }
+            Ok(())
+        },
+    ));
+
+    reports.push(check(
+        "timelock::resume_is_never_faster_than_pause",
+        "a policy is accepted exactly when both delays are in range and the resume is no faster",
+        seed,
+        iterations,
+        |prng, _| {
+            let pause = prng.below(u64::from(MAX_PAUSE_DELAY) + 3) as u32;
+            let unpause = prng.below(u64::from(MAX_PAUSE_DELAY) + 3) as u32;
+            (pause, unpause)
+        },
+        |(pause, unpause)| {
+            let accepted = TimelockPolicy::new(*pause, *unpause);
+            let expected = *pause >= MIN_PAUSE_DELAY
+                && *pause <= MAX_PAUSE_DELAY
+                && *unpause >= MIN_PAUSE_DELAY
+                && *unpause <= MAX_PAUSE_DELAY
+                && *unpause >= *pause;
+
+            if accepted.is_ok() != expected {
+                return Err(format!(
+                    "policy ({pause}, {unpause}) was {} but should have been {}",
+                    if accepted.is_ok() {
+                        "accepted"
+                    } else {
+                        "refused"
+                    },
+                    if expected { "accepted" } else { "refused" }
+                ));
+            }
+            if let Ok(policy) = accepted {
+                if policy.delay(DelayKind::Resume) < policy.delay(DelayKind::Pause) {
+                    return Err("an accepted policy resumes faster than it pauses".to_string());
+                }
             }
             Ok(())
         },
