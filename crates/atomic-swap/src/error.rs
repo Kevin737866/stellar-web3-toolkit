@@ -61,6 +61,14 @@ pub enum AtomicSwapError {
     #[error(transparent)]
     Replay(#[from] crate::replay::ReplayError),
 
+    /// An idempotency key was malformed (#212).
+    #[error("Invalid idempotency key: {reason}")]
+    InvalidIdempotencyKey { reason: String },
+
+    /// An idempotency key was already bound to a different initiation (#212).
+    #[error("Idempotency key `{key}` is already bound to a different swap request")]
+    IdempotencyConflict { key: String },
+
     /// Bounded coordination retry budget exhausted for a swap operation (#215).
     #[error(
         "Retry budget exhausted for {operation} on swap {swap_id}: {attempts}/{max_retries} attempts used"
