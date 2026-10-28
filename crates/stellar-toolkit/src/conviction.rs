@@ -1,4 +1,4 @@
-//! Conviction voting curve (issue #205).
+//! Conviction voting curve (issue #205) and bounded proposal metadata (issue #455).
 //!
 //! A conviction vote trades liquidity for influence: a holder locks tokens for a
 //! number of ledgers and votes with the resulting weight. The curve decides how
@@ -37,6 +37,68 @@ pub const MAX_LOCK_LEDGERS: u32 = 6_307_200;
 /// Fixed-point scale for the curve. `10_000` gives four decimal places of a
 /// whole vote unit while keeping every intermediate product well inside `u128`.
 pub const WEIGHT_SCALE: u128 = 10_000;
+
+/// Maximum byte length allowed for a governance proposal title (issue #455).
+pub const MAX_PROPOSAL_TITLE_LEN: usize = 128;
+
+/// Maximum byte length allowed for a governance proposal description (issue #455).
+pub const MAX_PROPOSAL_DESCRIPTION_LEN: usize = 4_096;
+
+/// Validated governance proposal metadata with non-empty title and bounded text fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProposalMetadata {
+    title: String,
+    description: String,
+}
+
+/// Errors returned when validating proposal titles and descriptions.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ProposalValidationError {
+    #[error("proposal title must not be empty or whitespace-only")]
+    EmptyTitle,
+    #[error("proposal title length {length} exceeds maximum {max} bytes")]
+    TitleTooLong { length: usize, max: usize },
+    #[error("proposal description length {length} exceeds maximum {max} bytes")]
+    DescriptionTooLong { length: usize, max: usize },
+}
+
+impl ProposalMetadata {
+    /// Validate and construct bounded proposal metadata.
+    ///
+    /// Rejects empty or whitespace-only titles, titles exceeding
+    /// [`MAX_PROPOSAL_TITLE_LEN`] bytes, and descriptions exceeding
+    /// [`MAX_PROPOSAL_DESCRIPTION_LEN`] bytes.
+    pub fn new(title: &str, description: &str) -> Result<Self, ProposalValidationError> {
+        let trimmed_title = title.trim();
+        if trimmed_title.is_empty() {
+            return Err(ProposalValidationError::EmptyTitle);
+        }
+        if title.len() > MAX_PROPOSAL_TITLE_LEN {
+            return Err(ProposalValidationError::TitleTooLong {
+                length: title.len(),
+                max: MAX_PROPOSAL_TITLE_LEN,
+            });
+        }
+        if description.len() > MAX_PROPOSAL_DESCRIPTION_LEN {
+            return Err(ProposalValidationError::DescriptionTooLong {
+                length: description.len(),
+                max: MAX_PROPOSAL_DESCRIPTION_LEN,
+            });
+        }
+        Ok(Self {
+            title: trimmed_title.to_string(),
+            description: description.to_string(),
+        })
+    }
+
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+}
 
 /// Voting weight for `balance` locked for `lock_ledgers`.
 ///
@@ -244,6 +306,43 @@ mod tests {
         assert_eq!(
             weight,
             isqrt(u128::from(u64::MAX) * WEIGHT_SCALE * WEIGHT_SCALE)
+        );
+    }
+
+    #[test]
+    fn empty_or_whitespace_proposal_titles_are_rejected() {
+        for empty in ["", " ", "   \t\n  "] {
+            assert_eq!(
+                ProposalMetadata::new(empty, "Valid description"),
+                Err(ProposalValidationError::EmptyTitle)
+            );
+        }
+    }
+
+    #[test]
+    fn proposal_title_and_description_bounds_are_enforced() {
+        let exact_title = "a".repeat(MAX_PROPOSAL_TITLE_LEN);
+        let exact_desc = "b".repeat(MAX_PROPOSAL_DESCRIPTION_LEN);
+        let meta = ProposalMetadata::new(&exact_title, &exact_desc).expect("at exact bounds");
+        assert_eq!(meta.title().len(), MAX_PROPOSAL_TITLE_LEN);
+        assert_eq!(meta.description().len(), MAX_PROPOSAL_DESCRIPTION_LEN);
+
+        let over_title = "a".repeat(MAX_PROPOSAL_TITLE_LEN + 1);
+        assert_eq!(
+            ProposalMetadata::new(&over_title, "ok"),
+            Err(ProposalValidationError::TitleTooLong {
+                length: MAX_PROPOSAL_TITLE_LEN + 1,
+                max: MAX_PROPOSAL_TITLE_LEN,
+            })
+        );
+
+        let over_desc = "b".repeat(MAX_PROPOSAL_DESCRIPTION_LEN + 1);
+        assert_eq!(
+            ProposalMetadata::new("Upgrade quorum", &over_desc),
+            Err(ProposalValidationError::DescriptionTooLong {
+                length: MAX_PROPOSAL_DESCRIPTION_LEN + 1,
+                max: MAX_PROPOSAL_DESCRIPTION_LEN,
+            })
         );
     }
 }
