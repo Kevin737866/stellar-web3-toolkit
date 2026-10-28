@@ -7,6 +7,7 @@ pub mod api_reference_gen;
 pub mod bridge_oracle;
 pub mod cli;
 pub mod compliance;
+pub mod conviction;
 pub mod env_config;
 pub mod error;
 pub mod example_gallery;
@@ -44,6 +45,11 @@ pub use cli::{App, ToolkitCommand};
 pub use compliance::{
     ComplianceCategory, ComplianceChecklist, ComplianceItem, VerificationHarness,
     VerificationHarnessReport, VerificationStep,
+};
+pub use conviction::{
+    conviction_weight, decayed_weight, isqrt, DelegationTracker, LifecycleError,
+    ProposalCancellationRecord, ProposalState, ProposalStateEvent, MAX_CANCELLATION_REASON_LEN,
+    MAX_LOCK_LEDGERS, WEIGHT_SCALE,
 };
 pub use env_config::{
     validate_directory, EnvConfig, EnvValidation, EnvValidationReport, Finding as EnvFinding,
