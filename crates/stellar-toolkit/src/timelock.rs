@@ -66,6 +66,13 @@ pub enum TimelockError {
          faster than it engages is decoration"
     )]
     ResumeFasterThanPause { pause: u32, unpause: u32 },
+    #[error("required quorum must be greater than zero")]
+    ZeroQuorumRequirement,
+    #[error("role {role:?} is not authorized to perform {action:?}")]
+    UnauthorizedGovernanceAction {
+        role: GovernanceRole,
+        action: GovernanceAction,
+    },
 }
 
 impl TimelockPolicy {
@@ -120,6 +127,74 @@ impl TimelockPolicy {
     /// `current_ledger`.
     pub fn is_effective(self, requested_ledger: u32, kind: DelayKind, current_ledger: u32) -> bool {
         current_ledger >= self.effective_ledger(requested_ledger, kind)
+    }
+}
+
+
+/// Snapshot of vote totals and quorum progress returned by proposal queries (issue #456).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProposalQuorumProgress {
+    pub votes_for: u128,
+    pub votes_against: u128,
+    pub votes_abstain: u128,
+    pub total_cast: u128,
+    pub required_quorum: u128,
+    pub quorum_progress_bps: u32,
+    pub quorum_reached: bool,
+}
+
+impl ProposalQuorumProgress {
+    /// Compute vote totals and quorum progress for a proposal query (issue #456).
+    pub fn compute(
+        votes_for: u128,
+        votes_against: u128,
+        votes_abstain: u128,
+        required_quorum: u128,
+    ) -> Result<Self, TimelockError> {
+        if required_quorum == 0 {
+            return Err(TimelockError::ZeroQuorumRequirement);
+        }
+        let total_cast = votes_for
+            .saturating_add(votes_against)
+            .saturating_add(votes_abstain);
+        let raw_bps = total_cast.saturating_mul(10_000) / required_quorum;
+        let quorum_progress_bps = raw_bps.min(10_000) as u32;
+        Ok(Self {
+            votes_for,
+            votes_against,
+            votes_abstain,
+            total_cast,
+            required_quorum,
+            quorum_progress_bps,
+            quorum_reached: total_cast >= required_quorum,
+        })
+    }
+}
+
+/// Roles recognized by the governance upgrade and emergency veto model (issue #457).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GovernanceRole {
+    Voter,
+    EmergencyGuardian,
+    TimelockAdmin,
+}
+
+/// Privileged governance operations subject to permission checks (issue #457).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GovernanceAction {
+    EmergencyVeto,
+    ExecuteUpgrade,
+}
+
+/// Verify whether `role` is permitted to invoke `action` (issue #457).
+pub fn authorize_governance_action(
+    role: GovernanceRole,
+    action: GovernanceAction,
+) -> Result<(), TimelockError> {
+    match (role, action) {
+        (GovernanceRole::EmergencyGuardian | GovernanceRole::TimelockAdmin, GovernanceAction::EmergencyVeto) => Ok(()),
+        (GovernanceRole::TimelockAdmin, GovernanceAction::ExecuteUpgrade) => Ok(()),
+        _ => Err(TimelockError::UnauthorizedGovernanceAction { role, action }),
     }
 }
 
@@ -227,5 +302,57 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn proposal_query_exposes_vote_totals_and_quorum_progress() {
+        assert_eq!(
+            ProposalQuorumProgress::compute(100, 50, 10, 0),
+            Err(TimelockError::ZeroQuorumRequirement)
+        );
+        let half = ProposalQuorumProgress::compute(300, 150, 50, 1_000).unwrap();
+        assert_eq!(half.total_cast, 500);
+        assert_eq!(half.quorum_progress_bps, 5_000);
+        assert!(!half.quorum_reached);
+
+        let full = ProposalQuorumProgress::compute(900, 200, 100, 1_000).unwrap();
+        assert_eq!(full.total_cast, 1_200);
+        assert_eq!(full.quorum_progress_bps, 10_000);
+        assert!(full.quorum_reached);
+    }
+
+    #[test]
+    fn governance_upgrade_and_emergency_veto_permissions_are_enforced() {
+        assert_eq!(
+            authorize_governance_action(
+                GovernanceRole::EmergencyGuardian,
+                GovernanceAction::EmergencyVeto
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            authorize_governance_action(
+                GovernanceRole::EmergencyGuardian,
+                GovernanceAction::ExecuteUpgrade
+            ),
+            Err(TimelockError::UnauthorizedGovernanceAction {
+                role: GovernanceRole::EmergencyGuardian,
+                action: GovernanceAction::ExecuteUpgrade,
+            })
+        );
+        assert_eq!(
+            authorize_governance_action(
+                GovernanceRole::TimelockAdmin,
+                GovernanceAction::ExecuteUpgrade
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            authorize_governance_action(GovernanceRole::Voter, GovernanceAction::EmergencyVeto),
+            Err(TimelockError::UnauthorizedGovernanceAction {
+                role: GovernanceRole::Voter,
+                action: GovernanceAction::EmergencyVeto,
+            })
+        );
     }
 }
