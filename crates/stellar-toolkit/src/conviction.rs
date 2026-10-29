@@ -112,6 +112,167 @@ pub fn isqrt(n: u128) -> u128 {
     }
 }
 
+
+/// Maximum byte length for an explicit proposal cancellation reason (issue #453).
+pub const MAX_CANCELLATION_REASON_LEN: usize = 512;
+
+/// Lifecycle states of a governance proposal (issue #452).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProposalState {
+    Active,
+    Cancelled,
+    Succeeded,
+    Defeated,
+    Queued,
+    Executed,
+}
+
+impl ProposalState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Cancelled => "cancelled",
+            Self::Succeeded => "succeeded",
+            Self::Defeated => "defeated",
+            Self::Queued => "queued",
+            Self::Executed => "executed",
+        }
+    }
+}
+
+/// Stable event emitted whenever a proposal transitions between states (issue #452).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProposalStateEvent {
+    pub proposal_id: u64,
+    pub from: ProposalState,
+    pub to: ProposalState,
+    pub ledger: u32,
+}
+
+impl ProposalStateEvent {
+    /// Deterministic wire format for indexers and audit logs (issue #452).
+    pub fn to_canonical_string(&self) -> String {
+        format!(
+            "proposal_state_change:id={}:from={}:to={}:ledger={}",
+            self.proposal_id,
+            self.from.as_str(),
+            self.to.as_str(),
+            self.ledger
+        )
+    }
+}
+
+/// Cancellation record requiring an explicit bounded reason (issue #453).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProposalCancellationRecord {
+    pub proposal_id: u64,
+    pub cancelled_by: String,
+    pub ledger: u32,
+    pub reason: String,
+}
+
+/// Errors for proposal lifecycle transitions, cancellation reasons, and delegation (issues #452, #453, #454).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum LifecycleError {
+    #[error("cancellation reason must not be empty")]
+    EmptyCancellationReason,
+    #[error("cancellation reason length {length} exceeds maximum {max} bytes")]
+    CancellationReasonTooLong { length: usize, max: usize },
+    #[error("invalid actor identifier")]
+    EmptyActor,
+    #[error("account '{account}' cannot delegate voting power to itself")]
+    SelfDelegation { account: String },
+}
+
+impl ProposalCancellationRecord {
+    pub fn new(
+        proposal_id: u64,
+        cancelled_by: &str,
+        ledger: u32,
+        reason: &str,
+    ) -> Result<(Self, ProposalStateEvent), LifecycleError> {
+        let actor = cancelled_by.trim();
+        if actor.is_empty() {
+            return Err(LifecycleError::EmptyActor);
+        }
+        let trimmed_reason = reason.trim();
+        if trimmed_reason.is_empty() {
+            return Err(LifecycleError::EmptyCancellationReason);
+        }
+        if reason.len() > MAX_CANCELLATION_REASON_LEN {
+            return Err(LifecycleError::CancellationReasonTooLong {
+                length: reason.len(),
+                max: MAX_CANCELLATION_REASON_LEN,
+            });
+        }
+        let record = Self {
+            proposal_id,
+            cancelled_by: actor.to_string(),
+            ledger,
+            reason: trimmed_reason.to_string(),
+        };
+        let event = ProposalStateEvent {
+            proposal_id,
+            from: ProposalState::Active,
+            to: ProposalState::Cancelled,
+            ledger,
+        };
+        Ok((record, event))
+    }
+}
+
+/// Tracks token balances and single-hop delegation across delegation changes (issue #454).
+#[derive(Debug, Default, Clone)]
+pub struct DelegationTracker {
+    balances: std::collections::BTreeMap<String, u64>,
+    delegates: std::collections::BTreeMap<String, String>,
+}
+
+impl DelegationTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set_balance(&mut self, account: &str, balance: u64) {
+        self.balances.insert(account.to_string(), balance);
+    }
+
+    pub fn delegate(&mut self, delegator: &str, delegatee: &str) -> Result<(), LifecycleError> {
+        if delegator.trim().is_empty() || delegatee.trim().is_empty() {
+            return Err(LifecycleError::EmptyActor);
+        }
+        if delegator == delegatee {
+            return Err(LifecycleError::SelfDelegation {
+                account: delegator.to_string(),
+            });
+        }
+        self.delegates
+            .insert(delegator.to_string(), delegatee.to_string());
+        Ok(())
+    }
+
+    pub fn undelegate(&mut self, delegator: &str) {
+        self.delegates.remove(delegator);
+    }
+
+    /// Effective voting balance of `account`, including incoming delegations and excluding
+    /// outgoing balance when `account` has delegated to someone else (issue #454).
+    pub fn effective_voting_balance(&self, account: &str) -> u64 {
+        let own = if self.delegates.contains_key(account) {
+            0
+        } else {
+            self.balances.get(account).copied().unwrap_or(0)
+        };
+        let incoming: u64 = self
+            .delegates
+            .iter()
+            .filter(|(_, target)| target.as_str() == account)
+            .map(|(delegator, _)| self.balances.get(delegator).copied().unwrap_or(0))
+            .fold(0u64, u64::saturating_add);
+        own.saturating_add(incoming)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,5 +406,65 @@ mod tests {
             weight,
             isqrt(u128::from(u64::MAX) * WEIGHT_SCALE * WEIGHT_SCALE)
         );
+    }
+
+    #[test]
+    fn proposal_cancellation_requires_explicit_bounded_reason_and_emits_stable_event() {
+        assert_eq!(
+            ProposalCancellationRecord::new(7, "GADMIN", 500, "   "),
+            Err(LifecycleError::EmptyCancellationReason)
+        );
+        let too_long = "x".repeat(MAX_CANCELLATION_REASON_LEN + 1);
+        assert_eq!(
+            ProposalCancellationRecord::new(7, "GADMIN", 500, &too_long),
+            Err(LifecycleError::CancellationReasonTooLong {
+                length: MAX_CANCELLATION_REASON_LEN + 1,
+                max: MAX_CANCELLATION_REASON_LEN,
+            })
+        );
+
+        let (rec, ev) =
+            ProposalCancellationRecord::new(7, "GADMIN", 500, "Parameter superseded by #8")
+                .expect("valid cancellation");
+        assert_eq!(rec.reason, "Parameter superseded by #8");
+        assert_eq!(
+            ev.to_canonical_string(),
+            "proposal_state_change:id=7:from=active:to=cancelled:ledger=500"
+        );
+    }
+
+    #[test]
+    fn delegated_voting_power_updates_accurately_across_delegation_changes() {
+        let mut tracker = DelegationTracker::new();
+        tracker.set_balance("alice", 1_000);
+        tracker.set_balance("bob", 500);
+        tracker.set_balance("carol", 250);
+
+        // Initially everyone holds their own balance.
+        assert_eq!(tracker.effective_voting_balance("alice"), 1_000);
+        assert_eq!(tracker.effective_voting_balance("bob"), 500);
+
+        // Self-delegation is rejected.
+        assert_eq!(
+            tracker.delegate("alice", "alice"),
+            Err(LifecycleError::SelfDelegation {
+                account: "alice".to_string(),
+            })
+        );
+
+        // Alice delegates to Bob: Alice has 0 direct voting balance, Bob has 1_500.
+        tracker.delegate("alice", "bob").unwrap();
+        assert_eq!(tracker.effective_voting_balance("alice"), 0);
+        assert_eq!(tracker.effective_voting_balance("bob"), 1_500);
+
+        // Alice re-delegates to Carol: Bob drops back to 500, Carol rises to 1_250.
+        tracker.delegate("alice", "carol").unwrap();
+        assert_eq!(tracker.effective_voting_balance("bob"), 500);
+        assert_eq!(tracker.effective_voting_balance("carol"), 1_250);
+
+        // Alice revokes delegation: Alice regains 1_000, Carol returns to 250.
+        tracker.undelegate("alice");
+        assert_eq!(tracker.effective_voting_balance("alice"), 1_000);
+        assert_eq!(tracker.effective_voting_balance("carol"), 250);
     }
 }
