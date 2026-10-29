@@ -174,6 +174,140 @@ pub fn isqrt(n: u128) -> u128 {
     }
 }
 
+
+/// Shortest allowed proposal voting window in ledgers (issue #448).
+pub const MIN_VOTE_WINDOW_LEDGERS: u32 = 1;
+
+/// Longest allowed proposal voting window in ledgers (~7 days at 5s/ledger, issue #448).
+pub const MAX_VOTE_WINDOW_LEDGERS: u32 = 120_960;
+
+/// Basis-point denominator for quorum calculations (`10_000` = 100%).
+pub const BPS_SCALE: u32 = 10_000;
+
+/// Validated voting window `[start_ledger, end_ledger]` for a proposal (issue #448).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VoteWindow {
+    start_ledger: u32,
+    end_ledger: u32,
+}
+
+/// Errors returned when validating vote windows, recording votes, or evaluating quorum.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum GovernanceVoteError {
+    #[error("vote window start ledger {start} is before current ledger {current}")]
+    StartLedgerInPast { start: u32, current: u32 },
+    #[error("vote window end ledger {end} must be strictly greater than start ledger {start}")]
+    InvalidWindowOrder { start: u32, end: u32 },
+    #[error(
+        "vote window duration {duration} is outside [{MIN_VOTE_WINDOW_LEDGERS}, {MAX_VOTE_WINDOW_LEDGERS}] ledgers"
+    )]
+    WindowDurationOutOfRange { duration: u32 },
+    #[error("voter '{voter}' has already cast a vote on proposal {proposal_id}")]
+    DuplicateVote { proposal_id: u64, voter: String },
+    #[error("voter identifier must not be empty")]
+    EmptyVoter,
+    #[error("eligible voting power is zero; quorum cannot be satisfied")]
+    ZeroEligibleVotingPower,
+    #[error("quorum threshold {quorum_bps} bps is outside [1, {BPS_SCALE}]")]
+    InvalidQuorumBps { quorum_bps: u32 },
+}
+
+impl VoteWindow {
+    /// Validate a proposal voting window before creation (issue #448).
+    pub fn new(
+        start_ledger: u32,
+        end_ledger: u32,
+        current_ledger: u32,
+    ) -> Result<Self, GovernanceVoteError> {
+        if start_ledger < current_ledger {
+            return Err(GovernanceVoteError::StartLedgerInPast {
+                start: start_ledger,
+                current: current_ledger,
+            });
+        }
+        if end_ledger <= start_ledger {
+            return Err(GovernanceVoteError::InvalidWindowOrder {
+                start: start_ledger,
+                end: end_ledger,
+            });
+        }
+        let duration = end_ledger - start_ledger;
+        if !(MIN_VOTE_WINDOW_LEDGERS..=MAX_VOTE_WINDOW_LEDGERS).contains(&duration) {
+            return Err(GovernanceVoteError::WindowDurationOutOfRange { duration });
+        }
+        Ok(Self {
+            start_ledger,
+            end_ledger,
+        })
+    }
+
+    pub fn start_ledger(self) -> u32 {
+        self.start_ledger
+    }
+
+    pub fn end_ledger(self) -> u32 {
+        self.end_ledger
+    }
+
+    pub fn duration(self) -> u32 {
+        self.end_ledger - self.start_ledger
+    }
+}
+
+/// Tracks cast votes per `(proposal_id, voter)` to prevent duplicate voting (issue #449).
+#[derive(Debug, Default, Clone)]
+pub struct ProposalBallotBox {
+    seen: std::collections::BTreeSet<(u64, String)>,
+}
+
+impl ProposalBallotBox {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a vote for `(proposal_id, voter)` or reject duplicates (issue #449).
+    pub fn record_vote(
+        &mut self,
+        proposal_id: u64,
+        voter: &str,
+        weight: u128,
+    ) -> Result<u128, GovernanceVoteError> {
+        let trimmed = voter.trim();
+        if trimmed.is_empty() {
+            return Err(GovernanceVoteError::EmptyVoter);
+        }
+        let key = (proposal_id, trimmed.to_string());
+        if self.seen.contains(&key) {
+            return Err(GovernanceVoteError::DuplicateVote {
+                proposal_id,
+                voter: trimmed.to_string(),
+            });
+        }
+        self.seen.insert(key);
+        Ok(weight)
+    }
+
+    pub fn has_voted(&self, proposal_id: u64, voter: &str) -> bool {
+        self.seen.contains(&(proposal_id, voter.trim().to_string()))
+    }
+}
+
+/// Evaluate whether participating votes reach quorum, explicitly rejecting zero eligible voting power (issue #450).
+pub fn evaluate_quorum(
+    participating_votes: u128,
+    eligible_voting_power: u128,
+    quorum_bps: u32,
+) -> Result<bool, GovernanceVoteError> {
+    if !(1..=BPS_SCALE).contains(&quorum_bps) {
+        return Err(GovernanceVoteError::InvalidQuorumBps { quorum_bps });
+    }
+    if eligible_voting_power == 0 {
+        return Err(GovernanceVoteError::ZeroEligibleVotingPower);
+    }
+    let required = (eligible_voting_power * u128::from(quorum_bps)).div_ceil(u128::from(BPS_SCALE));
+    Ok(participating_votes >= required)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -152,6 +152,74 @@ impl TimelockPolicy {
     }
 }
 
+
+/// Snapshot of vote totals and quorum progress returned by proposal queries (issue #456).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProposalQuorumProgress {
+    pub votes_for: u128,
+    pub votes_against: u128,
+    pub votes_abstain: u128,
+    pub total_cast: u128,
+    pub required_quorum: u128,
+    pub quorum_progress_bps: u32,
+    pub quorum_reached: bool,
+}
+
+impl ProposalQuorumProgress {
+    /// Compute vote totals and quorum progress for a proposal query (issue #456).
+    pub fn compute(
+        votes_for: u128,
+        votes_against: u128,
+        votes_abstain: u128,
+        required_quorum: u128,
+    ) -> Result<Self, TimelockError> {
+        if required_quorum == 0 {
+            return Err(TimelockError::ZeroQuorumRequirement);
+        }
+        let total_cast = votes_for
+            .saturating_add(votes_against)
+            .saturating_add(votes_abstain);
+        let raw_bps = total_cast.saturating_mul(10_000) / required_quorum;
+        let quorum_progress_bps = raw_bps.min(10_000) as u32;
+        Ok(Self {
+            votes_for,
+            votes_against,
+            votes_abstain,
+            total_cast,
+            required_quorum,
+            quorum_progress_bps,
+            quorum_reached: total_cast >= required_quorum,
+        })
+    }
+}
+
+/// Roles recognized by the governance upgrade and emergency veto model (issue #457).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GovernanceRole {
+    Voter,
+    EmergencyGuardian,
+    TimelockAdmin,
+}
+
+/// Privileged governance operations subject to permission checks (issue #457).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GovernanceAction {
+    EmergencyVeto,
+    ExecuteUpgrade,
+}
+
+/// Verify whether `role` is permitted to invoke `action` (issue #457).
+pub fn authorize_governance_action(
+    role: GovernanceRole,
+    action: GovernanceAction,
+) -> Result<(), TimelockError> {
+    match (role, action) {
+        (GovernanceRole::EmergencyGuardian | GovernanceRole::TimelockAdmin, GovernanceAction::EmergencyVeto) => Ok(()),
+        (GovernanceRole::TimelockAdmin, GovernanceAction::ExecuteUpgrade) => Ok(()),
+        _ => Err(TimelockError::UnauthorizedGovernanceAction { role, action }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

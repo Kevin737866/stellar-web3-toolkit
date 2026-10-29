@@ -74,7 +74,10 @@ pub use session_keys::{
 };
 pub use signal_sync::{Signal, SignalSnapshot, SyncError, SyncReport, SNAPSHOT_VERSION};
 pub use state_inspector::{Durability, StateEntry, StateInspector, StatePage, StateQuery};
-pub use timelock::{DelayKind, TimelockError, TimelockPolicy, MAX_PAUSE_DELAY, MIN_PAUSE_DELAY};
+pub use timelock::{
+    authorize_governance_action, DelayKind, GovernanceAction, GovernanceRole,
+    ProposalQuorumProgress, TimelockError, TimelockPolicy, MAX_PAUSE_DELAY, MIN_PAUSE_DELAY,
+};
 pub use treasury_stream::{
     StreamCancellation, StreamRelease, StreamStatus, Treasury, TreasuryStream,
 };
