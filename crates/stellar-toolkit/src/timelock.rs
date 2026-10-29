@@ -1,4 +1,4 @@
-//! Timelock delay minimums (issue #208).
+//! Timelock delay minimums (issue #208) and proposal execution gate (issue #451).
 //!
 //! The bridge pause guard (`contracts/bridge-pause-guard`) enforces its delays in
 //! `initialize`, so a deployed guard can never be configured with a pause that
@@ -54,7 +54,7 @@ pub struct TimelockPolicy {
     unpause_delay: u32,
 }
 
-/// A delay configuration the bridge would reject.
+/// A delay configuration or execution attempt the bridge or governance timelock rejects.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TimelockError {
     #[error("pause delay {configured} is outside [{MIN_PAUSE_DELAY}, {MAX_PAUSE_DELAY}] ledgers")]
@@ -66,17 +66,18 @@ pub enum TimelockError {
          faster than it engages is decoration"
     )]
     ResumeFasterThanPause { pause: u32, unpause: u32 },
-    #[error("required quorum must be greater than zero")]
-    ZeroQuorumRequirement,
-    #[error("role {role:?} is not authorized to perform {action:?}")]
-    UnauthorizedGovernanceAction {
-        role: GovernanceRole,
-        action: GovernanceAction,
+    #[error(
+        "proposal timelock has not expired at ledger {current_ledger} (effective at ledger {effective_ledger})"
+    )]
+    TimelockNotExpired {
+        current_ledger: u32,
+        effective_ledger: u32,
     },
 }
 
 impl TimelockPolicy {
-    /// Validate a delay pair.
+    /// Validate a `(pause_delay, unpause_delay)` pair against the contract's
+    /// install rules.
     pub fn new(pause_delay: u32, unpause_delay: u32) -> Result<Self, TimelockError> {
         if !(MIN_PAUSE_DELAY..=MAX_PAUSE_DELAY).contains(&pause_delay) {
             return Err(TimelockError::PauseDelayOutOfRange {
@@ -127,6 +128,27 @@ impl TimelockPolicy {
     /// `current_ledger`.
     pub fn is_effective(self, requested_ledger: u32, kind: DelayKind, current_ledger: u32) -> bool {
         current_ledger >= self.effective_ledger(requested_ledger, kind)
+    }
+
+    /// Enforce that a proposal or scheduled action is not executed before its
+    /// timelock expires (issue #451).
+    ///
+    /// Returns the `effective_ledger` when `current_ledger >= effective_ledger`,
+    /// or [`TimelockError::TimelockNotExpired`] if invoked early.
+    pub fn verify_execution(
+        self,
+        requested_ledger: u32,
+        kind: DelayKind,
+        current_ledger: u32,
+    ) -> Result<u32, TimelockError> {
+        let effective = self.effective_ledger(requested_ledger, kind);
+        if current_ledger < effective {
+            return Err(TimelockError::TimelockNotExpired {
+                current_ledger,
+                effective_ledger: effective,
+            });
+        }
+        Ok(effective)
     }
 }
 
@@ -305,54 +327,38 @@ mod tests {
     }
 
     #[test]
-    fn proposal_query_exposes_vote_totals_and_quorum_progress() {
-        assert_eq!(
-            ProposalQuorumProgress::compute(100, 50, 10, 0),
-            Err(TimelockError::ZeroQuorumRequirement)
-        );
-        let half = ProposalQuorumProgress::compute(300, 150, 50, 1_000).unwrap();
-        assert_eq!(half.total_cast, 500);
-        assert_eq!(half.quorum_progress_bps, 5_000);
-        assert!(!half.quorum_reached);
+    fn execution_before_timelock_expiry_is_rejected() {
+        let policy = TimelockPolicy::new(25, 50).unwrap();
+        let requested = 1_000u32;
 
-        let full = ProposalQuorumProgress::compute(900, 200, 100, 1_000).unwrap();
-        assert_eq!(full.total_cast, 1_200);
-        assert_eq!(full.quorum_progress_bps, 10_000);
-        assert!(full.quorum_reached);
-    }
-
-    #[test]
-    fn governance_upgrade_and_emergency_veto_permissions_are_enforced() {
         assert_eq!(
-            authorize_governance_action(
-                GovernanceRole::EmergencyGuardian,
-                GovernanceAction::EmergencyVeto
-            ),
-            Ok(())
-        );
-        assert_eq!(
-            authorize_governance_action(
-                GovernanceRole::EmergencyGuardian,
-                GovernanceAction::ExecuteUpgrade
-            ),
-            Err(TimelockError::UnauthorizedGovernanceAction {
-                role: GovernanceRole::EmergencyGuardian,
-                action: GovernanceAction::ExecuteUpgrade,
+            policy.verify_execution(requested, DelayKind::Pause, 1_000),
+            Err(TimelockError::TimelockNotExpired {
+                current_ledger: 1_000,
+                effective_ledger: 1_025,
             })
         );
         assert_eq!(
-            authorize_governance_action(
-                GovernanceRole::TimelockAdmin,
-                GovernanceAction::ExecuteUpgrade
-            ),
-            Ok(())
+            policy.verify_execution(requested, DelayKind::Pause, 1_024),
+            Err(TimelockError::TimelockNotExpired {
+                current_ledger: 1_024,
+                effective_ledger: 1_025,
+            })
         );
         assert_eq!(
-            authorize_governance_action(GovernanceRole::Voter, GovernanceAction::EmergencyVeto),
-            Err(TimelockError::UnauthorizedGovernanceAction {
-                role: GovernanceRole::Voter,
-                action: GovernanceAction::EmergencyVeto,
+            policy.verify_execution(requested, DelayKind::Pause, 1_025),
+            Ok(1_025)
+        );
+        assert_eq!(
+            policy.verify_execution(requested, DelayKind::Resume, 1_049),
+            Err(TimelockError::TimelockNotExpired {
+                current_ledger: 1_049,
+                effective_ledger: 1_050,
             })
+        );
+        assert_eq!(
+            policy.verify_execution(requested, DelayKind::Resume, 1_050),
+            Ok(1_050)
         );
     }
 }

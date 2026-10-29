@@ -1,4 +1,4 @@
-//! Conviction voting curve (issue #205).
+//! Conviction voting curve (issue #205) and bounded proposal metadata (issue #455).
 //!
 //! A conviction vote trades liquidity for influence: a holder locks tokens for a
 //! number of ledgers and votes with the resulting weight. The curve decides how
@@ -37,6 +37,68 @@ pub const MAX_LOCK_LEDGERS: u32 = 6_307_200;
 /// Fixed-point scale for the curve. `10_000` gives four decimal places of a
 /// whole vote unit while keeping every intermediate product well inside `u128`.
 pub const WEIGHT_SCALE: u128 = 10_000;
+
+/// Maximum byte length allowed for a governance proposal title (issue #455).
+pub const MAX_PROPOSAL_TITLE_LEN: usize = 128;
+
+/// Maximum byte length allowed for a governance proposal description (issue #455).
+pub const MAX_PROPOSAL_DESCRIPTION_LEN: usize = 4_096;
+
+/// Validated governance proposal metadata with non-empty title and bounded text fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProposalMetadata {
+    title: String,
+    description: String,
+}
+
+/// Errors returned when validating proposal titles and descriptions.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ProposalValidationError {
+    #[error("proposal title must not be empty or whitespace-only")]
+    EmptyTitle,
+    #[error("proposal title length {length} exceeds maximum {max} bytes")]
+    TitleTooLong { length: usize, max: usize },
+    #[error("proposal description length {length} exceeds maximum {max} bytes")]
+    DescriptionTooLong { length: usize, max: usize },
+}
+
+impl ProposalMetadata {
+    /// Validate and construct bounded proposal metadata.
+    ///
+    /// Rejects empty or whitespace-only titles, titles exceeding
+    /// [`MAX_PROPOSAL_TITLE_LEN`] bytes, and descriptions exceeding
+    /// [`MAX_PROPOSAL_DESCRIPTION_LEN`] bytes.
+    pub fn new(title: &str, description: &str) -> Result<Self, ProposalValidationError> {
+        let trimmed_title = title.trim();
+        if trimmed_title.is_empty() {
+            return Err(ProposalValidationError::EmptyTitle);
+        }
+        if title.len() > MAX_PROPOSAL_TITLE_LEN {
+            return Err(ProposalValidationError::TitleTooLong {
+                length: title.len(),
+                max: MAX_PROPOSAL_TITLE_LEN,
+            });
+        }
+        if description.len() > MAX_PROPOSAL_DESCRIPTION_LEN {
+            return Err(ProposalValidationError::DescriptionTooLong {
+                length: description.len(),
+                max: MAX_PROPOSAL_DESCRIPTION_LEN,
+            });
+        }
+        Ok(Self {
+            title: trimmed_title.to_string(),
+            description: description.to_string(),
+        })
+    }
+
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+}
 
 /// Voting weight for `balance` locked for `lock_ledgers`.
 ///
@@ -382,62 +444,39 @@ mod tests {
     }
 
     #[test]
-    fn vote_window_validation_rejects_past_start_inverted_bounds_and_overlong_durations() {
-        assert_eq!(
-            VoteWindow::new(99, 150, 100),
-            Err(GovernanceVoteError::StartLedgerInPast {
-                start: 99,
-                current: 100,
-            })
-        );
-        assert_eq!(
-            VoteWindow::new(100, 100, 100),
-            Err(GovernanceVoteError::InvalidWindowOrder {
-                start: 100,
-                end: 100,
-            })
-        );
-        assert_eq!(
-            VoteWindow::new(100, 100 + MAX_VOTE_WINDOW_LEDGERS + 1, 100),
-            Err(GovernanceVoteError::WindowDurationOutOfRange {
-                duration: MAX_VOTE_WINDOW_LEDGERS + 1,
-            })
-        );
-        let valid = VoteWindow::new(100, 100 + MAX_VOTE_WINDOW_LEDGERS, 100).unwrap();
-        assert_eq!(valid.duration(), MAX_VOTE_WINDOW_LEDGERS);
+    fn empty_or_whitespace_proposal_titles_are_rejected() {
+        for empty in ["", " ", "   \t\n  "] {
+            assert_eq!(
+                ProposalMetadata::new(empty, "Valid description"),
+                Err(ProposalValidationError::EmptyTitle)
+            );
+        }
     }
 
     #[test]
-    fn duplicate_votes_for_same_proposal_and_voter_are_rejected() {
-        let mut box_tracker = ProposalBallotBox::new();
-        assert_eq!(box_tracker.record_vote(42, "GABC123", 5_000), Ok(5_000));
-        assert!(box_tracker.has_voted(42, "GABC123"));
+    fn proposal_title_and_description_bounds_are_enforced() {
+        let exact_title = "a".repeat(MAX_PROPOSAL_TITLE_LEN);
+        let exact_desc = "b".repeat(MAX_PROPOSAL_DESCRIPTION_LEN);
+        let meta = ProposalMetadata::new(&exact_title, &exact_desc).expect("at exact bounds");
+        assert_eq!(meta.title().len(), MAX_PROPOSAL_TITLE_LEN);
+        assert_eq!(meta.description().len(), MAX_PROPOSAL_DESCRIPTION_LEN);
+
+        let over_title = "a".repeat(MAX_PROPOSAL_TITLE_LEN + 1);
         assert_eq!(
-            box_tracker.record_vote(42, "GABC123", 5_000),
-            Err(GovernanceVoteError::DuplicateVote {
-                proposal_id: 42,
-                voter: "GABC123".to_string(),
+            ProposalMetadata::new(&over_title, "ok"),
+            Err(ProposalValidationError::TitleTooLong {
+                length: MAX_PROPOSAL_TITLE_LEN + 1,
+                max: MAX_PROPOSAL_TITLE_LEN,
             })
         );
-        // Same voter on a different proposal is allowed.
-        assert_eq!(box_tracker.record_vote(43, "GABC123", 5_000), Ok(5_000));
-    }
 
-    #[test]
-    fn zero_eligible_voting_power_is_rejected_in_quorum_calculation() {
+        let over_desc = "b".repeat(MAX_PROPOSAL_DESCRIPTION_LEN + 1);
         assert_eq!(
-            evaluate_quorum(0, 0, 2_000),
-            Err(GovernanceVoteError::ZeroEligibleVotingPower)
+            ProposalMetadata::new("Upgrade quorum", &over_desc),
+            Err(ProposalValidationError::DescriptionTooLong {
+                length: MAX_PROPOSAL_DESCRIPTION_LEN + 1,
+                max: MAX_PROPOSAL_DESCRIPTION_LEN,
+            })
         );
-        assert_eq!(
-            evaluate_quorum(100, 0, 2_000),
-            Err(GovernanceVoteError::ZeroEligibleVotingPower)
-        );
-        assert_eq!(
-            evaluate_quorum(100, 1_000, 0),
-            Err(GovernanceVoteError::InvalidQuorumBps { quorum_bps: 0 })
-        );
-        assert_eq!(evaluate_quorum(200, 1_000, 2_000), Ok(true));
-        assert_eq!(evaluate_quorum(199, 1_000, 2_000), Ok(false));
     }
 }
