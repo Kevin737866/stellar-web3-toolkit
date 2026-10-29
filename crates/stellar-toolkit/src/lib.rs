@@ -47,9 +47,9 @@ pub use compliance::{
     VerificationHarnessReport, VerificationStep,
 };
 pub use conviction::{
-    conviction_weight, decayed_weight, isqrt, DelegationTracker, LifecycleError,
-    ProposalCancellationRecord, ProposalState, ProposalStateEvent, MAX_CANCELLATION_REASON_LEN,
-    MAX_LOCK_LEDGERS, WEIGHT_SCALE,
+    conviction_weight, decayed_weight, evaluate_quorum, isqrt, GovernanceVoteError,
+    ProposalBallotBox, VoteWindow, BPS_SCALE, MAX_LOCK_LEDGERS, MAX_VOTE_WINDOW_LEDGERS,
+    MIN_VOTE_WINDOW_LEDGERS, WEIGHT_SCALE,
 };
 pub use env_config::{
     validate_directory, EnvConfig, EnvValidation, EnvValidationReport, Finding as EnvFinding,

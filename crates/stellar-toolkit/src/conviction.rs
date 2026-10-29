@@ -113,164 +113,137 @@ pub fn isqrt(n: u128) -> u128 {
 }
 
 
-/// Maximum byte length for an explicit proposal cancellation reason (issue #453).
-pub const MAX_CANCELLATION_REASON_LEN: usize = 512;
+/// Shortest allowed proposal voting window in ledgers (issue #448).
+pub const MIN_VOTE_WINDOW_LEDGERS: u32 = 1;
 
-/// Lifecycle states of a governance proposal (issue #452).
+/// Longest allowed proposal voting window in ledgers (~7 days at 5s/ledger, issue #448).
+pub const MAX_VOTE_WINDOW_LEDGERS: u32 = 120_960;
+
+/// Basis-point denominator for quorum calculations (`10_000` = 100%).
+pub const BPS_SCALE: u32 = 10_000;
+
+/// Validated voting window `[start_ledger, end_ledger]` for a proposal (issue #448).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProposalState {
-    Active,
-    Cancelled,
-    Succeeded,
-    Defeated,
-    Queued,
-    Executed,
+pub struct VoteWindow {
+    start_ledger: u32,
+    end_ledger: u32,
 }
 
-impl ProposalState {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Active => "active",
-            Self::Cancelled => "cancelled",
-            Self::Succeeded => "succeeded",
-            Self::Defeated => "defeated",
-            Self::Queued => "queued",
-            Self::Executed => "executed",
-        }
-    }
-}
-
-/// Stable event emitted whenever a proposal transitions between states (issue #452).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProposalStateEvent {
-    pub proposal_id: u64,
-    pub from: ProposalState,
-    pub to: ProposalState,
-    pub ledger: u32,
-}
-
-impl ProposalStateEvent {
-    /// Deterministic wire format for indexers and audit logs (issue #452).
-    pub fn to_canonical_string(&self) -> String {
-        format!(
-            "proposal_state_change:id={}:from={}:to={}:ledger={}",
-            self.proposal_id,
-            self.from.as_str(),
-            self.to.as_str(),
-            self.ledger
-        )
-    }
-}
-
-/// Cancellation record requiring an explicit bounded reason (issue #453).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProposalCancellationRecord {
-    pub proposal_id: u64,
-    pub cancelled_by: String,
-    pub ledger: u32,
-    pub reason: String,
-}
-
-/// Errors for proposal lifecycle transitions, cancellation reasons, and delegation (issues #452, #453, #454).
+/// Errors returned when validating vote windows, recording votes, or evaluating quorum.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum LifecycleError {
-    #[error("cancellation reason must not be empty")]
-    EmptyCancellationReason,
-    #[error("cancellation reason length {length} exceeds maximum {max} bytes")]
-    CancellationReasonTooLong { length: usize, max: usize },
-    #[error("invalid actor identifier")]
-    EmptyActor,
-    #[error("account '{account}' cannot delegate voting power to itself")]
-    SelfDelegation { account: String },
+pub enum GovernanceVoteError {
+    #[error("vote window start ledger {start} is before current ledger {current}")]
+    StartLedgerInPast { start: u32, current: u32 },
+    #[error("vote window end ledger {end} must be strictly greater than start ledger {start}")]
+    InvalidWindowOrder { start: u32, end: u32 },
+    #[error(
+        "vote window duration {duration} is outside [{MIN_VOTE_WINDOW_LEDGERS}, {MAX_VOTE_WINDOW_LEDGERS}] ledgers"
+    )]
+    WindowDurationOutOfRange { duration: u32 },
+    #[error("voter '{voter}' has already cast a vote on proposal {proposal_id}")]
+    DuplicateVote { proposal_id: u64, voter: String },
+    #[error("voter identifier must not be empty")]
+    EmptyVoter,
+    #[error("eligible voting power is zero; quorum cannot be satisfied")]
+    ZeroEligibleVotingPower,
+    #[error("quorum threshold {quorum_bps} bps is outside [1, {BPS_SCALE}]")]
+    InvalidQuorumBps { quorum_bps: u32 },
 }
 
-impl ProposalCancellationRecord {
+impl VoteWindow {
+    /// Validate a proposal voting window before creation (issue #448).
     pub fn new(
-        proposal_id: u64,
-        cancelled_by: &str,
-        ledger: u32,
-        reason: &str,
-    ) -> Result<(Self, ProposalStateEvent), LifecycleError> {
-        let actor = cancelled_by.trim();
-        if actor.is_empty() {
-            return Err(LifecycleError::EmptyActor);
-        }
-        let trimmed_reason = reason.trim();
-        if trimmed_reason.is_empty() {
-            return Err(LifecycleError::EmptyCancellationReason);
-        }
-        if reason.len() > MAX_CANCELLATION_REASON_LEN {
-            return Err(LifecycleError::CancellationReasonTooLong {
-                length: reason.len(),
-                max: MAX_CANCELLATION_REASON_LEN,
+        start_ledger: u32,
+        end_ledger: u32,
+        current_ledger: u32,
+    ) -> Result<Self, GovernanceVoteError> {
+        if start_ledger < current_ledger {
+            return Err(GovernanceVoteError::StartLedgerInPast {
+                start: start_ledger,
+                current: current_ledger,
             });
         }
-        let record = Self {
-            proposal_id,
-            cancelled_by: actor.to_string(),
-            ledger,
-            reason: trimmed_reason.to_string(),
-        };
-        let event = ProposalStateEvent {
-            proposal_id,
-            from: ProposalState::Active,
-            to: ProposalState::Cancelled,
-            ledger,
-        };
-        Ok((record, event))
+        if end_ledger <= start_ledger {
+            return Err(GovernanceVoteError::InvalidWindowOrder {
+                start: start_ledger,
+                end: end_ledger,
+            });
+        }
+        let duration = end_ledger - start_ledger;
+        if !(MIN_VOTE_WINDOW_LEDGERS..=MAX_VOTE_WINDOW_LEDGERS).contains(&duration) {
+            return Err(GovernanceVoteError::WindowDurationOutOfRange { duration });
+        }
+        Ok(Self {
+            start_ledger,
+            end_ledger,
+        })
+    }
+
+    pub fn start_ledger(self) -> u32 {
+        self.start_ledger
+    }
+
+    pub fn end_ledger(self) -> u32 {
+        self.end_ledger
+    }
+
+    pub fn duration(self) -> u32 {
+        self.end_ledger - self.start_ledger
     }
 }
 
-/// Tracks token balances and single-hop delegation across delegation changes (issue #454).
+/// Tracks cast votes per `(proposal_id, voter)` to prevent duplicate voting (issue #449).
 #[derive(Debug, Default, Clone)]
-pub struct DelegationTracker {
-    balances: std::collections::BTreeMap<String, u64>,
-    delegates: std::collections::BTreeMap<String, String>,
+pub struct ProposalBallotBox {
+    seen: std::collections::BTreeSet<(u64, String)>,
 }
 
-impl DelegationTracker {
+impl ProposalBallotBox {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn set_balance(&mut self, account: &str, balance: u64) {
-        self.balances.insert(account.to_string(), balance);
-    }
-
-    pub fn delegate(&mut self, delegator: &str, delegatee: &str) -> Result<(), LifecycleError> {
-        if delegator.trim().is_empty() || delegatee.trim().is_empty() {
-            return Err(LifecycleError::EmptyActor);
+    /// Record a vote for `(proposal_id, voter)` or reject duplicates (issue #449).
+    pub fn record_vote(
+        &mut self,
+        proposal_id: u64,
+        voter: &str,
+        weight: u128,
+    ) -> Result<u128, GovernanceVoteError> {
+        let trimmed = voter.trim();
+        if trimmed.is_empty() {
+            return Err(GovernanceVoteError::EmptyVoter);
         }
-        if delegator == delegatee {
-            return Err(LifecycleError::SelfDelegation {
-                account: delegator.to_string(),
+        let key = (proposal_id, trimmed.to_string());
+        if self.seen.contains(&key) {
+            return Err(GovernanceVoteError::DuplicateVote {
+                proposal_id,
+                voter: trimmed.to_string(),
             });
         }
-        self.delegates
-            .insert(delegator.to_string(), delegatee.to_string());
-        Ok(())
+        self.seen.insert(key);
+        Ok(weight)
     }
 
-    pub fn undelegate(&mut self, delegator: &str) {
-        self.delegates.remove(delegator);
+    pub fn has_voted(&self, proposal_id: u64, voter: &str) -> bool {
+        self.seen.contains(&(proposal_id, voter.trim().to_string()))
     }
+}
 
-    /// Effective voting balance of `account`, including incoming delegations and excluding
-    /// outgoing balance when `account` has delegated to someone else (issue #454).
-    pub fn effective_voting_balance(&self, account: &str) -> u64 {
-        let own = if self.delegates.contains_key(account) {
-            0
-        } else {
-            self.balances.get(account).copied().unwrap_or(0)
-        };
-        let incoming: u64 = self
-            .delegates
-            .iter()
-            .filter(|(_, target)| target.as_str() == account)
-            .map(|(delegator, _)| self.balances.get(delegator).copied().unwrap_or(0))
-            .fold(0u64, u64::saturating_add);
-        own.saturating_add(incoming)
+/// Evaluate whether participating votes reach quorum, explicitly rejecting zero eligible voting power (issue #450).
+pub fn evaluate_quorum(
+    participating_votes: u128,
+    eligible_voting_power: u128,
+    quorum_bps: u32,
+) -> Result<bool, GovernanceVoteError> {
+    if !(1..=BPS_SCALE).contains(&quorum_bps) {
+        return Err(GovernanceVoteError::InvalidQuorumBps { quorum_bps });
     }
+    if eligible_voting_power == 0 {
+        return Err(GovernanceVoteError::ZeroEligibleVotingPower);
+    }
+    let required = (eligible_voting_power * u128::from(quorum_bps)).div_ceil(u128::from(BPS_SCALE));
+    Ok(participating_votes >= required)
 }
 
 #[cfg(test)]
@@ -409,62 +382,62 @@ mod tests {
     }
 
     #[test]
-    fn proposal_cancellation_requires_explicit_bounded_reason_and_emits_stable_event() {
+    fn vote_window_validation_rejects_past_start_inverted_bounds_and_overlong_durations() {
         assert_eq!(
-            ProposalCancellationRecord::new(7, "GADMIN", 500, "   "),
-            Err(LifecycleError::EmptyCancellationReason)
-        );
-        let too_long = "x".repeat(MAX_CANCELLATION_REASON_LEN + 1);
-        assert_eq!(
-            ProposalCancellationRecord::new(7, "GADMIN", 500, &too_long),
-            Err(LifecycleError::CancellationReasonTooLong {
-                length: MAX_CANCELLATION_REASON_LEN + 1,
-                max: MAX_CANCELLATION_REASON_LEN,
+            VoteWindow::new(99, 150, 100),
+            Err(GovernanceVoteError::StartLedgerInPast {
+                start: 99,
+                current: 100,
             })
         );
-
-        let (rec, ev) =
-            ProposalCancellationRecord::new(7, "GADMIN", 500, "Parameter superseded by #8")
-                .expect("valid cancellation");
-        assert_eq!(rec.reason, "Parameter superseded by #8");
         assert_eq!(
-            ev.to_canonical_string(),
-            "proposal_state_change:id=7:from=active:to=cancelled:ledger=500"
+            VoteWindow::new(100, 100, 100),
+            Err(GovernanceVoteError::InvalidWindowOrder {
+                start: 100,
+                end: 100,
+            })
         );
+        assert_eq!(
+            VoteWindow::new(100, 100 + MAX_VOTE_WINDOW_LEDGERS + 1, 100),
+            Err(GovernanceVoteError::WindowDurationOutOfRange {
+                duration: MAX_VOTE_WINDOW_LEDGERS + 1,
+            })
+        );
+        let valid = VoteWindow::new(100, 100 + MAX_VOTE_WINDOW_LEDGERS, 100).unwrap();
+        assert_eq!(valid.duration(), MAX_VOTE_WINDOW_LEDGERS);
     }
 
     #[test]
-    fn delegated_voting_power_updates_accurately_across_delegation_changes() {
-        let mut tracker = DelegationTracker::new();
-        tracker.set_balance("alice", 1_000);
-        tracker.set_balance("bob", 500);
-        tracker.set_balance("carol", 250);
-
-        // Initially everyone holds their own balance.
-        assert_eq!(tracker.effective_voting_balance("alice"), 1_000);
-        assert_eq!(tracker.effective_voting_balance("bob"), 500);
-
-        // Self-delegation is rejected.
+    fn duplicate_votes_for_same_proposal_and_voter_are_rejected() {
+        let mut box_tracker = ProposalBallotBox::new();
+        assert_eq!(box_tracker.record_vote(42, "GABC123", 5_000), Ok(5_000));
+        assert!(box_tracker.has_voted(42, "GABC123"));
         assert_eq!(
-            tracker.delegate("alice", "alice"),
-            Err(LifecycleError::SelfDelegation {
-                account: "alice".to_string(),
+            box_tracker.record_vote(42, "GABC123", 5_000),
+            Err(GovernanceVoteError::DuplicateVote {
+                proposal_id: 42,
+                voter: "GABC123".to_string(),
             })
         );
+        // Same voter on a different proposal is allowed.
+        assert_eq!(box_tracker.record_vote(43, "GABC123", 5_000), Ok(5_000));
+    }
 
-        // Alice delegates to Bob: Alice has 0 direct voting balance, Bob has 1_500.
-        tracker.delegate("alice", "bob").unwrap();
-        assert_eq!(tracker.effective_voting_balance("alice"), 0);
-        assert_eq!(tracker.effective_voting_balance("bob"), 1_500);
-
-        // Alice re-delegates to Carol: Bob drops back to 500, Carol rises to 1_250.
-        tracker.delegate("alice", "carol").unwrap();
-        assert_eq!(tracker.effective_voting_balance("bob"), 500);
-        assert_eq!(tracker.effective_voting_balance("carol"), 1_250);
-
-        // Alice revokes delegation: Alice regains 1_000, Carol returns to 250.
-        tracker.undelegate("alice");
-        assert_eq!(tracker.effective_voting_balance("alice"), 1_000);
-        assert_eq!(tracker.effective_voting_balance("carol"), 250);
+    #[test]
+    fn zero_eligible_voting_power_is_rejected_in_quorum_calculation() {
+        assert_eq!(
+            evaluate_quorum(0, 0, 2_000),
+            Err(GovernanceVoteError::ZeroEligibleVotingPower)
+        );
+        assert_eq!(
+            evaluate_quorum(100, 0, 2_000),
+            Err(GovernanceVoteError::ZeroEligibleVotingPower)
+        );
+        assert_eq!(
+            evaluate_quorum(100, 1_000, 0),
+            Err(GovernanceVoteError::InvalidQuorumBps { quorum_bps: 0 })
+        );
+        assert_eq!(evaluate_quorum(200, 1_000, 2_000), Ok(true));
+        assert_eq!(evaluate_quorum(199, 1_000, 2_000), Ok(false));
     }
 }
