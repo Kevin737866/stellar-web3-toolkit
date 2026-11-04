@@ -218,6 +218,7 @@ impl BridgePauseGuard {
     /// bridge, not to the guardian who started it.
     pub fn request_pause(env: Env, guardian: Address, reason: String) -> u32 {
         guardian.require_auth();
+        assert!(reason.len() > 0, "reason must not be empty");
         assert!(
             read_guardians(&env).contains(&guardian),
             "not a pause guardian"
@@ -879,5 +880,29 @@ mod test {
         // free text a guardian controls. The request is still only a request.
         assert!(f.client.try_assert_unpaused().is_ok());
         assert!(f.client.pending_change().is_some());
+    }
+
+    #[test]
+    #[should_panic(expected = "reason must not be empty")]
+    fn request_pause_requires_non_empty_reason() {
+        let f = Fixture::new();
+        f.client
+            .request_pause(&f.guardian_a, &String::from_str(&f.env, ""));
+    }
+
+    #[test]
+    fn guardian_rotation_and_lost_key_recovery() {
+        let f = Fixture::new();
+        let replacement = Address::generate(&f.env);
+
+        // Step 1: Add new guardian
+        f.client.add_guardian(&f.admin, &replacement);
+        assert!(f.client.is_guardian(&replacement));
+        assert_eq!(f.client.guardians().len(), 3);
+
+        // Step 2: Remove old / compromised guardian
+        f.client.remove_guardian(&f.admin, &f.guardian_a);
+        assert!(!f.client.is_guardian(&f.guardian_a));
+        assert_eq!(f.client.guardians().len(), 2);
     }
 }
