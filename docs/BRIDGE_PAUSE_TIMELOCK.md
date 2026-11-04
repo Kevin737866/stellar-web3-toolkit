@@ -223,3 +223,26 @@ priority as a pause request.
 `cargo fmt -p bridge-pause-guard -- --check` and
 `cargo build -p bridge-pause-guard --target wasm32v1-none --release` are clean, so
 the contract is deployable on Soroban.
+
+
+## Guardian Rotation and Lost-Key Recovery (#437)
+
+The pause authority set is managed by the contract admin via `add_guardian` and `remove_guardian`. Guardians hold emergency authority to initiate bridge pauses, so key hygiene, rotation routines, and lost-key recovery procedures are critical:
+
+### Planned Rotation
+1. **Identify New Key:** The replacement guardian generates a new keypair and provides their public address.
+2. **Add Guardian:** The admin calls `add_guardian(admin, new_guardian)`. This validates that `new_guardian` is not already a member and that `guardians.len() <= MAX_GUARDIANS (10)`. The `(guardian, add)` event is emitted on-chain.
+3. **Verify Membership:** Call `is_guardian(new_guardian)` to ensure the new address is active in instance storage.
+4. **Remove Old Key:** The admin calls `remove_guardian(admin, old_guardian)`. The `(guardian, remove)` event is emitted on-chain.
+5. **Enforce Minimum Quorum Invariant:** The contract guarantees `guardians.len() >= 1`. Attempting to remove the final guardian is rejected with `"the last guardian cannot be removed"`, ensuring the bridge is never left without pause authorities.
+
+### Lost-Key Recovery
+If a guardian loses their private key:
+1. **No Bridge Blockage:** Because pause requests can be triggered by *any* guardian (`request_pause`), a single lost key does not impair bridge safety if other guardians remain operational.
+2. **Immediate Remediation:** The admin provisions a fresh replacement address and executes the rotation sequence (`add_guardian` followed by `remove_guardian` for the lost key).
+3. **Compromised Key Response:** If a guardian key is believed to be compromised rather than merely lost, the admin should immediately:
+   - Check if an unauthorized pause was requested (`pending_change`). If so, execute `cancel_pending(admin)`.
+   - Call `remove_guardian(admin, compromised_key)` to instantly revoke all emergency pause permissions.
+
+### Explicit Pause Reason Requirement (#433)
+To prevent ambiguous or accidental emergency halts, `request_pause` strictly requires a non-empty `reason` string (`assert!(reason.len() > 0, "reason must not be empty")`). Empty reason strings are rejected at the contract boundary, ensuring every pause broadcast on-chain carries an auditable operational justification.
