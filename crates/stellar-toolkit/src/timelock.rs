@@ -73,6 +73,13 @@ pub enum TimelockError {
         current_ledger: u32,
         effective_ledger: u32,
     },
+    #[error("required quorum cannot be zero")]
+    ZeroQuorumRequirement,
+    #[error("unauthorized governance action {action:?} for role {role:?}")]
+    UnauthorizedGovernanceAction {
+        role: GovernanceRole,
+        action: GovernanceAction,
+    },
 }
 
 impl TimelockPolicy {
@@ -152,7 +159,6 @@ impl TimelockPolicy {
     }
 }
 
-
 /// Snapshot of vote totals and quorum progress returned by proposal queries (issue #456).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProposalQuorumProgress {
@@ -214,7 +220,10 @@ pub fn authorize_governance_action(
     action: GovernanceAction,
 ) -> Result<(), TimelockError> {
     match (role, action) {
-        (GovernanceRole::EmergencyGuardian | GovernanceRole::TimelockAdmin, GovernanceAction::EmergencyVeto) => Ok(()),
+        (
+            GovernanceRole::EmergencyGuardian | GovernanceRole::TimelockAdmin,
+            GovernanceAction::EmergencyVeto,
+        ) => Ok(()),
         (GovernanceRole::TimelockAdmin, GovernanceAction::ExecuteUpgrade) => Ok(()),
         _ => Err(TimelockError::UnauthorizedGovernanceAction { role, action }),
     }

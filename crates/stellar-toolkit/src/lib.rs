@@ -65,7 +65,10 @@ pub use key_hygiene::{
     ScanReport, SecretKind,
 };
 pub use one_click_airdrop::{AirdropClaimRequest, ClaimStatus, OneClickAirdropClaimer};
-pub use oracle_resilience::{assess_quorum_liveness, LivenessError, QuorumLiveness};
+pub use oracle_resilience::{
+    assess_quorum_liveness, JitteredRetryPolicy, LivenessError, PriceFeedScale, PriceObservation,
+    PriceValidationError, QuorumLiveness, ResilientPriceTracker,
+};
 pub use p2p_qr_payment::{P2PQRPaymentFlow, PaymentStatus, QRPaymentRequest};
 pub use scaffolder::{LintFinding, LintReport, LintSeverity, ScaffoldOptions, Scaffolder};
 pub use session_keys::{

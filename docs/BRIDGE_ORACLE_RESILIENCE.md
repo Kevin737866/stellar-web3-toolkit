@@ -98,3 +98,19 @@ to confirmation contents at all.
 * a 100-oracle set to prove there is no artificial cap;
 * a wide set with one duplicate and one stale position ending exactly at quorum;
 * invalid `n`/`m` configurations returning `LivenessError`.
+
+## Price Observation Units, Scale & Resilient Ingestion (#443, #444, #446)
+
+Oracle price feeds for bridge cross-currency calculations must operate with strictly documented decimal units and resilience policies:
+
+| Feed Type | Decimal Scale | Unit Multiplier | Example Format |
+| --- | --- | --- | --- |
+| Stellar Native (`STROOP`) | 7 | 10,000,000 | `15000000` -> `1.5` XLM |
+| Standard Asset / USD (`EIGHT_DECIMALS`) | 8 | 100,000,000 | `65432100000` -> `654.321` USD |
+| EVM Pegged (`EIGHTEEN_DECIMALS`) | 18 | 10^18 | 1 Wei base unit |
+
+### Invariants:
+1. **Units and Decimal Scale Enforcement (#446)**: Feeds must specify explicit `PriceFeedScale`. Any observation reporting an unexpected decimal scale is rejected with `PriceValidationError::ScaleMismatch`.
+2. **Preserving Previous Valid Price on Invalid Data (#443)**: When a source reports a non-positive or corrupted price, the observation is rejected with `PriceValidationError::NonPositivePrice`, but the tracker **preserves the source's previous valid price** intact without dropping historical quorum liveness.
+3. **Timestamp Ordering & Monotonicity (#444)**: Cumulative price observations must adhere to strict ascending timestamp order (`observation.timestamp > previous.timestamp`). Reordering or regressive timestamps are rejected with `PriceValidationError::TimestampRegression`.
+4. **Jittered Polling Retry Policy (#445)**: Relayers and oracle pollers use bounded exponential backoff with pseudo-random jitter (`JitteredRetryPolicy`) to prevent synchronized thundering-herd spikes against oracle endpoints.
