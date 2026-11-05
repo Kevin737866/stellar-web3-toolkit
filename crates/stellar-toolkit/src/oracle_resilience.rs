@@ -294,7 +294,7 @@ impl ResilientPriceTracker {
         }
 
         let obs = PriceObservation {
-            oracle_source: source.to_string(),
+            source: source.to_string(),
             price,
             timestamp,
             scale,
@@ -511,8 +511,13 @@ mod tests {
     fn preserves_previous_valid_price_on_invalid_reported_data() {
         let mut tracker = ResilientPriceTracker::new(PriceFeedScale::STROOP);
         // Valid initial observation
-        tracker.record_observation("feed_a", 15_000_000, 1000, PriceFeedScale::STROOP).expect("valid");
-        assert_eq!(tracker.get_latest_valid("feed_a").unwrap().price, 15_000_000);
+        tracker
+            .record_observation("feed_a", 15_000_000, 1000, PriceFeedScale::STROOP)
+            .expect("valid");
+        assert_eq!(
+            tracker.get_latest_valid("feed_a").unwrap().price,
+            15_000_000
+        );
 
         // Invalid non-positive price attempt
         let err = tracker.record_observation("feed_a", -500, 1010, PriceFeedScale::STROOP);
@@ -524,17 +529,23 @@ mod tests {
             })
         );
         // Invariant #443: previous valid price remains intact!
-        assert_eq!(tracker.get_latest_valid("feed_a").unwrap().price, 15_000_000);
+        assert_eq!(
+            tracker.get_latest_valid("feed_a").unwrap().price,
+            15_000_000
+        );
         assert_eq!(tracker.rejected_invalid_count(), 1);
     }
 
     #[test]
     fn validates_timestamp_ordering_strictly_ascending() {
         let mut tracker = ResilientPriceTracker::new(PriceFeedScale::STROOP);
-        tracker.record_observation("feed_b", 20_000_000, 1000, PriceFeedScale::STROOP).expect("valid");
+        tracker
+            .record_observation("feed_b", 20_000_000, 1000, PriceFeedScale::STROOP)
+            .expect("valid");
 
         // Regressive timestamp (990 <= 1000)
-        let reg_err = tracker.record_observation("feed_b", 21_000_000, 990, PriceFeedScale::STROOP);
+        let reg_err =
+            tracker.record_observation("feed_b", 21_000_000, 990, PriceFeedScale::STROOP);
         assert_eq!(
             reg_err,
             Err(PriceValidationError::TimestampRegression {
@@ -543,16 +554,28 @@ mod tests {
                 latest_ts: 1000,
             })
         );
-        assert_eq!(tracker.get_latest_valid("feed_b").unwrap().price, 20_000_000);
+        assert_eq!(
+            tracker.get_latest_valid("feed_b").unwrap().price,
+            20_000_000
+        );
         assert_eq!(tracker.rejected_regressive_count(), 1);
 
         // Equal timestamp (1000 <= 1000)
-        let eq_err = tracker.record_observation("feed_b", 21_000_000, 1000, PriceFeedScale::STROOP);
-        assert!(matches!(eq_err, Err(PriceValidationError::TimestampRegression { .. })));
+        let eq_err =
+            tracker.record_observation("feed_b", 21_000_000, 1000, PriceFeedScale::STROOP);
+        assert!(matches!(
+            eq_err,
+            Err(PriceValidationError::TimestampRegression { .. })
+        ));
 
         // Strictly newer succeeds
-        tracker.record_observation("feed_b", 22_000_000, 1001, PriceFeedScale::STROOP).expect("newer timestamp");
-        assert_eq!(tracker.get_latest_valid("feed_b").unwrap().price, 22_000_000);
+        tracker
+            .record_observation("feed_b", 22_000_000, 1001, PriceFeedScale::STROOP)
+            .expect("newer timestamp");
+        assert_eq!(
+            tracker.get_latest_valid("feed_b").unwrap().price,
+            22_000_000
+        );
     }
 
     #[test]
@@ -566,5 +589,4 @@ mod tests {
         let b_high = policy.calculate_backoff_ms(10, 42);
         assert!(b_high >= 750 && b_high <= 1000);
     }
-
 }
