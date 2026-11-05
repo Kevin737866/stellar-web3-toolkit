@@ -144,7 +144,6 @@ pub fn assess_quorum_liveness(
     })
 }
 
-
 /// Units and decimal scale definition for oracle price values (#446).
 ///
 /// Stellar asset native prices are represented with 7 decimals (1 stroop = 10^-7 XLM),
@@ -221,7 +220,9 @@ pub enum PriceValidationError {
         observed_ts: u64,
         latest_ts: u64,
     },
-    #[error("scale mismatch: expected {expected} decimals, got {actual} for source `{oracle_source}`")]
+    #[error(
+        "scale mismatch: expected {expected} decimals, got {actual} for source `{oracle_source}`"
+    )]
     ScaleMismatch {
         oracle_source: String,
         expected: u8,
@@ -544,8 +545,7 @@ mod tests {
             .expect("valid");
 
         // Regressive timestamp (990 <= 1000)
-        let reg_err =
-            tracker.record_observation("feed_b", 21_000_000, 990, PriceFeedScale::STROOP);
+        let reg_err = tracker.record_observation("feed_b", 21_000_000, 990, PriceFeedScale::STROOP);
         assert_eq!(
             reg_err,
             Err(PriceValidationError::TimestampRegression {
@@ -561,8 +561,7 @@ mod tests {
         assert_eq!(tracker.rejected_regressive_count(), 1);
 
         // Equal timestamp (1000 <= 1000)
-        let eq_err =
-            tracker.record_observation("feed_b", 21_000_000, 1000, PriceFeedScale::STROOP);
+        let eq_err = tracker.record_observation("feed_b", 21_000_000, 1000, PriceFeedScale::STROOP);
         assert!(matches!(
             eq_err,
             Err(PriceValidationError::TimestampRegression { .. })
@@ -583,10 +582,10 @@ mod tests {
         let policy = JitteredRetryPolicy::new(100, 1000, 5);
         // Attempt 0: base 100ms, jitter in [75, 100]
         let b0 = policy.calculate_backoff_ms(0, 15);
-        assert!(b0 >= 75 && b0 <= 100);
+        assert!((75..=100).contains(&b0));
 
         // High attempt capped at max_backoff 1000ms, jitter in [750, 1000]
         let b_high = policy.calculate_backoff_ms(10, 42);
-        assert!(b_high >= 750 && b_high <= 1000);
+        assert!((750..=1000).contains(&b_high));
     }
 }
