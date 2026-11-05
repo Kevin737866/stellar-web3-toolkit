@@ -213,17 +213,17 @@ pub struct PriceObservation {
 /// Errors occurring during price observation ingestion and validation (#443, #444).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PriceValidationError {
-    #[error("non-positive price {price} reported by source `{source}`")]
-    NonPositivePrice { source: String, price: i128 },
-    #[error("timestamp regression: observed {observed_ts} <= latest valid {latest_ts} for source `{source}`")]
+    #[error("non-positive price {price} reported by source `{oracle_source}`")]
+    NonPositivePrice { oracle_source: String, price: i128 },
+    #[error("timestamp regression: observed {observed_ts} <= latest valid {latest_ts} for source `{oracle_source}`")]
     TimestampRegression {
-        source: String,
+        oracle_source: String,
         observed_ts: u64,
         latest_ts: u64,
     },
-    #[error("scale mismatch: expected {expected} decimals, got {actual} for source `{source}`")]
+    #[error("scale mismatch: expected {expected} decimals, got {actual} for source `{oracle_source}`")]
     ScaleMismatch {
-        source: String,
+        oracle_source: String,
         expected: u8,
         actual: u8,
     },
@@ -268,7 +268,7 @@ impl ResilientPriceTracker {
         if scale.decimals != self.expected_scale.decimals {
             self.rejected_invalid += 1;
             return Err(PriceValidationError::ScaleMismatch {
-                source: source.to_string(),
+                oracle_source: source.to_string(),
                 expected: self.expected_scale.decimals,
                 actual: scale.decimals,
             });
@@ -277,7 +277,7 @@ impl ResilientPriceTracker {
         if price <= 0 {
             self.rejected_invalid += 1;
             return Err(PriceValidationError::NonPositivePrice {
-                source: source.to_string(),
+                oracle_source: source.to_string(),
                 price,
             });
         }
@@ -286,7 +286,7 @@ impl ResilientPriceTracker {
             if timestamp <= prev.timestamp {
                 self.rejected_regressive += 1;
                 return Err(PriceValidationError::TimestampRegression {
-                    source: source.to_string(),
+                    oracle_source: source.to_string(),
                     observed_ts: timestamp,
                     latest_ts: prev.timestamp,
                 });
@@ -294,7 +294,7 @@ impl ResilientPriceTracker {
         }
 
         let obs = PriceObservation {
-            source: source.to_string(),
+            oracle_source: source.to_string(),
             price,
             timestamp,
             scale,
@@ -519,7 +519,7 @@ mod tests {
         assert_eq!(
             err,
             Err(PriceValidationError::NonPositivePrice {
-                source: "feed_a".to_string(),
+                oracle_source: "feed_a".to_string(),
                 price: -500,
             })
         );
@@ -538,7 +538,7 @@ mod tests {
         assert_eq!(
             reg_err,
             Err(PriceValidationError::TimestampRegression {
-                source: "feed_b".to_string(),
+                oracle_source: "feed_b".to_string(),
                 observed_ts: 990,
                 latest_ts: 1000,
             })
