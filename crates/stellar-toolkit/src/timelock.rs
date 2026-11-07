@@ -73,6 +73,13 @@ pub enum TimelockError {
         current_ledger: u32,
         effective_ledger: u32,
     },
+    #[error("required quorum must be strictly positive")]
+    ZeroQuorumRequirement,
+    #[error("role {role:?} is not authorized to execute governance action {action:?}")]
+    UnauthorizedGovernanceAction {
+        role: GovernanceRole,
+        action: GovernanceAction,
+    },
 }
 
 impl TimelockPolicy {

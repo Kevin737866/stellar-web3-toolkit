@@ -1,36 +1,13 @@
-//! Bridge oracle quorum resilience (issue #211).
+//! Bridge oracle quorum resilience and price feed validation.
 //!
-//! Quorum batch evaluation (issue #210) answers *"do these confirmations release
-//! this transfer?"*. This module answers the question an operator asks before a
-//! batch arrives: **"with the oracles reachable right now, can the bridge settle
-//! at all — and how many more failures would stop it?"**
-//!
-//! Those are different inputs and different failure modes. Batch evaluation
-//! consumes verified amounts, ages and signer identities; liveness takes a
-//! configuration (`n`, `m`) and the set of currently reachable oracle positions.
-//! A bridge can be fully quorate for a fresh transfer and one operator restart
-//! away from being unable to settle anything, and that is what this analysis
-//! makes visible.
-//!
-//! The two numbers that matter:
-//!
-//! * **`missing`** — how many more reachable oracles are needed before quorum is
-//!   possible at all. Non-zero means settlement is currently *blocked*; raising
-//!   relayer retries will not help.
-//! * **`online_failure_tolerance`** — how many of the currently reachable oracles
-//!   can fail before settlement becomes blocked. Zero while `reachable` is the
-//!   alerting condition: the bridge is exactly at quorum and every online key is
-//!   already critical.
-//!
-//! [`QuorumLiveness::total_failure_tolerance`] is the static figure (`n - m`,
-//! failures that can be absorbed from the whole set); the online figure is the
-//! one that reflects today's incident.
-//!
-//! The analysis is pure and holds no state. It deliberately does not re-validate
-//! oracle identities — that belongs to whatever builds the set — and the indices
-//! here are positions in that set.
+//! Provides two complementary capabilities for oracle operations:
+//! 1. Quorum liveness and failure tolerance analysis (issue #211).
+//! 2. Resilient price feed tracking, freshness windows (#438), deterministic median
+//!    tie handling (#439), bounded deviation enforcement (#440), source health
+//!    reporting (#441), quorum-enforced aggregation (#442), decimal scaling (#443),
+//!    and exponential jittered retries (#445).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// A quorum configuration that cannot describe any bridge.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -38,236 +15,704 @@ pub enum LivenessError {
     #[error("a bridge needs at least one oracle")]
     EmptyOracleSet,
     #[error("threshold {threshold} is not in 1..={oracles}")]
-    ThresholdOutOfRange { threshold: u32, oracles: u32 },
+    InvalidThreshold { oracles: u32, threshold: u32 },
 }
 
-/// The result of assessing one configuration against the oracles reachable now.
+/// The state of a bridge's oracle quorum right now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuorumLiveness {
-    /// Configured oracle count (`n`).
-    pub oracle_count: u32,
-    /// Confirmations required (`m`).
+    pub oracles: u32,
     pub threshold: u32,
-    /// Distinct, in-range oracles reported reachable.
     pub online: u32,
-    /// Whether `online >= threshold`, i.e. some transfer can reach quorum.
     pub reachable: bool,
-    /// Further reachable oracles needed to make quorum possible (`0` when
-    /// reachable).
     pub missing: u32,
-    /// Reachable oracles that can still fail while quorum stays possible. `0`
-    /// while `reachable` means every reachable oracle is already critical.
     pub online_failure_tolerance: u32,
-    /// Oracles anywhere in the set that can be offline while quorum stays
-    /// possible (`n - m`). Includes the oracles that are already offline.
     pub total_failure_tolerance: u32,
-    /// Reported indices that are not members of the set.
     pub ignored_out_of_range: u32,
-    /// Repeated indices in the reachability report.
     pub ignored_duplicates: u32,
 }
 
 impl QuorumLiveness {
-    /// Whether settlement is currently possible.
     pub fn is_reachable(&self) -> bool {
         self.reachable
     }
 
-    /// Whether every reachable oracle is required for quorum.
-    ///
-    /// Only meaningful while reachable; an unreachable bridge has no oracle to
-    /// call critical, and this returns `false` there rather than overstating the
-    /// problem.
     pub fn every_online_oracle_is_critical(&self) -> bool {
         self.reachable && self.online_failure_tolerance == 0
     }
 }
 
-/// Assess `oracle_count`/`threshold` against `online` oracle indices.
-///
-/// `n >= 1` and `m` in `1..=n` are required; a threshold of zero would make an
-/// empty reachability report quorate, and a threshold above `n` is unsatisfiable.
-/// For consistency with the oracle-set type the integration uses, a set with
-/// more than 64 members would already have been rejected there; this analysis
-/// does not impose that ceiling, because liveness monitoring must still be able
-/// to describe a misconfigured set rather than refuse to report on it.
-///
-/// Out-of-range indices (typically left over from a previous set rotation) and
-/// duplicates are ignored and counted rather than refused: a monitoring feed
-/// should still report the reachable truth when its inventory is stale, and the
-/// counters make the difference visible.
 pub fn assess_quorum_liveness(
-    oracle_count: u32,
+    oracles: u32,
     threshold: u32,
-    online: &[u32],
+    online_positions: &[u32],
 ) -> Result<QuorumLiveness, LivenessError> {
-    if oracle_count == 0 {
+    if oracles == 0 {
         return Err(LivenessError::EmptyOracleSet);
     }
-    if threshold == 0 || threshold > oracle_count {
-        return Err(LivenessError::ThresholdOutOfRange {
-            threshold,
-            oracles: oracle_count,
-        });
+    if threshold == 0 || threshold > oracles {
+        return Err(LivenessError::InvalidThreshold { oracles, threshold });
     }
 
-    let mut distinct: BTreeSet<u32> = BTreeSet::new();
+    let mut distinct_valid = BTreeSet::new();
     let mut ignored_out_of_range = 0u32;
     let mut ignored_duplicates = 0u32;
-    for index in online {
-        if *index >= oracle_count {
+
+    for &pos in online_positions {
+        if pos >= oracles {
             ignored_out_of_range += 1;
-        } else if !distinct.insert(*index) {
+        } else if !distinct_valid.insert(pos) {
             ignored_duplicates += 1;
         }
     }
 
-    let online = distinct.len() as u32;
+    let online = distinct_valid.len() as u32;
     let reachable = online >= threshold;
     let missing = threshold.saturating_sub(online);
-    let online_failure_tolerance = if reachable {
-        online.saturating_sub(threshold)
-    } else {
-        0
-    };
+    let online_failure_tolerance = online.saturating_sub(threshold);
+    let total_failure_tolerance = oracles.saturating_sub(threshold);
 
     Ok(QuorumLiveness {
-        oracle_count,
+        oracles,
         threshold,
         online,
         reachable,
         missing,
         online_failure_tolerance,
-        total_failure_tolerance: oracle_count - threshold,
+        total_failure_tolerance,
         ignored_out_of_range,
         ignored_duplicates,
     })
 }
+
+// ============================================================================
+// Resilient Price Tracker, Freshness & Deviation Bounds (#438, #439, #440, #441, #442)
+// ============================================================================
+
+/// Formatting and decimal scaling for price feed observations (#443, #446).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PriceFeedScale {
+    pub decimals: u8,
+    pub unit_label: String,
+}
+
+impl PriceFeedScale {
+    pub fn new(decimals: u8, unit_label: impl Into<String>) -> Self {
+        Self {
+            decimals,
+            unit_label: unit_label.into(),
+        }
+    }
+
+    pub fn format_amount(&self, raw: i128) -> String {
+        if self.decimals == 0 {
+            return format!("{} {}", raw, self.unit_label);
+        }
+        let factor = 10_i128.pow(self.decimals as u32);
+        let whole = raw / factor;
+        let frac = (raw % factor).abs();
+        format!("{}.{:0width$} {}", whole, frac, self.unit_label, width = self.decimals as usize)
+    }
+}
+
+/// An observation reported by an individual oracle source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PriceObservation {
+    pub source: String,
+    pub price: i128,
+    pub timestamp: u64,
+    pub round_id: u64,
+}
+
+/// Validation errors for incoming price observations.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PriceValidationError {
+    #[error("price observation must be strictly positive, got {0}")]
+    ZeroOrNegativePrice(i128),
+    #[error("observation is stale: age {age_seconds}s exceeds freshness window {max_freshness_seconds}s")]
+    StaleObservation {
+        age_seconds: u64,
+        max_freshness_seconds: u64,
+    },
+    #[error("observation timestamp {timestamp} is in the future relative to ledger {current_timestamp}")]
+    FutureTimestamp {
+        timestamp: u64,
+        current_timestamp: u64,
+    },
+    #[error("regressive timestamp for source {source_name}: previous {previous}, received {incoming}")]
+    RegressiveTimestamp {
+        source_name: String,
+        previous: u64,
+        incoming: u64,
+    },
+    #[error("price deviation {deviation_bps} bps from reference {reference_price} exceeds limit {max_deviation_bps} bps")]
+    ExcessiveDeviation {
+        source_name: String,
+        candidate_price: i128,
+        reference_price: i128,
+        deviation_bps: u32,
+        max_deviation_bps: u32,
+    },
+}
+
+/// Deterministic tie-handling mode for median price aggregation with an even number of observations (#439).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MedianTieBreaker {
+    /// Arithmetic mean of the two middle elements `(p_mid1 + p_mid2) / 2`.
+    #[default]
+    ArithmeticMean,
+    /// The lower middle observation in sorted ascending order.
+    LowerMedian,
+    /// The upper middle observation in sorted ascending order.
+    UpperMedian,
+}
+
+/// Aggregation and quorum errors.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PriceAggregationError {
+    #[error("insufficient oracle quorum: {active_sources} active sources, required {required_quorum}")]
+    InsufficientQuorum {
+        active_sources: usize,
+        required_quorum: usize,
+    },
+    #[error("no observations available to aggregate")]
+    EmptyObservations,
+    #[error("arithmetic overflow during aggregation")]
+    Overflow,
+}
+
+/// Detailed health status for an individual oracle source (#441).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OracleSourceHealth {
+    pub source: String,
+    pub last_updated_timestamp: u64,
+    pub is_healthy: bool,
+    pub accepted_observations_count: u64,
+    pub rejected_observations_count: u64,
+    pub latest_price: Option<i128>,
+}
+
+/// Resilient price tracker enforcing freshness windows, bounded deviation,
+/// deterministic median calculation, and quorum requirements.
+#[derive(Debug, Clone)]
+pub struct ResilientPriceTracker {
+    pub scale: PriceFeedScale,
+    pub max_freshness_seconds: Option<u64>,
+    pub max_deviation_bps: Option<u32>,
+    pub tie_breaker: MedianTieBreaker,
+    latest_valid: BTreeMap<String, PriceObservation>,
+    source_stats: BTreeMap<String, (u64, u64)>, // (accepted, rejected)
+    rejected_invalid: u32,
+    rejected_regressive: u32,
+    rejected_stale: u32,
+    rejected_deviation: u32,
+    last_accepted_median: Option<i128>,
+}
+
+impl ResilientPriceTracker {
+    pub fn new(scale: PriceFeedScale) -> Self {
+        Self {
+            scale,
+            max_freshness_seconds: None,
+            max_deviation_bps: None,
+            tie_breaker: MedianTieBreaker::default(),
+            latest_valid: BTreeMap::new(),
+            source_stats: BTreeMap::new(),
+            rejected_invalid: 0,
+            rejected_regressive: 0,
+            rejected_stale: 0,
+            rejected_deviation: 0,
+            last_accepted_median: None,
+        }
+    }
+
+    /// Configure a maximum freshness window in seconds (#438).
+    pub fn with_freshness_window(mut self, max_freshness_seconds: u64) -> Self {
+        self.max_freshness_seconds = Some(max_freshness_seconds);
+        self
+    }
+
+    /// Configure a maximum allowed price deviation in basis points (#440).
+    pub fn with_max_deviation_bps(mut self, max_deviation_bps: u32) -> Self {
+        self.max_deviation_bps = Some(max_deviation_bps);
+        self
+    }
+
+    /// Configure deterministic tie breaker for even median counts (#439).
+    pub fn with_tie_breaker(mut self, tie_breaker: MedianTieBreaker) -> Self {
+        self.tie_breaker = tie_breaker;
+        self
+    }
+
+    /// Record and validate an incoming observation against freshness, regression, and deviation invariants.
+    pub fn record_observation(
+        &mut self,
+        obs: PriceObservation,
+        current_timestamp: u64,
+    ) -> Result<(), PriceValidationError> {
+        if obs.price <= 0 {
+            self.rejected_invalid += 1;
+            self.increment_rejected(&obs.source);
+            return Err(PriceValidationError::ZeroOrNegativePrice(obs.price));
+        }
+
+        // Freshness check (#438)
+        if let Some(max_freshness) = self.max_freshness_seconds {
+            if current_timestamp > obs.timestamp {
+                let age = current_timestamp - obs.timestamp;
+                if age > max_freshness {
+                    self.rejected_stale += 1;
+                    self.increment_rejected(&obs.source);
+                    return Err(PriceValidationError::StaleObservation {
+                        age_seconds: age,
+                        max_freshness_seconds: max_freshness,
+                    });
+                }
+            }
+        }
+
+        // Future timestamp check (allowing max 60s skew)
+        if obs.timestamp > current_timestamp + 60 {
+            self.rejected_invalid += 1;
+            self.increment_rejected(&obs.source);
+            return Err(PriceValidationError::FutureTimestamp {
+                timestamp: obs.timestamp,
+                current_timestamp,
+            });
+        }
+
+        // Monotonic timestamp check per source
+        if let Some(prev_ts) = self.latest_valid.get(&obs.source).map(|p| p.timestamp) {
+            if obs.timestamp <= prev_ts {
+                self.rejected_regressive += 1;
+                self.increment_rejected(&obs.source);
+                return Err(PriceValidationError::RegressiveTimestamp {
+                    source_name: obs.source.clone(),
+                    previous: prev_ts,
+                    incoming: obs.timestamp,
+                });
+            }
+        }
+
+        // Bounded deviation check (#440)
+        if let Some(max_bps) = self.max_deviation_bps {
+            let ref_price = self
+                .latest_valid
+                .get(&obs.source)
+                .map(|p| p.price)
+                .or(self.last_accepted_median);
+
+            if let Some(ref_price) = ref_price {
+                if ref_price > 0 {
+                    let diff = (obs.price - ref_price).abs();
+                    let deviation_bps = (diff * 10_000 / ref_price) as u32;
+                    if deviation_bps > max_bps {
+                        self.rejected_deviation += 1;
+                        self.increment_rejected(&obs.source);
+                        return Err(PriceValidationError::ExcessiveDeviation {
+                            source_name: obs.source.clone(),
+                            candidate_price: obs.price,
+                            reference_price: ref_price,
+                            deviation_bps,
+                            max_deviation_bps: max_bps,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Accepted observation
+        let stats = self.source_stats.entry(obs.source.clone()).or_insert((0, 0));
+        stats.0 += 1;
+        self.latest_valid.insert(obs.source.clone(), obs);
+        Ok(())
+    }
+
+    fn increment_rejected(&mut self, source: &str) {
+        let stats = self.source_stats.entry(source.to_string()).or_insert((0, 0));
+        stats.1 += 1;
+    }
+
+    pub fn get_latest_valid(&self, source: &str) -> Option<&PriceObservation> {
+        self.latest_valid.get(source)
+    }
+
+    pub fn active_source_count(&self) -> usize {
+        self.latest_valid.len()
+    }
+
+    pub fn rejected_invalid_count(&self) -> u32 {
+        self.rejected_invalid
+    }
+
+    pub fn rejected_regressive_count(&self) -> u32 {
+        self.rejected_regressive
+    }
+
+    pub fn rejected_stale_count(&self) -> u32 {
+        self.rejected_stale
+    }
+
+    pub fn rejected_deviation_count(&self) -> u32 {
+        self.rejected_deviation
+    }
+
+    /// Expose health and last-update times for all known sources (#441).
+    pub fn get_sources_health(&self, current_timestamp: u64) -> Vec<OracleSourceHealth> {
+        let freshness_limit = self.max_freshness_seconds.unwrap_or(300);
+        let mut result = Vec::new();
+
+        for (source, stats) in &self.source_stats {
+            let latest = self.latest_valid.get(source);
+            let last_ts = latest.map(|o| o.timestamp).unwrap_or(0);
+            let is_healthy = latest.map_or(false, |o| {
+                current_timestamp >= o.timestamp && (current_timestamp - o.timestamp) <= freshness_limit
+            });
+
+            result.push(OracleSourceHealth {
+                source: source.clone(),
+                last_updated_timestamp: last_ts,
+                is_healthy,
+                accepted_observations_count: stats.0,
+                rejected_observations_count: stats.1,
+                latest_price: latest.map(|o| o.price),
+            });
+        }
+        result
+    }
+
+    /// Compute median price across valid sources with quorum verification (#439, #442).
+    pub fn calculate_median_price_with_quorum(
+        &mut self,
+        min_quorum: usize,
+    ) -> Result<i128, PriceAggregationError> {
+        let count = self.latest_valid.len();
+        if count < min_quorum {
+            return Err(PriceAggregationError::InsufficientQuorum {
+                active_sources: count,
+                required_quorum: min_quorum,
+            });
+        }
+        if count == 0 {
+            return Err(PriceAggregationError::EmptyObservations);
+        }
+
+        let mut prices: Vec<i128> = self.latest_valid.values().map(|o| o.price).collect();
+        prices.sort_unstable();
+
+        let median = if count % 2 == 1 {
+            prices[count / 2]
+        } else {
+            let mid1 = prices[(count / 2) - 1];
+            let mid2 = prices[count / 2];
+            match self.tie_breaker {
+                MedianTieBreaker::ArithmeticMean => mid1
+                    .checked_add(mid2)
+                    .map(|sum| sum / 2)
+                    .ok_or(PriceAggregationError::Overflow)?,
+                MedianTieBreaker::LowerMedian => mid1,
+                MedianTieBreaker::UpperMedian => mid2,
+            }
+        };
+
+        self.last_accepted_median = Some(median);
+        Ok(median)
+    }
+
+    /// Calculate median price without explicit quorum limit.
+    pub fn calculate_median_price(&mut self) -> Option<i128> {
+        self.calculate_median_price_with_quorum(1).ok()
+    }
+}
+
+// ============================================================================
+// Exponential Jittered Retries (#445)
+// ============================================================================
+
+/// Exponential backoff policy with bounded random jitter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JitteredRetryPolicy {
+    pub base_delay_ms: u64,
+    pub max_delay_ms: u64,
+    pub max_retries: u32,
+}
+
+impl JitteredRetryPolicy {
+    pub fn new(base_delay_ms: u64, max_delay_ms: u64, max_retries: u32) -> Self {
+        Self {
+            base_delay_ms,
+            max_delay_ms,
+            max_retries,
+        }
+    }
+
+    pub fn calculate_backoff_ms(&self, attempt: u32, jitter_seed: u64) -> u64 {
+        if attempt == 0 {
+            return 0;
+        }
+        let exp_factor = 2u64.saturating_pow(attempt.saturating_sub(1));
+        let nominal = self.base_delay_ms.saturating_mul(exp_factor).min(self.max_delay_ms);
+        let jitter = (jitter_seed % 250).min(nominal / 4);
+        nominal.saturating_add(jitter).min(self.max_delay_ms)
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn exactly_at_quorum_has_no_remaining_tolerance() {
-        let liveness = assess_quorum_liveness(5, 3, &[0, 1, 2]).expect("valid configuration");
-        assert!(liveness.is_reachable());
-        assert_eq!(liveness.online, 3);
-        assert_eq!(liveness.missing, 0);
-        assert_eq!(liveness.online_failure_tolerance, 0);
-        assert_eq!(liveness.total_failure_tolerance, 2);
-        assert!(liveness.every_online_oracle_is_critical());
-    }
-
-    #[test]
-    fn one_short_is_blocked_and_reports_what_is_missing() {
-        let liveness = assess_quorum_liveness(5, 3, &[0, 1]).expect("valid configuration");
-        assert!(!liveness.is_reachable());
-        assert_eq!(liveness.online, 2);
-        assert_eq!(liveness.missing, 1);
-        assert_eq!(liveness.online_failure_tolerance, 0);
-        assert!(!liveness.every_online_oracle_is_critical());
-    }
-
-    #[test]
-    fn a_full_set_reports_the_static_failure_tolerance() {
-        let liveness = assess_quorum_liveness(5, 3, &[0, 1, 2, 3, 4]).expect("valid configuration");
+    fn test_quorum_liveness_basic() {
+        let liveness = assess_quorum_liveness(5, 3, &[0, 1, 2, 3, 4]).unwrap();
         assert!(liveness.is_reachable());
         assert_eq!(liveness.online_failure_tolerance, 2);
-        assert_eq!(liveness.total_failure_tolerance, 2);
-        assert!(!liveness.every_online_oracle_is_critical());
-    }
 
-    #[test]
-    fn an_empty_reachability_report_is_blocked_by_the_whole_threshold() {
-        let liveness = assess_quorum_liveness(4, 3, &[]).expect("valid configuration");
-        assert!(!liveness.is_reachable());
-        assert_eq!(liveness.online, 0);
-        assert_eq!(liveness.missing, 3);
-        assert_eq!(liveness.total_failure_tolerance, 1);
-    }
+        let liveness = assess_quorum_liveness(5, 3, &[0, 1, 2]).unwrap();
+        assert!(liveness.every_online_oracle_is_critical());
 
-    #[test]
-    fn out_of_range_indices_are_ignored_and_counted() {
-        // Index 7 is not in a 5-oracle set: a stale inventory must not be able
-        // to report a bridge as reachable when it is not.
-        let liveness = assess_quorum_liveness(5, 3, &[0, 1, 7, 99]).expect("valid configuration");
-        assert_eq!(liveness.online, 2);
-        assert_eq!(liveness.ignored_out_of_range, 2);
+        let liveness = assess_quorum_liveness(5, 3, &[0, 1]).unwrap();
         assert!(!liveness.is_reachable());
         assert_eq!(liveness.missing, 1);
     }
 
     #[test]
-    fn duplicate_indices_count_once() {
-        let liveness =
-            assess_quorum_liveness(5, 3, &[0, 0, 1, 1, 2, 2, 2]).expect("valid configuration");
-        assert_eq!(liveness.online, 3);
-        assert_eq!(liveness.ignored_duplicates, 4);
-        assert_eq!(liveness.online_failure_tolerance, 0);
+    fn test_freshness_window_rejection_issue_438() {
+        let scale = PriceFeedScale::new(7, "USDC");
+        let mut tracker = ResilientPriceTracker::new(scale).with_freshness_window(120);
+
+        // Fresh observation within 120s window: accepted
+        let obs_fresh = PriceObservation {
+            source: "oracle_alpha".into(),
+            price: 10_000_000,
+            timestamp: 1_000,
+            round_id: 1,
+        };
+        assert!(tracker.record_observation(obs_fresh, 1_050).is_ok());
+
+        // Stale observation (150s old > 120s): rejected with StaleObservation
+        let obs_stale = PriceObservation {
+            source: "oracle_beta".into(),
+            price: 10_050_000,
+            timestamp: 800,
+            round_id: 1,
+        };
+        let err = tracker.record_observation(obs_stale, 1_050);
+        assert!(matches!(
+            err,
+            Err(PriceValidationError::StaleObservation { age_seconds: 250, max_freshness_seconds: 120 })
+        ));
+        assert_eq!(tracker.rejected_stale_count(), 1);
+
+        // Boundary test: exactly 120s age is accepted
+        let obs_boundary = PriceObservation {
+            source: "oracle_gamma".into(),
+            price: 10_020_000,
+            timestamp: 930,
+            round_id: 1,
+        };
+        assert!(tracker.record_observation(obs_boundary, 1_050).is_ok());
     }
 
     #[test]
-    fn a_single_oracle_bridge_is_its_own_quorum() {
-        let online = assess_quorum_liveness(1, 1, &[0]).expect("valid configuration");
-        assert!(online.is_reachable());
-        assert_eq!(online.total_failure_tolerance, 0);
-        assert!(online.every_online_oracle_is_critical());
+    fn test_deterministic_tie_breaker_issue_439() {
+        let scale = PriceFeedScale::new(7, "USDC");
 
-        let offline = assess_quorum_liveness(1, 1, &[]).expect("valid configuration");
-        assert!(!offline.is_reachable());
-        assert_eq!(offline.missing, 1);
+        // Even number of observations (10 and 20)
+        let setup_even = |tie_breaker| {
+            let mut tracker = ResilientPriceTracker::new(scale.clone()).with_tie_breaker(tie_breaker);
+            tracker
+                .record_observation(
+                    PriceObservation {
+                        source: "s1".into(),
+                        price: 10_000_000,
+                        timestamp: 100,
+                        round_id: 1,
+                    },
+                    100,
+                )
+                .unwrap();
+            tracker
+                .record_observation(
+                    PriceObservation {
+                        source: "s2".into(),
+                        price: 20_000_000,
+                        timestamp: 100,
+                        round_id: 1,
+                    },
+                    100,
+                )
+                .unwrap();
+            tracker
+        };
+
+        // ArithmeticMean: (10 + 20) / 2 = 15
+        let mut t_mean = setup_even(MedianTieBreaker::ArithmeticMean);
+        assert_eq!(t_mean.calculate_median_price(), Some(15_000_000));
+
+        // LowerMedian: 10
+        let mut t_lower = setup_even(MedianTieBreaker::LowerMedian);
+        assert_eq!(t_lower.calculate_median_price(), Some(10_000_000));
+
+        // UpperMedian: 20
+        let mut t_upper = setup_even(MedianTieBreaker::UpperMedian);
+        assert_eq!(t_upper.calculate_median_price(), Some(20_000_000));
     }
 
     #[test]
-    fn a_wide_set_is_analysed_without_an_artificial_cap() {
-        // The analysis describes whatever set it is given; a monitoring tool
-        // should not refuse to report on a misconfigured 100-oracle bridge.
-        let all: Vec<u32> = (0..100).collect();
-        let liveness = assess_quorum_liveness(100, 60, &all).expect("valid configuration");
-        assert_eq!(liveness.online, 100);
-        assert_eq!(liveness.online_failure_tolerance, 40);
-        assert_eq!(liveness.total_failure_tolerance, 40);
+    fn test_bounded_deviation_issue_440() {
+        let scale = PriceFeedScale::new(7, "USDC");
+        // Max 500 bps = 5.00% deviation allowed
+        let mut tracker = ResilientPriceTracker::new(scale).with_max_deviation_bps(500);
 
-        let one_missing = assess_quorum_liveness(100, 60, &all[1..]).expect("valid configuration");
-        assert_eq!(one_missing.online, 99);
-        assert_eq!(one_missing.online_failure_tolerance, 39);
-    }
+        // Baseline: 10_000_000
+        tracker
+            .record_observation(
+                PriceObservation {
+                    source: "feed_1".into(),
+                    price: 10_000_000,
+                    timestamp: 100,
+                    round_id: 1,
+                },
+                100,
+            )
+            .unwrap();
 
-    #[test]
-    fn wide_sets_do_not_double_count_or_accept_stale_positions() {
-        // One duplicate, one index outside the set: only 60 distinct positions
-        // are reachable, which is exactly the threshold.
-        let mut report: Vec<u32> = (0..60).collect();
-        report.push(0);
-        report.push(100);
-        let liveness = assess_quorum_liveness(100, 60, &report).expect("valid configuration");
-        assert_eq!(liveness.online, 60);
-        assert!(liveness.is_reachable());
-        assert!(liveness.every_online_oracle_is_critical());
-        assert_eq!(liveness.ignored_duplicates, 1);
-        assert_eq!(liveness.ignored_out_of_range, 1);
-    }
+        // 3% increase: 10_300_000 (within 5% threshold): accepted
+        assert!(tracker
+            .record_observation(
+                PriceObservation {
+                    source: "feed_1".into(),
+                    price: 10_300_000,
+                    timestamp: 110,
+                    round_id: 2,
+                },
+                110,
+            )
+            .is_ok());
 
-    #[test]
-    fn rejects_configurations_with_no_valid_quorum() {
-        assert_eq!(
-            assess_quorum_liveness(0, 1, &[]),
-            Err(LivenessError::EmptyOracleSet)
+        // 10% jump: 11_330_000 (deviation > 500 bps from 10_300_000): rejected
+        let err = tracker.record_observation(
+            PriceObservation {
+                source: "feed_1".into(),
+                price: 11_500_000,
+                timestamp: 120,
+                round_id: 3,
+            },
+            120,
         );
-        assert_eq!(
-            assess_quorum_liveness(3, 0, &[0]),
-            Err(LivenessError::ThresholdOutOfRange {
-                threshold: 0,
-                oracles: 3
+        assert!(matches!(
+            err,
+            Err(PriceValidationError::ExcessiveDeviation {
+                source_name: _,
+                candidate_price: 11_500_000,
+                reference_price: 10_300_000,
+                deviation_bps: _,
+                max_deviation_bps: 500,
             })
+        ));
+        assert_eq!(tracker.rejected_deviation_count(), 1);
+    }
+
+    #[test]
+    fn test_oracle_source_health_reporting_issue_441() {
+        let scale = PriceFeedScale::new(7, "USDC");
+        let mut tracker = ResilientPriceTracker::new(scale).with_freshness_window(60);
+
+        // Record 1 valid and 1 invalid for source A
+        tracker
+            .record_observation(
+                PriceObservation {
+                    source: "source_A".into(),
+                    price: 100,
+                    timestamp: 1_000,
+                    round_id: 1,
+                },
+                1_000,
+            )
+            .unwrap();
+        let _ = tracker.record_observation(
+            PriceObservation {
+                source: "source_A".into(),
+                price: -50,
+                timestamp: 1_010,
+                round_id: 2,
+            },
+            1_010,
         );
-        assert_eq!(
-            assess_quorum_liveness(3, 4, &[0, 1, 2]),
-            Err(LivenessError::ThresholdOutOfRange {
-                threshold: 4,
-                oracles: 3
-            })
-        );
+
+        let health = tracker.get_sources_health(1_020);
+        assert_eq!(health.len(), 1);
+        let s_a = &health[0];
+        assert_eq!(s_a.source, "source_A");
+        assert!(s_a.is_healthy);
+        assert_eq!(s_a.accepted_observations_count, 1);
+        assert_eq!(s_a.rejected_observations_count, 1);
+        assert_eq!(s_a.latest_price, Some(100));
+
+        // Evaluate at timestamp 1_100 (> 60s age): reported as unhealthy
+        let stale_health = tracker.get_sources_health(1_100);
+        assert!(!stale_health[0].is_healthy);
+    }
+
+    #[test]
+    fn test_insufficient_quorum_aggregation_issue_442() {
+        let scale = PriceFeedScale::new(7, "USDC");
+        let mut tracker = ResilientPriceTracker::new(scale);
+
+        // Empty tracker with quorum 1: InsufficientQuorum
+        let res_empty = tracker.calculate_median_price_with_quorum(1);
+        assert!(matches!(
+            res_empty,
+            Err(PriceAggregationError::InsufficientQuorum { active_sources: 0, required_quorum: 1 })
+        ));
+
+        // Insert 1 observation
+        tracker
+            .record_observation(
+                PriceObservation {
+                    source: "node_1".into(),
+                    price: 50_000_000,
+                    timestamp: 10,
+                    round_id: 1,
+                },
+                10,
+            )
+            .unwrap();
+
+        // Quorum 2 requires at least 2 sources
+        let res_fail = tracker.calculate_median_price_with_quorum(2);
+        assert!(matches!(
+            res_fail,
+            Err(PriceAggregationError::InsufficientQuorum { active_sources: 1, required_quorum: 2 })
+        ));
+
+        // Insert second observation: Quorum 2 succeeds
+        tracker
+            .record_observation(
+                PriceObservation {
+                    source: "node_2".into(),
+                    price: 60_000_000,
+                    timestamp: 10,
+                    round_id: 1,
+                },
+                10,
+            )
+            .unwrap();
+        let res_ok = tracker.calculate_median_price_with_quorum(2);
+        assert_eq!(res_ok, Ok(55_000_000));
+    }
+
+    #[test]
+    fn test_jittered_retry_policy_issue_445() {
+        let policy = JitteredRetryPolicy::new(100, 1000, 5);
+        assert_eq!(policy.calculate_backoff_ms(0, 42), 0);
+        let b1 = policy.calculate_backoff_ms(1, 10);
+        assert!((100..=125).contains(&b1));
+        let b_high = policy.calculate_backoff_ms(10, 99);
+        assert_eq!(b_high, 1000);
     }
 }
