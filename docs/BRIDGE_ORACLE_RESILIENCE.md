@@ -98,3 +98,16 @@ to confirmation contents at all.
 * a 100-oracle set to prove there is no artificial cap;
 * a wide set with one duplicate and one stale position ending exactly at quorum;
 * invalid `n`/`m` configurations returning `LivenessError`.
+
+
+## Price Feed Validation, Freshness & Deviation Bounds (#438, #439, #440, #441, #442)
+
+In addition to quorum liveness, `stellar_toolkit::oracle_resilience` provides full-lifecycle validation for incoming oracle price feeds:
+
+### Features & Invariants
+- **Freshness Window (#438)**: `with_freshness_window(seconds)` rejects observations older than the configured threshold with `PriceValidationError::StaleObservation`.
+- **Deterministic Median Tie Handling (#439)**: `with_tie_breaker(MedianTieBreaker)` provides configurable, fully deterministic resolution (`ArithmeticMean`, `LowerMedian`, `UpperMedian`) when aggregating an even count of observations.
+- **Bounded Deviation (#440)**: `with_max_deviation_bps(bps)` protects oracle state against extreme price swings and flash manipulation by rejecting observations exceeding basis point thresholds from reference prices.
+- **Source Health Telemetry (#441)**: `get_sources_health(current_timestamp)` surfaces real-time liveness, acceptance/rejection counters, and last observed prices.
+- **Quorum Enforcement (#442)**: `calculate_median_price_with_quorum(min_quorum)` returns actionable `PriceAggregationError::InsufficientQuorum` whenever reachable sources fall short of the safety quorum.
+- **Jittered Retries (#445)**: `JitteredRetryPolicy` calculates deterministic, bounded exponential backoff with randomized jitter to prevent herd-retry storms.
