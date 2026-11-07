@@ -139,15 +139,15 @@ pub enum PriceValidationError {
         timestamp: u64,
         current_timestamp: u64,
     },
-    #[error("regressive timestamp for source {source}: previous {previous}, received {incoming}")]
+    #[error("regressive timestamp for source {source_name}: previous {previous}, received {incoming}")]
     RegressiveTimestamp {
-        source: String,
+        source_name: String,
         previous: u64,
         incoming: u64,
     },
     #[error("price deviation {deviation_bps} bps from reference {reference_price} exceeds limit {max_deviation_bps} bps")]
     ExcessiveDeviation {
-        source: String,
+        source_name: String,
         candidate_price: i128,
         reference_price: i128,
         deviation_bps: u32,
@@ -282,13 +282,13 @@ impl ResilientPriceTracker {
         }
 
         // Monotonic timestamp check per source
-        if let Some(prev) = self.latest_valid.get(&obs.source) {
-            if obs.timestamp <= prev.timestamp {
+        if let Some(prev_ts) = self.latest_valid.get(&obs.source).map(|p| p.timestamp) {
+            if obs.timestamp <= prev_ts {
                 self.rejected_regressive += 1;
                 self.increment_rejected(&obs.source);
                 return Err(PriceValidationError::RegressiveTimestamp {
-                    source: obs.source.clone(),
-                    previous: prev.timestamp,
+                    source_name: obs.source.clone(),
+                    previous: prev_ts,
                     incoming: obs.timestamp,
                 });
             }
@@ -310,7 +310,7 @@ impl ResilientPriceTracker {
                         self.rejected_deviation += 1;
                         self.increment_rejected(&obs.source);
                         return Err(PriceValidationError::ExcessiveDeviation {
-                            source: obs.source.clone(),
+                            source_name: obs.source.clone(),
                             candidate_price: obs.price,
                             reference_price: ref_price,
                             deviation_bps,
@@ -607,7 +607,7 @@ mod tests {
         assert!(matches!(
             err,
             Err(PriceValidationError::ExcessiveDeviation {
-                source: _,
+                source_name: _,
                 candidate_price: 11_500_000,
                 reference_price: 10_300_000,
                 deviation_bps: _,
