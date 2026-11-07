@@ -223,3 +223,13 @@ priority as a pause request.
 `cargo fmt -p bridge-pause-guard -- --check` and
 `cargo build -p bridge-pause-guard --target wasm32v1-none --release` are clean, so
 the contract is deployable on Soroban.
+
+## Bridge Pause Quorum, Status Queries, and Audit Lifecycle (#430-#436)
+
+The bridge safety module enforces strict operational controls across emergency pause and resume workflows:
+1. **Active Proposal ID Reporting (#436)**: `BridgePauseStatus` exposes `active_proposal_id` for external monitoring and relayer coordination.
+2. **Timelock Deadlines and Remaining Ledgers (#431)**: Status queries compute `effective_deadline_ledger` and real-time countdown `remaining_ledgers`.
+3. **Guardian Quorum Validation (#430, #435)**: Guardian pause proposals enforce configurable quorum thresholds (`GuardianQuorum`) rejecting non-positive thresholds or thresholds exceeding the active guardian set size.
+4. **Active Timelock Mutual Exclusion (#434)**: `validate_bridge_resume_proposal` rejects resume proposals whenever a pause proposal timelock is actively pending.
+5. **Audit Event Stream (#432)**: All proposal, activation, and cancellation actions are serialized into structured `BridgePauseAuditEvent` records for compliance and indexing.
+

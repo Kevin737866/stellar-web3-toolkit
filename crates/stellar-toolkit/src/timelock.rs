@@ -73,6 +73,21 @@ pub enum TimelockError {
         current_ledger: u32,
         effective_ledger: u32,
     },
+    #[error("required quorum must be strictly positive")]
+    ZeroQuorumRequirement,
+    #[error("role {role:?} is not authorized to execute governance action {action:?}")]
+    UnauthorizedGovernanceAction {
+        role: GovernanceRole,
+        action: GovernanceAction,
+    },
+    #[error("cannot propose bridge resume while pause timelock is active")]
+    ResumeWhilePauseTimelockActive,
+    #[error("bridge is already unpaused; cannot propose resume")]
+    BridgeAlreadyUnpaused,
+    #[error("guardian quorum not reached: received {votes} votes, required {required}")]
+    InsufficientGuardianQuorum { votes: u32, required: u32 },
+    #[error("guardian threshold {threshold} exceeds active guardian count {count}")]
+    ThresholdExceedsGuardianCount { threshold: u32, count: u32 },
 }
 
 impl TimelockPolicy {
@@ -220,6 +235,149 @@ pub fn authorize_governance_action(
     }
 }
 
+
+
+// ============================================================================
+// Bridge Pause Governance, Quorum, and Audit Types (Issues #430-#436)
+// ============================================================================
+
+/// Snapshot of the bridge pause status including active proposal ID and deadlines (issues #431, #436).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgePauseStatus {
+    pub is_paused: bool,
+    /// Active proposal ID under evaluation (#436).
+    pub active_proposal_id: Option<u64>,
+    pub current_ledger: u32,
+    /// Ledger at which the pending change becomes effective (#431).
+    pub effective_deadline_ledger: Option<u32>,
+    /// Remaining ledgers until effective execution (#431).
+    pub remaining_ledgers: Option<u32>,
+    pub change_direction: Option<DelayKind>,
+    pub guardian_quorum_reached: bool,
+}
+
+/// Guardian quorum configuration and threshold management (#430, #435).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuardianQuorum {
+    pub active_guardians: u32,
+    pub required_threshold: u32,
+}
+
+impl GuardianQuorum {
+    /// Create and validate a guardian quorum threshold (#430, #435).
+    pub fn new(active_guardians: u32, required_threshold: u32) -> Result<Self, TimelockError> {
+        if required_threshold == 0 {
+            return Err(TimelockError::ZeroQuorumRequirement);
+        }
+        if required_threshold > active_guardians {
+            return Err(TimelockError::ThresholdExceedsGuardianCount {
+                threshold: required_threshold,
+                count: active_guardians,
+            });
+        }
+        Ok(Self {
+            active_guardians,
+            required_threshold,
+        })
+    }
+
+    /// Check whether a given vote count reaches quorum.
+    pub fn is_quorum_reached(&self, votes: u32) -> bool {
+        votes >= self.required_threshold
+    }
+
+    /// Validate guardian quorum before accepting pause actions (#430).
+    pub fn validate_quorum(&self, votes: u32) -> Result<(), TimelockError> {
+        if !self.is_quorum_reached(votes) {
+            return Err(TimelockError::InsufficientGuardianQuorum {
+                votes,
+                required: self.required_threshold,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Audit event stream entries for bridge pause and resume lifecycle actions (#432).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BridgePauseAuditEvent {
+    PauseProposed {
+        proposal_id: u64,
+        proposer: String,
+        effective_ledger: u32,
+        reason: String,
+    },
+    PauseActivated {
+        proposal_id: u64,
+        activated_ledger: u32,
+    },
+    ResumeProposed {
+        proposal_id: u64,
+        proposer: String,
+        effective_ledger: u32,
+    },
+    ResumeActivated {
+        proposal_id: u64,
+        activated_ledger: u32,
+    },
+    ProposalCancelled {
+        proposal_id: u64,
+        cancelled_ledger: u32,
+        cancelled_by: String,
+    },
+}
+
+/// Compute observable bridge pause status reporting active proposal ID, timelock deadlines, and remaining ledgers (#431, #436).
+pub fn compute_bridge_pause_status(
+    is_paused: bool,
+    pending: Option<(u64, DelayKind, u32)>, // (proposal_id, kind, requested_ledger)
+    current_ledger: u32,
+    policy: TimelockPolicy,
+    quorum: Option<GuardianQuorum>,
+    guardian_votes: u32,
+) -> BridgePauseStatus {
+    let (active_proposal_id, change_direction, effective_deadline_ledger, remaining_ledgers) =
+        match pending {
+            Some((id, kind, req_ledger)) => {
+                let deadline = policy.effective_ledger(req_ledger, kind);
+                let remaining = deadline.saturating_sub(current_ledger);
+                (Some(id), Some(kind), Some(deadline), Some(remaining))
+            }
+            None => (None, None, None, None),
+        };
+
+    let guardian_quorum_reached = match quorum {
+        Some(q) => q.is_quorum_reached(guardian_votes),
+        None => true,
+    };
+
+    BridgePauseStatus {
+        is_paused,
+        active_proposal_id,
+        current_ledger,
+        effective_deadline_ledger,
+        remaining_ledgers,
+        change_direction,
+        guardian_quorum_reached,
+    }
+}
+
+/// Validate that a bridge resume proposal is allowed (#434).
+///
+/// Rejects resume proposals while a pause proposal timelock is actively pending.
+pub fn validate_bridge_resume_proposal(
+    is_paused: bool,
+    pause_pending: bool,
+) -> Result<(), TimelockError> {
+    if pause_pending {
+        return Err(TimelockError::ResumeWhilePauseTimelockActive);
+    }
+    if !is_paused {
+        return Err(TimelockError::BridgeAlreadyUnpaused);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,4 +519,113 @@ mod tests {
             Ok(1_050)
         );
     }
+
+    #[test]
+    fn bridge_pause_status_reports_proposal_id_and_deadlines() {
+        let policy = TimelockPolicy::new(10, 20).unwrap();
+        let status = compute_bridge_pause_status(
+            false,
+            Some((42, DelayKind::Pause, 1_000)),
+            1_004,
+            policy,
+            Some(GuardianQuorum::new(5, 3).unwrap()),
+            3,
+        );
+
+        assert_eq!(status.active_proposal_id, Some(42));
+        assert_eq!(status.effective_deadline_ledger, Some(1_010));
+        assert_eq!(status.remaining_ledgers, Some(6));
+        assert_eq!(status.change_direction, Some(DelayKind::Pause));
+        assert!(status.guardian_quorum_reached);
+    }
+
+    #[test]
+    fn bridge_pause_status_when_no_pending_proposal() {
+        let policy = TimelockPolicy::new(10, 20).unwrap();
+        let status = compute_bridge_pause_status(true, None, 1_050, policy, None, 0);
+
+        assert_eq!(status.active_proposal_id, None);
+        assert_eq!(status.effective_deadline_ledger, None);
+        assert_eq!(status.remaining_ledgers, None);
+        assert_eq!(status.change_direction, None);
+        assert!(status.is_paused);
+        assert!(status.guardian_quorum_reached);
+    }
+
+    #[test]
+    fn guardian_quorum_validation_and_threshold_boundaries() {
+        // Valid quorum threshold
+        let quorum = GuardianQuorum::new(5, 3).unwrap();
+        assert!(quorum.is_quorum_reached(3));
+        assert!(quorum.is_quorum_reached(4));
+        assert!(!quorum.is_quorum_reached(2));
+        assert!(quorum.validate_quorum(3).is_ok());
+        assert_eq!(
+            quorum.validate_quorum(2),
+            Err(TimelockError::InsufficientGuardianQuorum { votes: 2, required: 3 })
+        );
+
+        // Boundary: 0 threshold is refused
+        assert_eq!(
+            GuardianQuorum::new(5, 0),
+            Err(TimelockError::ZeroQuorumRequirement)
+        );
+
+        // Boundary: threshold > guardian count is refused
+        assert_eq!(
+            GuardianQuorum::new(5, 6),
+            Err(TimelockError::ThresholdExceedsGuardianCount { threshold: 6, count: 5 })
+        );
+
+        // Boundary: unanimous threshold (threshold == count) is accepted
+        assert!(GuardianQuorum::new(5, 5).is_ok());
+    }
+
+    #[test]
+    fn resume_proposal_rejected_when_pause_timelock_is_active() {
+        // Pause is pending -> resume must be rejected
+        assert_eq!(
+            validate_bridge_resume_proposal(false, true),
+            Err(TimelockError::ResumeWhilePauseTimelockActive)
+        );
+
+        // Bridge not paused and no pause pending -> rejected
+        assert_eq!(
+            validate_bridge_resume_proposal(false, false),
+            Err(TimelockError::BridgeAlreadyUnpaused)
+        );
+
+        // Bridge paused and no pause pending -> allowed
+        assert!(validate_bridge_resume_proposal(true, false).is_ok());
+    }
+
+    #[test]
+    fn bridge_pause_audit_event_stream_variants() {
+        let proposed = BridgePauseAuditEvent::PauseProposed {
+            proposal_id: 101,
+            proposer: "guardian_alpha".into(),
+            effective_ledger: 500,
+            reason: "Detected suspicious outflow anomaly".into(),
+        };
+        let activated = BridgePauseAuditEvent::PauseActivated {
+            proposal_id: 101,
+            activated_ledger: 500,
+        };
+        let resume_proposed = BridgePauseAuditEvent::ResumeProposed {
+            proposal_id: 102,
+            proposer: "admin_beta".into(),
+            effective_ledger: 550,
+        };
+        let cancelled = BridgePauseAuditEvent::ProposalCancelled {
+            proposal_id: 101,
+            cancelled_ledger: 490,
+            cancelled_by: "timelock_admin".into(),
+        };
+
+        assert!(matches!(proposed, BridgePauseAuditEvent::PauseProposed { proposal_id: 101, .. }));
+        assert!(matches!(activated, BridgePauseAuditEvent::PauseActivated { proposal_id: 101, .. }));
+        assert!(matches!(resume_proposed, BridgePauseAuditEvent::ResumeProposed { proposal_id: 102, .. }));
+        assert!(matches!(cancelled, BridgePauseAuditEvent::ProposalCancelled { proposal_id: 101, .. }));
+    }
 }
+
