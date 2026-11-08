@@ -223,3 +223,17 @@ priority as a pause request.
 `cargo fmt -p bridge-pause-guard -- --check` and
 `cargo build -p bridge-pause-guard --target wasm32v1-none --release` are clean, so
 the contract is deployable on Soroban.
+
+
+## Network Domain Separation & Replay Protection (#428, #429)
+
+### Network Domain Binding (#428)
+To prevent cross-network replay attacks between Stellar Mainnet and test networks, bridge pause proposals are cryptographically bound to an explicit `NetworkDomain`.
+- `NetworkDomain::from_str(domain)` derives a unique 32-byte domain tag.
+- `BoundPauseRequest::verify_domain(&expected_domain)` ensures that proposals constructed for one network cannot be replayed or activated on another network.
+
+### Resume Proposal Replay Protection (#429)
+The `BridgeResumeReplayGuard` maintains state tracking across bridge resume proposal lifecycles:
+1. Rejects resume proposals while the bridge is not paused or while a pause timelock countdown is actively running.
+2. Rejects duplicate active proposals and previously finalized/processed proposals (`ResumeProposalAlreadyProcessed`).
+3. Ensures strict auditability and deterministic state transitions for all bridge unpause operations.

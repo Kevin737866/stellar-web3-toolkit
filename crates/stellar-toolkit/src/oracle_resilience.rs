@@ -271,3 +271,67 @@ mod tests {
         );
     }
 }
+
+
+#[cfg(test)]
+mod oracle_outage_fixture_tests {
+    use super::*;
+
+    /// Fixture-based test simulating a progressive cluster cascade outage and recovery lifecycle (#447).
+    #[test]
+    fn test_oracle_cluster_cascade_outage_and_recovery() {
+        let total_oracles = 5u32;
+        let quorum_threshold = 3u32;
+
+        // Step 1: Fully healthy cluster (oracles 0, 1, 2, 3, 4 online)
+        let s1 = assess_quorum_liveness(total_oracles, quorum_threshold, &[0, 1, 2, 3, 4]).unwrap();
+        assert!(s1.is_reachable());
+        assert_eq!(s1.online, 5);
+        assert_eq!(s1.missing, 0);
+        assert_eq!(s1.online_failure_tolerance, 2);
+        assert!(!s1.every_online_oracle_is_critical());
+
+        // Step 2: Minor outage: oracle 1 and 3 drop offline (0, 2, 4 online)
+        // Quorum is exactly reached, but every remaining oracle is critical!
+        let s2 = assess_quorum_liveness(total_oracles, quorum_threshold, &[0, 2, 4]).unwrap();
+        assert!(s2.is_reachable());
+        assert_eq!(s2.online, 3);
+        assert_eq!(s2.missing, 0);
+        assert_eq!(s2.online_failure_tolerance, 0);
+        assert!(s2.every_online_oracle_is_critical());
+
+        // Step 3: Critical failure: oracle 4 drops offline (only 0, 2 online)
+        // Settlement is now blocked!
+        let s3 = assess_quorum_liveness(total_oracles, quorum_threshold, &[0, 2]).unwrap();
+        assert!(!s3.is_reachable());
+        assert_eq!(s3.online, 2);
+        assert_eq!(s3.missing, 1);
+        assert_eq!(s3.online_failure_tolerance, 0);
+        assert!(!s3.every_online_oracle_is_critical());
+
+        // Step 4: Total blackout: all oracles drop offline
+        let s4 = assess_quorum_liveness(total_oracles, quorum_threshold, &[]).unwrap();
+        assert!(!s4.is_reachable());
+        assert_eq!(s4.online, 0);
+        assert_eq!(s4.missing, 3);
+
+        // Step 5: Recovery starts: oracle 1 and 2 recover
+        let s5 = assess_quorum_liveness(total_oracles, quorum_threshold, &[1, 2]).unwrap();
+        assert!(!s5.is_reachable());
+        assert_eq!(s5.missing, 1);
+
+        // Step 6: Quorum restored: oracle 3 recovers -> 3 online, bridge unblocked
+        let s6 = assess_quorum_liveness(total_oracles, quorum_threshold, &[1, 2, 3]).unwrap();
+        assert!(s6.is_reachable());
+        assert_eq!(s6.missing, 0);
+        assert!(s6.every_online_oracle_is_critical());
+
+        // Step 7: Chaotic reconnection: reports contain duplicates and out-of-range indices
+        let s7 = assess_quorum_liveness(total_oracles, quorum_threshold, &[0, 1, 2, 3, 3, 4, 99, 100]).unwrap();
+        assert!(s7.is_reachable());
+        assert_eq!(s7.online, 5);
+        assert_eq!(s7.ignored_duplicates, 1);
+        assert_eq!(s7.ignored_out_of_range, 2);
+        assert_eq!(s7.online_failure_tolerance, 2);
+    }
+}
