@@ -73,6 +73,31 @@ pub enum TimelockError {
         current_ledger: u32,
         effective_ledger: u32,
     },
+    #[error("network domain string cannot be empty")]
+    EmptyNetworkDomain,
+    #[error("network domain mismatch: expected {expected:?}, got {actual:?}")]
+    NetworkDomainMismatch {
+        expected: [u8; 32],
+        actual: [u8; 32],
+    },
+    #[error("pause reason must not be empty")]
+    MissingPauseReason,
+    #[error("resume proposal {proposal_id} has already been processed")]
+    ResumeProposalAlreadyProcessed {
+        proposal_id: u64,
+    },
+    #[error("resume proposal {proposal_id} is already actively pending")]
+    DuplicateActiveResumeProposal {
+        proposal_id: u64,
+    },
+    #[error("resume proposal {proposal_id} is not currently active")]
+    UnknownResumeProposal {
+        proposal_id: u64,
+    },
+    #[error("cannot propose bridge resume while bridge is not paused")]
+    BridgeAlreadyUnpaused,
+    #[error("cannot propose bridge resume while pause timelock is active")]
+    ResumeWhilePauseTimelockActive,
 }
 
 impl TimelockPolicy {
@@ -360,5 +385,214 @@ mod tests {
             policy.verify_execution(requested, DelayKind::Resume, 1_050),
             Ok(1_050)
         );
+    }
+}
+
+
+// ============================================================================
+// Network Domain Separation and Resume Replay Protection (#428, #429)
+// ============================================================================
+
+/// Network domain identifier for cross-chain and multi-network domain separation (#428).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NetworkDomain(pub [u8; 32]);
+
+impl NetworkDomain {
+    /// Creates a 32-byte domain identifier from a domain string using a deterministic tag.
+    pub fn from_str(domain: &str) -> Result<Self, TimelockError> {
+        let trimmed = domain.trim();
+        if trimmed.is_empty() {
+            return Err(TimelockError::EmptyNetworkDomain);
+        }
+        let mut out = [0u8; 32];
+        let prefix = b"STELLAR_BRIDGE_DOMAIN:";
+        let bytes = trimmed.as_bytes();
+        let mut idx = 0;
+        for &b in prefix.iter().chain(bytes.iter()) {
+            out[idx % 32] ^= b;
+            idx += 1;
+        }
+        if out == [0u8; 32] {
+            out[0] = 1;
+        }
+        Ok(Self(out))
+    }
+
+    /// Creates a NetworkDomain directly from a 32-byte array.
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// A bridge pause request bound to an explicit network domain (#428).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundPauseRequest {
+    pub proposal_id: u64,
+    pub guardian: String,
+    pub network_domain: NetworkDomain,
+    pub reason: String,
+    pub requested_ledger: u32,
+    pub effective_ledger: u32,
+}
+
+impl BoundPauseRequest {
+    /// Creates a new bound pause request, validating pause reason and delay.
+    pub fn new(
+        proposal_id: u64,
+        guardian: String,
+        network_domain: NetworkDomain,
+        reason: String,
+        current_ledger: u32,
+        delay: u32,
+    ) -> Result<Self, TimelockError> {
+        let trimmed = reason.trim();
+        if trimmed.is_empty() {
+            return Err(TimelockError::MissingPauseReason);
+        }
+        Ok(Self {
+            proposal_id,
+            guardian,
+            network_domain,
+            reason: trimmed.to_string(),
+            requested_ledger: current_ledger,
+            effective_ledger: current_ledger + delay,
+        })
+    }
+
+    /// Verifies that the pause request matches the expected network domain (#428).
+    pub fn verify_domain(&self, expected: &NetworkDomain) -> Result<(), TimelockError> {
+        if &self.network_domain != expected {
+            return Err(TimelockError::NetworkDomainMismatch {
+                expected: expected.0,
+                actual: self.network_domain.0,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Replay protection tracker for repeated bridge resume proposals (#429).
+#[derive(Debug, Clone, Default)]
+pub struct BridgeResumeReplayGuard {
+    processed_proposal_ids: std::collections::BTreeSet<u64>,
+    active_proposal_id: Option<u64>,
+}
+
+impl BridgeResumeReplayGuard {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Submits a resume proposal and guards against replay of already processed proposals (#429).
+    pub fn submit_resume_proposal(
+        &mut self,
+        proposal_id: u64,
+        bridge_is_paused: bool,
+        pause_timelock_active: bool,
+    ) -> Result<(), TimelockError> {
+        if !bridge_is_paused {
+            return Err(TimelockError::BridgeAlreadyUnpaused);
+        }
+        if pause_timelock_active {
+            return Err(TimelockError::ResumeWhilePauseTimelockActive);
+        }
+        if self.processed_proposal_ids.contains(&proposal_id) {
+            return Err(TimelockError::ResumeProposalAlreadyProcessed { proposal_id });
+        }
+        if self.active_proposal_id == Some(proposal_id) {
+            return Err(TimelockError::DuplicateActiveResumeProposal { proposal_id });
+        }
+        self.active_proposal_id = Some(proposal_id);
+        Ok(())
+    }
+
+    /// Finalizes a resume proposal, recording it in the processed set so it cannot be replayed (#429).
+    pub fn finalize_resume_proposal(&mut self, proposal_id: u64) -> Result<(), TimelockError> {
+        if self.active_proposal_id != Some(proposal_id) {
+            return Err(TimelockError::UnknownResumeProposal { proposal_id });
+        }
+        self.active_proposal_id = None;
+        self.processed_proposal_ids.insert(proposal_id);
+        Ok(())
+    }
+
+    pub fn is_processed(&self, proposal_id: u64) -> bool {
+        self.processed_proposal_ids.contains(&proposal_id)
+    }
+
+    pub fn active_proposal(&self) -> Option<u64> {
+        self.active_proposal_id
+    }
+}
+
+#[cfg(test)]
+mod domain_and_replay_tests {
+    use super::*;
+
+    #[test]
+    fn test_network_domain_binding() {
+        let domain_pub = NetworkDomain::from_str("Public Global Stellar Network ; September 2015").unwrap();
+        let domain_test = NetworkDomain::from_str("Test SDF Network ; September 2015").unwrap();
+
+        assert_ne!(domain_pub, domain_test);
+        assert!(NetworkDomain::from_str("   ").is_err());
+
+        let req = BoundPauseRequest::new(
+            1,
+            "G_GUARDIAN".to_string(),
+            domain_pub,
+            "Urgent drain detected".to_string(),
+            100,
+            10,
+        )
+        .unwrap();
+
+        assert!(req.verify_domain(&domain_pub).is_ok());
+        assert!(matches!(
+            req.verify_domain(&domain_test),
+            Err(TimelockError::NetworkDomainMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_resume_replay_guard_lifecycle() {
+        let mut guard = BridgeResumeReplayGuard::new();
+
+        // 1. Cannot resume if bridge is not paused
+        assert!(matches!(
+            guard.submit_resume_proposal(101, false, false),
+            Err(TimelockError::BridgeAlreadyUnpaused)
+        ));
+
+        // 2. Cannot resume while pause timelock is active
+        assert!(matches!(
+            guard.submit_resume_proposal(101, true, true),
+            Err(TimelockError::ResumeWhilePauseTimelockActive)
+        ));
+
+        // 3. Valid submission
+        assert!(guard.submit_resume_proposal(101, true, false).is_ok());
+        assert_eq!(guard.active_proposal(), Some(101));
+
+        // 4. Duplicate active proposal rejected
+        assert!(matches!(
+            guard.submit_resume_proposal(101, true, false),
+            Err(TimelockError::DuplicateActiveResumeProposal { proposal_id: 101 })
+        ));
+
+        // 5. Finalize
+        assert!(guard.finalize_resume_proposal(101).is_ok());
+        assert_eq!(guard.active_proposal(), None);
+        assert!(guard.is_processed(101));
+
+        // 6. Replayed proposal rejected
+        assert!(matches!(
+            guard.submit_resume_proposal(101, true, false),
+            Err(TimelockError::ResumeProposalAlreadyProcessed { proposal_id: 101 })
+        ));
     }
 }
