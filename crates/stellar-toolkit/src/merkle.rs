@@ -604,3 +604,67 @@ mod tests {
         assert!(!ct_eq(&a, &b));
     }
 }
+
+
+/// Error returned when attempting to consume an invalid or already consumed Merkle claim (#426).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MerkleClaimError {
+    #[error("merkle claim leaf {leaf:?} has already been consumed")]
+    AlreadyConsumed { leaf: Hash },
+    #[error("invalid merkle proof for allocation")]
+    InvalidProof,
+}
+
+/// Tracks consumed Merkle claims to prevent double-claiming and replay attacks (#426).
+#[derive(Debug, Clone, Default)]
+pub struct MerkleClaimTracker {
+    consumed: std::collections::BTreeSet<Hash>,
+}
+
+impl MerkleClaimTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Attempts to consume a claim leaf, returning an error if already consumed (#426).
+    pub fn consume_claim(&mut self, leaf: &Hash) -> Result<(), MerkleClaimError> {
+        if self.consumed.contains(leaf) {
+            return Err(MerkleClaimError::AlreadyConsumed { leaf: *leaf });
+        }
+        self.consumed.insert(*leaf);
+        Ok(())
+    }
+
+    pub fn is_consumed(&self, leaf: &Hash) -> bool {
+        self.consumed.contains(leaf)
+    }
+
+    pub fn consumed_count(&self) -> usize {
+        self.consumed.len()
+    }
+}
+
+#[cfg(test)]
+mod claim_tracker_tests {
+    use super::*;
+
+    #[test]
+    fn test_claim_tracker_rejects_already_consumed_leaf() {
+        let mut tracker = MerkleClaimTracker::new();
+        let leaf = leaf_hash("G_ALICE", 500);
+
+        assert!(!tracker.is_consumed(&leaf));
+        assert_eq!(tracker.consumed_count(), 0);
+
+        // First consume succeeds
+        assert!(tracker.consume_claim(&leaf).is_ok());
+        assert!(tracker.is_consumed(&leaf));
+        assert_eq!(tracker.consumed_count(), 1);
+
+        // Second consume fails (#426)
+        assert_eq!(
+            tracker.consume_claim(&leaf),
+            Err(MerkleClaimError::AlreadyConsumed { leaf })
+        );
+    }
+}

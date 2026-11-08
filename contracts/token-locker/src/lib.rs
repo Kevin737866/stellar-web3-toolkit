@@ -294,6 +294,50 @@ impl TokenLocker {
         ids
     }
 
+    /// Paginated query for vest ids `funder` has outstanding for `token` (#427).
+    /// `offset`: 0-based starting index.
+    /// `limit`: maximum elements to return (capped at 50 to bound gas consumption).
+    pub fn lock_ids_paginated(
+        env: Env,
+        funder: Address,
+        token: Address,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<u32> {
+        let all_ids = Self::lock_ids(env.clone(), funder, token);
+        let len = all_ids.len();
+        if offset >= len || limit == 0 {
+            return Vec::new(&env);
+        }
+        let capped_limit = if limit > 50 { 50 } else { limit };
+        let end = core::cmp::min(offset + capped_limit, len);
+        let mut slice = Vec::new(&env);
+        let mut i = offset;
+        while i < end {
+            slice.push_back(all_ids.get(i).unwrap());
+            i += 1;
+        }
+        slice
+    }
+
+    /// Paginated query for position objects (#427).
+    pub fn locks_paginated(
+        env: Env,
+        funder: Address,
+        token: Address,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<Lock> {
+        let ids = Self::lock_ids_paginated(env.clone(), funder, token, offset, limit);
+        let mut locks = Vec::new(&env);
+        for id in ids.iter() {
+            if let Some(lock) = Self::lock_of(env.clone(), id) {
+                locks.push_back(lock);
+            }
+        }
+        locks
+    }
+
     /// Whether a vest has reached its unlock ledger.
     pub fn is_matured(env: Env, id: u32) -> bool {
         match read_lock(&env, id) {
@@ -1161,5 +1205,43 @@ mod test {
         ] {
             assert!(names.contains(&expected), "missing {expected:?}");
         }
+    }
+
+    #[test]
+    fn test_lock_ids_paginated_slices() {
+        let (env, admin, token, client) = setup();
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        mint(&env, &token, &alice, 10_000);
+        client.deposit(&alice, &token, &10_000);
+
+        // Create 5 locks
+        for i in 1..=5 {
+            client.lock(&alice, &bob, &token, &100, &(100 + i));
+        }
+
+        assert_eq!(client.lock_ids(&alice, &token).len(), 5);
+
+        // Page 1: offset 0, limit 2
+        let p1 = client.lock_ids_paginated(&alice, &token, &0, &2);
+        assert_eq!(p1.len(), 2);
+        assert_eq!(p1.get(0).unwrap(), 1);
+        assert_eq!(p1.get(1).unwrap(), 2);
+
+        // Page 2: offset 2, limit 2
+        let p2 = client.lock_ids_paginated(&alice, &token, &2, &2);
+        assert_eq!(p2.len(), 2);
+        assert_eq!(p2.get(0).unwrap(), 3);
+        assert_eq!(p2.get(1).unwrap(), 4);
+
+        // Page 3: offset 4, limit 2 (only 1 remaining)
+        let p3 = client.lock_ids_paginated(&alice, &token, &4, &2);
+        assert_eq!(p3.len(), 1);
+        assert_eq!(p3.get(0).unwrap(), 5);
+
+        // Out of bounds
+        let p_empty = client.lock_ids_paginated(&alice, &token, &10, &2);
+        assert_eq!(p_empty.len(), 0);
     }
 }
