@@ -785,4 +785,22 @@ mod test {
         }
         assert!(names.contains(&symbol_short!("claim")));
     }
+    #[test]
+    fn claim_cannot_be_consumed_twice() {
+        let (env, _, token, client) = setup(0);
+        let alice = Address::generate(&env);
+        let amount = 500i128;
+        let (root, paths) = build_tree(&env, &[claim_leaf(&env, &alice, amount)]);
+        client.set_merkle_root(&root, &amount);
+        fund(&env, &token, &client, &alice, amount * 2);
+
+        // First claim succeeds
+        let claimed = client.claim(&alice, &amount, &to_proof(&env, &paths[0]));
+        assert_eq!(claimed, amount);
+
+        // Second claim with the same proof must fail (#426)
+        assert!(client
+            .try_claim(&alice, &amount, &to_proof(&env, &paths[0]))
+            .is_err());
+    }
 }

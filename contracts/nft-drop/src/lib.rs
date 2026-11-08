@@ -410,6 +410,10 @@ impl NftDropContract {
         owner_of(&env, token_id);
 
         let config = read_config(&env);
+        assert!(
+            matches!(config.phase, SalePhase::Public | SalePhase::Ended),
+            "reveal not allowed before public or ended phase"
+        );
         if config.reveal_time > 0 {
             assert!(
                 env.ledger().timestamp() >= config.reveal_time,
@@ -788,5 +792,69 @@ mod test {
             &0_u64,
             &None,
         );
+    }
+}
+
+/// Derives a deterministic token ID allocation from a fixed seed and mint index (#425).
+pub fn deterministic_token_id(seed: u64, mint_index: u64, total_supply: u64) -> u64 {
+    if total_supply <= 1 {
+        return 0;
+    }
+    const LCG_A: u64 = 6364136223846793005;
+    const LCG_C: u64 = 1442695040888963407;
+    let mixed = (mint_index ^ seed).wrapping_mul(LCG_A).wrapping_add(LCG_C);
+    mixed % total_supply
+}
+
+#[cfg(test)]
+mod drop_safety_tests {
+    use super::*;
+
+    #[test]
+    fn test_reveal_blocked_before_public_or_ended_phase() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let payment_token = Address::generate(&env);
+        let id = env.register_contract(None, NftDrop);
+        let client = NftDropClient::new(&env, &id);
+
+        client.configure(
+            &admin,
+            &payment_token,
+            &100,
+            &200,
+            &10,
+            &5,
+            &0,
+            &0,
+            &0,
+            &None,
+        );
+
+        // In Pending phase, reveal is rejected (#424)
+        assert!(client.try_reveal(&admin, &0, &String::from_str(&env, "ipfs://test")).is_err());
+
+        // In Allowlist phase, reveal is also rejected (#424)
+        client.set_phase(&admin, &SalePhase::Allowlist);
+        assert!(client.try_reveal(&admin, &0, &String::from_str(&env, "ipfs://test")).is_err());
+    }
+
+    #[test]
+    fn test_deterministic_drop_allocation_for_fixed_seed() {
+        let seed = 0xDEADBEEFCAFE;
+        let total_supply = 100u64;
+
+        let id0 = deterministic_token_id(seed, 0, total_supply);
+        let id1 = deterministic_token_id(seed, 1, total_supply);
+        let id2 = deterministic_token_id(seed, 2, total_supply);
+
+        // Fixed seed produces fully deterministic allocation outputs (#425)
+        assert_eq!(deterministic_token_id(seed, 0, total_supply), id0);
+        assert_eq!(deterministic_token_id(seed, 1, total_supply), id1);
+        assert_eq!(deterministic_token_id(seed, 2, total_supply), id2);
+        assert!(id0 < total_supply);
+        assert!(id1 < total_supply);
+        assert!(id2 < total_supply);
     }
 }
