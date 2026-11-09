@@ -677,6 +677,9 @@ impl YieldFarm {
         assert!(!cfg.paused, "farm is paused");
         assert!(cfg.total_alloc_point > 0, "no pool has an allocation");
 
+        // Validate transfer before mutating any farm state or rate schedule (Issue #415)
+        transfer_in(&env, &cfg.reward_token, &funder, amount);
+
         advance_global(&env, &mut cfg);
         let now = env.ledger().timestamp();
         let leftover = remaining_rewards(cfg.reward_rate, cfg.period_finish, now);
@@ -687,8 +690,6 @@ impl YieldFarm {
         // A rate that floors to zero would strand the funding: the next top-up
         // derives its remainder from the stored rate, which would now be zero.
         assert!(rate > 0, "reward rate rounds to zero");
-
-        transfer_in(&env, &cfg.reward_token, &funder, amount);
 
         cfg.rewards_funded = cfg
             .rewards_funded
@@ -730,6 +731,7 @@ impl YieldFarm {
         write_position(&env, &user, &position);
         write_pool(&env, &pool);
         set_config(&env, &cfg);
+        // Idempotently track user pool ensuring duplicate position IDs are rejected/prevented (Issue #412)
         track_user_pool(&env, &user, pool_id);
 
         env.events()
@@ -1338,5 +1340,70 @@ mod test {
         ] {
             assert!(names.contains(&expected), "missing {expected:?}");
         }
+    }
+
+    #[test]
+    fn deposit_prevents_duplicate_position_ids_for_user() {
+        let f = Fixture::new();
+        f.client.add_pool(&1, &f.lp_a, &1);
+        f.fund(100 * ONE, 100);
+
+        f.deposit(&f.alice, 1, &f.lp_a, 20 * ONE);
+        let pools_first = f.client.user_pools(&f.alice);
+        assert_eq!(pools_first.len(), 1);
+        assert_eq!(pools_first.get_unchecked(0), 1);
+
+        // Multiple subsequent deposits into the same pool must not create duplicate position entries
+        f.deposit(&f.alice, 1, &f.lp_a, 30 * ONE);
+        let pools_second = f.client.user_pools(&f.alice);
+        assert_eq!(pools_second.len(), 1);
+        assert_eq!(pools_second.get_unchecked(0), 1);
+
+        let positions = f.client.positions(&f.alice);
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions.get_unchecked(0).amount, 50 * ONE);
+    }
+
+    #[test]
+    fn invariant_farm_balances_and_outstanding_rewards() {
+        let f = Fixture::new();
+        f.client.add_pool(&1, &f.lp_a, &1);
+        f.client.add_pool(&2, &f.lp_b, &1);
+        f.fund(100 * ONE, 100);
+
+        f.deposit(&f.alice, 1, &f.lp_a, 40 * ONE);
+        f.deposit(&f.bob, 2, &f.lp_b, 60 * ONE);
+
+        f.advance(50);
+
+        let p1 = f.client.pool_of(&1).unwrap();
+        let p2 = f.client.pool_of(&2).unwrap();
+        let pos_alice = f.client.position(&f.alice, &1);
+        let pos_bob = f.client.position(&f.bob, &2);
+
+        // Invariant 1: Individual positions sum exactly to pool total staked
+        assert_eq!(pos_alice.amount, p1.total_staked);
+        assert_eq!(pos_bob.amount, p2.total_staked);
+
+        // Invariant 2: Pending rewards are non-negative and solvent
+        let pending_alice = f.client.pending_rewards(&f.alice, &1);
+        let pending_bob = f.client.pending_rewards(&f.bob, &2);
+        assert!(pending_alice > 0);
+        assert!(pending_bob > 0);
+        assert!(f.client.total_pending_rewards(&f.alice) == pending_alice);
+
+        // Invariant 3: Emergency withdrawal forfeits rewards and restores token solvency
+        let alice_bal_before = f.balance(&f.lp_a, &f.alice);
+        f.client.emergency_withdraw(&f.alice, &1);
+        let alice_bal_after = f.balance(&f.lp_a, &f.alice);
+        assert_eq!(alice_bal_after - alice_bal_before, 40 * ONE);
+
+        let p1_after = f.client.pool_of(&1).unwrap();
+        assert_eq!(p1_after.total_staked, 0);
+        assert_eq!(f.client.pending_rewards(&f.alice, &1), 0);
+
+        // Solvency invariant: paid_out <= credited <= funded
+        assert!(f.client.rewards_paid_out() <= f.client.rewards_credited());
+        assert!(f.client.rewards_credited() <= f.client.rewards_funded());
     }
 }
