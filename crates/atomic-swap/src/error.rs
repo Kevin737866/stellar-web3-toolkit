@@ -4,6 +4,9 @@ pub type Result<T> = std::result::Result<T, AtomicSwapError>;
 
 #[derive(Error, Debug)]
 pub enum AtomicSwapError {
+        #[error("Invalid asset identifier `{asset}`: {reason}")]
+    InvalidAssetIdentifier { asset: String, reason: String },
+
     #[error("Swap not found: {swap_id}")]
     SwapNotFound { swap_id: String },
 

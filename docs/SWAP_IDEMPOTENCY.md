@@ -101,3 +101,11 @@ fan-out, and plain `initiate_swap` is unaffected — it does not take the lock.
   swap; a conflicting request creates nothing and leaves the original reachable;
   a failed initiation leaves the key unbound; two concurrent retries produce one
   swap; a forgotten key may initiate again.
+
+## Atomic Swap Safety Properties (Issues #388, #389, #390, #391, #392)
+
+- **Asset Validation (#388)**: Asset identifiers are validated using standard 1-12 alphanumeric character Stellar conventions prior to offer generation.
+- **Expiry Protection (#389)**: Offers that have reached or passed their expiration ledger are strictly rejected before signature or state commitment.
+- **State Transition Persistence (#390)**: Coordinator state transitions are committed locally before dispatching RPC or network transaction submissions.
+- **Terminal Reasons (#391)**: Failed swaps record an explicit `failure_reason` accessible through `terminal_reason()`.
+- **Bounded Coordination Retries (#392)**: Polling and coordination retries strictly obey configured retry budgets, raising `RetryBudgetExhausted` upon exhaustion.
