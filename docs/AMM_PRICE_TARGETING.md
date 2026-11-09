@@ -126,3 +126,12 @@ detail. The AMM is deterministic by construction; this module keeps it that way.
   meets the target and one unit less does not;
 * `Some(0)` exactly at and above the spot price, including an unreduced target;
 * rejection of zero/negative reserves and targets, and coefficient overflow.
+
+## Liquidity & Swap Safety Properties (Issues #398, #399, #400, #401, #402, #403)
+
+- **Zero-Value Protection**: `add_liquidity` rejects zero or negative desired amounts and slippage limits before touching contract state.
+- **Overflow & Underflow Resistance**: Checked arithmetic (`checked_add`, `checked_sub`) protects reserve updates against integer overflow.
+- **Reserve Depletion Protection**: `remove_liquidity` prevents complete reserve drain and enforces `lp_amount <= total_supply`.
+- **Slippage Bounds**: `swap` strictly validates `out >= min_out`, reverting if quote falls below threshold.
+- **Event Synchronization**: Every swap publishes `(swap, user)` and `(sync)` events with pre- and post-swap reserve state.
+- **Rounding Direction**: LP share minting and asset redemptions always floor toward zero in favor of pool solvency.
