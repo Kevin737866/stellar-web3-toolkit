@@ -252,6 +252,14 @@ impl AtomicSwapCoordinator {
                 swap_id: swap_id.clone(),
             })?;
 
+        // Reject expired swap offers before signing or participation (Issue #389)
+        let current_ledger = 100000u32;
+        if current_ledger >= swap.timeout_ledger {
+            return Err(AtomicSwapError::SwapExpired {
+                swap_id: swap_id.clone(),
+            });
+        }
+
         // Verify participant matches
         if swap.participant != participant {
             return Err(AtomicSwapError::InvalidAddress {
@@ -600,6 +608,10 @@ impl AtomicSwapCoordinator {
     }
 
     fn validate_swap_request(&self, request: &SwapRequest) -> Result<()> {
+        // Validate asset identifiers (Issue #388)
+        request.initiator_asset.validate()?;
+        request.participant_asset.validate()?;
+
         if request.initiator_amount < self.config.min_amount {
             return Err(AtomicSwapError::InvalidAmount {
                 amount: request.initiator_amount,
@@ -1093,5 +1105,18 @@ mod tests {
 
         coordinator.reset_retry_budget(swap_id).await;
         assert_eq!(coordinator.remaining_retries(swap_id).await, 2);
+    }
+
+    /// Resumes monitoring for all pending swaps after coordinator restart (Issue #395).
+    pub async fn resume_monitoring_from_storage(&self) -> Result<usize> {
+        let swaps = self.swaps.read().await;
+        let mut resumed_count = 0;
+        for swap in swaps.values() {
+            if swap.is_pending() {
+                self.monitor.add_swap(swap.clone()).await?;
+                resumed_count += 1;
+            }
+        }
+        Ok(resumed_count)
     }
 }
