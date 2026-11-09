@@ -142,3 +142,14 @@ cargo test -p marketplace-contract -p royalty-splitter
 Coverage includes escrow/release accounting, fee math, cancellation,
 authorization failures, duplicate receivers, cap enforcement, fallback royalties,
 and rounding behaviour.
+
+## Marketplace Orders, Ownership Validation & Partial-Fill (Issues #418, #419, #420)
+
+The marketplace contract supports granular order execution via `execute_order` and `buy_partial` while maintaining full compatibility with the legacy `buy` method.
+
+### Order Parameters (`Order`)
+- **`listing_id`**: The target listing to fill.
+- **`expected_seller` (Issue #418)**: Validates that the active listing belongs to the expected seller. Prevents front-running or purchasing from unexpected addresses if an order was created with a specific seller in mind. Panics with `"listing owner mismatch"` on discrepancy.
+- **`expiry_ledger` (Issue #419)**: Enforces that the order is rejected if the current ledger sequence exceeds the order's valid lifetime (`expiry_ledger >= env.ledger().sequence()`). Likewise, listings created via `create_listing_with_expiry` cannot be purchased past their configured expiry ledger.
+- **`fill_amount` (Issue #420)**: Enables partial-fill accounting. Buyers can purchase any integer fraction of an asset listing. Proportional payment pricing is calculated as `(price * fill_amount) / listing.amount`. The listing's remaining amount and price are adjusted atomically, remaining `Active` until completely filled (`Sold`).
+- **`max_price`**: Protects the buyer against paying more than their designated limit for a fill.
