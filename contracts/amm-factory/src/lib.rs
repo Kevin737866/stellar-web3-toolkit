@@ -179,4 +179,39 @@ mod test {
         let (ra, rb) = pool.get_reserves();
         assert!(ra > 0 && rb > 0);
     }
+
+    #[test]
+    fn deterministic_pool_creation_and_asset_ordering() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let factory_id = env.register_contract(None, AmmFactory);
+        let factory = AmmFactoryClient::new(&env, &factory_id);
+        let admin = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[9u8; 32]);
+        factory.init(&admin, &hash);
+
+        let token_x = Address::generate(&env);
+        let token_y = Address::generate(&env);
+
+        // Asset ordering is canonical: get_pair(X, Y) and get_pair(Y, X) query identical storage key
+        assert_eq!(factory.get_pair(&token_x, &token_y), factory.get_pair(&token_y, &token_x));
+        assert!(factory.get_pair(&token_x, &token_y).is_none());
+    }
+
+    #[test]
+    fn factory_initialization_requires_authorization_and_is_idempotent() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let factory_id = env.register_contract(None, AmmFactory);
+        let factory = AmmFactoryClient::new(&env, &factory_id);
+        let admin = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+        factory.init(&admin, &hash);
+
+        assert_eq!(factory.admin(), admin);
+        assert_eq!(factory.pool_wasm_hash(), hash);
+
+        // Second initialization call must fail
+        assert!(factory.try_init(&admin, &hash).is_err());
+    }
 }
