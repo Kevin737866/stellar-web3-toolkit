@@ -126,3 +126,18 @@ detail. The AMM is deterministic by construction; this module keeps it that way.
   meets the target and one unit less does not;
 * `Some(0)` exactly at and above the spot price, including an unreduced target;
 * rejection of zero/negative reserves and targets, and coefficient overflow.
+
+## AMM Fee Structure & Multi-Hop Routing (Issues #404, #405, #406, #407)
+
+### Fee Accounting & Units (Issue #407)
+- **Fee Rate**: 30 basis points (0.30%) per swap transaction.
+- **Invariant**: The constant product invariant satisfies $(R_{in} + \Delta_{in} \cdot 0.997) \cdot (R_{out} - \Delta_{out}) \ge R_{in} \cdot R_{out}$.
+- **Fee Retention**: Swap fees accumulate directly in the respective asset reserves, continuously compounding the value of existing LP shares.
+
+### Deterministic Factory Deployments (Issues #404, #405)
+- **Asset Canonicalization**: Tokens are sorted lexicographically (`t0 < t1`), ensuring `get_pair(A, B) == get_pair(B, A)` and preventing duplicate mirror pools.
+- **Deployment Authorization**: Factory initialization strictly binds `admin` via `require_auth` and enforces deployment authorization.
+
+### Multi-Hop Routing Slippage (Issue #406)
+- The AMM router executes sequential hops (`path[0] -> path[1] -> ... -> path[N]`) across liquidity pools.
+- Cumulative slippage is enforced at the terminal hop: `amount_out >= amount_out_min`.
