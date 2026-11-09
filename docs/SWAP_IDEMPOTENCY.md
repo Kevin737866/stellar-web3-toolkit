@@ -101,3 +101,24 @@ fan-out, and plain `initiate_swap` is unaffected — it does not take the lock.
   swap; a conflicting request creates nothing and leaves the original reachable;
   a failed initiation leaves the key unbound; two concurrent retries produce one
   swap; a forgotten key may initiate again.
+
+## Atomic Swap Safety Properties (Issues #388, #389, #390, #391, #392)
+
+- **Asset Validation (#388)**: Asset identifiers are validated using standard 1-12 alphanumeric character Stellar conventions prior to offer generation.
+- **Expiry Protection (#389)**: Offers that have reached or passed their expiration ledger are strictly rejected before signature or state commitment.
+- **State Transition Persistence (#390)**: Coordinator state transitions are committed locally before dispatching RPC or network transaction submissions.
+- **Terminal Reasons (#391)**: Failed swaps record an explicit `failure_reason` accessible through `terminal_reason()`.
+- **Bounded Coordination Retries (#392)**: Polling and coordination retries strictly obey configured retry budgets, raising `RetryBudgetExhausted` upon exhaustion.
+
+## Coordinator Recovery & Invariant Verification (Issues #393, #394, #395, #396, #397)
+
+### Coordinator Restart & Recovery Procedure (#397, #395)
+1. **State Rehydration**: Upon coordinator daemon launch or restart, stored state is loaded into the in-memory registry.
+2. **Monitoring Resumption**: `resume_monitoring_from_storage()` registers all pending swaps with the active `SwapMonitor`, re-establishing ledger polling, timeout tracking, and automated refund paths.
+3. **Idempotency Preservation**: Persistent idempotency records prevent duplicate transaction submission for previously initiated requests.
+
+### Digest Canonicalization (#393)
+- Swap hash locks strictly require SHA-256 preimages over canonical raw byte encodings, maintaining cross-chain digest interoperability across Stellar and external EVM HTLCs.
+
+### Timeout Boundary Guarantees (#396)
+- Ledger bounds define an unambiguous threshold: for `current_ledger < timeout_ledger`, preimage claim operations are strictly authorized; for `current_ledger >= timeout_ledger`, refund executions are strictly authorized.

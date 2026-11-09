@@ -376,4 +376,36 @@ mod tests {
         assert!(!store.forget(&key));
         assert!(store.lookup(&key, "initiator", &request(1_000)).is_none());
     }
+
+    #[test]
+    fn test_rejects_reused_idempotency_key_with_different_parameters() {
+        let mut store = IdempotencyStore::new();
+        let key = IdempotencyKey::parse("valid-key-123").unwrap();
+
+        let req1 = request(100);
+        let resp1 = response("swap-1");
+        store.record(&key, "alice".to_string(), req1.clone(), resp1.clone());
+
+        // Identical request succeeds with identical response
+        let res_same = store.lookup(&key, "alice", &req1);
+        assert!(res_same.is_some());
+        assert_eq!(res_same.unwrap().unwrap().swap_id, "swap-1");
+
+        // Different amount -> rejected with IdempotencyConflict (Issue #394)
+        let req_diff_amount = request(200);
+        let res_diff_amount = store.lookup(&key, "alice", &req_diff_amount);
+        assert!(res_diff_amount.is_some());
+        assert!(matches!(
+            res_diff_amount.unwrap(),
+            Err(AtomicSwapError::IdempotencyConflict { .. })
+        ));
+
+        // Different initiator -> rejected with IdempotencyConflict
+        let res_diff_initiator = store.lookup(&key, "bob", &req1);
+        assert!(res_diff_initiator.is_some());
+        assert!(matches!(
+            res_diff_initiator.unwrap(),
+            Err(AtomicSwapError::IdempotencyConflict { .. })
+        ));
+    }
 }
