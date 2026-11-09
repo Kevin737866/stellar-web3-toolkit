@@ -651,6 +651,9 @@ impl DelegatedStaking {
         // while the pool is paused.
         assert!(!config(&env).paused, "contract is paused");
 
+        // Validate transfer before mutating any pool state or rate schedule (Issue #415)
+        transfer_in(&env, &config(&env).token, &funder, amount);
+
         let mut cfg = update_pool(&env);
         let now = env.ledger().timestamp();
         let leftover = remaining_rewards(cfg.reward_rate, cfg.period_finish, now);
@@ -661,8 +664,6 @@ impl DelegatedStaking {
         // A rate that floors to zero would leave the funding stranded: the next
         // top-up computes its leftover from `rate`, which would now be zero.
         assert!(rate > 0, "reward rate rounds to zero");
-
-        transfer_in(&env, &cfg.token, &funder, amount);
 
         cfg.rewards_funded = cfg
             .rewards_funded
@@ -1487,5 +1488,54 @@ mod test {
             .client
             .try_delegate(&f.other_operator, &f.operator, &(10 * ONE))
             .is_err());
+    }
+
+    #[test]
+    fn emergency_undelegate_forfeits_rewards_and_restores_principal() {
+        let f = Fixture::new();
+        f.fund(100 * ONE, 100);
+        f.mint(&f.alice, 50 * ONE);
+
+        f.client.delegate(&f.alice, &f.operator, &(50 * ONE));
+        f.advance(40);
+
+        let pending_before = f.client.pending_rewards(&f.alice, &f.operator);
+        assert!(pending_before > 0);
+
+        let alice_bal_before = f.balance(&f.alice);
+        let returned = f.client.emergency_undelegate(&f.alice, &f.operator);
+        assert_eq!(returned, 50 * ONE);
+        assert_eq!(f.balance(&f.alice) - alice_bal_before, 50 * ONE);
+
+        // Position is zeroed out and forfeited
+        let pos = f.client.position(&f.alice, &f.operator);
+        assert_eq!(pos.amount, 0);
+        assert_eq!(pos.accrued, 0);
+        assert_eq!(f.client.pending_rewards(&f.alice, &f.operator), 0);
+        assert_eq!(f.client.total_staked(), 0);
+        assert_eq!(f.client.operator_of(&f.operator).unwrap().total_staked, 0);
+
+        // Subsequent emergency undelegate fails (zero balance)
+        assert!(f.client.try_emergency_undelegate(&f.alice, &f.operator).is_err());
+    }
+
+    #[test]
+    fn invariant_delegated_staking_accounting_and_solvency() {
+        let f = Fixture::new();
+        f.fund(100 * ONE, 100);
+        f.mint(&f.alice, 60 * ONE);
+        f.mint(&f.bob, 40 * ONE);
+
+        f.client.delegate(&f.alice, &f.operator, &(60 * ONE));
+        f.client.delegate(&f.bob, &f.operator, &(40 * ONE));
+        f.advance(50);
+
+        let op = f.client.operator_of(&f.operator).unwrap();
+        assert_eq!(op.total_staked, 100 * ONE);
+        assert_eq!(f.client.total_staked(), 100 * ONE);
+
+        // Accounting solvency invariant
+        assert!(f.client.rewards_paid_out() <= f.client.rewards_credited());
+        assert!(f.client.rewards_credited() <= f.client.rewards_funded());
     }
 }
