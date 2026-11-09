@@ -1,3 +1,27 @@
+impl Asset {
+    /// Validates asset code format according to Stellar conventions (Issue #388).
+    pub fn validate(&self) -> crate::error::Result<()> {
+        match self {
+            Asset::XLM => Ok(()),
+            Asset::Custom(code) => {
+                if code.is_empty() || code.len() > 12 {
+                    return Err(crate::error::AtomicSwapError::InvalidAssetIdentifier {
+                        asset: code.clone(),
+                        reason: "Asset code must be 1 to 12 characters".to_string(),
+                    });
+                }
+                if !code.chars().all(|c| c.is_ascii_alphanumeric()) {
+                    return Err(crate::error::AtomicSwapError::InvalidAssetIdentifier {
+                        asset: code.clone(),
+                        reason: "Asset code must contain only ASCII alphanumeric characters".to_string(),
+                    });
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -149,5 +173,25 @@ mod tests {
         let retrieved = registry.get(&Asset::Custom("USDC".to_string()));
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().decimals, 7);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_asset_validation() {
+        assert!(Asset::XLM.validate().is_ok());
+        assert!(Asset::Custom("USDC".to_string()).validate().is_ok());
+        assert!(Asset::Custom("A12345678901".to_string()).validate().is_ok());
+
+        // Invalid: empty code
+        assert!(Asset::Custom("".to_string()).validate().is_err());
+        // Invalid: too long (> 12 chars)
+        assert!(Asset::Custom("TOOLONGASSETCODE123".to_string()).validate().is_err());
+        // Invalid: non-alphanumeric characters
+        assert!(Asset::Custom("USD$".to_string()).validate().is_err());
+        assert!(Asset::Custom("BTC-ETH".to_string()).validate().is_err());
     }
 }

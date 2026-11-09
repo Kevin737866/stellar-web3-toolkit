@@ -42,6 +42,8 @@ pub struct AtomicSwap {
     /// replay guard. `None` for a purely local swap.
     pub origin_nonce: Option<u64>,
     pub metadata: HashMap<String, String>,
+    /// Explicit terminal reason when status is Failed (Issue #391).
+    pub failure_reason: Option<String>,
 }
 
 impl AtomicSwap {
@@ -79,6 +81,7 @@ impl AtomicSwap {
             origin_chain: None,
             origin_nonce: None,
             metadata: HashMap::new(),
+            failure_reason: None,
         }
     }
 
@@ -99,6 +102,16 @@ impl AtomicSwap {
     pub fn is_pending(&self) -> bool {
         matches!(self.status, SwapStatus::Pending)
     }
+
+    pub fn mark_failed(&mut self, reason: impl Into<String>) {
+        self.status = SwapStatus::Failed;
+        self.failure_reason = Some(reason.into());
+    }
+
+    pub fn terminal_reason(&self) -> Option<&str> {
+        self.failure_reason.as_deref()
+    }
+
 
     pub fn is_completed(&self) -> bool {
         matches!(self.status, SwapStatus::Completed)

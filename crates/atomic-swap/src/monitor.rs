@@ -71,6 +71,7 @@ impl SwapMonitor {
     pub fn new(config: MonitoringConfig) -> Self {
         Self {
             swaps: Arc::new(RwLock::new(HashMap::new())),
+
             event_handlers: Arc::new(RwLock::new(Vec::new())),
             config,
             current_ledger: Arc::new(RwLock::new(0)),
