@@ -84,8 +84,12 @@ impl Pathfinder {
                 continue;
             }
 
-            // Check hop limit
-            if path.len() >= self.max_hops {
+            // Check hop limit (Issue #364)
+            let effective_max_hops = request
+                .max_hops
+                .map(|h| h.min(self.max_hops))
+                .unwrap_or(self.max_hops);
+            if path.len() >= effective_max_hops {
                 continue;
             }
 
@@ -247,7 +251,11 @@ impl Pathfinder {
                 return self.build_route(path, request.amount);
             }
 
-            if path.len() >= self.max_hops {
+            let effective_max_hops = request
+                .max_hops
+                .map(|h| h.min(self.max_hops))
+                .unwrap_or(self.max_hops);
+            if path.len() >= effective_max_hops {
                 continue;
             }
 
@@ -648,5 +656,125 @@ mod tests {
         assert!(Pathfinder::new()
             .find_route_dijkstra(&graph, &request())
             .is_ok());
+    }
+
+    #[test]
+    fn test_max_hops_enforcement_in_request() {
+        // Issue #364: Request max_hops strictly limits path length
+        let make_node = |id: &str| Node {
+            id: id.to_string(),
+            public_key: vec![1],
+            alias: None,
+            online: true,
+            last_seen: 0,
+            features: NodeFeatures::default(),
+        };
+
+        let mut graph = NetworkGraph::new();
+        for i in 0..5 {
+            graph.add_node(make_node(&format!("n{}", i)));
+        }
+
+        // Linear path n0 -> n1 -> n2 -> n3 -> n4 (4 hops)
+        for i in 0..4 {
+            graph.add_channel(Channel {
+                id: format!("c{}", i),
+                node_a: format!("n{}", i),
+                node_b: format!("n{}", i + 1),
+                capacity_a_to_b: 10_000,
+                capacity_b_to_a: 10_000,
+                base_fee: 1,
+                fee_rate: 10,
+                cltv_delta: 10,
+                min_htlc_size: 1,
+                max_htlc_size: 10_000,
+                htlcs_in_flight: 0,
+                enabled: true,
+                age_seconds: 0,
+            });
+        }
+
+        let pathfinder = Pathfinder::new();
+
+        // 4 hops requested allowed: succeeds
+        let req_ok = RouteRequest::new("n0".to_string(), "n4".to_string(), 100).with_max_hops(4);
+        let route = pathfinder
+            .find_route_dijkstra(&graph, &req_ok)
+            .expect("route with 4 hops should succeed");
+        assert_eq!(route.hops.len(), 4);
+
+        // 3 hops requested: must fail since path requires 4 hops
+        let req_too_short =
+            RouteRequest::new("n0".to_string(), "n4".to_string(), 100).with_max_hops(3);
+        let err = pathfinder.find_route_dijkstra(&graph, &req_too_short);
+        assert!(err.is_err(), "route exceeding request max_hops must fail");
+    }
+
+    #[test]
+    fn test_route_search_disconnected_network_components() {
+        // Issue #366: Route search between disconnected network components
+        let make_node = |id: &str| Node {
+            id: id.to_string(),
+            public_key: vec![1],
+            alias: None,
+            online: true,
+            last_seen: 0,
+            features: NodeFeatures::default(),
+        };
+
+        let mut graph = NetworkGraph::new();
+
+        // Component A: n0 <-> n1
+        graph.add_node(make_node("n0"));
+        graph.add_node(make_node("n1"));
+        graph.add_channel(Channel {
+            id: "c_a".to_string(),
+            node_a: "n0".to_string(),
+            node_b: "n1".to_string(),
+            capacity_a_to_b: 5_000,
+            capacity_b_to_a: 5_000,
+            base_fee: 1,
+            fee_rate: 10,
+            cltv_delta: 10,
+            min_htlc_size: 1,
+            max_htlc_size: 5_000,
+            htlcs_in_flight: 0,
+            enabled: true,
+            age_seconds: 0,
+        });
+
+        // Component B: n2 <-> n3 (disconnected from Component A)
+        graph.add_node(make_node("n2"));
+        graph.add_node(make_node("n3"));
+        graph.add_channel(Channel {
+            id: "c_b".to_string(),
+            node_a: "n2".to_string(),
+            node_b: "n3".to_string(),
+            capacity_a_to_b: 5_000,
+            capacity_b_to_a: 5_000,
+            base_fee: 1,
+            fee_rate: 10,
+            cltv_delta: 10,
+            min_htlc_size: 1,
+            max_htlc_size: 5_000,
+            htlcs_in_flight: 0,
+            enabled: true,
+            age_seconds: 0,
+        });
+
+        // Isolated node: n_iso with 0 channels
+        graph.add_node(make_node("n_iso"));
+
+        let pathfinder = Pathfinder::new();
+
+        // Cross-component search (n0 -> n3) must fail cleanly with NoPathFound
+        let req_disconnected = RouteRequest::new("n0".to_string(), "n3".to_string(), 500);
+        let res_disc = pathfinder.find_route_dijkstra(&graph, &req_disconnected);
+        assert!(matches!(res_disc, Err(RoutingError::NoPathFound { .. })));
+
+        // Search from isolated node must fail cleanly
+        let req_iso = RouteRequest::new("n_iso".to_string(), "n1".to_string(), 500);
+        let res_iso = pathfinder.find_route_dijkstra(&graph, &req_iso);
+        assert!(matches!(res_iso, Err(RoutingError::NoPathFound { .. })));
     }
 }
