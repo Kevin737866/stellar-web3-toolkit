@@ -41,8 +41,32 @@ pub struct SimulatorConfig {
     pub num_payments: usize,
     /// Maximum payment amount
     pub max_payment_amount: i128,
-    /// Random seed for reproducibility
+    /// Random seed for reproducibility (Issue #378)
     pub seed: Option<u64>,
+    /// Minimum message latency in milliseconds per channel hop (Issue #379)
+    pub min_latency_ms: u64,
+    /// Maximum message latency in milliseconds per channel hop (Issue #379)
+    pub max_latency_ms: u64,
+}
+
+impl SimulatorConfig {
+    /// Configure explicit seed for reproducible simulation runs (Issue #378)
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.seed = Some(seed);
+        self
+    }
+
+    /// Retrieve the configured seed if any (Issue #378)
+    pub fn seed(&self) -> Option<u64> {
+        self.seed
+    }
+
+    /// Configure channel message latency range in milliseconds (Issue #379)
+    pub fn with_latency_range(mut self, min_ms: u64, max_ms: u64) -> Self {
+        self.min_latency_ms = min_ms;
+        self.max_latency_ms = max_ms;
+        self
+    }
 }
 
 impl Default for SimulatorConfig {
@@ -59,6 +83,8 @@ impl Default for SimulatorConfig {
             num_payments: 1000,
             max_payment_amount: 1_000_000, // 1 XLM
             seed: None,
+            min_latency_ms: 5,
+            max_latency_ms: 25,
         }
     }
 }
@@ -121,6 +147,12 @@ pub struct Simulator {
     stats: Arc<RwLock<SimulationStats>>,
     /// Random number generator
     rng: parking_lot::Mutex<rand::rngs::StdRng>,
+    /// Effective seed used for initializing RNG (Issue #378)
+    effective_seed: u64,
+    /// Custom message latency per channel in milliseconds (Issue #379)
+    channel_latencies: Arc<RwLock<HashMap<String, u64>>>,
+    /// Nodes temporarily disconnected from the simulation (Issue #380)
+    disconnected_nodes: Arc<RwLock<HashSet<String>>>,
 }
 
 impl Simulator {
@@ -141,10 +173,68 @@ impl Simulator {
             nodes: Arc::new(RwLock::new(HashMap::new())),
             stats: Arc::new(RwLock::new(SimulationStats::default())),
             rng: parking_lot::Mutex::new(rng),
+            effective_seed: seed,
+            channel_latencies: Arc::new(RwLock::new(HashMap::new())),
+            disconnected_nodes: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
     /// Initialize the network with random topology
+    /// Create a new simulator using an explicit deterministic seed (Issue #378)
+    pub fn from_seed(mut config: SimulatorConfig, seed: u64) -> Self {
+        config.seed = Some(seed);
+        Self::new(config)
+    }
+
+    /// Retrieve the effective seed used by this simulator instance (Issue #378)
+    pub fn seed(&self) -> u64 {
+        self.effective_seed
+    }
+
+    /// Configure custom message latency for a specific channel in milliseconds (Issue #379)
+    pub fn set_channel_latency(&self, channel_id: &str, latency_ms: u64) {
+        self.channel_latencies
+            .write()
+            .insert(channel_id.to_string(), latency_ms);
+    }
+
+    /// Get configured message latency for a channel if explicitly set (Issue #379)
+    pub fn get_channel_latency(&self, channel_id: &str) -> Option<u64> {
+        self.channel_latencies.read().get(channel_id).copied()
+    }
+
+    /// Temporarily disconnect a node from the simulation network (Issue #380)
+    pub fn disconnect_node(&self, node_id: &str) -> Result<(), SimulatorError> {
+        let nodes = self.nodes.read();
+        if !nodes.contains_key(node_id) {
+            return Err(SimulatorError::NodeNotFound(node_id.to_string()));
+        }
+        self.disconnected_nodes.write().insert(node_id.to_string());
+        info!("Node {} disconnected from simulation", node_id);
+        Ok(())
+    }
+
+    /// Reconnect a previously disconnected node to the simulation network (Issue #380)
+    pub fn reconnect_node(&self, node_id: &str) -> Result<(), SimulatorError> {
+        let nodes = self.nodes.read();
+        if !nodes.contains_key(node_id) {
+            return Err(SimulatorError::NodeNotFound(node_id.to_string()));
+        }
+        self.disconnected_nodes.write().remove(node_id);
+        info!("Node {} reconnected to simulation", node_id);
+        Ok(())
+    }
+
+    /// Check if a node is currently connected (Issue #380)
+    pub fn is_node_connected(&self, node_id: &str) -> bool {
+        !self.disconnected_nodes.read().contains(node_id)
+    }
+
+    /// Get list of currently disconnected nodes (Issue #380)
+    pub fn get_disconnected_nodes(&self) -> Vec<String> {
+        self.disconnected_nodes.read().iter().cloned().collect()
+    }
+
     pub fn initialize_network(&self) -> Result<(), SimulatorError> {
         info!("Initializing network with {} nodes", self.config.num_nodes);
 
@@ -299,8 +389,23 @@ impl Simulator {
         let mut total_fees = 0i128;
         let mut path_lengths = Vec::new();
 
+        let mut latencies_ms = Vec::new();
+
         for (source, dest, amount) in payments {
             let start = std::time::Instant::now();
+
+            // Check if source or destination is disconnected (Issue #380)
+            {
+                let disconnected = self.disconnected_nodes.read();
+                if disconnected.contains(&source) || disconnected.contains(&dest) {
+                    failed += 1;
+                    debug!(
+                        "Payment failed: endpoint node disconnected: {} -> {}",
+                        source, dest
+                    );
+                    continue;
+                }
+            }
 
             let request = RouteRequest {
                 source: source.clone(),
@@ -314,21 +419,55 @@ impl Simulator {
 
             match pathfinder.find_route_dijkstra(&network, &request) {
                 Ok(route) => {
+                    // Check if any intermediate hop is disconnected (Issue #380)
+                    let is_hop_disconnected = {
+                        let disconnected = self.disconnected_nodes.read();
+                        route.hops.iter().any(|h| disconnected.contains(&h.node_id))
+                    };
+
+                    if is_hop_disconnected {
+                        failed += 1;
+                        debug!("Payment failed: intermediate hop is disconnected along path");
+                        continue;
+                    }
+
+                    // Calculate simulated message latency over hops (Issue #379)
+                    let mut hop_latency_total: u64 = 0;
+                    {
+                        let custom_latencies = self.channel_latencies.read();
+                        let min_lat = self.config.min_latency_ms;
+                        let max_lat = self.config.max_latency_ms.max(min_lat);
+                        for hop in &route.hops {
+                            let hop_lat = if let Some(&lat) = custom_latencies.get(&hop.channel_id)
+                            {
+                                lat
+                            } else if max_lat > min_lat {
+                                rng.gen_range(min_lat..=max_lat)
+                            } else {
+                                min_lat
+                            };
+                            hop_latency_total += hop_lat;
+                        }
+                    }
+
                     let elapsed = start.elapsed().as_millis() as u64;
+                    let total_payment_latency = hop_latency_total + elapsed;
 
                     successful += 1;
                     total_value += amount;
                     total_fees += route.total_fees;
                     path_lengths.push(route.hops.len());
+                    latencies_ms.push(total_payment_latency);
 
                     debug!(
-                        "Payment {} succeeded: {} -> {} ({} hops, {} fee) in {}ms",
+                        "Payment {} succeeded: {} -> {} ({} hops, {} fee) in {}ms (hop latency: {}ms)",
                         successful,
                         source,
                         dest,
                         route.hops.len(),
                         route.total_fees,
-                        elapsed
+                        elapsed,
+                        hop_latency_total
                     );
                 }
                 Err(e) => {
@@ -358,7 +497,7 @@ impl Simulator {
             max_path_length: max_path,
             success_rate,
             network_utilization: 0.0, // Would need more complex calculation
-            latency_ms: Vec::new(),
+            latency_ms: latencies_ms,
         };
 
         *self.stats.write() = stats.clone();
@@ -527,6 +666,18 @@ pub enum SimulatorError {
 
     #[error("Invalid configuration: {0}")]
     InvalidConfig(String),
+
+    #[error("Node not found: {0}")]
+    NodeNotFound(String),
+
+    #[error("Node {0} is disconnected")]
+    NodeDisconnected(String),
+
+    #[error("Channel not found: {0}")]
+    ChannelNotFound(String),
+
+    #[error("Serialization error: {0}")]
+    SerializationError(String),
 }
 
 #[cfg(test)]
@@ -571,5 +722,98 @@ mod tests {
         let network = simulator.get_network();
         let graph = network.read();
         assert!(graph.num_channels() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_reproducible_simulation_seeding() {
+        // Issue #378: Two simulations with identical seeds must yield identical results
+        let seed = 987654321u64;
+
+        let config1 = SimulatorConfig {
+            num_nodes: 12,
+            avg_channels_per_node: 3.0,
+            num_payments: 40,
+            seed: Some(seed),
+            ..Default::default()
+        };
+        let sim1 = Simulator::new(config1);
+        sim1.initialize_network().unwrap();
+        let stats1 = sim1.run_simulation().await.unwrap();
+
+        let config2 = SimulatorConfig {
+            num_nodes: 12,
+            avg_channels_per_node: 3.0,
+            num_payments: 40,
+            seed: Some(seed),
+            ..Default::default()
+        };
+        let sim2 = Simulator::new(config2);
+        sim2.initialize_network().unwrap();
+        let stats2 = sim2.run_simulation().await.unwrap();
+
+        assert_eq!(sim1.seed(), seed);
+        assert_eq!(sim2.seed(), seed);
+        assert_eq!(stats1.total_payments, stats2.total_payments);
+        assert_eq!(stats1.successful_payments, stats2.successful_payments);
+        assert_eq!(stats1.failed_payments, stats2.failed_payments);
+        assert_eq!(stats1.total_value_routed, stats2.total_value_routed);
+        assert_eq!(stats1.total_fees_collected, stats2.total_fees_collected);
+    }
+
+    #[tokio::test]
+    async fn test_configurable_channel_latency() {
+        // Issue #379: Verify message latency is recorded and respects configuration
+        let config = SimulatorConfig {
+            num_nodes: 10,
+            avg_channels_per_node: 3.0,
+            num_payments: 30,
+            min_latency_ms: 20,
+            max_latency_ms: 40,
+            seed: Some(42),
+            ..Default::default()
+        };
+
+        let sim = Simulator::new(config);
+        sim.initialize_network().unwrap();
+        sim.set_channel_latency("ch_custom", 75);
+        assert_eq!(sim.get_channel_latency("ch_custom"), Some(75));
+
+        let stats = sim.run_simulation().await.unwrap();
+        assert_eq!(stats.latency_ms.len(), stats.successful_payments);
+        for &lat in &stats.latency_ms {
+            assert!(
+                lat >= 20,
+                "Hop latency must be >= min_latency_ms (got {})",
+                lat
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_node_disconnection_and_recovery() {
+        // Issue #380: Disconnecting nodes blocks routing; reconnecting restores it
+        let config = SimulatorConfig {
+            num_nodes: 10,
+            avg_channels_per_node: 4.0,
+            num_payments: 30,
+            seed: Some(42),
+            ..Default::default()
+        };
+
+        let sim = Simulator::new(config);
+        sim.initialize_network().unwrap();
+
+        let all_nodes = sim.get_all_nodes();
+        assert!(!all_nodes.is_empty());
+        let target_node = &all_nodes[0].id;
+
+        assert!(sim.is_node_connected(target_node));
+        sim.disconnect_node(target_node).unwrap();
+        assert!(!sim.is_node_connected(target_node));
+        assert!(sim.get_disconnected_nodes().contains(target_node));
+
+        sim.reconnect_node(target_node).unwrap();
+        assert!(sim.is_node_connected(target_node));
+        assert!(!sim.get_disconnected_nodes().contains(target_node));
     }
 }

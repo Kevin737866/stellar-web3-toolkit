@@ -7,6 +7,7 @@ description = "Network simulator for testing Stellar payment channels"
 [dependencies]
 anyhow = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
