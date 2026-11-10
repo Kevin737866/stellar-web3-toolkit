@@ -105,6 +105,12 @@ pub struct ChannelMonitor {
     network_passphrase: String,
     /// Cached channel states
     cache: std::sync::Arc<parking_lot::RwLock<HashMap<String, ChannelUpdate>>>,
+    /// Highest ledger height observed across channel checks (#370)
+    last_seen_ledger: std::sync::Arc<parking_lot::RwLock<u32>>,
+    /// Latest known network head ledger height (#370)
+    network_head_ledger: std::sync::Arc<parking_lot::RwLock<u32>>,
+    /// Channels configured to simulate transient monitor failures (#374)
+    simulated_failures: std::sync::Arc<parking_lot::RwLock<HashMap<String, String>>>,
 }
 
 impl ChannelMonitor {
@@ -114,7 +120,58 @@ impl ChannelMonitor {
             rpc_url,
             network_passphrase,
             cache: std::sync::Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            last_seen_ledger: std::sync::Arc::new(parking_lot::RwLock::new(0)),
+            network_head_ledger: std::sync::Arc::new(parking_lot::RwLock::new(0)),
+            simulated_failures: std::sync::Arc::new(parking_lot::RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Update the latest known network chain head ledger (#370).
+    pub fn set_network_head_ledger(&self, ledger: u32) {
+        let mut head = self.network_head_ledger.write();
+        if ledger > *head {
+            *head = ledger;
+        }
+    }
+
+    /// Record the highest ledger observed during channel scanning (#370).
+    pub fn record_seen_ledger(&self, ledger: u32) {
+        let mut seen = self.last_seen_ledger.write();
+        if ledger > *seen {
+            *seen = ledger;
+        }
+    }
+
+    /// Last ledger height observed by this monitor (#370).
+    pub fn last_seen_ledger(&self) -> u32 {
+        *self.last_seen_ledger.read()
+    }
+
+    /// Number of ledgers the monitor trails behind network head (#370).
+    pub fn monitoring_lag_ledgers(&self) -> u32 {
+        let head = *self.network_head_ledger.read();
+        let seen = *self.last_seen_ledger.read();
+        head.saturating_sub(seen)
+    }
+
+    /// Seed a cached channel update (useful for deterministic scenario tests).
+    pub fn seed_channel_update(&self, update: ChannelUpdate) {
+        self.record_seen_ledger(update.block_height);
+        self.cache
+            .write()
+            .insert(update.channel_id.clone(), update);
+    }
+
+    /// Inject a simulated check failure for a single channel (#374).
+    pub fn set_simulated_failure(&self, channel_id: &str, reason: &str) {
+        self.simulated_failures
+            .write()
+            .insert(channel_id.to_string(), reason.to_string());
+    }
+
+    /// Clear any simulated check failure for a channel (#374).
+    pub fn clear_simulated_failure(&self, channel_id: &str) {
+        self.simulated_failures.write().remove(channel_id);
     }
 
     /// Check a channel for updates
@@ -127,10 +184,15 @@ impl ChannelMonitor {
 
         debug!("Checking channel: {}", channel_id);
 
+        if let Some(err) = self.simulated_failures.read().get(channel_id).cloned() {
+            return Err(MonitorError::NetworkError(err));
+        }
+
         // Check cache first
         {
             let cache = self.cache.read();
             if let Some(cached) = cache.get(channel_id) {
+                self.record_seen_ledger(cached.block_height);
                 return Ok(Some(cached.clone()));
             }
         }
@@ -285,5 +347,28 @@ mod tests {
         let _breach = monitor.detect_breach("test", &new_update);
         // In this case, it won't detect a breach because we check sequence number order
         // In production, breach detection would be more sophisticated
+    }
+
+    #[tokio::test]
+    async fn monitor_tracks_last_seen_ledger_and_lag() {
+        let monitor = ChannelMonitor::new("http://localhost".to_string(), "test".to_string());
+        monitor.set_network_head_ledger(500);
+        assert_eq!(monitor.last_seen_ledger(), 0);
+        assert_eq!(monitor.monitoring_lag_ledgers(), 500);
+
+        monitor.seed_channel_update(ChannelUpdate {
+            channel_id: "ch-lag".to_string(),
+            sequence_number: 1,
+            balance_a: 100,
+            balance_b: 100,
+            is_closed: false,
+            close_type: None,
+            block_height: 485,
+            timestamp: 10,
+        });
+
+        let _ = monitor.check_channel("ch-lag").await.unwrap();
+        assert_eq!(monitor.last_seen_ledger(), 485);
+        assert_eq!(monitor.monitoring_lag_ledgers(), 15);
     }
 }
