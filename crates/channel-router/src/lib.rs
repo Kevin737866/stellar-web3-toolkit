@@ -63,6 +63,9 @@ pub enum RoutingError {
     #[error("Invalid node address")]
     InvalidNodeAddress,
 
+    #[error("Route failed policy checks: {0}")]
+    PolicyCheckFailed(String),
+
     #[error(
         "Channel {channel_id} advertises a fee rate of {fee_rate} ppm, above the protocol cap of {cap} ppm"
     )]
@@ -255,6 +258,33 @@ pub struct RouteRequest {
     pub find_any: bool,
     /// Payment metadata
     pub payment_metadata: Option<PaymentMetadata>,
+}
+
+impl RouteRequest {
+    /// Create a new route request (Issue #364)
+    pub fn new(source: String, destination: String, amount: i128) -> Self {
+        RouteRequest {
+            source,
+            destination,
+            amount,
+            max_fee_budget: None,
+            max_hops: None,
+            find_any: false,
+            payment_metadata: None,
+        }
+    }
+
+    /// Configure maximum allowed hops for this request (Issue #364)
+    pub fn with_max_hops(mut self, max_hops: usize) -> Self {
+        self.max_hops = Some(max_hops);
+        self
+    }
+
+    /// Configure maximum fee budget for this request
+    pub fn with_max_fee_budget(mut self, budget: i128) -> Self {
+        self.max_fee_budget = Some(budget);
+        self
+    }
 }
 
 /// Payment metadata for routing decisions
