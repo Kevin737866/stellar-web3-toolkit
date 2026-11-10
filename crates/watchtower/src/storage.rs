@@ -2,12 +2,87 @@
 //!
 //! Persistent storage backends for the watchtower.
 
+use crate::justice::JusticeTxStatus;
 use crate::monitor::{ChannelMonitorState, ChannelUpdate};
 use crate::Alert;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
 use tracing::{debug, info};
+
+/// Persisted record of a watchtower justice action written prior to submission (#368).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JusticeActionRecord {
+    /// Deterministic action identifier `(channel_id, breach_tx_hash)` for idempotency.
+    pub action_id: String,
+    /// Target channel ID.
+    pub channel_id: String,
+    /// Offending breach transaction hash.
+    pub breach_tx_hash: String,
+    /// Justice transaction hash generated for submission.
+    pub tx_hash: String,
+    /// Current lifecycle status.
+    pub status: JusticeTxStatus,
+    /// Creation Unix timestamp.
+    pub created_at: u64,
+    /// Last status update Unix timestamp.
+    pub updated_at: u64,
+    /// Number of submission/storage attempts.
+    pub attempts: u32,
+}
+
+/// Health check result for a watchtower storage backend (#375).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageHealth {
+    /// Whether the backend passed read/write availability checks.
+    pub healthy: bool,
+    /// Backend identifier (`in_memory`, `sqlite`, etc.).
+    pub backend: String,
+    /// Measured check latency in milliseconds.
+    pub latency_ms: u64,
+    /// Diagnostic summary.
+    pub details: String,
+}
+
+/// Retry policy for transient storage errors (#369).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryPolicy {
+    /// Maximum retry attempts after an initial failure.
+    pub max_retries: u32,
+    /// Initial backoff delay in milliseconds (doubles per attempt).
+    pub base_backoff_ms: u64,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        RetryPolicy {
+            max_retries: 3,
+            base_backoff_ms: 5,
+        }
+    }
+}
+
+/// Execute a storage closure with bounded retries on transient errors (#369).
+pub fn retry_storage_op<T, F>(policy: &RetryPolicy, mut op: F) -> Result<T, StorageError>
+where
+    F: FnMut() -> Result<T, StorageError>,
+{
+    let mut attempt = 0u32;
+    loop {
+        match op() {
+            Ok(value) => return Ok(value),
+            Err(err) if err.is_transient() && attempt < policy.max_retries => {
+                let shift = attempt.min(10);
+                let delay_ms = policy.base_backoff_ms.saturating_mul(1u64 << shift);
+                if delay_ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                }
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
 
 /// Retention rules applied by [`StorageBackend::compact`].
 ///
@@ -124,6 +199,31 @@ pub trait StorageBackend: Send + Sync {
     fn compact_with_defaults(&self) -> Result<CompactionReport, StorageError> {
         self.compact(&CompactionPolicy::default())
     }
+
+    /// Persist a justice action idempotently before network submission (#368, #369).
+    fn store_justice_action(&self, action: &JusticeActionRecord) -> Result<(), StorageError>;
+
+    /// Fetch a persisted justice action by its deterministic `action_id` (#368).
+    fn get_justice_action(
+        &self,
+        action_id: &str,
+    ) -> Result<Option<JusticeActionRecord>, StorageError>;
+
+    /// List all persisted justice actions for a given channel (#368).
+    fn get_justice_actions_for_channel(
+        &self,
+        channel_id: &str,
+    ) -> Result<Vec<JusticeActionRecord>, StorageError>;
+
+    /// Update the status of an already-persisted justice action (#368).
+    fn update_justice_action_status(
+        &self,
+        action_id: &str,
+        status: JusticeTxStatus,
+    ) -> Result<(), StorageError>;
+
+    /// Verify backend availability and responsiveness (#375).
+    fn health_check(&self) -> Result<StorageHealth, StorageError>;
 }
 
 /// In-memory storage backend
@@ -132,6 +232,7 @@ pub struct InMemoryStorage {
     channel_updates: parking_lot::RwLock<HashMap<String, ChannelUpdate>>,
     alerts: parking_lot::RwLock<Vec<Alert>>,
     subscriptions: parking_lot::RwLock<Vec<String>>,
+    justice_actions: parking_lot::RwLock<HashMap<String, JusticeActionRecord>>,
 }
 
 impl InMemoryStorage {
@@ -142,6 +243,7 @@ impl InMemoryStorage {
             channel_updates: parking_lot::RwLock::new(HashMap::new()),
             alerts: parking_lot::RwLock::new(Vec::new()),
             subscriptions: parking_lot::RwLock::new(Vec::new()),
+            justice_actions: parking_lot::RwLock::new(HashMap::new()),
         }
     }
 }
@@ -314,6 +416,61 @@ impl StorageBackend for InMemoryStorage {
 
         Ok(report)
     }
+
+    fn store_justice_action(&self, action: &JusticeActionRecord) -> Result<(), StorageError> {
+        let mut actions = self.justice_actions.write();
+        // Upsert keyed by action_id so storage retries never duplicate actions (#369).
+        actions.insert(action.action_id.clone(), action.clone());
+        Ok(())
+    }
+
+    fn get_justice_action(
+        &self,
+        action_id: &str,
+    ) -> Result<Option<JusticeActionRecord>, StorageError> {
+        let actions = self.justice_actions.read();
+        Ok(actions.get(action_id).cloned())
+    }
+
+    fn get_justice_actions_for_channel(
+        &self,
+        channel_id: &str,
+    ) -> Result<Vec<JusticeActionRecord>, StorageError> {
+        let actions = self.justice_actions.read();
+        let mut list: Vec<JusticeActionRecord> = actions
+            .values()
+            .filter(|a| a.channel_id == channel_id)
+            .cloned()
+            .collect();
+        list.sort_by_key(|a| a.created_at);
+        Ok(list)
+    }
+
+    fn update_justice_action_status(
+        &self,
+        action_id: &str,
+        status: JusticeTxStatus,
+    ) -> Result<(), StorageError> {
+        let mut actions = self.justice_actions.write();
+        let record = actions.get_mut(action_id).ok_or_else(|| {
+            StorageError::QueryError(format!("justice action {} not found", action_id))
+        })?;
+        record.status = status;
+        record.updated_at = current_timestamp();
+        Ok(())
+    }
+
+    fn health_check(&self) -> Result<StorageHealth, StorageError> {
+        let start = std::time::Instant::now();
+        let subs = self.subscriptions.read().len();
+        let actions = self.justice_actions.read().len();
+        Ok(StorageHealth {
+            healthy: true,
+            backend: "in_memory".to_string(),
+            latency_ms: start.elapsed().as_millis() as u64,
+            details: format!("subscriptions={}, justice_actions={}", subs, actions),
+        })
+    }
 }
 
 /// SQLite storage backend (placeholder implementation)
@@ -326,6 +483,11 @@ pub struct SqliteStorage {
 impl SqliteStorage {
     /// Create a new SQLite storage backend
     pub fn new(path: &str) -> Result<Self, StorageError> {
+        if path.trim().is_empty() {
+            return Err(StorageError::DatabaseError(
+                "sqlite database path must not be empty".to_string(),
+            ));
+        }
         // In production, this would initialize SQLite connection
         Ok(SqliteStorage {
             path: path.to_string(),
@@ -406,6 +568,57 @@ impl StorageBackend for SqliteStorage {
         );
         Ok(CompactionReport::default())
     }
+
+    fn store_justice_action(&self, action: &JusticeActionRecord) -> Result<(), StorageError> {
+        info!(
+            "SQLite: persisting justice action {} for channel {}",
+            action.action_id, action.channel_id
+        );
+        Ok(())
+    }
+
+    fn get_justice_action(
+        &self,
+        action_id: &str,
+    ) -> Result<Option<JusticeActionRecord>, StorageError> {
+        info!("SQLite: getting justice action {}", action_id);
+        Ok(None)
+    }
+
+    fn get_justice_actions_for_channel(
+        &self,
+        channel_id: &str,
+    ) -> Result<Vec<JusticeActionRecord>, StorageError> {
+        info!("SQLite: listing justice actions for {}", channel_id);
+        Ok(Vec::new())
+    }
+
+    fn update_justice_action_status(
+        &self,
+        action_id: &str,
+        status: JusticeTxStatus,
+    ) -> Result<(), StorageError> {
+        info!(
+            "SQLite: updating justice action {} to {:?}",
+            action_id, status
+        );
+        Ok(())
+    }
+
+    fn health_check(&self) -> Result<StorageHealth, StorageError> {
+        let start = std::time::Instant::now();
+        if self.path.trim().is_empty() {
+            return Err(StorageError::DatabaseError(
+                "sqlite path is empty".to_string(),
+            ));
+        }
+        Ok(StorageHealth {
+            healthy: true,
+            backend: "sqlite".to_string(),
+            latency_ms: start.elapsed().as_millis() as u64,
+            details: format!("path={}", self.path),
+        })
+    }
 }
 
 /// Seconds since the Unix epoch.
@@ -427,6 +640,16 @@ pub enum StorageError {
 
     #[error("Query error: {0}")]
     QueryError(String),
+
+    #[error("Transient storage error: {0}")]
+    TransientError(String),
+}
+
+impl StorageError {
+    /// Whether this error is transient and safe to retry idempotently (#369).
+    pub fn is_transient(&self) -> bool {
+        matches!(self, StorageError::TransientError(_))
+    }
 }
 
 #[cfg(test)]
@@ -676,5 +899,179 @@ mod tests {
         storage.store_alert(&alert).unwrap();
         let alerts = storage.get_alerts(10).unwrap();
         assert_eq!(alerts.len(), 1);
+    }
+
+    struct FlakyJusticeStorage {
+        inner: InMemoryStorage,
+        remaining_transient_failures: parking_lot::Mutex<u32>,
+    }
+
+    impl FlakyJusticeStorage {
+        fn new(failures: u32) -> Self {
+            FlakyJusticeStorage {
+                inner: InMemoryStorage::new(),
+                remaining_transient_failures: parking_lot::Mutex::new(failures),
+            }
+        }
+    }
+
+    impl StorageBackend for FlakyJusticeStorage {
+        fn store_channel_state(
+            &self,
+            channel_id: &str,
+            state: &ChannelMonitorState,
+        ) -> Result<(), StorageError> {
+            self.inner.store_channel_state(channel_id, state)
+        }
+
+        fn get_channel_state(
+            &self,
+            channel_id: &str,
+        ) -> Result<Option<ChannelMonitorState>, StorageError> {
+            self.inner.get_channel_state(channel_id)
+        }
+
+        fn store_alert(&self, alert: &Alert) -> Result<(), StorageError> {
+            self.inner.store_alert(alert)
+        }
+
+        fn get_alerts(&self, limit: usize) -> Result<Vec<Alert>, StorageError> {
+            self.inner.get_alerts(limit)
+        }
+
+        fn store_channel_update(&self, update: &ChannelUpdate) -> Result<(), StorageError> {
+            self.inner.store_channel_update(update)
+        }
+
+        fn get_channel_update(
+            &self,
+            channel_id: &str,
+        ) -> Result<Option<ChannelUpdate>, StorageError> {
+            self.inner.get_channel_update(channel_id)
+        }
+
+        fn store_subscription(&self, channel_id: &str) -> Result<(), StorageError> {
+            self.inner.store_subscription(channel_id)
+        }
+
+        fn get_subscriptions(&self) -> Result<Vec<String>, StorageError> {
+            self.inner.get_subscriptions()
+        }
+
+        fn remove_subscription(&self, channel_id: &str) -> Result<(), StorageError> {
+            self.inner.remove_subscription(channel_id)
+        }
+
+        fn compact(&self, policy: &CompactionPolicy) -> Result<CompactionReport, StorageError> {
+            self.inner.compact(policy)
+        }
+
+        fn store_justice_action(&self, action: &JusticeActionRecord) -> Result<(), StorageError> {
+            let mut rem = self.remaining_transient_failures.lock();
+            if *rem > 0 {
+                *rem -= 1;
+                return Err(StorageError::TransientError(
+                    "temporary lock timeout".to_string(),
+                ));
+            }
+            self.inner.store_justice_action(action)
+        }
+
+        fn get_justice_action(
+            &self,
+            action_id: &str,
+        ) -> Result<Option<JusticeActionRecord>, StorageError> {
+            self.inner.get_justice_action(action_id)
+        }
+
+        fn get_justice_actions_for_channel(
+            &self,
+            channel_id: &str,
+        ) -> Result<Vec<JusticeActionRecord>, StorageError> {
+            self.inner.get_justice_actions_for_channel(channel_id)
+        }
+
+        fn update_justice_action_status(
+            &self,
+            action_id: &str,
+            status: JusticeTxStatus,
+        ) -> Result<(), StorageError> {
+            self.inner.update_justice_action_status(action_id, status)
+        }
+
+        fn health_check(&self) -> Result<StorageHealth, StorageError> {
+            self.inner.health_check()
+        }
+    }
+
+    #[test]
+    fn storage_retry_handles_transient_failures_without_duplicates() {
+        let storage = FlakyJusticeStorage::new(2);
+        let policy = RetryPolicy {
+            max_retries: 3,
+            base_backoff_ms: 1,
+        };
+        let record = JusticeActionRecord {
+            action_id: "ch1:breach_1".to_string(),
+            channel_id: "ch1".to_string(),
+            breach_tx_hash: "breach_1".to_string(),
+            tx_hash: "justice_ch1_100".to_string(),
+            status: JusticeTxStatus::Pending,
+            created_at: 100,
+            updated_at: 100,
+            attempts: 1,
+        };
+
+        retry_storage_op(&policy, || storage.store_justice_action(&record))
+            .expect("should succeed on 3rd attempt");
+
+        // Re-running must remain idempotent with exactly 1 persisted action.
+        retry_storage_op(&policy, || storage.store_justice_action(&record))
+            .expect("idempotent retry should succeed");
+
+        let actions = storage.get_justice_actions_for_channel("ch1").unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].action_id, "ch1:breach_1");
+    }
+
+    #[test]
+    fn storage_retry_stops_when_budget_exhausted() {
+        let storage = FlakyJusticeStorage::new(5);
+        let policy = RetryPolicy {
+            max_retries: 2,
+            base_backoff_ms: 1,
+        };
+        let record = JusticeActionRecord {
+            action_id: "ch1:breach_2".to_string(),
+            channel_id: "ch1".to_string(),
+            breach_tx_hash: "breach_2".to_string(),
+            tx_hash: "justice_ch1_200".to_string(),
+            status: JusticeTxStatus::Pending,
+            created_at: 200,
+            updated_at: 200,
+            attempts: 1,
+        };
+
+        let err = retry_storage_op(&policy, || storage.store_justice_action(&record)).unwrap_err();
+        assert!(err.is_transient());
+        assert!(storage
+            .get_justice_actions_for_channel("ch1")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn storage_health_checks_report_status_for_backends() {
+        let mem = InMemoryStorage::new();
+        let mem_health = mem.health_check().unwrap();
+        assert!(mem_health.healthy);
+        assert_eq!(mem_health.backend, "in_memory");
+
+        let sqlite = SqliteStorage::new(":memory:").unwrap();
+        let sqlite_health = sqlite.health_check().unwrap();
+        assert!(sqlite_health.healthy);
+        assert_eq!(sqlite_health.backend, "sqlite");
+
+        assert!(SqliteStorage::new("   ").is_err());
     }
 }
