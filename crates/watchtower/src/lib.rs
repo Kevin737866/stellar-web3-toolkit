@@ -49,6 +49,16 @@ pub struct WatchtowerConfig {
     /// pass, leaving [`Watchtower::compact_storage`] as the only entry point.
     #[serde(default = "default_compaction_interval_secs")]
     pub compaction_interval_secs: u64,
+    /// Retention limits for encrypted watchtower channel state blobs (#372)
+    #[serde(default)]
+    pub encrypted_retention: EncryptedStateRetentionPolicy,
+    /// Maximum retry attempts for alert delivery (#373)
+    #[serde(default = "default_alert_max_retries")]
+    pub alert_max_retries: u32,
+}
+
+fn default_alert_max_retries() -> u32 {
+    3
 }
 
 /// Default automatic compaction interval: hourly.
@@ -70,6 +80,8 @@ impl Default for WatchtowerConfig {
             alert_webhook_url: None,
             compaction: storage::CompactionPolicy::default(),
             compaction_interval_secs: default_compaction_interval_secs(),
+            encrypted_retention: EncryptedStateRetentionPolicy::default(),
+            alert_max_retries: default_alert_max_retries(),
         }
     }
 }
@@ -218,6 +230,284 @@ impl Alert {
     }
 }
 
+/// Retention limits for encrypted watchtower state blobs (#372).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EncryptedStateRetentionPolicy {
+    /// Maximum encrypted entries retained across channels.
+    pub max_entries: usize,
+    /// Maximum age in seconds before an encrypted blob expires.
+    pub max_age_secs: u64,
+    /// Maximum aggregate ciphertext bytes allowed in the store.
+    pub max_total_bytes: usize,
+}
+
+impl Default for EncryptedStateRetentionPolicy {
+    fn default() -> Self {
+        EncryptedStateRetentionPolicy {
+            max_entries: 10_000,
+            max_age_secs: 30 * 24 * 60 * 60,
+            max_total_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
+impl EncryptedStateRetentionPolicy {
+    /// Validate retention bounds explicitly, rejecting unsafe zero limits (#372).
+    pub fn validate(&self) -> Result<(), WatchtowerError> {
+        if self.max_entries == 0 {
+            return Err(WatchtowerError::InvalidRetentionPolicy(
+                "max_entries must be greater than zero".to_string(),
+            ));
+        }
+        if self.max_total_bytes == 0 {
+            return Err(WatchtowerError::InvalidRetentionPolicy(
+                "max_total_bytes must be greater than zero".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Encrypted watchtower blob persisted for a monitored channel (#372).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EncryptedChannelBlob {
+    pub channel_id: String,
+    pub ciphertext: Vec<u8>,
+    pub nonce: [u8; 12],
+    pub stored_at: u64,
+}
+
+/// Summary of entries pruned while enforcing encrypted state retention (#372).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetentionPruneReport {
+    pub evicted_expired: usize,
+    pub evicted_overflow: usize,
+    pub remaining_entries: usize,
+    pub remaining_bytes: usize,
+}
+
+/// Bounded in-memory store for encrypted channel recovery blobs (#372).
+pub struct EncryptedStateStore {
+    policy: EncryptedStateRetentionPolicy,
+    entries: RwLock<Vec<EncryptedChannelBlob>>,
+}
+
+impl EncryptedStateStore {
+    /// Construct a validated encrypted state store (#372).
+    pub fn new(policy: EncryptedStateRetentionPolicy) -> Result<Self, WatchtowerError> {
+        policy.validate()?;
+        Ok(EncryptedStateStore {
+            policy,
+            entries: RwLock::new(Vec::new()),
+        })
+    }
+
+    /// Store or refresh an encrypted channel blob, enforcing byte and entry caps (#372).
+    pub fn store_blob(
+        &self,
+        blob: EncryptedChannelBlob,
+    ) -> Result<RetentionPruneReport, WatchtowerError> {
+        if blob.ciphertext.len() > self.policy.max_total_bytes {
+            return Err(WatchtowerError::InvalidRetentionPolicy(format!(
+                "blob size {} exceeds max_total_bytes {}",
+                blob.ciphertext.len(),
+                self.policy.max_total_bytes
+            )));
+        }
+
+        let now = blob.stored_at;
+        let mut entries = self.entries.write();
+        entries.retain(|existing| existing.channel_id != blob.channel_id);
+        entries.push(blob);
+        Ok(Self::prune_locked(&mut entries, &self.policy, now))
+    }
+
+    /// Retrieve an encrypted blob if present and not expired (#372).
+    pub fn get_blob(&self, channel_id: &str, now: u64) -> Option<EncryptedChannelBlob> {
+        let cutoff = now.saturating_sub(self.policy.max_age_secs);
+        self.entries
+            .read()
+            .iter()
+            .find(|b| b.channel_id == channel_id && b.stored_at >= cutoff)
+            .cloned()
+    }
+
+    /// Enforce age, entry-count, and total-byte caps explicitly (#372).
+    pub fn enforce_retention(&self, now: u64) -> RetentionPruneReport {
+        let mut entries = self.entries.write();
+        Self::prune_locked(&mut entries, &self.policy, now)
+    }
+
+    fn prune_locked(
+        entries: &mut Vec<EncryptedChannelBlob>,
+        policy: &EncryptedStateRetentionPolicy,
+        now: u64,
+    ) -> RetentionPruneReport {
+        let before_age = entries.len();
+        let cutoff = now.saturating_sub(policy.max_age_secs);
+        entries.retain(|b| b.stored_at >= cutoff);
+        let evicted_expired = before_age.saturating_sub(entries.len());
+
+        // Oldest entries first so newest encrypted states survive eviction.
+        entries.sort_by_key(|b| b.stored_at);
+
+        let mut evicted_overflow = 0usize;
+        let mut total_bytes: usize = entries.iter().map(|b| b.ciphertext.len()).sum();
+        while !entries.is_empty()
+            && (entries.len() > policy.max_entries || total_bytes > policy.max_total_bytes)
+        {
+            let removed = entries.remove(0);
+            total_bytes = total_bytes.saturating_sub(removed.ciphertext.len());
+            evicted_overflow += 1;
+        }
+
+        RetentionPruneReport {
+            evicted_expired,
+            evicted_overflow,
+            remaining_entries: entries.len(),
+            remaining_bytes: total_bytes,
+        }
+    }
+
+    /// Number of retained encrypted blobs.
+    pub fn len(&self) -> usize {
+        self.entries.read().len()
+    }
+
+    /// Whether the encrypted store is currently empty.
+    pub fn is_empty(&self) -> bool {
+        self.entries.read().is_empty()
+    }
+
+    /// Aggregate ciphertext bytes currently held.
+    pub fn total_bytes(&self) -> usize {
+        self.entries.read().iter().map(|b| b.ciphertext.len()).sum()
+    }
+}
+
+/// Delivery lifecycle state for an alert webhook/notification (#373).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AlertDeliveryStatus {
+    Pending,
+    Retrying,
+    Delivered,
+    Failed,
+}
+
+/// Tracked alert delivery item keyed by deterministic `delivery_id` (#373).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlertDeliveryRecord {
+    pub delivery_id: String,
+    pub alert_id: String,
+    pub destination: String,
+    pub attempts: u32,
+    pub max_attempts: u32,
+    pub status: AlertDeliveryStatus,
+    pub last_error: Option<String>,
+}
+
+/// Manages idempotent alert enqueueing and retryable delivery (#373).
+pub struct AlertDeliveryManager {
+    max_attempts: u32,
+    records: RwLock<std::collections::HashMap<String, AlertDeliveryRecord>>,
+}
+
+impl AlertDeliveryManager {
+    /// Create a delivery manager enforcing at least one attempt.
+    pub fn new(max_attempts: u32) -> Self {
+        AlertDeliveryManager {
+            max_attempts: max_attempts.max(1),
+            records: RwLock::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Compute deterministic delivery ID for `(alert_id, destination)` (#373).
+    pub fn deterministic_delivery_id(alert_id: &str, destination: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(alert_id.as_bytes());
+        hasher.update(b":");
+        hasher.update(destination.as_bytes());
+        let digest = hasher.finalize();
+        format!(
+            "dlv_{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7]
+        )
+    }
+
+    /// Enqueue an alert idempotently, returning its stable `delivery_id` (#373).
+    pub fn enqueue(&self, alert: &Alert, destination: &str) -> String {
+        let delivery_id = Self::deterministic_delivery_id(&alert.id, destination);
+        let mut records = self.records.write();
+        records
+            .entry(delivery_id.clone())
+            .or_insert_with(|| AlertDeliveryRecord {
+                delivery_id: delivery_id.clone(),
+                alert_id: alert.id.clone(),
+                destination: destination.to_string(),
+                attempts: 0,
+                max_attempts: self.max_attempts,
+                status: AlertDeliveryStatus::Pending,
+                last_error: None,
+            });
+        delivery_id
+    }
+
+    /// Attempt delivery using the caller-supplied transport closure (#373).
+    pub fn attempt_delivery<F>(
+        &self,
+        delivery_id: &str,
+        mut transport: F,
+    ) -> Result<AlertDeliveryRecord, WatchtowerError>
+    where
+        F: FnMut(&str) -> Result<(), String>,
+    {
+        let mut records = self.records.write();
+        let record = records.get_mut(delivery_id).ok_or_else(|| {
+            WatchtowerError::AlertDeliveryFailed(format!("unknown delivery_id {}", delivery_id))
+        })?;
+
+        if record.status == AlertDeliveryStatus::Delivered {
+            return Ok(record.clone());
+        }
+        if record.attempts >= record.max_attempts {
+            record.status = AlertDeliveryStatus::Failed;
+            return Ok(record.clone());
+        }
+
+        record.attempts += 1;
+        match transport(delivery_id) {
+            Ok(()) => {
+                record.status = AlertDeliveryStatus::Delivered;
+                record.last_error = None;
+            }
+            Err(err) => {
+                record.last_error = Some(err);
+                record.status = if record.attempts >= record.max_attempts {
+                    AlertDeliveryStatus::Failed
+                } else {
+                    AlertDeliveryStatus::Retrying
+                };
+            }
+        }
+        Ok(record.clone())
+    }
+
+    /// Fetch delivery state by `delivery_id`.
+    pub fn get_record(&self, delivery_id: &str) -> Option<AlertDeliveryRecord> {
+        self.records.read().get(delivery_id).cloned()
+    }
+}
+
+/// Outcome of scanning all subscribed channels once (#374).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScanCycleReport {
+    /// Channels scanned cleanly without errors.
+    pub succeeded: Vec<String>,
+    /// Per-channel failures `(channel_id, error_message)` (#374).
+    pub failed: Vec<(String, String)>,
+}
+
 /// Watchtower state
 pub struct WatchtowerState {
     /// Subscribed channel IDs
@@ -232,6 +522,8 @@ pub struct WatchtowerState {
     pub stats: RwLock<WatchtowerStats>,
     /// Unix timestamp of the last storage compaction
     pub last_compaction_ts: RwLock<u64>,
+    /// Per-channel latest monitoring error messages (#374)
+    pub per_channel_failures: RwLock<std::collections::HashMap<String, String>>,
     /// Storage backend, shared with the owning [`Watchtower`]
     storage: Arc<dyn storage::StorageBackend>,
 }
@@ -269,6 +561,10 @@ pub struct Watchtower {
     justice: justice::JusticeService,
     /// Persistent storage for subscriptions, channel state and alerts
     storage: Arc<dyn storage::StorageBackend>,
+    /// Bounded encrypted channel state store (#372)
+    encrypted_state: EncryptedStateStore,
+    /// Retryable alert delivery queue (#373)
+    alert_deliveries: AlertDeliveryManager,
 }
 
 impl Watchtower {
@@ -290,6 +586,9 @@ impl Watchtower {
             config.justice_fee_budget,
         );
 
+        let encrypted_state = EncryptedStateStore::new(config.encrypted_retention)?;
+        let alert_deliveries = AlertDeliveryManager::new(config.alert_max_retries);
+
         let state = Arc::new(WatchtowerState {
             subscribed_channels: RwLock::new(std::collections::HashSet::new()),
             channel_states: RwLock::new(std::collections::HashMap::new()),
@@ -297,6 +596,7 @@ impl Watchtower {
             is_running: RwLock::new(false),
             stats: RwLock::new(WatchtowerStats::default()),
             last_compaction_ts: RwLock::new(current_timestamp()),
+            per_channel_failures: RwLock::new(std::collections::HashMap::new()),
             storage: Arc::clone(&storage),
         });
 
@@ -306,6 +606,8 @@ impl Watchtower {
             monitor,
             justice,
             storage,
+            encrypted_state,
+            alert_deliveries,
         })
     }
 
@@ -461,7 +763,89 @@ impl Watchtower {
         Ok(report)
     }
 
-    /// Get current watchtower status
+    /// Scan all subscribed channels once, isolating failures per channel (#374).
+    pub async fn scan_channels_once(&self) -> ScanCycleReport {
+        let mut channels: Vec<String> = self
+            .state
+            .subscribed_channels
+            .read()
+            .iter()
+            .cloned()
+            .collect();
+        channels.sort();
+
+        let mut report = ScanCycleReport::default();
+
+        for channel_id in channels {
+            match self.monitor.check_channel(&channel_id).await {
+                Ok(Some(update)) => {
+                    self.state.per_channel_failures.write().remove(&channel_id);
+                    if let Some(breach) = self.monitor.detect_breach(&channel_id, &update) {
+                        warn!("Breach attempt detected on channel {}", channel_id);
+                        let alert = Alert::breach_attempt(
+                            channel_id.clone(),
+                            breach.old_sequence,
+                            breach.new_sequence,
+                        );
+                        self.state.add_alert(alert);
+                        if self.config.auto_justice {
+                            if let Err(e) = self.justice.submit_justice(&breach).await {
+                                error!("Failed to submit justice: {:?}", e);
+                            }
+                        }
+                    }
+                    self.state.update_channel_state(&channel_id, update);
+                    report.succeeded.push(channel_id);
+                }
+                Ok(None) => {
+                    self.state.per_channel_failures.write().remove(&channel_id);
+                    self.state.remove_channel(&channel_id);
+                    report.succeeded.push(channel_id);
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    error!("Error checking channel {}: {}", channel_id, msg);
+                    self.state
+                        .per_channel_failures
+                        .write()
+                        .insert(channel_id.clone(), msg.clone());
+                    self.state.add_alert(Alert {
+                        id: uuid_v4(),
+                        alert_type: AlertType::HealthCheckFailed {
+                            component: format!("channel:{}", channel_id),
+                            error: msg.clone(),
+                        },
+                        severity: AlertSeverity::Warning,
+                        timestamp: current_timestamp(),
+                        context: serde_json::json!({ "channel_id": channel_id }),
+                    });
+                    report.failed.push((channel_id, msg));
+                }
+            }
+        }
+
+        let mut stats = self.state.stats.write();
+        stats.last_scan_ts = current_timestamp();
+        stats.channels_monitored = self.state.subscribed_channels.read().len() as u64;
+        report
+    }
+
+    /// Access the underlying channel monitor (#370, #374).
+    pub fn monitor(&self) -> &monitor::ChannelMonitor {
+        &self.monitor
+    }
+
+    /// Access the bounded encrypted state store (#372).
+    pub fn encrypted_state(&self) -> &EncryptedStateStore {
+        &self.encrypted_state
+    }
+
+    /// Access the retryable alert delivery manager (#373).
+    pub fn alert_deliveries(&self) -> &AlertDeliveryManager {
+        &self.alert_deliveries
+    }
+
+    /// Get current watchtower status including monitoring lag & per-channel failures (#370, #374)
     pub fn status(&self) -> WatchtowerStatus {
         let stats = self.state.stats.read();
         let alerts = self.state.recent_alerts.read();
@@ -472,6 +856,9 @@ impl Watchtower {
             breach_attempts_detected: stats.breach_attempts_detected,
             justice_txs_submitted: stats.justice_txs_submitted,
             recent_alerts_count: alerts.len(),
+            last_seen_ledger: self.monitor.last_seen_ledger(),
+            monitoring_lag_ledgers: self.monitor.monitoring_lag_ledgers(),
+            per_channel_failures: self.state.per_channel_failures.read().clone(),
         }
     }
 
@@ -584,6 +971,12 @@ pub struct WatchtowerStatus {
     pub breach_attempts_detected: u64,
     pub justice_txs_submitted: u64,
     pub recent_alerts_count: usize,
+    /// Highest ledger height observed by the monitor (#370)
+    pub last_seen_ledger: u32,
+    /// Ledgers elapsed between network head and `last_seen_ledger` (#370)
+    pub monitoring_lag_ledgers: u32,
+    /// Most recent per-channel check errors keyed by channel ID (#374)
+    pub per_channel_failures: std::collections::HashMap<String, String>,
 }
 
 /// Errors that can occur in the watchtower
@@ -603,6 +996,12 @@ pub enum WatchtowerError {
 
     #[error("Watchtower not running")]
     NotRunning,
+
+    #[error("Invalid encrypted state retention policy: {0}")]
+    InvalidRetentionPolicy(String),
+
+    #[error("Alert delivery failed: {0}")]
+    AlertDeliveryFailed(String),
 }
 
 impl From<storage::StorageError> for WatchtowerError {
@@ -779,5 +1178,125 @@ mod tests {
             .unwrap()
             .expect("state should be persisted");
         assert_eq!(state.last_known_sequence, 4);
+    }
+
+    #[test]
+    fn encrypted_state_retention_enforces_age_count_and_byte_limits() {
+        assert!(EncryptedStateStore::new(EncryptedStateRetentionPolicy {
+            max_entries: 0,
+            ..Default::default()
+        })
+        .is_err());
+
+        let store = EncryptedStateStore::new(EncryptedStateRetentionPolicy {
+            max_entries: 2,
+            max_age_secs: 60,
+            max_total_bytes: 16,
+        })
+        .unwrap();
+
+        let oversized = EncryptedChannelBlob {
+            channel_id: "too-big".to_string(),
+            ciphertext: vec![1u8; 32],
+            nonce: [0u8; 12],
+            stored_at: 100,
+        };
+        assert!(store.store_blob(oversized).is_err());
+
+        store
+            .store_blob(EncryptedChannelBlob {
+                channel_id: "c1".to_string(),
+                ciphertext: vec![1u8; 6],
+                nonce: [0u8; 12],
+                stored_at: 100,
+            })
+            .unwrap();
+        store
+            .store_blob(EncryptedChannelBlob {
+                channel_id: "c2".to_string(),
+                ciphertext: vec![2u8; 6],
+                nonce: [0u8; 12],
+                stored_at: 120,
+            })
+            .unwrap();
+        let report = store
+            .store_blob(EncryptedChannelBlob {
+                channel_id: "c3".to_string(),
+                ciphertext: vec![3u8; 6],
+                nonce: [0u8; 12],
+                stored_at: 140,
+            })
+            .unwrap();
+
+        assert_eq!(report.evicted_overflow, 1);
+        assert_eq!(store.len(), 2);
+        assert!(store.get_blob("c1", 150).is_none());
+        assert!(store.get_blob("c2", 150).is_some());
+
+        let pruned = store.enforce_retention(300);
+        assert_eq!(pruned.evicted_expired, 2);
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn alert_delivery_is_retryable_with_stable_delivery_id() {
+        let manager = AlertDeliveryManager::new(3);
+        let alert = Alert::breach_attempt("ch1".to_string(), 1, 5);
+        let id1 = manager.enqueue(&alert, "https://ops.example/webhook");
+        let id2 = manager.enqueue(&alert, "https://ops.example/webhook");
+        assert_eq!(id1, id2);
+
+        let r1 = manager
+            .attempt_delivery(&id1, |_| Err("503 unavailable".to_string()))
+            .unwrap();
+        assert_eq!(r1.status, AlertDeliveryStatus::Retrying);
+        assert_eq!(r1.attempts, 1);
+
+        let r2 = manager.attempt_delivery(&id1, |_| Ok(())).unwrap();
+        assert_eq!(r2.status, AlertDeliveryStatus::Delivered);
+        assert_eq!(r2.attempts, 2);
+        assert!(r2.last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn per_channel_monitoring_failures_do_not_stop_other_channels() {
+        let wt = Watchtower::new(WatchtowerConfig::default()).unwrap();
+        wt.subscribe("ch-bad".to_string()).unwrap();
+        wt.subscribe("ch-good".to_string()).unwrap();
+
+        wt.monitor().set_network_head_ledger(200);
+        wt.monitor().seed_channel_update(monitor::ChannelUpdate {
+            channel_id: "ch-good".to_string(),
+            sequence_number: 2,
+            balance_a: 500,
+            balance_b: 500,
+            is_closed: false,
+            close_type: None,
+            block_height: 192,
+            timestamp: current_timestamp(),
+        });
+        wt.monitor().set_simulated_failure("ch-bad", "rpc timeout");
+
+        let cycle = wt.scan_channels_once().await;
+        assert_eq!(cycle.succeeded, vec!["ch-good".to_string()]);
+        assert_eq!(cycle.failed.len(), 1);
+        assert_eq!(cycle.failed[0].0, "ch-bad");
+
+        let status = wt.status();
+        assert_eq!(status.last_seen_ledger, 192);
+        assert_eq!(status.monitoring_lag_ledgers, 8);
+        assert_eq!(
+            status
+                .per_channel_failures
+                .get("ch-bad")
+                .map(String::as_str),
+            Some("Network error: rpc timeout")
+        );
+
+        // Clearing the transient error allows ch-bad to recover on next scan.
+        wt.monitor().clear_simulated_failure("ch-bad");
+        let recovery = wt.scan_channels_once().await;
+        assert_eq!(recovery.failed.len(), 0);
+        assert!(wt.status().per_channel_failures.is_empty());
     }
 }
