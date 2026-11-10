@@ -139,7 +139,8 @@ impl FuzzReport {
 
     /// Retrieve the failing seed if a failure occurred (Issue #382)
     pub fn failure_seed(&self) -> Option<u64> {
-        self.seed_on_failure.or_else(|| self.failures.first().map(|f| f.seed))
+        self.seed_on_failure
+            .or_else(|| self.failures.first().map(|f| f.seed))
     }
 
     /// Fraction of topologies that had at least one route, as a percentage.
@@ -473,7 +474,10 @@ impl TopologyFuzzer {
                     report.seed_on_failure = Some(first_fail.seed);
                     report.failure_diagnostic = Some(format!(
                         "Fuzz invariant failure at iteration {} (seed: {}): [{}] {}",
-                        first_fail.iteration, first_fail.seed, first_fail.invariant, first_fail.detail
+                        first_fail.iteration,
+                        first_fail.seed,
+                        first_fail.invariant,
+                        first_fail.detail
                     ));
                 }
             }
@@ -583,6 +587,8 @@ impl TopologyFuzzer {
             num_payments: self.config.payments_per_topology,
             max_payment_amount: min_capacity * rng.gen_range(1i128..8),
             seed: None,
+            min_latency_ms: 5,
+            max_latency_ms: 25,
         }
     }
 
@@ -904,16 +910,14 @@ mod tests {
 
     #[test]
     fn test_bounded_fuzz_duration_stops_early() {
-        let fuzzer = TopologyFuzzer::new(
-            TopologyFuzzConfig {
-                iterations: 50_000,
-                seed: 12345,
-                min_nodes: 5,
-                max_nodes: 20,
-                payments_per_topology: 10,
-                max_duration: Some(std::time::Duration::from_millis(50)),
-            }
-        );
+        let fuzzer = TopologyFuzzer::new(TopologyFuzzConfig {
+            iterations: 50_000,
+            seed: 12345,
+            min_nodes: 5,
+            max_nodes: 20,
+            payments_per_topology: 10,
+            max_duration: Some(std::time::Duration::from_millis(50)),
+        });
 
         let report = fuzzer.run();
         assert!(report.duration_bounded);
@@ -932,7 +936,8 @@ mod tests {
             detail: "simulated failure for diagnostic verification".to_string(),
         });
         report.seed_on_failure = Some(0xDEADBEEF);
-        report.failure_diagnostic = Some("Fuzz invariant failure at iteration 3 (seed: 3735928559)".to_string());
+        report.failure_diagnostic =
+            Some("Fuzz invariant failure at iteration 3 (seed: 3735928559)".to_string());
 
         assert!(!report.is_clean());
         assert_eq!(report.failure_seed(), Some(0xDEADBEEF));

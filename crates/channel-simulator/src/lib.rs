@@ -193,7 +193,9 @@ impl Simulator {
 
     /// Configure custom message latency for a specific channel in milliseconds (Issue #379)
     pub fn set_channel_latency(&self, channel_id: &str, latency_ms: u64) {
-        self.channel_latencies.write().insert(channel_id.to_string(), latency_ms);
+        self.channel_latencies
+            .write()
+            .insert(channel_id.to_string(), latency_ms);
     }
 
     /// Get configured message latency for a channel if explicitly set (Issue #379)
@@ -397,7 +399,10 @@ impl Simulator {
                 let disconnected = self.disconnected_nodes.read();
                 if disconnected.contains(&source) || disconnected.contains(&dest) {
                     failed += 1;
-                    debug!("Payment failed: endpoint node disconnected: {} -> {}", source, dest);
+                    debug!(
+                        "Payment failed: endpoint node disconnected: {} -> {}",
+                        source, dest
+                    );
                     continue;
                 }
             }
@@ -417,9 +422,7 @@ impl Simulator {
                     // Check if any intermediate hop is disconnected (Issue #380)
                     let is_hop_disconnected = {
                         let disconnected = self.disconnected_nodes.read();
-                        route.hops.iter().any(|h| {
-                            disconnected.contains(&h.source) || disconnected.contains(&h.destination)
-                        })
+                        route.hops.iter().any(|h| disconnected.contains(&h.node_id))
                     };
 
                     if is_hop_disconnected {
@@ -435,7 +438,8 @@ impl Simulator {
                         let min_lat = self.config.min_latency_ms;
                         let max_lat = self.config.max_latency_ms.max(min_lat);
                         for hop in &route.hops {
-                            let hop_lat = if let Some(&lat) = custom_latencies.get(&hop.channel_id) {
+                            let hop_lat = if let Some(&lat) = custom_latencies.get(&hop.channel_id)
+                            {
                                 lat
                             } else if max_lat > min_lat {
                                 rng.gen_range(min_lat..=max_lat)
@@ -777,7 +781,11 @@ mod tests {
         let stats = sim.run_simulation().await.unwrap();
         assert_eq!(stats.latency_ms.len(), stats.successful_payments);
         for &lat in &stats.latency_ms {
-            assert!(lat >= 20, "Hop latency must be >= min_latency_ms (got {})", lat);
+            assert!(
+                lat >= 20,
+                "Hop latency must be >= min_latency_ms (got {})",
+                lat
+            );
         }
     }
 
