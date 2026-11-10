@@ -85,7 +85,10 @@ impl Pathfinder {
             }
 
             // Check hop limit (Issue #364)
-            let effective_max_hops = request.max_hops.map(|h| h.min(self.max_hops)).unwrap_or(self.max_hops);
+            let effective_max_hops = request
+                .max_hops
+                .map(|h| h.min(self.max_hops))
+                .unwrap_or(self.max_hops);
             if path.len() >= effective_max_hops {
                 continue;
             }
@@ -248,7 +251,10 @@ impl Pathfinder {
                 return self.build_route(path, request.amount);
             }
 
-            let effective_max_hops = request.max_hops.map(|h| h.min(self.max_hops)).unwrap_or(self.max_hops);
+            let effective_max_hops = request
+                .max_hops
+                .map(|h| h.min(self.max_hops))
+                .unwrap_or(self.max_hops);
             if path.len() >= effective_max_hops {
                 continue;
             }
@@ -692,11 +698,14 @@ mod tests {
 
         // 4 hops requested allowed: succeeds
         let req_ok = RouteRequest::new("n0".to_string(), "n4".to_string(), 100).with_max_hops(4);
-        let route = pathfinder.find_route_dijkstra(&graph, &req_ok).expect("route with 4 hops should succeed");
+        let route = pathfinder
+            .find_route_dijkstra(&graph, &req_ok)
+            .expect("route with 4 hops should succeed");
         assert_eq!(route.hops.len(), 4);
 
         // 3 hops requested: must fail since path requires 4 hops
-        let req_too_short = RouteRequest::new("n0".to_string(), "n4".to_string(), 100).with_max_hops(3);
+        let req_too_short =
+            RouteRequest::new("n0".to_string(), "n4".to_string(), 100).with_max_hops(3);
         let err = pathfinder.find_route_dijkstra(&graph, &req_too_short);
         assert!(err.is_err(), "route exceeding request max_hops must fail");
     }

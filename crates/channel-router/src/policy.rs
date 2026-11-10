@@ -2,21 +2,48 @@
 //!
 //! Routing policies and constraints for the payment channel router.
 
-use crate::{Channel, NetworkGraph, Route, RouteHop, RouteMetadata, RouteRequest, RoutingError, MAX_ROUTE_HOPS};
+use crate::{
+    Channel, NetworkGraph, Route, RouteHop, RouteMetadata, RouteRequest, RoutingError,
+    MAX_ROUTE_HOPS,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 /// Detailed reasons why a route or channel violates a routing policy (Issue #365)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PolicyViolation {
-    MaxHopsExceeded { actual_hops: usize, limit: usize },
-    FeeBpsExceeded { actual_bps: u32, max_bps: u32 },
-    BaseFeeExceeded { base_fee: i128, max_base_fee: i128, channel_id: String },
-    FeeRateExceeded { fee_rate: u32, max_fee_rate: u32, channel_id: String },
-    ExcludedNode { node: String },
-    ExcludedChannel { channel_id: String },
-    AmountBelowMinimum { amount: i128, min_amount: i128 },
-    AmountAboveMaximum { amount: i128, max_amount: i128 },
+    MaxHopsExceeded {
+        actual_hops: usize,
+        limit: usize,
+    },
+    FeeBpsExceeded {
+        actual_bps: u32,
+        max_bps: u32,
+    },
+    BaseFeeExceeded {
+        base_fee: i128,
+        max_base_fee: i128,
+        channel_id: String,
+    },
+    FeeRateExceeded {
+        fee_rate: u32,
+        max_fee_rate: u32,
+        channel_id: String,
+    },
+    ExcludedNode {
+        node: String,
+    },
+    ExcludedChannel {
+        channel_id: String,
+    },
+    AmountBelowMinimum {
+        amount: i128,
+        min_amount: i128,
+    },
+    AmountAboveMaximum {
+        amount: i128,
+        max_amount: i128,
+    },
 }
 
 /// Report detailing the outcome of routing policy evaluation (Issue #365)
@@ -53,14 +80,31 @@ impl PolicyCheckReport {
                     PolicyViolation::MaxHopsExceeded { actual_hops, limit } => {
                         format!("hop count {} exceeds limit {}", actual_hops, limit)
                     }
-                    PolicyViolation::FeeBpsExceeded { actual_bps, max_bps } => {
+                    PolicyViolation::FeeBpsExceeded {
+                        actual_bps,
+                        max_bps,
+                    } => {
                         format!("fee {} bps exceeds maximum {} bps", actual_bps, max_bps)
                     }
-                    PolicyViolation::BaseFeeExceeded { base_fee, max_base_fee, channel_id } => {
-                        format!("channel {} base fee {} exceeds maximum {}", channel_id, base_fee, max_base_fee)
+                    PolicyViolation::BaseFeeExceeded {
+                        base_fee,
+                        max_base_fee,
+                        channel_id,
+                    } => {
+                        format!(
+                            "channel {} base fee {} exceeds maximum {}",
+                            channel_id, base_fee, max_base_fee
+                        )
                     }
-                    PolicyViolation::FeeRateExceeded { fee_rate, max_fee_rate, channel_id } => {
-                        format!("channel {} fee rate {} ppm exceeds maximum {} ppm", channel_id, fee_rate, max_fee_rate)
+                    PolicyViolation::FeeRateExceeded {
+                        fee_rate,
+                        max_fee_rate,
+                        channel_id,
+                    } => {
+                        format!(
+                            "channel {} fee rate {} ppm exceeds maximum {} ppm",
+                            channel_id, fee_rate, max_fee_rate
+                        )
                     }
                     PolicyViolation::ExcludedNode { node } => {
                         format!("node {} is in policy excluded_nodes", node)
@@ -466,8 +510,14 @@ mod tests {
 
         let report = policy.evaluate_route(&route, &request);
         assert!(!report.passed);
-        assert!(report.violations.iter().any(|v| matches!(v, PolicyViolation::MaxHopsExceeded { .. })));
-        assert!(report.violations.iter().any(|v| matches!(v, PolicyViolation::ExcludedNode { .. })));
+        assert!(report
+            .violations
+            .iter()
+            .any(|v| matches!(v, PolicyViolation::MaxHopsExceeded { .. })));
+        assert!(report
+            .violations
+            .iter()
+            .any(|v| matches!(v, PolicyViolation::ExcludedNode { .. })));
 
         let diagnostic = report.diagnostic();
         assert!(diagnostic.contains("hop count 2 exceeds limit 1"));
