@@ -805,7 +805,6 @@ mod tests {
         let graph = network.read();
         assert!(graph.num_channels() > 0);
     }
-}
 
     #[test]
     fn test_baseline_network_fixture_routing_regression() {
