@@ -7,10 +7,12 @@ pub mod fuzz;
 pub mod network;
 pub mod statistics;
 
+pub use crate::network::NetworkFixture;
+pub use crate::statistics::{
+    FailedPaymentDetail, FailedPaymentSummary, FailureReason, HopLengthMetrics,
+};
 use channel_router::pathfinder::Pathfinder;
 use channel_router::{Channel, Direction, NetworkGraph, Node, RouteRequest};
-pub use crate::statistics::{FailureReason, FailedPaymentDetail, FailedPaymentSummary, HopLengthMetrics};
-pub use crate::network::NetworkFixture;
 use parking_lot::RwLock;
 use rand::Rng;
 use rand::SeedableRng;
@@ -87,7 +89,6 @@ impl DeterministicScheduler {
         self.events.is_empty()
     }
 }
-
 
 /// Simulator configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,7 +172,9 @@ pub struct SimulationStats {
 impl SimulationStats {
     /// Return the observed payment success rate for a specific hop count (Issue #383)
     pub fn success_rate_for_hops(&self, hops: usize) -> Option<f64> {
-        self.success_by_hop_length.get(&hops).map(|m| m.success_rate)
+        self.success_by_hop_length
+            .get(&hops)
+            .map(|m| m.success_rate)
     }
 }
 
@@ -517,7 +520,10 @@ impl Simulator {
                     total_value += amount;
                     total_fees += route.total_fees;
                     path_lengths.push(hops_count);
-                    hop_metrics.entry(hops_count).or_default().record_success(route.total_fees);
+                    hop_metrics
+                        .entry(hops_count)
+                        .or_default()
+                        .record_success(route.total_fees);
 
                     debug!(
                         "Payment {} succeeded: {} -> {} ({} hops, {} fee) in {}ms",
@@ -815,7 +821,9 @@ mod tests {
             ..Default::default()
         };
         let simulator = Simulator::new(config);
-        simulator.initialize_with_baseline_fixture().expect("baseline fixture init failed");
+        simulator
+            .initialize_with_baseline_fixture()
+            .expect("baseline fixture init failed");
 
         let network = simulator.get_network();
         let graph = network.read();
@@ -833,7 +841,9 @@ mod tests {
             find_any: false,
             payment_metadata: None,
         };
-        let route = pathfinder.find_route_dijkstra(&graph, &req).expect("route should exist");
+        let route = pathfinder
+            .find_route_dijkstra(&graph, &req)
+            .expect("route should exist");
         // Shortest path is through relay_a (2 hops)
         assert_eq!(route.hops.len(), 2);
         assert_eq!(route.hops[0].node_id, "dst");
@@ -875,7 +885,7 @@ mod tests {
         assert_eq!(ordered.len(), 3);
         assert_eq!(ordered[0].priority, 5); // tick 1, priority 5
         assert_eq!(ordered[1].priority, 1); // tick 1, priority 1
-        assert_eq!(ordered[2].tick, 5);       // tick 5
+        assert_eq!(ordered[2].tick, 5); // tick 5
     }
 
     #[tokio::test]
@@ -908,7 +918,9 @@ mod tests {
             ..Default::default()
         };
         let simulator = Simulator::new(config);
-        simulator.initialize_with_baseline_fixture().expect("baseline fixture failed");
+        simulator
+            .initialize_with_baseline_fixture()
+            .expect("baseline fixture failed");
 
         let stats = simulator.run_simulation().await.expect("simulation failed");
         assert_eq!(stats.total_payments, 25);
