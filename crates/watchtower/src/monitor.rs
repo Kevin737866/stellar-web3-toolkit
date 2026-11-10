@@ -157,9 +157,7 @@ impl ChannelMonitor {
     /// Seed a cached channel update (useful for deterministic scenario tests).
     pub fn seed_channel_update(&self, update: ChannelUpdate) {
         self.record_seen_ledger(update.block_height);
-        self.cache
-            .write()
-            .insert(update.channel_id.clone(), update);
+        self.cache.write().insert(update.channel_id.clone(), update);
     }
 
     /// Inject a simulated check failure for a single channel (#374).

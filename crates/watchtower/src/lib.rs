@@ -303,7 +303,10 @@ impl EncryptedStateStore {
     }
 
     /// Store or refresh an encrypted channel blob, enforcing byte and entry caps (#372).
-    pub fn store_blob(&self, blob: EncryptedChannelBlob) -> Result<RetentionPruneReport, WatchtowerError> {
+    pub fn store_blob(
+        &self,
+        blob: EncryptedChannelBlob,
+    ) -> Result<RetentionPruneReport, WatchtowerError> {
         if blob.ciphertext.len() > self.policy.max_total_bytes {
             return Err(WatchtowerError::InvalidRetentionPolicy(format!(
                 "blob size {} exceeds max_total_bytes {}",
@@ -428,14 +431,7 @@ impl AlertDeliveryManager {
         let digest = hasher.finalize();
         format!(
             "dlv_{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-            digest[0],
-            digest[1],
-            digest[2],
-            digest[3],
-            digest[4],
-            digest[5],
-            digest[6],
-            digest[7]
+            digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7]
         )
     }
 
@@ -1279,8 +1275,7 @@ mod tests {
             block_height: 192,
             timestamp: current_timestamp(),
         });
-        wt.monitor()
-            .set_simulated_failure("ch-bad", "rpc timeout");
+        wt.monitor().set_simulated_failure("ch-bad", "rpc timeout");
 
         let cycle = wt.scan_channels_once().await;
         assert_eq!(cycle.succeeded, vec!["ch-good".to_string()]);
@@ -1291,7 +1286,10 @@ mod tests {
         assert_eq!(status.last_seen_ledger, 192);
         assert_eq!(status.monitoring_lag_ledgers, 8);
         assert_eq!(
-            status.per_channel_failures.get("ch-bad").map(String::as_str),
+            status
+                .per_channel_failures
+                .get("ch-bad")
+                .map(String::as_str),
             Some("Network error: rpc timeout")
         );
 
