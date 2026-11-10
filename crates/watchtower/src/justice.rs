@@ -254,7 +254,9 @@ impl JusticeService {
         if let Some(tx) = pending.iter_mut().find(|tx| tx.tx_hash == tx_hash) {
             tx.status = status;
             let action_id = Self::action_id_for_breach(&tx.breach);
-            let _ = self.storage.update_justice_action_status(&action_id, status);
+            let _ = self
+                .storage
+                .update_justice_action_status(&action_id, status);
         }
     }
 
@@ -450,8 +452,7 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_breach_notifications_do_not_create_duplicate_actions() {
-        let service =
-            JusticeService::new("http://localhost".to_string(), "test".to_string(), 1000);
+        let service = JusticeService::new("http://localhost".to_string(), "test".to_string(), 1000);
         let breach = valid_breach("ch1", "breach_tx_dup");
 
         let first = service
