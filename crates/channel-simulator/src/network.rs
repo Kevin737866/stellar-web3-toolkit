@@ -641,3 +641,193 @@ impl NetworkTopology {
         (0..len).map(|_| rng.gen()).collect()
     }
 }
+
+// =========================================================================
+// Network Fixtures for Routing Regression Tests (Issue #387)
+// =========================================================================
+
+/// Deterministic network fixtures for reproducible routing regression tests
+pub struct NetworkFixture;
+
+impl NetworkFixture {
+    /// Create a linear chain of nodes: node_0 <-> node_1 <-> ... <-> node_N
+    pub fn linear(hops: usize, capacity: i128) -> (NetworkGraph, HashMap<String, SimulatedNode>) {
+        assert!(hops >= 1, "hops must be at least 1");
+        let num_nodes = hops + 1;
+        let mut graph = NetworkGraph::new();
+        let mut nodes = HashMap::new();
+
+        for i in 0..num_nodes {
+            let id = format!("node_{}", i);
+            let node = Node {
+                id: id.clone(),
+                public_key: vec![i as u8; 32],
+                alias: Some(format!("Linear Node {}", i)),
+                online: true,
+                last_seen: 0,
+                features: channel_router::NodeFeatures::default(),
+            };
+            graph.add_node(node.clone());
+            nodes.insert(
+                id.clone(),
+                SimulatedNode {
+                    node,
+                    balance: 0,
+                    channels: HashSet::new(),
+                },
+            );
+        }
+
+        for i in 0..hops {
+            let u = format!("node_{}", i);
+            let v = format!("node_{}", i + 1);
+            let half = capacity / 2;
+            let ch = Channel {
+                id: format!("ch_{}_{}", u, v),
+                node_a: u.clone(),
+                node_b: v.clone(),
+                capacity_a_to_b: half,
+                capacity_b_to_a: capacity - half,
+                base_fee: 1,
+                fee_rate: 100,
+                cltv_delta: 40,
+                min_htlc_size: 1,
+                max_htlc_size: capacity,
+                htlcs_in_flight: 0,
+                enabled: true,
+                age_seconds: 0,
+            };
+            graph.add_channel(ch);
+            nodes.get_mut(&u).unwrap().channels.insert(v.clone());
+            nodes.get_mut(&v).unwrap().channels.insert(u.clone());
+        }
+
+        (graph, nodes)
+    }
+
+    /// Create a diamond topology: source -> {upper, lower} -> dest
+    pub fn diamond(
+        capacity: i128,
+        fee_rate_upper: u32,
+        fee_rate_lower: u32,
+    ) -> (NetworkGraph, HashMap<String, SimulatedNode>) {
+        let mut graph = NetworkGraph::new();
+        let mut nodes = HashMap::new();
+
+        let node_names = ["source", "upper", "lower", "dest"];
+        for (i, name) in node_names.iter().enumerate() {
+            let node = Node {
+                id: name.to_string(),
+                public_key: vec![i as u8; 32],
+                alias: Some(format!("Node {}", name)),
+                online: true,
+                last_seen: 0,
+                features: channel_router::NodeFeatures::default(),
+            };
+            graph.add_node(node.clone());
+            nodes.insert(
+                name.to_string(),
+                SimulatedNode {
+                    node,
+                    balance: 0,
+                    channels: HashSet::new(),
+                },
+            );
+        }
+
+        let half = capacity / 2;
+        let edges = [
+            ("source", "upper", fee_rate_upper, half),
+            ("upper", "dest", fee_rate_upper, half),
+            ("source", "lower", fee_rate_lower, half),
+            ("lower", "dest", fee_rate_lower, half),
+        ];
+
+        for (u, v, fee_rate, cap) in edges {
+            let ch = Channel {
+                id: format!("ch_{}_{}", u, v),
+                node_a: u.to_string(),
+                node_b: v.to_string(),
+                capacity_a_to_b: cap,
+                capacity_b_to_a: cap,
+                base_fee: 1,
+                fee_rate,
+                cltv_delta: 40,
+                min_htlc_size: 1,
+                max_htlc_size: cap * 2,
+                htlcs_in_flight: 0,
+                enabled: true,
+                age_seconds: 0,
+            };
+            graph.add_channel(ch);
+            nodes.get_mut(u).unwrap().channels.insert(v.to_string());
+            nodes.get_mut(v).unwrap().channels.insert(u.to_string());
+        }
+
+        (graph, nodes)
+    }
+
+    /// Baseline 6-node fixture for comprehensive regression testing of pathfinding
+    pub fn baseline_routing_regression_fixture() -> (NetworkGraph, HashMap<String, SimulatedNode>) {
+        let mut graph = NetworkGraph::new();
+        let mut nodes = HashMap::new();
+
+        let node_names = ["src", "relay_a", "relay_b", "hub_c", "gw_d", "dst"];
+        for (i, name) in node_names.iter().enumerate() {
+            let node = Node {
+                id: name.to_string(),
+                public_key: vec![i as u8; 32],
+                alias: Some(format!("Regression Node {}", name)),
+                online: true,
+                last_seen: 0,
+                features: channel_router::NodeFeatures::default(),
+            };
+            graph.add_node(node.clone());
+            nodes.insert(
+                name.to_string(),
+                SimulatedNode {
+                    node,
+                    balance: 0,
+                    channels: HashSet::new(),
+                },
+            );
+        }
+
+        // Channels:
+        // Path 1 (Short, 2 hops): src -> relay_a -> dst (cap 50,000, fee 10)
+        // Path 2 (Deep, 3 hops): src -> relay_b -> hub_c -> dst (cap 200,000, fee 50)
+        // Path 3 (Bottleneck): src -> gw_d -> dst (cap 500, fee 5)
+        let channels_spec = [
+            ("src", "relay_a", 25_000, 25_000, 10),
+            ("relay_a", "dst", 25_000, 25_000, 10),
+            ("src", "relay_b", 100_000, 100_000, 50),
+            ("relay_b", "hub_c", 100_000, 100_000, 50),
+            ("hub_c", "dst", 100_000, 100_000, 50),
+            ("src", "gw_d", 250, 250, 5),
+            ("gw_d", "dst", 250, 250, 5),
+        ];
+
+        for (u, v, cap_ab, cap_ba, fee_rate) in channels_spec {
+            let ch = Channel {
+                id: format!("ch_{}_{}", u, v),
+                node_a: u.to_string(),
+                node_b: v.to_string(),
+                capacity_a_to_b: cap_ab,
+                capacity_b_to_a: cap_ba,
+                base_fee: 1,
+                fee_rate,
+                cltv_delta: 20,
+                min_htlc_size: 1,
+                max_htlc_size: cap_ab + cap_ba,
+                htlcs_in_flight: 0,
+                enabled: true,
+                age_seconds: 0,
+            };
+            graph.add_channel(ch);
+            nodes.get_mut(u).unwrap().channels.insert(v.to_string());
+            nodes.get_mut(v).unwrap().channels.insert(u.to_string());
+        }
+
+        (graph, nodes)
+    }
+}

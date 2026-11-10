@@ -542,6 +542,7 @@ impl TopologyFuzzer {
             num_payments: self.config.payments_per_topology,
             max_payment_amount: min_capacity * rng.gen_range(1i128..8),
             seed: None,
+            model_liquidity_depletion: false,
         }
     }
 

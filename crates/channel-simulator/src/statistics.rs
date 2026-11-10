@@ -443,3 +443,140 @@ mod tests {
         assert_eq!(stats.mean, 0.8); // 4 total connections / 5 nodes
     }
 }
+
+// =========================================================================
+// Enhancements for Issues #383, #386: Failure Summaries & Hop Length Metrics
+// =========================================================================
+
+/// Reason a simulated payment failed
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum FailureReason {
+    /// No route exists connecting source and destination
+    NoRouteFound,
+    /// Insufficient channel balance / liquidity on candidate path
+    InsufficientLiquidity,
+    /// Route fees exceeded the sender's fee budget
+    FeeExceededBudget,
+    /// Route exceeded maximum permitted hop count
+    MaxHopsExceeded,
+    /// Channel liquidity completely depleted due to previous volume
+    ChannelDepleted,
+    /// Invalid payment parameters (e.g. non-positive amount)
+    InvalidAmount,
+    /// Source equals destination
+    SourceEqualsDestination,
+    /// Node was offline or unreachable
+    NodeOffline,
+    /// Unknown or generic error
+    Other,
+}
+
+impl std::fmt::Display for FailureReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FailureReason::NoRouteFound => write!(f, "NoRouteFound"),
+            FailureReason::InsufficientLiquidity => write!(f, "InsufficientLiquidity"),
+            FailureReason::FeeExceededBudget => write!(f, "FeeExceededBudget"),
+            FailureReason::MaxHopsExceeded => write!(f, "MaxHopsExceeded"),
+            FailureReason::ChannelDepleted => write!(f, "ChannelDepleted"),
+            FailureReason::InvalidAmount => write!(f, "InvalidAmount"),
+            FailureReason::SourceEqualsDestination => write!(f, "SourceEqualsDestination"),
+            FailureReason::NodeOffline => write!(f, "NodeOffline"),
+            FailureReason::Other => write!(f, "Other"),
+        }
+    }
+}
+
+/// Detailed diagnostic for a failed payment scenario (Issue #386)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailedPaymentDetail {
+    pub source: String,
+    pub destination: String,
+    pub amount: i128,
+    pub reason: FailureReason,
+    pub details: String,
+}
+
+/// Comprehensive summary of failed payment scenarios (Issue #386)
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FailedPaymentSummary {
+    pub total_failures: usize,
+    pub by_reason: HashMap<FailureReason, usize>,
+    pub samples: Vec<FailedPaymentDetail>,
+}
+
+impl FailedPaymentSummary {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn record_failure(
+        &mut self,
+        source: String,
+        destination: String,
+        amount: i128,
+        reason: FailureReason,
+        details: String,
+    ) {
+        self.total_failures += 1;
+        *self.by_reason.entry(reason).or_insert(0) += 1;
+        if self.samples.len() < 100 {
+            self.samples.push(FailedPaymentDetail {
+                source,
+                destination,
+                amount,
+                reason,
+                details,
+            });
+        }
+    }
+
+    pub fn format_report(&self) -> String {
+        let mut report = format!("Failed Payment Summary: total={}\n", self.total_failures);
+        for (reason, count) in &self.by_reason {
+            let pct = if self.total_failures > 0 {
+                (*count as f64 / self.total_failures as f64) * 100.0
+            } else {
+                0.0
+            };
+            report.push_str(&format!("  - {}: {} ({:.1}%)\n", reason, count, pct));
+        }
+        report
+    }
+}
+
+/// Success and cost metrics broken down by route length / hops (Issue #383)
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HopLengthMetrics {
+    pub attempts: usize,
+    pub successes: usize,
+    pub failures: usize,
+    pub success_rate: f64,
+    pub total_fees: i128,
+    pub avg_fee: f64,
+}
+
+impl HopLengthMetrics {
+    pub fn record_attempt(&mut self) {
+        self.attempts += 1;
+        self.update_rate();
+    }
+
+    pub fn record_success(&mut self, fee: i128) {
+        self.successes += 1;
+        self.total_fees += fee;
+        self.avg_fee = self.total_fees as f64 / self.successes as f64;
+        self.update_rate();
+    }
+
+    pub fn record_failure(&mut self) {
+        self.failures += 1;
+        self.update_rate();
+    }
+
+    fn update_rate(&mut self) {
+        if self.attempts > 0 {
+            self.success_rate = (self.successes as f64 / self.attempts as f64) * 100.0;
+        }
+    }
+}
