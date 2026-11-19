@@ -169,8 +169,14 @@ impl HtlcContract {
             .unwrap_or_else(|| panic!("swap not found"))
     }
 
-    pub fn get_active_swaps(_env: Env, _participant: Address) -> Vec<BytesN<32>> {
-        Vec::new(&_env)
+    /// Not implemented yet: no index of per-participant swaps is kept.
+    ///
+    /// `participant` is named rather than `_participant` because `contractimpl`
+    /// generates a client that passes it through, which would trip
+    /// `used_underscore_binding`; the explicit discard documents the intent.
+    pub fn get_active_swaps(env: Env, participant: Address) -> Vec<BytesN<32>> {
+        let _ = participant;
+        Vec::new(&env)
     }
 
     pub fn can_complete(env: Env, swap_id: BytesN<32>) -> bool {

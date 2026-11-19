@@ -78,6 +78,7 @@ impl SignRequest {
     /// "bc"`. The fields are fixed-width beyond that, so the encoding is
     /// unambiguous without relying on a separator byte that a field could
     /// contain.
+    #[must_use]
     pub fn digest(&self) -> [u8; 32] {
         use sha2::{Digest, Sha256};
 
@@ -98,6 +99,7 @@ impl SignRequest {
 
     /// Hex rendering of [`SignRequest::digest`], the value an operator compares
     /// against the one computed on the online machine.
+    #[must_use]
     pub fn digest_hex(&self) -> String {
         hex::encode(self.digest())
     }
@@ -167,10 +169,12 @@ impl StubHsm {
         }
     }
 
+    #[must_use]
     pub fn handle(&self) -> &str {
         &self.handle
     }
 
+    #[must_use]
     pub fn is_locked(&self) -> bool {
         !self.unlocked
     }
@@ -208,12 +212,14 @@ impl StubHsm {
     }
 
     /// Whether `request` has been reviewed and not yet spent.
+    #[must_use]
     pub fn is_approved(&self, request: &SignRequest) -> bool {
         let digest = request.digest();
         self.reviewed.contains(&digest) && !self.spent.contains(&digest)
     }
 
     /// The last sequence this signer produced a signature for.
+    #[must_use]
     pub fn last_signed_sequence(&self) -> Option<u64> {
         self.last_signed
     }
@@ -223,6 +229,7 @@ impl StubHsm {
     /// This is what the online machine does before submitting: it recomputes the
     /// digest it reviewed and checks the signature is over that digest, not over
     /// something else the signer was tricked into signing.
+    #[must_use]
     pub fn verify(&self, request: &SignRequest, signature: &[u8; 64]) -> bool {
         let signature = Ed25519Signature::from_bytes(signature);
         self.verifying_key()

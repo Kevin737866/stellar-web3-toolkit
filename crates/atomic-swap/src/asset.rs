@@ -12,7 +12,7 @@ impl fmt::Display for Asset {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Asset::XLM => write!(f, "XLM"),
-            Asset::Custom(code) => write!(f, "{}", code),
+            Asset::Custom(code) => write!(f, "{code}"),
         }
     }
 }
@@ -56,7 +56,7 @@ impl AssetInfo {
             Asset::XLM => "XLM".to_string(),
             Asset::Custom(code) => {
                 if let Some(issuer) = &self.issuer {
-                    format!("{}:{}", code, issuer)
+                    format!("{code}:{issuer}")
                 } else {
                     code.clone()
                 }

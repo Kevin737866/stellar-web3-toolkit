@@ -118,6 +118,7 @@ impl ChannelMonitor {
     }
 
     /// Check a channel for updates
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // kept async so the RPC query can be awaited later
     pub async fn check_channel(
         &self,
         channel_id: &str,

@@ -46,12 +46,12 @@ pub const MAX_COMMISSION_BPS: u32 = 2_000;
 /// starts after the schedule ended contributes nothing. `last_update` can be
 /// ahead of `period_finish` once the schedule has expired, hence the `0` guard.
 pub fn distributable_seconds(last_update: u64, period_finish: u64, now: u64) -> u64 {
-    let end = if now < period_finish { now } else { period_finish };
-    if end <= last_update {
-        0
+    let end = if now < period_finish {
+        now
     } else {
-        end - last_update
-    }
+        period_finish
+    };
+    end.saturating_sub(last_update)
 }
 
 /// Rewards still owed by the current schedule, i.e. `rate *` time remaining.
@@ -99,14 +99,8 @@ pub fn reward_index_delta(
     let rewards = reward_rate
         .checked_mul(elapsed_seconds as i128)
         .expect("reward overflow");
-    let delta = rewards
-        .checked_mul(PRECISION)
-        .expect("index overflow")
-        / total_staked;
-    let credited = delta
-        .checked_mul(total_staked)
-        .expect("credited overflow")
-        / PRECISION;
+    let delta = rewards.checked_mul(PRECISION).expect("index overflow") / total_staked;
+    let credited = delta.checked_mul(total_staked).expect("credited overflow") / PRECISION;
     (delta, credited)
 }
 
@@ -147,6 +141,9 @@ pub fn split_commission(gross: i128, commission_bps: u32) -> (i128, i128) {
     (gross - commission, commission)
 }
 
+/// Upper bound on the nodes a single cycle search will visit.
+const MAX_NODES: usize = 64;
+
 /// Detects whether adding the directed delegation edge `delegator -> operator`
 /// would create a cycle in `edges` (#209).
 ///
@@ -157,7 +154,6 @@ pub fn detect_delegation_loop(edges: &[(u32, u32)], delegator: u32, operator: u3
     if delegator == operator {
         return true;
     }
-    const MAX_NODES: usize = 64;
     let mut visited = [0u32; MAX_NODES];
     let mut visited_len = 0usize;
     let mut stack = [0u32; MAX_NODES];
@@ -178,7 +174,7 @@ pub fn detect_delegation_loop(edges: &[(u32, u32)], delegator: u32, operator: u3
             if to == delegator {
                 return true;
             }
-            let already_seen = visited[..visited_len].iter().any(|&v| v == to);
+            let already_seen = visited[..visited_len].contains(&to);
             if !already_seen && visited_len < MAX_NODES && stack_len < MAX_NODES {
                 visited[visited_len] = to;
                 visited_len += 1;

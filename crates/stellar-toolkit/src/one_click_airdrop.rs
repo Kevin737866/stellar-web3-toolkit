@@ -99,12 +99,14 @@ impl AirdropDistribution {
     }
 
     /// Attach a denylist of refused address prefixes.
+    #[must_use]
     pub fn with_denylist(mut self, entries: Vec<String>) -> Self {
         self.denylist = entries.into_iter().filter(|e| !e.is_empty()).collect();
         self
     }
 
     /// The tree depth every proof for this distribution must have.
+    #[must_use]
     pub fn depth(&self) -> usize {
         merkle::depth_for(self.leaf_count)
     }
@@ -163,16 +165,13 @@ impl OneClickAirdropClaimer {
             });
         }
 
-        let proof = match parse_proof(&request.proof) {
-            Some(proof) => proof,
-            None => {
-                return Ok(ClaimStatus::Ineligible {
-                    reason: format!(
-                        "Proof is malformed: expected hex-encoded 32-byte nodes for airdrop `{}`",
-                        distribution.airdrop_id
-                    ),
-                })
-            }
+        let Some(proof) = parse_proof(&request.proof) else {
+            return Ok(ClaimStatus::Ineligible {
+                reason: format!(
+                    "Proof is malformed: expected hex-encoded 32-byte nodes for airdrop `{}`",
+                    distribution.airdrop_id
+                ),
+            });
         };
 
         let expected_depth = distribution.depth();
@@ -209,13 +208,12 @@ impl OneClickAirdropClaimer {
                     "proof": request.proof,
                     "amount": amount,
                     "fee": 100,
-                    "built_at": 1700000000
+                    "built_at": 1_700_000_000
                 });
                 Ok(tx_payload.to_string())
             }
             ClaimStatus::Ineligible { reason } => Err(ToolkitError::Session(format!(
-                "Cannot build claim transaction: {}",
-                reason
+                "Cannot build claim transaction: {reason}"
             ))),
             _ => Err(ToolkitError::Session(
                 "Airdrop claim transaction build failed".to_string(),
@@ -238,7 +236,7 @@ impl OneClickAirdropClaimer {
 
         Ok(ClaimStatus::Claimed {
             tx_hash: mock_hash,
-            timestamp: 1700000050,
+            timestamp: 1_700_000_050,
         })
     }
 
@@ -252,7 +250,7 @@ impl OneClickAirdropClaimer {
             Self::execute_one_click_claim(request, distribution)
         } else {
             Ok(ClaimStatus::Failed {
-                reason: format!("Non-retryable failure: {}", failure_reason),
+                reason: format!("Non-retryable failure: {failure_reason}"),
                 retryable: false,
             })
         }

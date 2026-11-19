@@ -47,7 +47,7 @@
 //!
 //! # Fragility, stated plainly
 //!
-//! This is a Markdown parser for one known file, not a general CommonMark
+//! This is a Markdown parser for one known file, not a general `CommonMark`
 //! implementation. It handles `###`-or-deeper headings, `**bold**` term
 //! markers, `---` rules, and fenced code blocks (a `###` inside a fence is not
 //! treated as a heading). It does **not** handle setext headings, HTML, nested
@@ -91,6 +91,7 @@ pub enum MatchKind {
 
 impl MatchKind {
     /// Human label used in terminal output.
+    #[must_use]
     pub fn label(&self) -> &'static str {
         match self {
             Self::Exact => "exact",
@@ -138,6 +139,7 @@ fn rank(entry: &GlossaryEntry) -> (usize, usize, &str) {
 /// marker below the heading is present. Matching GitHub is the point: a link
 /// works in every renderer, and re-rendering the Markdown without the explicit
 /// anchors does not break a single incoming link.
+#[must_use]
 pub fn anchor_for(term: &str) -> String {
     let mut out = String::with_capacity(term.len());
     let mut pending_hyphen = false;
@@ -165,6 +167,7 @@ impl Glossary {
     /// non-empty line up to the next heading, a `---` rule, a fence, or EOF.
     /// Headings with no prose beneath them are skipped, since they are section
     /// labels rather than terms.
+    #[must_use]
     pub fn parse(markdown: &str) -> Self {
         let mut entries: Vec<GlossaryEntry> = Vec::new();
         // (term, declared anchor if the file provided one, definition lines)
@@ -245,6 +248,7 @@ impl Glossary {
     }
 
     /// All terms, in document order.
+    #[must_use]
     pub fn terms(&self) -> Vec<&str> {
         self.entries.iter().map(|e| e.term.as_str()).collect()
     }
@@ -253,6 +257,7 @@ impl Glossary {
     ///
     /// Returns `None` when nothing matches at any tier, which callers must treat
     /// as a failure rather than an empty success.
+    #[must_use]
     pub fn lookup(&self, query: &str) -> Option<Lookup> {
         let q = query.trim();
         if q.is_empty() {
@@ -302,6 +307,7 @@ impl Glossary {
     }
 
     /// Terms closest to a query, for a "did you mean" list when nothing matched.
+    #[must_use]
     pub fn suggestions(&self, query: &str, limit: usize) -> Vec<GlossaryEntry> {
         let q = query.trim().to_ascii_lowercase();
         if q.is_empty() {

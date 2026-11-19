@@ -95,6 +95,7 @@ impl JusticeService {
     }
 
     /// Build a justice transaction for a breach attempt
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // kept async so signing/submission can be awaited later
     async fn build_justice_transaction(
         &self,
         breach: &BreachAttempt,

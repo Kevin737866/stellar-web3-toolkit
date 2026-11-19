@@ -11,7 +11,7 @@ mod htlc;
 mod state;
 mod types;
 
-use error::PaymentChannelError;
+pub use error::PaymentChannelError;
 use soroban_sdk::{
     contract, contractimpl, contractmeta, Address, Bytes, BytesN, Env, IntoVal, TryFromVal,
     Vec as SorobanVec,
@@ -75,7 +75,6 @@ impl PaymentChannel {
 
         let channel_id: BytesN<32> = env.crypto().sha256(&data).into();
 
-        let _total_balance = initial_balance_a + initial_balance_b;
         let state = ChannelState::new(
             &env,
             channel_id.clone(),
@@ -115,15 +114,22 @@ impl PaymentChannel {
         channel_id: BytesN<32>,
         new_balance_a: i128,
         new_balance_b: i128,
-        _signature_a: BytesN<64>,
-        _signature_b: BytesN<64>,
+        signature_a: BytesN<64>,
+        signature_b: BytesN<64>,
     ) -> Result<(), PaymentChannelError> {
+        // Both signatures are part of the channel ABI but are not verified yet.
+        let _ = (signature_a, signature_b);
         let mut state = state::get_channel_state(&env, &channel_id)?;
+        if state.is_cooperative_close {
+            return Err(PaymentChannelError::ChannelAlreadyClosed);
+        }
 
         if new_balance_a < 0 || new_balance_b < 0 {
             return Err(PaymentChannelError::InvalidBalance);
         }
-        let new_total = new_balance_a + new_balance_b;
+        let new_total = new_balance_a
+            .checked_add(new_balance_b)
+            .ok_or(PaymentChannelError::BalanceMismatch)?;
         if new_total != state.total_balance {
             return Err(PaymentChannelError::BalanceMismatch);
         }
@@ -150,6 +156,9 @@ impl PaymentChannel {
         receiver: Address,
     ) -> Result<BytesN<32>, PaymentChannelError> {
         let mut state = state::get_channel_state(&env, &channel_id)?;
+        if state.is_cooperative_close {
+            return Err(PaymentChannelError::ChannelAlreadyClosed);
+        }
 
         if amount <= 0 {
             return Err(PaymentChannelError::InvalidHtlcAmount);
@@ -206,6 +215,9 @@ impl PaymentChannel {
         preimage: BytesN<32>,
     ) -> Result<(), PaymentChannelError> {
         let mut state = state::get_channel_state(&env, &channel_id)?;
+        if state.is_cooperative_close {
+            return Err(PaymentChannelError::ChannelAlreadyClosed);
+        }
 
         let htlc_val = state
             .htlcs
@@ -253,6 +265,9 @@ impl PaymentChannel {
         htlc_id: BytesN<32>,
     ) -> Result<(), PaymentChannelError> {
         let mut state = state::get_channel_state(&env, &channel_id)?;
+        if state.is_cooperative_close {
+            return Err(PaymentChannelError::ChannelAlreadyClosed);
+        }
 
         let htlc_val = state
             .htlcs
@@ -286,23 +301,54 @@ impl PaymentChannel {
         Ok(())
     }
 
-    /// Initiate cooperative close of the channel
+    /// Settle the channel cooperatively at an agreed final balance split.
+    ///
+    /// Idempotent (#351). A client that loses the response to this call and
+    /// retries must not be able to corrupt the settlement, so the same close can
+    /// be presented any number of times:
+    ///
+    /// * first call — balances are written, `is_cooperative_close` is set, the
+    ///   close is stamped with the sequence number it settled at
+    ///   (`close_sequence`) and one `channel_close` event is published;
+    /// * retry with the same balances — `Ok(())`, no state change, no second
+    ///   event, sequence number untouched;
+    /// * retry with *different* balances — [`PaymentChannelError::ChannelAlreadyClosed`],
+    ///   because the channel already settled on a different split.
+    ///
+    /// A close is refused while the channel has unsettled HTLCs
+    /// ([`PaymentChannelError::ActiveHtlcsExist`]): the HTLC amounts are held
+    /// outside the two balances, so closing over them would strand them.
     pub fn cooperative_close(
         env: Env,
         channel_id: BytesN<32>,
         final_balance_a: i128,
         final_balance_b: i128,
-        _signature_a: BytesN<64>,
-        _signature_b: BytesN<64>,
+        signature_a: BytesN<64>,
+        signature_b: BytesN<64>,
     ) -> Result<(), PaymentChannelError> {
+        // Both signatures are part of the channel ABI but are not verified yet.
+        let _ = (signature_a, signature_b);
         let mut state = state::get_channel_state(&env, &channel_id)?;
 
         if final_balance_a < 0 || final_balance_b < 0 {
             return Err(PaymentChannelError::InvalidBalance);
         }
-        let total = final_balance_a + final_balance_b;
+        let total = final_balance_a
+            .checked_add(final_balance_b)
+            .ok_or(PaymentChannelError::BalanceMismatch)?;
         if total != state.total_balance {
             return Err(PaymentChannelError::BalanceMismatch);
+        }
+
+        if state.is_cooperative_close {
+            if state.balance_a == final_balance_a && state.balance_b == final_balance_b {
+                return Ok(());
+            }
+            return Err(PaymentChannelError::ChannelAlreadyClosed);
+        }
+
+        if state::has_active_htlcs(&env, &state.htlcs) {
+            return Err(PaymentChannelError::ActiveHtlcsExist);
         }
 
         state.balance_a = final_balance_a;
@@ -310,6 +356,7 @@ impl PaymentChannel {
         state.is_cooperative_close = true;
         state.close_time = env.ledger().timestamp();
         state.sequence_number += 1;
+        state.close_sequence = state.sequence_number;
 
         state::store_channel_state(&env, &channel_id, &state);
 
@@ -328,12 +375,15 @@ impl PaymentChannel {
         initiator: Address,
     ) -> Result<u64, PaymentChannelError> {
         let mut state = state::get_channel_state(&env, &channel_id)?;
+        if state.is_cooperative_close {
+            return Err(PaymentChannelError::ChannelAlreadyClosed);
+        }
 
         if initiator != state.participant_a && initiator != state.participant_b {
             return Err(PaymentChannelError::UnauthorizedParticipant);
         }
 
-        let has_active = state::has_active_htlcs(&env, &state.htlcs)?;
+        let has_active = state::has_active_htlcs(&env, &state.htlcs);
         if has_active {
             return Err(PaymentChannelError::ActiveHtlcsExist);
         }
@@ -357,11 +407,14 @@ impl PaymentChannel {
     pub fn contest_close(
         env: Env,
         channel_id: BytesN<32>,
-        _contesting_balance_a: i128,
-        _contesting_balance_b: i128,
+        contesting_balance_a: i128,
+        contesting_balance_b: i128,
         contest_sequence: u32,
-        _signature: BytesN<64>,
+        signature: BytesN<64>,
     ) -> Result<(), PaymentChannelError> {
+        // The contesting balances and signature are part of the ABI but are not
+        // verified yet.
+        let _ = (contesting_balance_a, contesting_balance_b, signature);
         let state = state::get_channel_state(&env, &channel_id)?;
 
         if contest_sequence <= state.sequence_number {
@@ -384,6 +437,9 @@ impl PaymentChannel {
         participant: Address,
     ) -> Result<(), PaymentChannelError> {
         let mut state = state::get_channel_state(&env, &channel_id)?;
+        if state.is_cooperative_close {
+            return Err(PaymentChannelError::ChannelAlreadyClosed);
+        }
 
         if top_up_amount <= 0 {
             return Err(PaymentChannelError::InvalidBalance);

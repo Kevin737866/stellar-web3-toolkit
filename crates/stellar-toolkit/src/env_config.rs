@@ -21,6 +21,7 @@
 
 use crate::error::{Result, ToolkitError};
 use serde::{Deserialize, Serialize};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 /// Environments the toolkit supports, in promotion order.
@@ -35,6 +36,7 @@ pub const DEFAULT_CONFIG_DIR: &str = "config";
 /// passphrase does not match its network produces transactions for the *wrong*
 /// chain that simply fail to submit, which is exactly the kind of late failure
 /// this validation exists to prevent.
+#[must_use]
 pub fn passphrase_for_network(network: &str) -> Option<&'static str> {
     match network {
         "local" => Some("Standalone Network ; February 2017"),
@@ -53,6 +55,7 @@ pub enum Severity {
 }
 
 impl Severity {
+    #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Error => "error",
@@ -114,6 +117,7 @@ pub struct DeployConfig {
 
 impl DeployConfig {
     /// The fee as an integer, or `None` when it is not a valid stroop amount.
+    #[must_use]
     pub fn fee_stroops(&self) -> Option<u64> {
         self.fee.trim().parse::<u64>().ok()
     }
@@ -187,16 +191,19 @@ impl EnvConfig {
     }
 
     /// Name of the environment this file describes, as declared by `[env] name`.
+    #[must_use]
     pub fn name(&self) -> &str {
         &self.env.name
     }
 
     /// True when the environment deploys to the public network.
+    #[must_use]
     pub fn is_production(&self) -> bool {
         self.env.stellar_network == "mainnet"
     }
 
     /// Every problem in this config, in field order. Empty means valid.
+    #[must_use]
     pub fn validate(&self) -> Vec<Finding> {
         let mut findings = Vec::new();
         self.validate_network(&mut findings);
@@ -234,7 +241,7 @@ impl EnvConfig {
                         "network `{}` requires the passphrase `{expected}`",
                         env.stellar_network
                     ),
-                ))
+                ));
             }
             Some(_) => {}
             None => findings.push(Finding::error(
@@ -386,6 +393,7 @@ pub struct EnvValidation {
 
 impl EnvValidation {
     /// Errors in this config (warnings do not fail a run).
+    #[must_use]
     pub fn errors(&self) -> usize {
         self.findings
             .iter()
@@ -393,6 +401,7 @@ impl EnvValidation {
             .count()
     }
 
+    #[must_use]
     pub fn passed(&self) -> bool {
         self.errors() == 0
     }
@@ -409,6 +418,7 @@ impl EnvValidationReport {
         self.configs.iter().map(EnvValidation::errors).sum()
     }
 
+    #[must_use]
     pub fn warnings(&self) -> usize {
         self.configs
             .iter()
@@ -416,40 +426,46 @@ impl EnvValidationReport {
             .sum()
     }
 
+    #[must_use]
     pub fn passed(&self) -> bool {
         self.errors() == 0
     }
 
+    #[must_use]
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
     }
 
     /// Human readable report used by the CLI and by CI logs.
+    #[must_use]
     pub fn render(&self) -> String {
         let mut out = String::new();
         for config in &self.configs {
-            out.push_str(&format!(
-                "{} ({}) — {} error(s), {} warning(s)\n",
+            let _ = writeln!(
+                out,
+                "{} ({}) — {} error(s), {} warning(s)",
                 config.name,
                 config.path.display(),
                 config.errors(),
                 config.findings.len() - config.errors()
-            ));
+            );
             for finding in &config.findings {
-                out.push_str(&format!(
-                    "  {:<7} {:<34} {}\n",
+                let _ = writeln!(
+                    out,
+                    "  {:<7} {:<34} {}",
                     finding.severity.as_str(),
                     finding.field,
                     finding.message
-                ));
+                );
             }
         }
-        out.push_str(&format!(
-            "{} environment(s): {} error(s), {} warning(s)\n",
+        let _ = writeln!(
+            out,
+            "{} environment(s): {} error(s), {} warning(s)",
             self.configs.len(),
             self.errors(),
             self.warnings()
-        ));
+        );
         out
     }
 }

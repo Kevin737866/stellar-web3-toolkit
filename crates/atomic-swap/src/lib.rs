@@ -19,4 +19,6 @@ pub use preimage::{Preimage, PreimageManager};
 pub use replay::{
     CrossChainIntent, NonceWindow, ReplayDomain, ReplayError, ReplayGuard, ReplayStats,
 };
-pub use swap::{AtomicSwap, SwapDirection, SwapStatus, SwapTemplate};
+pub use swap::{
+    AtomicSwap, SwapDirection, SwapFailure, SwapFailureReason, SwapStatus, SwapTemplate,
+};

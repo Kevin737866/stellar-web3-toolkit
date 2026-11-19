@@ -66,6 +66,7 @@ use crate::error::{Result, ToolkitError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::path::Path;
 
 /// Maximum number of arguments a Soroban contract function may declare.
@@ -378,11 +379,13 @@ pub enum ArgumentChange {
 
 impl ArgumentChange {
     /// Every argument-list change except a reorder is breaking.
+    #[must_use]
     pub fn is_breaking(&self) -> bool {
         true
     }
 
     /// One-line rendering, used by both the text and JSON output.
+    #[must_use]
     pub fn describe(&self) -> String {
         match self {
             Self::Added { position, arg } => {
@@ -421,8 +424,13 @@ pub struct FunctionChange {
 impl FunctionChange {
     /// A function change is breaking if any argument changed or the return
     /// type changed.
+    #[must_use]
     pub fn is_breaking(&self) -> bool {
-        self.return_changed || self.argument_changes.iter().any(|c| c.is_breaking())
+        self.return_changed
+            || self
+                .argument_changes
+                .iter()
+                .any(ArgumentChange::is_breaking)
     }
 }
 
@@ -446,6 +454,7 @@ impl EventChange {
     /// Events are consumed by indexers rather than called positionally, so
     /// only a *removed* event is treated as breaking; a changed event is
     /// reported but does not fail a migration.
+    #[must_use]
     pub fn is_breaking(&self) -> bool {
         false
     }
@@ -476,6 +485,7 @@ pub struct SpecDiff {
 
 impl SpecDiff {
     /// Total number of individual changes, for a one-line summary.
+    #[must_use]
     pub fn change_count(&self) -> usize {
         self.functions.added.len()
             + self.functions.removed.len()
@@ -498,6 +508,7 @@ impl SpecDiff {
 
     /// Every breaking change, as human-readable lines, in a stable order.
     /// Argument changes come first because they are the highest-value signal.
+    #[must_use]
     pub fn breaking_lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
         for f in &self.functions.changed {
@@ -525,6 +536,7 @@ impl SpecDiff {
 ///
 /// Pure: no I/O, no clock, no formatting. Two identical snapshots always
 /// produce an empty diff.
+#[must_use]
 pub fn diff_specs(before: &ContractSpec, after: &ContractSpec) -> SpecDiff {
     let mut functions = FunctionChanges::default();
     let mut events = EventChanges::default();
@@ -644,8 +656,14 @@ fn diff_arguments(before: &[ArgSpec], after: &[ArgSpec]) -> Vec<ArgumentChange> 
         .collect();
     if common_before != common_after && !common_before.is_empty() {
         changes.push(ArgumentChange::Reordered {
-            before: common_before.iter().map(|s| s.to_string()).collect(),
-            after: common_after.iter().map(|s| s.to_string()).collect(),
+            before: common_before
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
+            after: common_after
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
         });
     }
 
@@ -671,6 +689,7 @@ fn diff_arguments(before: &[ArgSpec], after: &[ArgSpec]) -> Vec<ArgumentChange> 
 /// Breaking argument and return changes are printed first, under their own
 /// heading, because they are what breaks callers and they are the reason to
 /// read this output at all.
+#[must_use]
 pub fn render_text(diff: &SpecDiff) -> String {
     let mut out = String::new();
 
@@ -680,7 +699,7 @@ pub fn render_text(diff: &SpecDiff) -> String {
 
     let breaking = diff.breaking_lines();
     if !breaking.is_empty() {
-        out.push_str(&format!("BREAKING CHANGES ({}):\n", breaking.len()));
+        let _ = writeln!(out, "BREAKING CHANGES ({}):", breaking.len());
         for line in &breaking {
             out.push_str("  ");
             out.push_str(line);
@@ -692,7 +711,7 @@ pub fn render_text(diff: &SpecDiff) -> String {
     if !diff.functions.removed.is_empty() {
         out.push_str("Functions removed:\n");
         for f in &diff.functions.removed {
-            out.push_str(&format!("  - {}({})\n", f.name, render_args(&f.inputs)));
+            let _ = writeln!(out, "  - {}({})", f.name, render_args(&f.inputs));
         }
         out.push('\n');
     }
@@ -700,12 +719,13 @@ pub fn render_text(diff: &SpecDiff) -> String {
     if !diff.functions.added.is_empty() {
         out.push_str("Functions added:\n");
         for f in &diff.functions.added {
-            out.push_str(&format!(
-                "  + {}({}) -> {}\n",
+            let _ = writeln!(
+                out,
+                "  + {}({}) -> {}",
                 f.name,
                 render_args(&f.inputs),
                 render_outputs(&f.outputs)
-            ));
+            );
         }
         out.push('\n');
     }
@@ -713,15 +733,16 @@ pub fn render_text(diff: &SpecDiff) -> String {
     if !diff.functions.changed.is_empty() {
         out.push_str("Functions changed:\n");
         for f in &diff.functions.changed {
-            out.push_str(&format!("  ~ {}\n", f.name));
+            let _ = writeln!(out, "  ~ {}", f.name);
             for c in &f.argument_changes {
-                out.push_str(&format!("      {}\n", c.describe()));
+                let _ = writeln!(out, "      {}", c.describe());
             }
             if f.return_changed {
-                out.push_str(&format!(
-                    "      ~ return: {} -> {}\n",
+                let _ = writeln!(
+                    out,
+                    "      ~ return: {} -> {}",
                     f.return_before, f.return_after
-                ));
+                );
             }
         }
         out.push('\n');
@@ -730,7 +751,7 @@ pub fn render_text(diff: &SpecDiff) -> String {
     if !diff.events.removed.is_empty() {
         out.push_str("Events removed:\n");
         for e in &diff.events.removed {
-            out.push_str(&format!("  - {}\n", e.name));
+            let _ = writeln!(out, "  - {}", e.name);
         }
         out.push('\n');
     }
@@ -738,11 +759,7 @@ pub fn render_text(diff: &SpecDiff) -> String {
     if !diff.events.added.is_empty() {
         out.push_str("Events added:\n");
         for e in &diff.events.added {
-            out.push_str(&format!(
-                "  + {}({})\n",
-                e.name,
-                render_event_params(&e.params)
-            ));
+            let _ = writeln!(out, "  + {}({})", e.name, render_event_params(&e.params));
         }
         out.push('\n');
     }
@@ -750,26 +767,28 @@ pub fn render_text(diff: &SpecDiff) -> String {
     if !diff.events.changed.is_empty() {
         out.push_str("Events changed:\n");
         for e in &diff.events.changed {
-            out.push_str(&format!("  ~ {}\n", e.name));
+            let _ = writeln!(out, "  ~ {}", e.name);
             for c in &e.argument_changes {
-                out.push_str(&format!("      {}\n", c.describe()));
+                let _ = writeln!(out, "      {}", c.describe());
             }
             if e.data_format_changed {
-                out.push_str(&format!(
-                    "      ~ data format: {} -> {}\n",
+                let _ = writeln!(
+                    out,
+                    "      ~ data format: {} -> {}",
                     e.data_format_before, e.data_format_after
-                ));
+                );
             }
         }
         out.push('\n');
     }
 
-    out.push_str(&format!(
-        "Summary: {} function(s) changed ({} breaking), {} event(s) changed.\n",
+    let _ = writeln!(
+        out,
+        "Summary: {} function(s) changed ({} breaking), {} event(s) changed.",
         diff.functions.added.len() + diff.functions.removed.len() + diff.functions.changed.len(),
         diff.breaking_lines().len(),
         diff.events.added.len() + diff.events.removed.len() + diff.events.changed.len(),
-    ));
+    );
     out
 }
 

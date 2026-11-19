@@ -1,5 +1,5 @@
 use crate::error::Result;
-use crate::swap::{AtomicSwap, SwapStatus};
+use crate::swap::{AtomicSwap, SwapFailureReason, SwapStatus};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,6 +27,9 @@ pub enum SwapEvent {
     Failed {
         swap_id: String,
         error: String,
+        /// Coarse grouping code for the terminal reason (#391), e.g.
+        /// `retry_budget_exhausted`. Stable across releases; `error` is for humans.
+        reason_code: String,
         timestamp: u64,
     },
     TimeoutWarning {
@@ -98,6 +101,31 @@ impl SwapMonitor {
         Ok(())
     }
 
+    /// Record a terminal failure for `swap_id` and emit it (#391).
+    ///
+    /// Returns `true` when this call recorded the reason, `false` when the swap
+    /// already carried one (or is unknown). Re-failing a swap never rewrites the
+    /// reason, so a retry loop cannot mask the first, most specific cause.
+    pub async fn fail_swap(&self, swap_id: &str, reason: SwapFailureReason, ledger: u32) -> bool {
+        let mut swaps = self.swaps.write().await;
+        let Some(swap) = swaps.get_mut(swap_id) else {
+            return false;
+        };
+        if !swap.mark_failed(reason.clone(), ledger) {
+            return false;
+        }
+
+        let event = SwapEvent::Failed {
+            swap_id: swap_id.to_string(),
+            error: reason.to_string(),
+            reason_code: reason.code().to_string(),
+            timestamp: chrono::Utc::now().timestamp() as u64,
+        };
+        drop(swaps);
+        self.emit_event(event).await;
+        true
+    }
+
     pub async fn get_swap(&self, swap_id: &str) -> Option<AtomicSwap> {
         let swaps = self.swaps.read().await;
         swaps.get(swap_id).cloned()
@@ -130,6 +158,7 @@ impl SwapMonitor {
         handlers.push(Arc::new(handler));
     }
 
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // public API; the loop it spawns is what awaits
     pub async fn start_monitoring(&self) -> Result<()> {
         info!("Starting swap monitoring service");
 
@@ -346,7 +375,7 @@ mod tests {
         // Add some test swaps
         for i in 0..5 {
             let mut swap = AtomicSwap::new(
-                format!("swap_{}", i),
+                format!("swap_{i}"),
                 "initiator".to_string(),
                 "participant".to_string(),
                 Asset::XLM,
@@ -363,7 +392,15 @@ mod tests {
                 0 => swap.mark_completed("preimage".to_string(), 2000),
                 1 => swap.mark_refunded(),
                 2 => swap.mark_expired(),
-                3 => swap.mark_failed(),
+                3 => {
+                    swap.mark_failed(
+                        SwapFailureReason::ChainActionFailed {
+                            operation: "fund".to_string(),
+                            detail: "test fixture".to_string(),
+                        },
+                        2_000,
+                    );
+                }
                 _ => {} // Keep one pending
             }
 

@@ -92,7 +92,7 @@ impl StatisticsCalculator {
         let degrees: Vec<usize> = graph
             .adjacency
             .values()
-            .map(|neighbors| neighbors.len())
+            .map(std::collections::HashMap::len)
             .collect();
 
         let avg_degree = if num_nodes > 0 {
@@ -138,7 +138,7 @@ impl StatisticsCalculator {
         let degrees: Vec<usize> = graph
             .adjacency
             .values()
-            .map(|neighbors| neighbors.len())
+            .map(std::collections::HashMap::len)
             .collect();
 
         if degrees.is_empty() {
@@ -154,7 +154,7 @@ impl StatisticsCalculator {
         let mean = sum as f64 / degrees.len() as f64;
 
         let mut sorted = degrees.clone();
-        sorted.sort();
+        sorted.sort_unstable();
         let median = if sorted.len().is_multiple_of(2) {
             (sorted[sorted.len() / 2 - 1] + sorted[sorted.len() / 2]) as f64 / 2.0
         } else {
@@ -176,8 +176,7 @@ impl StatisticsCalculator {
         let mode = counts
             .into_iter()
             .max_by_key(|(_, count)| *count)
-            .map(|(d, _)| d)
-            .unwrap_or(0);
+            .map_or(0, |(d, _)| d);
 
         DegreeStats {
             mean,
@@ -221,7 +220,7 @@ impl StatisticsCalculator {
         let avg = all_paths.iter().sum::<usize>() as f64 / all_paths.len() as f64;
 
         let mut sorted = all_paths.clone();
-        sorted.sort();
+        sorted.sort_unstable();
         let median = if sorted.len() % 2 == 0 {
             (sorted[sorted.len() / 2 - 1] + sorted[sorted.len() / 2]) as f64 / 2.0
         } else {
@@ -387,6 +386,7 @@ impl StatisticsCalculator {
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)] // the fixtures assert exact values they construct
 mod tests {
     use super::*;
 
@@ -397,7 +397,7 @@ mod tests {
 
         for i in 0..5 {
             graph.add_node(channel_router::Node {
-                id: format!("n{}", i),
+                id: format!("n{i}"),
                 public_key: vec![],
                 alias: None,
                 online: true,
