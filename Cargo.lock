@@ -188,6 +188,7 @@ dependencies = [
  "sha2",
  "soroban-sdk",
  "stellar-xdr",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tokio-test",

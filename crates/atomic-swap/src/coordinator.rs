@@ -1,6 +1,7 @@
 use crate::asset::{Asset, AssetInfo, AssetRegistry};
 use crate::error::{AtomicSwapError, Result};
 use crate::idempotency::{IdempotencyKey, IdempotencyStore};
+use crate::journal::{InMemoryJournal, TransitionJournal, TransitionRecord, UnresolvedAction};
 use crate::monitor::{MonitoringConfig, SwapMonitor};
 use crate::preimage::PreimageManager;
 use crate::replay::{ReplayError, ReplayGuard, ReplayStats};
@@ -125,6 +126,9 @@ pub struct AtomicSwapCoordinator {
     retry_budget: Arc<RwLock<RetryBudget>>,
     /// Caller-chosen keys bound to the initiation they first produced (#212).
     idempotency: Arc<Mutex<IdempotencyStore>>,
+    /// Durable record of every state transition, written before it is applied
+    /// and before any chain action is submitted (#390).
+    journal: Arc<dyn TransitionJournal>,
     monitor: SwapMonitor,
     config: SwapConfig,
 }
@@ -135,6 +139,18 @@ impl AtomicSwapCoordinator {
     }
 
     pub fn with_retry_budget(config: SwapConfig, max_retries: u32) -> Self {
+        Self::with_journal(config, max_retries, Arc::new(InMemoryJournal::new()))
+    }
+
+    /// Build a coordinator that persists transitions to `journal` (#390).
+    ///
+    /// Pass a [`crate::FileJournal`] to survive a restart; the process-local
+    /// [`InMemoryJournal`] is used by the shorter constructors.
+    pub fn with_journal(
+        config: SwapConfig,
+        max_retries: u32,
+        journal: Arc<dyn TransitionJournal>,
+    ) -> Self {
         let monitor_config = MonitoringConfig::default();
         let monitor = SwapMonitor::new(monitor_config);
 
@@ -146,9 +162,15 @@ impl AtomicSwapCoordinator {
             replay: Arc::new(RwLock::new(ReplayGuard::new())),
             retry_budget: Arc::new(RwLock::new(RetryBudget::new(max_retries))),
             idempotency: Arc::new(Mutex::new(IdempotencyStore::new())),
+            journal,
             monitor,
             config,
         }
+    }
+
+    /// The journal backing this coordinator's transitions (#390).
+    pub fn journal(&self) -> &Arc<dyn TransitionJournal> {
+        &self.journal
     }
 
     /// Initialize a new swap as initiator
@@ -216,6 +238,11 @@ impl AtomicSwapCoordinator {
         for (key, value) in request.metadata {
             swap.add_metadata(key, value);
         }
+
+        // Record the creation before it becomes visible in memory, so a restart
+        // can rebuild the swap from the journal alone (#390).
+        self.journal
+            .append(TransitionRecord::initiated(&swap, current_ledger))?;
 
         // Store swap
         let mut swaps = self.swaps.write().await;
@@ -301,6 +328,14 @@ impl AtomicSwapCoordinator {
             return Err(AtomicSwapError::InvalidPreimage { swap_id });
         }
 
+        // Persist the settled state before it is applied in memory, so a crash
+        // mid-settlement cannot lose the preimage the chain already revealed
+        // (#390).
+        let mut settled = swap.clone();
+        settled.mark_completed(preimage.clone(), current_ledger);
+        self.journal
+            .append(TransitionRecord::settled(&settled, current_ledger))?;
+
         // Mark swap as completed
         swap.mark_completed(preimage, current_ledger);
 
@@ -324,6 +359,12 @@ impl AtomicSwapCoordinator {
         if !swap.can_refund(current_ledger) {
             return Err(AtomicSwapError::SwapExpired { swap_id });
         }
+
+        // Persist the refund before it is applied in memory (#390).
+        let mut refunded = swap.clone();
+        refunded.mark_refunded();
+        self.journal
+            .append(TransitionRecord::refunded(&refunded, current_ledger))?;
 
         // Mark swap as refunded
         swap.mark_refunded();
@@ -367,6 +408,20 @@ impl AtomicSwapCoordinator {
             });
         }
 
+        // Only the first reason is recorded, so only the first one is journalled
+        // (#390): appending a second `failed` record would claim a transition
+        // that never happens.
+        let already_failed = swap.failure.is_some();
+        if !already_failed {
+            let mut failed = swap.clone();
+            failed.mark_failed(reason.clone(), current_ledger);
+            self.journal.append(TransitionRecord::failed(
+                &failed,
+                reason.code(),
+                current_ledger,
+            ))?;
+        }
+
         let recorded = swap.mark_failed(reason.clone(), current_ledger);
         drop(swaps);
 
@@ -381,6 +436,40 @@ impl AtomicSwapCoordinator {
         Ok(recorded)
     }
 
+    /// Mark a pending swap expired once its timeout ledger has passed (#390).
+    ///
+    /// The monitor can flip its own copy to `Expired`, but that copy is not the
+    /// coordinator's record — without this path an expired swap stayed `Pending`
+    /// in the journal and would come back as refundable after a restart.
+    ///
+    /// Returns `true` when the swap was marked expired, `false` when it is not
+    /// pending or the timeout has not passed yet.
+    pub async fn expire_swap(&self, swap_id: &str, current_ledger: u32) -> Result<bool> {
+        let mut swaps = self.swaps.write().await;
+        let swap = swaps
+            .get_mut(swap_id)
+            .ok_or_else(|| AtomicSwapError::SwapNotFound {
+                swap_id: swap_id.to_string(),
+            })?;
+
+        if !swap.is_pending() || !swap.is_expired(current_ledger) {
+            return Ok(false);
+        }
+
+        // Journal first: a restart that saw `Pending` would let a refund race a
+        // swap the chain has already timed out (#390).
+        let mut expired = swap.clone();
+        expired.mark_expired();
+        self.journal
+            .append(TransitionRecord::expired(&expired, current_ledger))?;
+
+        swap.mark_expired();
+        drop(swaps);
+
+        info!("Expired swap: {} at ledger {}", swap_id, current_ledger);
+        Ok(true)
+    }
+
     /// The terminal reason recorded for a failed swap (#391).
     ///
     /// `None` while the swap can still settle, or when it settled/timed out.
@@ -392,6 +481,100 @@ impl AtomicSwapCoordinator {
                 swap_id: swap_id.to_string(),
             })?;
         Ok(swap.terminal_reason())
+    }
+
+    /// Record that `operation` is about to be submitted to the chain (#390).
+    ///
+    /// Call this *before* the chain action. The intent is durable first, so a
+    /// process that dies while the action is in flight leaves an
+    /// [`UnresolvedAction`] behind instead of a swap that silently claims the
+    /// action never happened.
+    ///
+    /// Returns the `seq` of the recorded transition. Re-recording the same
+    /// `(swap, operation)` is a no-op.
+    pub async fn record_chain_action_pending(
+        &self,
+        swap_id: &str,
+        operation: &str,
+        current_ledger: u32,
+    ) -> Result<u64> {
+        let swap = self.get_swap(swap_id.to_string()).await?;
+        let record = self.journal.append(TransitionRecord::chain_action_pending(
+            &swap,
+            operation,
+            current_ledger,
+        ))?;
+        Ok(record.seq)
+    }
+
+    /// Record that the chain accepted `operation` (#390).
+    pub async fn record_chain_action_confirmed(
+        &self,
+        swap_id: &str,
+        operation: &str,
+        current_ledger: u32,
+    ) -> Result<u64> {
+        let swap = self.get_swap(swap_id.to_string()).await?;
+        let record = self
+            .journal
+            .append(TransitionRecord::chain_action_confirmed(
+                &swap,
+                operation,
+                current_ledger,
+            ))?;
+        Ok(record.seq)
+    }
+
+    /// Record that the chain rejected `operation`, with the action's own error
+    /// (#390).
+    pub async fn record_chain_action_failed(
+        &self,
+        swap_id: &str,
+        operation: &str,
+        detail: &str,
+        current_ledger: u32,
+    ) -> Result<u64> {
+        let swap = self.get_swap(swap_id.to_string()).await?;
+        let record = self.journal.append(TransitionRecord::chain_action_failed(
+            &swap,
+            operation,
+            detail,
+            current_ledger,
+        ))?;
+        Ok(record.seq)
+    }
+
+    /// Chain actions that were started but whose outcome was never recorded.
+    ///
+    /// After a restart these are the swaps an operator (or a retry loop) must
+    /// reconcile against the chain before doing anything else (#390).
+    pub fn unresolved_chain_actions(&self) -> Result<Vec<UnresolvedAction>> {
+        self.journal.unresolved_actions()
+    }
+
+    /// Rebuild in-memory state from the journal (#390).
+    ///
+    /// Every swap is restored to the state its last record describes, so a
+    /// coordinator started against a [`crate::FileJournal`] sees exactly the
+    /// swaps that had been initiated and their latest transition. Returns the
+    /// number of swaps restored.
+    ///
+    /// Swaps already present in memory are left alone: recovery fills gaps, it
+    /// never overwrites live state.
+    pub async fn recover_from_journal(&self) -> Result<usize> {
+        let mut restored = 0;
+        for swap_id in self.journal.swap_ids()? {
+            let Some(latest) = self.journal.transitions(&swap_id)?.pop() else {
+                continue;
+            };
+            let mut swaps = self.swaps.write().await;
+            if swaps.contains_key(&swap_id) {
+                continue;
+            }
+            swaps.insert(swap_id.clone(), latest.snapshot);
+            restored += 1;
+        }
+        Ok(restored)
     }
 
     /// Create a multi-hop swap through intermediary assets
@@ -723,6 +906,8 @@ impl AtomicSwapCoordinator {
 mod tests {
     use super::*;
     use crate::asset::Asset;
+    use crate::journal::TransitionKind;
+    use crate::swap::SwapStatus;
 
     #[tokio::test]
     async fn test_swap_initiation() {
@@ -1280,5 +1465,281 @@ mod tests {
 
         coordinator.reset_retry_budget(swap_id).await;
         assert_eq!(coordinator.remaining_retries(swap_id).await, 2);
+    }
+
+    // ---- Durable state transitions (#390) ----
+
+    fn journal_entries(
+        coordinator: &AtomicSwapCoordinator,
+        swap_id: &str,
+    ) -> Vec<TransitionRecord> {
+        coordinator.journal().transitions(swap_id).unwrap()
+    }
+
+    #[tokio::test]
+    async fn initiation_is_journalled_before_the_swap_is_stored() {
+        let coordinator = coordinator_with_usdc().await;
+
+        let response = coordinator
+            .initiate_swap("initiator".to_string(), request_with_origin(None))
+            .await
+            .unwrap();
+
+        let entries = journal_entries(&coordinator, &response.swap_id);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, TransitionKind::Initiated);
+        assert_eq!(entries[0].seq, 1);
+        assert_eq!(entries[0].snapshot.id, response.swap_id);
+    }
+
+    #[tokio::test]
+    async fn a_chain_action_is_bracketed_by_intent_and_outcome() {
+        let coordinator = coordinator_with_usdc().await;
+        let swap_id = coordinator
+            .initiate_swap("initiator".to_string(), request_with_origin(None))
+            .await
+            .unwrap()
+            .swap_id;
+
+        coordinator
+            .record_chain_action_pending(&swap_id, "lock", 100_001)
+            .await
+            .unwrap();
+        assert_eq!(
+            coordinator.unresolved_chain_actions().unwrap(),
+            vec![UnresolvedAction {
+                swap_id: swap_id.clone(),
+                operation: "lock".to_string(),
+                ledger: 100_001,
+            }],
+            "an intent with no outcome must be reported as unresolved"
+        );
+
+        coordinator
+            .record_chain_action_confirmed(&swap_id, "lock", 100_002)
+            .await
+            .unwrap();
+        assert!(coordinator.unresolved_chain_actions().unwrap().is_empty());
+
+        let kinds: Vec<_> = journal_entries(&coordinator, &swap_id)
+            .into_iter()
+            .map(|r| r.kind)
+            .collect();
+        assert_eq!(kinds.len(), 3);
+        assert_eq!(
+            kinds[1],
+            TransitionKind::ChainActionPending {
+                operation: "lock".to_string()
+            }
+        );
+        assert_eq!(
+            kinds[2],
+            TransitionKind::ChainActionConfirmed {
+                operation: "lock".to_string()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_chain_action_records_the_reason() {
+        let coordinator = coordinator_with_usdc().await;
+        let swap_id = coordinator
+            .initiate_swap("initiator".to_string(), request_with_origin(None))
+            .await
+            .unwrap()
+            .swap_id;
+
+        coordinator
+            .record_chain_action_pending(&swap_id, "lock", 100_001)
+            .await
+            .unwrap();
+        coordinator
+            .record_chain_action_failed(&swap_id, "lock", "tx_bad_seq", 100_002)
+            .await
+            .unwrap();
+
+        assert!(coordinator.unresolved_chain_actions().unwrap().is_empty());
+        let entries = journal_entries(&coordinator, &swap_id);
+        assert_eq!(
+            entries.last().unwrap().kind,
+            TransitionKind::ChainActionFailed {
+                operation: "lock".to_string(),
+                detail: "tx_bad_seq".to_string()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn settlement_and_refund_are_journalled() {
+        let coordinator = coordinator_with_usdc().await;
+
+        let settled = coordinator
+            .initiate_swap("initiator".to_string(), request_with_origin(None))
+            .await
+            .unwrap();
+        let preimage = settled.preimage.clone().unwrap();
+        coordinator
+            .complete_swap(settled.swap_id.clone(), preimage, 100_500)
+            .await
+            .unwrap();
+        let entries = journal_entries(&coordinator, &settled.swap_id);
+        assert_eq!(entries.last().unwrap().kind, TransitionKind::Settled);
+        assert_eq!(
+            entries.last().unwrap().snapshot.status,
+            SwapStatus::Completed
+        );
+
+        let refundable = coordinator
+            .initiate_swap("initiator".to_string(), request_with_origin(None))
+            .await
+            .unwrap();
+        // `initiate_swap` opens the swap at ledger 100_000 with a 24h timeout.
+        coordinator
+            .refund_swap(refundable.swap_id.clone(), 200_000)
+            .await
+            .unwrap();
+        let entries = journal_entries(&coordinator, &refundable.swap_id);
+        assert_eq!(entries.last().unwrap().kind, TransitionKind::Refunded);
+        assert_eq!(
+            entries.last().unwrap().snapshot.status,
+            SwapStatus::Refunded
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failure_is_journalled_once_and_keeps_the_first_reason() {
+        let coordinator = coordinator_with_usdc().await;
+        let swap_id = coordinator
+            .initiate_swap("initiator".to_string(), request_with_origin(None))
+            .await
+            .unwrap()
+            .swap_id;
+
+        let first = SwapFailureReason::ChainActionFailed {
+            operation: "lock".to_string(),
+            detail: "tx_bad_seq".to_string(),
+        };
+        assert!(coordinator
+            .fail_swap(&swap_id, first, 100_200)
+            .await
+            .unwrap());
+        let second = SwapFailureReason::Abandoned {
+            detail: "operator gave up".to_string(),
+        };
+        assert!(!coordinator
+            .fail_swap(&swap_id, second, 100_300)
+            .await
+            .unwrap());
+
+        let failures: Vec<_> = journal_entries(&coordinator, &swap_id)
+            .into_iter()
+            .filter(|r| matches!(r.kind, TransitionKind::Failed { .. }))
+            .collect();
+        assert_eq!(
+            failures.len(),
+            1,
+            "the overwritten reason must not be journalled"
+        );
+        assert_eq!(
+            failures[0].kind,
+            TransitionKind::Failed {
+                code: "chain_action_failed".to_string()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn expiry_is_journalled_and_only_after_the_timeout() {
+        let coordinator = coordinator_with_usdc().await;
+        let swap_id = coordinator
+            .initiate_swap("initiator".to_string(), request_with_origin(None))
+            .await
+            .unwrap()
+            .swap_id;
+
+        // Still inside the 24h window: nothing happens.
+        assert!(!coordinator.expire_swap(&swap_id, 100_001).await.unwrap());
+        assert_eq!(
+            coordinator.get_swap(swap_id.clone()).await.unwrap().status,
+            SwapStatus::Pending
+        );
+        assert_eq!(journal_entries(&coordinator, &swap_id).len(), 1);
+
+        assert!(coordinator.expire_swap(&swap_id, 200_000).await.unwrap());
+        assert_eq!(
+            coordinator.get_swap(swap_id.clone()).await.unwrap().status,
+            SwapStatus::Expired
+        );
+        let entries = journal_entries(&coordinator, &swap_id);
+        assert_eq!(entries.last().unwrap().kind, TransitionKind::Expired);
+        assert_eq!(entries.last().unwrap().snapshot.status, SwapStatus::Expired);
+
+        // Expiring twice is a no-op, not a second record.
+        assert!(!coordinator.expire_swap(&swap_id, 200_001).await.unwrap());
+        assert_eq!(journal_entries(&coordinator, &swap_id).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn recovery_restores_swaps_from_a_durable_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.jsonl");
+
+        let (swap_id, hash_lock) = {
+            let journal = std::sync::Arc::new(crate::journal::FileJournal::open(&path).unwrap());
+            let coordinator =
+                AtomicSwapCoordinator::with_journal(SwapConfig::default(), 3, journal);
+            coordinator
+                .register_asset(AssetInfo::custom(
+                    "USDC".to_string(),
+                    "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".to_string(),
+                    7,
+                ))
+                .await
+                .unwrap();
+            let response = coordinator
+                .initiate_swap("initiator".to_string(), request_with_origin(None))
+                .await
+                .unwrap();
+            coordinator
+                .record_chain_action_pending(&response.swap_id, "lock", 100_010)
+                .await
+                .unwrap();
+            (response.swap_id, response.hash_lock)
+        };
+
+        // A fresh coordinator over the same journal is a restart.
+        let journal = std::sync::Arc::new(crate::journal::FileJournal::open(&path).unwrap());
+        let restarted = AtomicSwapCoordinator::with_journal(SwapConfig::default(), 3, journal);
+        assert_eq!(restarted.recover_from_journal().await.unwrap(), 1);
+
+        let recovered = restarted.get_swap(swap_id.clone()).await.unwrap();
+        assert_eq!(recovered.id, swap_id);
+        assert_eq!(recovered.hash_lock, hash_lock);
+        assert_eq!(recovered.status, SwapStatus::Pending);
+        assert_eq!(
+            restarted.unresolved_chain_actions().unwrap(),
+            vec![UnresolvedAction {
+                swap_id,
+                operation: "lock".to_string(),
+                ledger: 100_010,
+            }],
+            "the restart must surface the in-flight chain action"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_does_not_overwrite_live_state() {
+        let coordinator = coordinator_with_usdc().await;
+        let swap_id = coordinator
+            .initiate_swap("initiator".to_string(), request_with_origin(None))
+            .await
+            .unwrap()
+            .swap_id;
+
+        assert_eq!(coordinator.recover_from_journal().await.unwrap(), 0);
+        assert_eq!(
+            coordinator.get_swap(swap_id).await.unwrap().status,
+            SwapStatus::Pending
+        );
     }
 }

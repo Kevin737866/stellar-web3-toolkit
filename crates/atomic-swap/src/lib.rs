@@ -2,6 +2,7 @@ pub mod asset;
 pub mod coordinator;
 pub mod error;
 pub mod idempotency;
+pub mod journal;
 pub mod monitor;
 pub mod preimage;
 pub mod replay;
@@ -14,6 +15,10 @@ pub use coordinator::{
 };
 pub use error::{AtomicSwapError, Result};
 pub use idempotency::{IdempotencyKey, IdempotencyStore, MAX_IDEMPOTENCY_KEY_LEN};
+pub use journal::{
+    FileJournal, InMemoryJournal, JournalError, TransitionJournal, TransitionKind,
+    TransitionRecord, UnresolvedAction,
+};
 pub use monitor::{MonitoringConfig, SwapMonitor};
 pub use preimage::{Preimage, PreimageManager};
 pub use replay::{
