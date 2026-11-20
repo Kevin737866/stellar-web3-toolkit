@@ -142,3 +142,15 @@ cargo test -p marketplace-contract -p royalty-splitter
 Coverage includes escrow/release accounting, fee math, cancellation,
 authorization failures, duplicate receivers, cap enforcement, fallback royalties,
 and rounding behaviour.
+
+## Rounding Remainder Strategies & Beneficiary Protection (Issues #421, #422)
+
+To satisfy exact payment accounting requirements when dividing multi-receiver royalty shares:
+
+### Remainder Strategies (`RemainderStrategy`)
+- **`Floor` (0)**: Traditional behavior where fractional stroops/dust remain with the seller/payer.
+- **`PrimaryReceiver` (1)**: Rounding remainder (`total_royalty - sum(floored_payouts)`) is credited to the primary beneficiary (index 0), guaranteeing `sum(payouts) == total_royalty`.
+- **`DesignatedReceiver` (2)**: Remainder is credited to an explicitly designated beneficiary address (`designated: Option<Address>`). Rejects with actionable error if designated address is not among the receivers.
+
+### Duplicate Beneficiary Validation
+All distribution pathways (`distribute`, `distribute_with_strategy`, `distribute_direct`) enforce strict uniqueness validation across beneficiary addresses before issuing token transfers, eliminating double-counting and re-distribution vulnerabilities.

@@ -111,15 +111,30 @@ fn effective_permissions(env: &Env, collection: &Address, account: &Address) -> 
     default_permissions(env, collection) | explicit_permissions(env, collection, account)
 }
 
-fn require_collection_admin(env: &Env, caller: &Address, collection: &Address) {
-    caller.require_auth();
+fn is_owner_or_system_admin(env: &Env, caller: &Address, collection: &Address) -> bool {
     if caller == &admin(env) {
-        return;
+        return true;
     }
     if let Some(owner) = owner_of(env, collection) {
         if caller == &owner {
-            return;
+            return true;
         }
+    }
+    false
+}
+
+fn require_owner_or_system_admin(env: &Env, caller: &Address, collection: &Address) {
+    caller.require_auth();
+    assert!(
+        is_owner_or_system_admin(env, caller, collection),
+        "unauthorized: only owner or contract admin may perform this role change"
+    );
+}
+
+fn require_collection_admin(env: &Env, caller: &Address, collection: &Address) {
+    caller.require_auth();
+    if is_owner_or_system_admin(env, caller, collection) {
+        return;
     }
     let perms = effective_permissions(env, collection, caller);
     assert!(perms & PERM_ADMIN != 0, "unauthorized");
@@ -172,15 +187,17 @@ impl CollectionAccessControl {
     }
 
     /// Transfers collection ownership. Callable by the current owner or the
-    /// contract admin (both of whom hold `PERM_ADMIN`).
+    /// contract admin (issues #423).
     pub fn transfer_ownership(env: Env, caller: Address, collection: Address, new_owner: Address) {
-        require_collection_admin(&env, &caller, &collection);
-
         let key = DataKey::Owner(collection.clone());
         assert!(
             env.storage().persistent().has(&key),
             "collection not registered"
         );
+        require_owner_or_system_admin(&env, &caller, &collection);
+        let current_owner = owner_of(&env, &collection).unwrap();
+        assert!(new_owner != current_owner, "new owner must be different from current owner");
+
         env.storage().persistent().set(&key, &new_owner);
         env.storage()
             .persistent()
@@ -191,7 +208,8 @@ impl CollectionAccessControl {
     }
 
     /// Adds `permissions` to an account's grant without disturbing existing
-    /// bits. Caller must hold `PERM_ADMIN` for the collection.
+    /// bits. Caller must hold `PERM_ADMIN` for the collection. Elevating to `PERM_ADMIN`
+    /// requires collection owner or contract admin authority (issue #423).
     pub fn grant_permissions(
         env: Env,
         caller: Address,
@@ -199,8 +217,18 @@ impl CollectionAccessControl {
         account: Address,
         permissions: u32,
     ) {
+        let key = DataKey::Owner(collection.clone());
+        assert!(
+            env.storage().persistent().has(&key),
+            "collection not registered"
+        );
         require_collection_admin(&env, &caller, &collection);
         assert!(permissions != 0, "permissions must be non-zero");
+
+        // Privilege escalation check: only owner or contract admin may grant PERM_ADMIN
+        if permissions & PERM_ADMIN != 0 {
+            require_owner_or_system_admin(&env, &caller, &collection);
+        }
 
         let current = explicit_permissions(&env, &collection, &account);
         write_permissions(&env, &collection, &account, current | permissions);
@@ -210,7 +238,8 @@ impl CollectionAccessControl {
     }
 
     /// Removes `permissions` from an account's grant, leaving other bits
-    /// intact. Caller must hold `PERM_ADMIN` for the collection.
+    /// intact. Caller must hold `PERM_ADMIN` for the collection. Revoking `PERM_ADMIN`
+    /// requires collection owner or contract admin authority (issue #423).
     pub fn revoke_permissions(
         env: Env,
         caller: Address,
@@ -218,8 +247,18 @@ impl CollectionAccessControl {
         account: Address,
         permissions: u32,
     ) {
+        let key = DataKey::Owner(collection.clone());
+        assert!(
+            env.storage().persistent().has(&key),
+            "collection not registered"
+        );
         require_collection_admin(&env, &caller, &collection);
         assert!(permissions != 0, "permissions must be non-zero");
+
+        // Privilege escalation check: only owner or contract admin may revoke PERM_ADMIN
+        if permissions & PERM_ADMIN != 0 {
+            require_owner_or_system_admin(&env, &caller, &collection);
+        }
 
         let current = explicit_permissions(&env, &collection, &account);
         write_permissions(&env, &collection, &account, current & !permissions);
@@ -231,7 +270,8 @@ impl CollectionAccessControl {
     }
 
     /// Overwrites an account's explicit permissions. Caller must hold
-    /// `PERM_ADMIN` for the collection.
+    /// `PERM_ADMIN` for the collection. Setting or modifying `PERM_ADMIN`
+    /// requires collection owner or contract admin authority (issue #423).
     pub fn set_permissions(
         env: Env,
         caller: Address,
@@ -239,7 +279,18 @@ impl CollectionAccessControl {
         account: Address,
         permissions: u32,
     ) {
+        let key = DataKey::Owner(collection.clone());
+        assert!(
+            env.storage().persistent().has(&key),
+            "collection not registered"
+        );
         require_collection_admin(&env, &caller, &collection);
+
+        let current = explicit_permissions(&env, &collection, &account);
+        if (permissions & PERM_ADMIN != 0) || (current & PERM_ADMIN != 0) {
+            require_owner_or_system_admin(&env, &caller, &collection);
+        }
+
         write_permissions(&env, &collection, &account, permissions);
 
         env.events().publish(
@@ -250,22 +301,32 @@ impl CollectionAccessControl {
 
     /// Sets the permissions granted to every account in the collection (for
     /// example `PERM_TRANSFER`). Caller must hold `PERM_ADMIN`.
+    /// `PERM_ADMIN` cannot be granted as a default permission (issue #423).
     pub fn set_default_permissions(
         env: Env,
         caller: Address,
         collection: Address,
         permissions: u32,
     ) {
+        let key = DataKey::Owner(collection.clone());
+        assert!(
+            env.storage().persistent().has(&key),
+            "collection not registered"
+        );
+        assert!(
+            permissions & PERM_ADMIN == 0,
+            "cannot grant admin permission by default"
+        );
         require_collection_admin(&env, &caller, &collection);
 
-        let key = DataKey::DefaultPermissions(collection.clone());
+        let default_key = DataKey::DefaultPermissions(collection.clone());
         if permissions == 0 {
-            env.storage().persistent().remove(&key);
+            env.storage().persistent().remove(&default_key);
         } else {
-            env.storage().persistent().set(&key, &permissions);
+            env.storage().persistent().set(&default_key, &permissions);
             env.storage()
                 .persistent()
-                .extend_ttl(&key, PERM_TTL_THRESHOLD, PERM_TTL_BUMP);
+                .extend_ttl(&default_key, PERM_TTL_THRESHOLD, PERM_TTL_BUMP);
         }
 
         env.events()
@@ -475,5 +536,68 @@ mod test {
         let (_admin, _collection, client) = setup(&env);
         let unknown = Address::generate(&env);
         client.get_owner(&unknown);
+    }
+
+    #[test]
+    #[should_panic(expected = "unauthorized: only owner or contract admin may perform this role change")]
+    fn delegated_admin_cannot_grant_admin_role() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (admin, collection, client) = setup(&env);
+        let owner = Address::generate(&env);
+        let sub_admin = Address::generate(&env);
+        let target = Address::generate(&env);
+        client.register_collection(&admin, &collection, &owner);
+
+        // Owner grants PERM_ADMIN to sub_admin
+        client.grant_permissions(&owner, &collection, &sub_admin, &PERM_ADMIN);
+
+        // Sub-admin attempts to grant PERM_ADMIN to target -> must fail
+        client.grant_permissions(&sub_admin, &collection, &target, &PERM_ADMIN);
+    }
+
+    #[test]
+    #[should_panic(expected = "unauthorized: only owner or contract admin may perform this role change")]
+    fn delegated_admin_cannot_transfer_ownership() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (admin, collection, client) = setup(&env);
+        let owner = Address::generate(&env);
+        let sub_admin = Address::generate(&env);
+        let target = Address::generate(&env);
+        client.register_collection(&admin, &collection, &owner);
+
+        // Owner grants PERM_ADMIN to sub_admin
+        client.grant_permissions(&owner, &collection, &sub_admin, &PERM_ADMIN);
+
+        // Sub-admin attempts to transfer ownership -> must fail
+        client.transfer_ownership(&sub_admin, &collection, &target);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot grant admin permission by default")]
+    fn cannot_set_default_admin_permission() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (admin, collection, client) = setup(&env);
+        let owner = Address::generate(&env);
+        client.register_collection(&admin, &collection, &owner);
+
+        client.set_default_permissions(&owner, &collection, &PERM_ADMIN);
+    }
+
+    #[test]
+    #[should_panic(expected = "collection not registered")]
+    fn unregistered_collection_rejects_grant() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (admin, collection, client) = setup(&env);
+        let artist = Address::generate(&env);
+
+        client.grant_permissions(&admin, &collection, &artist, &PERM_MINTER);
     }
 }

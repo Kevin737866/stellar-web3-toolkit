@@ -99,3 +99,13 @@ cargo test -p collection-access-control
 Coverage includes the owner's implicit `PERM_ALL`, grant/revoke bit toggling,
 combined permission checks, default permissions, ownership transfer, and
 unauthorized-access rejections.
+
+## Privilege Escalation & Role Change Authorization (Issue #423)
+
+To protect collection administration against unauthorized role changes and privilege escalation:
+
+### Invariants & Authorization Controls
+- **Collection Registration Guard**: Role modification operations (`grant_permissions`, `revoke_permissions`, `set_permissions`, `set_default_permissions`) strictly require the collection to have been registered beforehand via `register_collection`.
+- **Admin Privilege Escalation Protection**: Only the registered collection owner or the contract-wide admin may grant or revoke `PERM_ADMIN`. Accounts holding delegated `PERM_ADMIN` cannot elevate other accounts to admin or strip admin permissions.
+- **Ownership Transfer Authority**: `transfer_ownership` is strictly limited to the collection owner or system admin, and rejects self-transfers to the current owner.
+- **Default Permissions Guard**: `set_default_permissions` explicitly prohibits specifying `PERM_ADMIN` as a default permission.
