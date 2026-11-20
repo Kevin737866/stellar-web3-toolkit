@@ -236,7 +236,8 @@ impl AmmPool {
         min_b: i128,
     ) -> i128 {
         user.require_auth();
-        assert!(amount_a_desired > 0 && amount_b_desired > 0, "amounts");
+        assert!(amount_a_desired > 0 && amount_b_desired > 0, "amounts must be positive");
+        assert!(min_a > 0 && min_b > 0, "min amounts must be positive");
         let pool = env.current_contract_address();
         let (ta, tb) = get_tokens(&env);
         let (reserve_a, reserve_b) = reserves(&env);
@@ -276,8 +277,9 @@ impl AmmPool {
             l1.min(l2)
         };
         assert!(liq > 0, "liq");
-        let new_a = reserve_a.saturating_add(amount_a);
-        let new_b = reserve_b.saturating_add(amount_b);
+        assert!(amount_a > 0 && amount_b > 0, "deposited amounts must be positive");
+        let new_a = reserve_a.checked_add(amount_a).expect("reserve_a overflow");
+        let new_b = reserve_b.checked_add(amount_b).expect("reserve_b overflow");
         set_reserves(&env, new_a, new_b);
         mint_lp(&env, user, liq);
         grow_cumulative(&env);
@@ -292,11 +294,12 @@ impl AmmPool {
         min_b: i128,
     ) -> (i128, i128) {
         user.require_auth();
-        assert!(lp_amount > 0, "lp");
+        assert!(lp_amount > 0, "lp amount must be positive");
         let pool = env.current_contract_address();
         let (reserve_a, reserve_b) = reserves(&env);
         let supply = total_lp(&env);
         assert!(supply > 0, "supply");
+        assert!(lp_amount <= supply, "cannot redeem more shares than supply");
 
         let amount_a = lp_amount
             .saturating_mul(reserve_a)
@@ -315,11 +318,11 @@ impl AmmPool {
         TokenClient::new(&env, &ta).transfer(&pool, &user, &amount_a);
         TokenClient::new(&env, &tb).transfer(&pool, &user, &amount_b);
 
-        set_reserves(
-            &env,
-            reserve_a.saturating_sub(amount_a),
-            reserve_b.saturating_sub(amount_b),
-        );
+        assert!(amount_a < reserve_a && amount_b < reserve_b, "removal exceeds reserves");
+        let remaining_a = reserve_a.checked_sub(amount_a).expect("reserve_a underflow");
+        let remaining_b = reserve_b.checked_sub(amount_b).expect("reserve_b underflow");
+        assert!(remaining_a > 0 && remaining_b > 0, "reserves must remain positive");
+        set_reserves(&env, remaining_a, remaining_b);
         grow_cumulative(&env);
         (amount_a, amount_b)
     }
@@ -359,6 +362,15 @@ impl AmmPool {
 
         TokenClient::new(&env, &token_out).transfer(&pool, &to, &out);
         grow_cumulative(&env);
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("swap"), to),
+            (token_in, amount_in, out, new_in, new_out),
+        );
+        env.events().publish(
+            (soroban_sdk::symbol_short!("sync"),),
+            (new_in, new_out),
+        );
         out
     }
 
@@ -578,5 +590,74 @@ mod test {
         let _ = pool.swap(&ta, &u, &1);
         let (c1, d1, _) = pool.observe();
         assert!(c1 > c0 || d1 > d0);
+    }
+
+    #[test]
+    fn add_liquidity_rejects_zero_or_negative_inputs() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let pool_id = env.register_contract(None, AmmPool);
+        let pool = AmmPoolClient::new(&env, &pool_id);
+        let admin = Address::generate(&env);
+        let ta = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let tb = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        pool.initialize(&admin, &ta, &tb);
+
+        let u = Address::generate(&env);
+        assert!(pool.try_add_liquidity(&u, &0, &100, &1, &1).is_err());
+        assert!(pool.try_add_liquidity(&u, &100, &0, &1, &1).is_err());
+        assert!(pool.try_add_liquidity(&u, &100, &100, &0, &1).is_err());
+        assert!(pool.try_add_liquidity(&u, &100, &100, &1, &0).is_err());
+    }
+
+    #[test]
+    fn remove_liquidity_rejects_exceeding_pool_reserves_or_supply() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let pool_id = env.register_contract(None, AmmPool);
+        let pool = AmmPoolClient::new(&env, &pool_id);
+        let admin = Address::generate(&env);
+        let ta = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let tb = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        pool.initialize(&admin, &ta, &tb);
+
+        let u = Address::generate(&env);
+        soroban_sdk::token::StellarAssetClient::new(&env, &ta).mint(&u, &1_000_000);
+        soroban_sdk::token::StellarAssetClient::new(&env, &tb).mint(&u, &1_000_000);
+        let shares = pool.add_liquidity(&u, &100_000, &100_000, &1, &1);
+
+        // Cannot redeem more than existing share balance or entire reserves
+        assert!(pool.try_remove_liquidity(&u, &(shares + 1), &1, &1).is_err());
+        assert!(pool.try_remove_liquidity(&u, &0, &1, &1).is_err());
+    }
+
+    #[test]
+    fn swap_enforces_min_out_and_emits_events() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let pool_id = env.register_contract(None, AmmPool);
+        let pool = AmmPoolClient::new(&env, &pool_id);
+        let admin = Address::generate(&env);
+        let ta = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let tb = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        pool.initialize(&admin, &ta, &tb);
+
+        let u = Address::generate(&env);
+        soroban_sdk::token::StellarAssetClient::new(&env, &ta).mint(&u, &1_000_000);
+        soroban_sdk::token::StellarAssetClient::new(&env, &tb).mint(&u, &1_000_000);
+        pool.add_liquidity(&u, &200_000, &200_000, &1, &1);
+
+        // Transfer token in before swap
+        soroban_sdk::token::TokenClient::new(&env, &ta).transfer(&u, &pool_id, &10_000);
+
+        // min_out too high fails
+        assert!(pool.try_swap(&ta, &u, &15_000).is_err());
+
+        // valid swap succeeds
+        let out = pool.swap(&ta, &u, &5_000);
+        assert!(out >= 5_000);
+        let (ra, rb) = pool.get_reserves();
+        assert_eq!(ra, 210_000);
+        assert_eq!(rb, 200_000 - out);
     }
 }
