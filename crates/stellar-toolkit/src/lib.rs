@@ -19,6 +19,8 @@ pub mod hsm;
 pub mod invariants;
 pub mod key_hygiene;
 pub mod merkle;
+
+pub use merkle::{AirdropLeaf, Hash, MerkleClaimError, MerkleClaimTracker, MerkleTree};
 pub mod migration_diff;
 pub mod monitoring_dashboard;
 pub mod one_click_airdrop;
