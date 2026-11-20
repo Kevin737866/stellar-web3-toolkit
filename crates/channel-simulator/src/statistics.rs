@@ -80,6 +80,48 @@ pub struct ChannelStats {
 }
 
 /// Statistics calculator
+
+impl SimulationStats {
+    /// Export simulation statistics as formatted JSON string (Issue #381)
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+
+    /// Export simulation statistics as pretty-printed JSON string (Issue #381)
+    pub fn to_json_pretty(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+
+    /// Deserialize simulation statistics from a JSON string (Issue #381)
+    pub fn from_json(json_str: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(json_str)
+    }
+
+    /// Write simulation statistics directly to a JSON file (Issue #381)
+    pub fn export_json_file<P: AsRef<std::path::Path>>(&self, path: P) -> std::io::Result<()> {
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(path, json)
+    }
+}
+
+impl NetworkStats {
+    /// Export network statistics as formatted JSON string (Issue #381)
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+
+    /// Export network statistics as pretty-printed JSON string (Issue #381)
+    pub fn to_json_pretty(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+
+    /// Deserialize network statistics from a JSON string (Issue #381)
+    pub fn from_json(json_str: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(json_str)
+    }
+}
+
 pub struct StatisticsCalculator;
 
 impl StatisticsCalculator {
@@ -441,5 +483,30 @@ mod tests {
 
         let stats = StatisticsCalculator::calculate_degree_stats(&graph);
         assert_eq!(stats.mean, 0.8); // 4 total connections / 5 nodes
+    }
+
+    #[test]
+    fn test_statistics_json_export_and_parse() {
+        let mut sim_stats = SimulationStats::default();
+        sim_stats.total_payments = 120;
+        sim_stats.successful_payments = 115;
+        sim_stats.failed_payments = 5;
+        sim_stats.total_value_routed = 50_000_000;
+        sim_stats.total_fees_collected = 1_500;
+        sim_stats.success_rate = 95.83;
+        sim_stats.latency_ms = vec![12, 15, 18, 22];
+
+        let json = sim_stats.to_json().expect("to_json failed");
+        assert!(json.contains(""total_payments":120"));
+        assert!(json.contains(""successful_payments":115"));
+
+        let pretty_json = sim_stats.to_json_pretty().expect("to_json_pretty failed");
+        assert!(pretty_json.contains("  "total_payments": 120"));
+
+        let parsed = SimulationStats::from_json(&json).expect("from_json failed");
+        assert_eq!(parsed.total_payments, 120);
+        assert_eq!(parsed.successful_payments, 115);
+        assert_eq!(parsed.total_value_routed, 50_000_000);
+        assert_eq!(parsed.latency_ms, vec![12, 15, 18, 22]);
     }
 }
