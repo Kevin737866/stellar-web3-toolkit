@@ -37,6 +37,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 
 /// Every topology shape the generator knows about.
 pub const ALL_TOPOLOGIES: [TopologyType; 7] = [
@@ -140,17 +141,18 @@ impl FuzzReport {
         );
 
         for failure in self.failures.iter().take(5) {
-            summary.push_str(&format!(
+            let _ = write!(
+                summary,
                 "\n  [{} seed={}] {}: {}",
                 failure.topology_name(),
                 failure.seed,
                 failure.invariant,
                 failure.detail
-            ));
+            );
         }
 
         if self.failures.len() > 5 {
-            summary.push_str(&format!("\n  ... and {} more", self.failures.len() - 5));
+            let _ = write!(summary, "\n  ... and {} more", self.failures.len() - 5);
         }
 
         summary
@@ -176,9 +178,9 @@ impl FuzzFailure {
 ///
 /// Returns the number of channels that were verified, or a description of the
 /// first violation found.
-pub fn verify_topology(
+pub fn verify_topology<S: std::hash::BuildHasher>(
     graph: &NetworkGraph,
-    nodes: &HashMap<String, SimulatedNode>,
+    nodes: &HashMap<String, SimulatedNode, S>,
 ) -> Result<usize, String> {
     if graph.num_nodes() != nodes.len() {
         return Err(format!(
@@ -398,7 +400,7 @@ pub fn verify_route(
         }
 
         expected_amount = hop.amount + hop.fee;
-        current = next.clone();
+        current.clone_from(next);
     }
 
     if current != request.destination {
@@ -485,11 +487,8 @@ impl TopologyFuzzer {
             ];
 
             for (algorithm, result) in attempts {
-                let route = match result {
-                    Ok(route) => route,
-                    // Failing to find a route is a legitimate outcome.
-                    Err(_) => continue,
-                };
+                // Failing to find a route is a legitimate outcome.
+                let Ok(route) = result else { continue };
 
                 report.routes_found += 1;
                 routed_here = true;
@@ -554,8 +553,7 @@ impl TopologyFuzzer {
                 graph
                     .adjacency
                     .get(*id)
-                    .map(|neighbours| !neighbours.is_empty())
-                    .unwrap_or(false)
+                    .is_some_and(|neighbours| !neighbours.is_empty())
             })
             .collect();
 

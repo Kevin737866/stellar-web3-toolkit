@@ -12,3 +12,6 @@ doctest = false
 [dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 amm-pool = { path = "../../contracts/amm-pool", features = ["testutils"] }
+
+[lints]
+workspace = true

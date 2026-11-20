@@ -68,11 +68,11 @@ impl NetworkTopology {
 
         // Create nodes
         for i in 0..self.config.num_nodes {
-            let node_id = format!("node_{:03}", i);
+            let node_id = format!("node_{i:03}");
             let node = Node {
                 id: node_id.clone(),
                 public_key: Self::random_bytes(32, rng),
-                alias: Some(format!("Node {}", i)),
+                alias: Some(format!("Node {i}")),
                 online: true,
                 last_seen: 0,
                 features: channel_router::NodeFeatures::default(),
@@ -122,8 +122,7 @@ impl NetworkTopology {
             // duplicate edge from being created.
             if nodes
                 .get(node_a)
-                .map(|n| n.channels.contains(node_b))
-                .unwrap_or(false)
+                .is_some_and(|n| n.channels.contains(node_b))
             {
                 continue;
             }
@@ -133,7 +132,7 @@ impl NetworkTopology {
             let balance = (capacity as f64 * self.config.avg_balance_percent) as i128;
 
             let channel = self.create_channel(
-                format!("ch_{:06}", edges_created),
+                format!("ch_{edges_created:06}"),
                 node_a.clone(),
                 node_b.clone(),
                 balance,
@@ -168,11 +167,11 @@ impl NetworkTopology {
         let mut nodes = HashMap::new();
         let node_ids: Vec<String> = (0..self.config.num_nodes)
             .map(|i| {
-                let id = format!("node_{:03}", i);
+                let id = format!("node_{i:03}");
                 let node = Node {
                     id: id.clone(),
                     public_key: Self::random_bytes(32, rng),
-                    alias: Some(format!("Node {}", i)),
+                    alias: Some(format!("Node {i}")),
                     online: true,
                     last_seen: 0,
                     features: channel_router::NodeFeatures::default(),
@@ -273,11 +272,11 @@ impl NetworkTopology {
         let mut nodes = HashMap::new();
         let node_ids: Vec<String> = (0..self.config.num_nodes)
             .map(|i| {
-                let id = format!("node_{:03}", i);
+                let id = format!("node_{i:03}");
                 let node = Node {
                     id: id.clone(),
                     public_key: Self::random_bytes(32, rng),
-                    alias: Some(format!("Node {}", i)),
+                    alias: Some(format!("Node {i}")),
                     online: true,
                     last_seen: 0,
                     features: channel_router::NodeFeatures::default(),
@@ -321,8 +320,7 @@ impl NetworkTopology {
             // A previous rewire may already have removed this edge.
             if !nodes
                 .get(&source)
-                .map(|n| n.channels.contains(&target))
-                .unwrap_or(false)
+                .is_some_and(|n| n.channels.contains(&target))
             {
                 continue;
             }
@@ -369,7 +367,7 @@ impl NetworkTopology {
 
         // Create nodes in a grid
         for i in 0..self.config.num_nodes {
-            let node_id = format!("node_{:03}", i);
+            let node_id = format!("node_{i:03}");
             let node = Node {
                 id: node_id.clone(),
                 public_key: Self::random_bytes(32, rng),
@@ -446,11 +444,11 @@ impl NetworkTopology {
 
         // Create spoke nodes
         for i in 1..self.config.num_nodes {
-            let node_id = format!("node_{:03}", i);
+            let node_id = format!("node_{i:03}");
             let node = Node {
                 id: node_id.clone(),
                 public_key: Self::random_bytes(32, rng),
-                alias: Some(format!("Spoke {}", i)),
+                alias: Some(format!("Spoke {i}")),
                 online: true,
                 last_seen: 0,
                 features: channel_router::NodeFeatures::default(),
@@ -479,11 +477,11 @@ impl NetworkTopology {
         let mut nodes = HashMap::new();
 
         for i in 0..self.config.num_nodes {
-            let node_id = format!("node_{:03}", i);
+            let node_id = format!("node_{i:03}");
             let node = Node {
                 id: node_id.clone(),
                 public_key: Self::random_bytes(32, rng),
-                alias: Some(format!("Node {}", i)),
+                alias: Some(format!("Node {i}")),
                 online: true,
                 last_seen: 0,
                 features: channel_router::NodeFeatures::default(),
@@ -520,11 +518,11 @@ impl NetworkTopology {
         let mut nodes = HashMap::new();
 
         for i in 0..self.config.num_nodes {
-            let node_id = format!("node_{:03}", i);
+            let node_id = format!("node_{i:03}");
             let node = Node {
                 id: node_id.clone(),
                 public_key: Self::random_bytes(32, rng),
-                alias: Some(format!("Node {}", i)),
+                alias: Some(format!("Node {i}")),
                 online: true,
                 last_seen: 0,
                 features: channel_router::NodeFeatures::default(),
@@ -545,8 +543,8 @@ impl NetworkTopology {
         for i in 0..self.config.num_nodes {
             let next = (i + 1) % self.config.num_nodes;
             self.add_edge(
-                &format!("node_{:03}", i),
-                &format!("node_{:03}", next),
+                &format!("node_{i:03}"),
+                &format!("node_{next:03}"),
                 &mut graph,
                 &mut nodes,
                 rng,
@@ -575,8 +573,7 @@ impl NetworkTopology {
         // set about how the network is wired.
         if nodes
             .get(node_a)
-            .map(|node| node.channels.contains(node_b))
-            .unwrap_or(false)
+            .is_some_and(|node| node.channels.contains(node_b))
         {
             return;
         }
@@ -585,7 +582,7 @@ impl NetworkTopology {
         let balance = (capacity as f64 * self.config.avg_balance_percent) as i128;
 
         let channel = self.create_channel(
-            format!("ch_{}_{}", node_a, node_b),
+            format!("ch_{node_a}_{node_b}"),
             node_a.to_string(),
             node_b.to_string(),
             balance,

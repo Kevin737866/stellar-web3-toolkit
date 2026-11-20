@@ -114,6 +114,7 @@ pub struct Node {
 
 /// Node feature flags
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct NodeFeatures {
     /// Supports variable size HTLCs
     pub variable_size_htlcs: bool,

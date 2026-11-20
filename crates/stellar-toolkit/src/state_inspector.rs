@@ -8,6 +8,7 @@
 use crate::error::{Result, ToolkitError};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::Path;
 
 /// Number of entries returned when the caller does not pick a page size.
@@ -28,6 +29,7 @@ pub enum Durability {
 }
 
 impl Durability {
+    #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Instance => "instance",
@@ -74,6 +76,7 @@ impl Default for StateQuery {
 }
 
 impl StateQuery {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -91,39 +94,47 @@ impl StateQuery {
     }
 
     /// Temporary entries are excluded by default because they are rolled back.
+    #[must_use]
     pub fn including_temporary(mut self, include_temporary: bool) -> Self {
         self.include_temporary = include_temporary;
         self
     }
 
     /// Page size is clamped to `1..=MAX_PAGE_SIZE`.
+    #[must_use]
     pub fn with_page_size(mut self, page_size: usize) -> Self {
         self.page_size = page_size.clamp(1, MAX_PAGE_SIZE);
         self
     }
 
     /// Cursor returned by a previous page (`0` starts at the first entry).
+    #[must_use]
     pub fn with_cursor(mut self, cursor: usize) -> Self {
         self.cursor = cursor;
         self
     }
 
+    #[must_use]
     pub fn contract_id(&self) -> Option<&str> {
         self.contract_id.as_deref()
     }
 
+    #[must_use]
     pub fn key_prefix(&self) -> Option<&str> {
         self.key_prefix.as_deref()
     }
 
+    #[must_use]
     pub fn include_temporary(&self) -> bool {
         self.include_temporary
     }
 
+    #[must_use]
     pub fn page_size(&self) -> usize {
         self.page_size
     }
 
+    #[must_use]
     pub fn cursor(&self) -> usize {
         self.cursor
     }
@@ -147,11 +158,13 @@ pub struct StatePage {
 
 impl StatePage {
     /// `true` when no further cursor is returned, i.e. this is the last page.
+    #[must_use]
     pub fn is_last_page(&self) -> bool {
         !self.has_more
     }
 
     /// Human readable rendering used by the CLI.
+    #[must_use]
     pub fn render(&self) -> String {
         let scope = self.contract_id.as_deref().unwrap_or("all contracts");
         let mut out = format!(
@@ -170,24 +183,26 @@ impl StatePage {
                 Some(ledger) => format!(" (expires at ledger {ledger})"),
                 None => String::new(),
             };
-            out.push_str(&format!(
-                "  {:<10} {:<28} = {}{} (ledger {})\n",
+            let _ = writeln!(
+                out,
+                "  {:<10} {:<28} = {}{} (ledger {})",
                 entry.durability.as_str(),
                 entry.key,
                 entry.value,
                 expiry,
                 entry.ledger
-            ));
+            );
         }
         if self.is_last_page() {
             out.push_str("end of results\n");
         } else if let Some(cursor) = self.next_cursor {
-            out.push_str(&format!("next cursor: {cursor}\n"));
+            let _ = writeln!(out, "next cursor: {cursor}");
         }
         out
     }
 
     /// JSON rendering used by `--json` and by scripts.
+    #[must_use]
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
     }
@@ -200,6 +215,7 @@ pub struct StateInspector {
 }
 
 impl StateInspector {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -238,16 +254,19 @@ impl StateInspector {
         self.entries.insert(key, entry).is_some()
     }
 
+    #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
     /// Entries matching the filter, in a stable
     /// (durability, key, contract) order.
+    #[must_use]
     pub fn filtered(&self, query: &StateQuery) -> Vec<&StateEntry> {
         self.entries
             .values()
@@ -255,6 +274,7 @@ impl StateInspector {
             .collect()
     }
 
+    #[must_use]
     pub fn total(&self, query: &StateQuery) -> usize {
         self.filtered(query).len()
     }
@@ -286,6 +306,7 @@ impl StateInspector {
     }
 
     /// Every page of the query, starting from the query cursor.
+    #[must_use]
     pub fn pages(&self, query: &StateQuery) -> Vec<StatePage> {
         let mut pages = Vec::new();
         let mut cursor = query.cursor();
@@ -295,22 +316,19 @@ impl StateInspector {
             if page.entries.is_empty() {
                 return pages;
             }
-            match page.next_cursor {
-                Some(next) => {
-                    cursor = next;
-                    pages.push(page);
-                }
-                // The last page has no cursor of its own, so it has to be
-                // pushed here: returning on `None` dropped it entirely.
-                None => {
-                    pages.push(page);
-                    return pages;
-                }
-            }
+            // The last page has no cursor of its own, so it has to be pushed
+            // here: returning before this dropped it entirely.
+            let next_cursor = page.next_cursor;
+            pages.push(page);
+            let Some(next) = next_cursor else {
+                return pages;
+            };
+            cursor = next;
         }
     }
 
     /// Built-in sample export so the CLI is usable without a live RPC query.
+    #[must_use]
     pub fn sample() -> Self {
         let mut inspector = Self::new();
         for entry in sample_entries() {

@@ -73,14 +73,8 @@ pub fn acc_reward_delta(share: i128, total_staked: i128) -> (i128, i128) {
     if share <= 0 || total_staked <= 0 {
         return (0, 0);
     }
-    let delta = share
-        .checked_mul(PRECISION)
-        .expect("accumulator overflow")
-        / total_staked;
-    let credited = delta
-        .checked_mul(total_staked)
-        .expect("credited overflow")
-        / PRECISION;
+    let delta = share.checked_mul(PRECISION).expect("accumulator overflow") / total_staked;
+    let credited = delta.checked_mul(total_staked).expect("credited overflow") / PRECISION;
     (delta, credited)
 }
 
@@ -105,12 +99,12 @@ pub fn accrued(amount: i128, acc_now: i128, acc_paid: i128) -> i128 {
 /// end contributes only up to that end. `last_update` can be ahead of
 /// `period_finish` once the schedule has expired, hence the `0` guard.
 pub fn distributable_seconds(last_update: u64, period_finish: u64, now: u64) -> u64 {
-    let end = if now < period_finish { now } else { period_finish };
-    if end <= last_update {
-        0
+    let end = if now < period_finish {
+        now
     } else {
-        end - last_update
-    }
+        period_finish
+    };
+    end.saturating_sub(last_update)
 }
 
 /// Reward tokens the current schedule has left to stream.

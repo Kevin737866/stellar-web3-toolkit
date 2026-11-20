@@ -26,7 +26,7 @@
 
 use crate::monitoring_dashboard::sha256_hex;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Bumped when the on-disk shape of a snapshot changes incompatibly.
 pub const SNAPSHOT_VERSION: u32 = 1;
@@ -140,11 +140,13 @@ pub struct SyncReport {
 
 impl SyncReport {
     /// True when the feed matched the snapshot exactly.
+    #[must_use]
     pub fn is_noop(&self) -> bool {
         self.added.is_empty() && self.updated.is_empty() && self.removed.is_empty()
     }
 
     /// One-line summary for a deploy log.
+    #[must_use]
     pub fn render(&self) -> String {
         format!(
             "signals: {} added, {} updated, {} removed, {} unchanged (digest {})",
@@ -174,6 +176,7 @@ impl Default for SignalSnapshot {
 }
 
 impl SignalSnapshot {
+    #[must_use]
     pub fn empty() -> Self {
         Self {
             version: SNAPSHOT_VERSION,
@@ -187,10 +190,10 @@ impl SignalSnapshot {
         I: IntoIterator<Item = Signal>,
     {
         let mut snapshot = Self::empty();
-        let mut seen = BTreeMap::new();
+        let mut seen = BTreeSet::new();
         for signal in signals {
             signal.validate()?;
-            if seen.insert(signal.id.clone(), ()).is_some() {
+            if !seen.insert(signal.id.clone()) {
                 return Err(SyncError::DuplicateSignal(signal.id));
             }
             snapshot.signals.insert(signal.id.clone(), signal);
@@ -198,14 +201,17 @@ impl SignalSnapshot {
         Ok(snapshot)
     }
 
+    #[must_use]
     pub fn len(&self) -> usize {
         self.signals.len()
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.signals.is_empty()
     }
 
+    #[must_use]
     pub fn get(&self, id: &str) -> Option<&Signal> {
         self.signals.get(id)
     }
@@ -219,6 +225,7 @@ impl SignalSnapshot {
     ///
     /// Length prefixes keep the encoding injective; the domain separator keeps
     /// it from colliding with any other sha256 this toolkit produces.
+    #[must_use]
     pub fn digest(&self) -> String {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(DIGEST_DOMAIN);

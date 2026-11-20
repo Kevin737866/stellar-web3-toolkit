@@ -281,6 +281,36 @@ pub enum MonitoringCommand {
         #[arg(long)]
         checksums: Option<PathBuf>,
     },
+    /// Record the build inputs and artifact hashes of a WASM build (#182)
+    ProvenanceRecord {
+        /// Workspace root
+        #[arg(long, default_value = ".")]
+        workspace: PathBuf,
+        /// Directory holding the built `.wasm` artifacts
+        #[arg(long, default_value = crate::wasm_provenance::DEFAULT_WASM_DIR)]
+        wasm_dir: PathBuf,
+        /// Manifest to write
+        #[arg(long, default_value = crate::wasm_provenance::DEFAULT_MANIFEST)]
+        manifest: PathBuf,
+    },
+    /// Verify WASM artifacts against a recorded provenance manifest (#182)
+    ProvenanceVerify {
+        /// Workspace root
+        #[arg(long, default_value = ".")]
+        workspace: PathBuf,
+        /// Directory holding the built `.wasm` artifacts
+        #[arg(long, default_value = crate::wasm_provenance::DEFAULT_WASM_DIR)]
+        wasm_dir: PathBuf,
+        /// Manifest to verify against
+        #[arg(long, default_value = crate::wasm_provenance::DEFAULT_MANIFEST)]
+        manifest: PathBuf,
+        /// Print the report as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        /// Exit zero on explained drift (a build input changed) as well as a clean match
+        #[arg(long, default_value_t = false)]
+        allow_explained: bool,
+    },
     /// Verify a saved snapshot against its sha256 manifest (exits non-zero on mismatch)
     Restore {
         /// Snapshot directory containing dashboard.json, metrics.txt, report.html, checksums.sha256
@@ -477,8 +507,7 @@ impl ToolkitCommand {
 impl CodegenCommand {
     fn spec_path(&self) -> Option<&PathBuf> {
         match self {
-            Self::Ts { spec, .. } => spec.as_ref(),
-            Self::Check { spec } => spec.as_ref(),
+            Self::Ts { spec, .. } | Self::Check { spec } => spec.as_ref(),
         }
     }
 }
@@ -725,6 +754,81 @@ fn run_monitoring(cmd: &MonitoringCommand) -> Result<()> {
             }
             Ok(())
         }
+        MonitoringCommand::ProvenanceRecord {
+            workspace,
+            wasm_dir,
+            manifest,
+        } => {
+            let root = normalize_workspace_root(workspace);
+            let wasm_path = resolve_path(&root, wasm_dir);
+            let manifest_path = resolve_path(&root, manifest);
+            let recorded = crate::wasm_provenance::ProvenanceManifest::record(&root, &wasm_path)
+                .map_err(|e| {
+                    ToolkitError::ExecutionError(format!(
+                        "record provenance from {}: {e}",
+                        wasm_path.display()
+                    ))
+                })?;
+            recorded
+                .save(&manifest_path)
+                .map_err(|e| ToolkitError::ExecutionError(e.to_string()))?;
+            println!(
+                "Recorded {} artifact(s) to {}",
+                recorded.artifacts.len(),
+                manifest_path.display()
+            );
+            for (name, artifact) in &recorded.artifacts {
+                println!(
+                    "  {name}  sha256={}  {} bytes",
+                    artifact.sha256, artifact.size_bytes
+                );
+            }
+            Ok(())
+        }
+        MonitoringCommand::ProvenanceVerify {
+            workspace,
+            wasm_dir,
+            manifest,
+            json,
+            allow_explained,
+        } => {
+            let root = normalize_workspace_root(workspace);
+            let wasm_path = resolve_path(&root, wasm_dir);
+            let manifest_path = resolve_path(&root, manifest);
+            let recorded = crate::wasm_provenance::ProvenanceManifest::load(&manifest_path)
+                .map_err(|e| ToolkitError::ExecutionError(e.to_string()))?;
+            let report =
+                crate::wasm_provenance::verify(&recorded, &root, &wasm_path).map_err(|e| {
+                    ToolkitError::ExecutionError(format!("verify {}: {e}", wasm_path.display()))
+                })?;
+
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report)
+                        .map_err(|e| ToolkitError::ExecutionError(e.to_string()))?
+                );
+            } else {
+                for line in report.summary_lines() {
+                    println!("{line}");
+                }
+            }
+
+            let unexplained = report.unexplained().len();
+            if unexplained > 0 {
+                return Err(ToolkitError::ExecutionError(format!(
+                    "{unexplained} artifact(s) changed without a recorded input change"
+                )));
+            }
+            if !report.is_clean() && !*allow_explained {
+                return Err(ToolkitError::ExecutionError(
+                    "build inputs changed since the manifest was recorded; \
+                     rebuild and re-record, or pass --allow-explained"
+                        .to_string(),
+                ));
+            }
+            Ok(())
+        }
         MonitoringCommand::Restore { snapshot } => {
             let dir = resolve_path(&root, snapshot);
             let restore =
@@ -783,90 +887,86 @@ fn run_glossary(cmd: &GlossaryCommand) -> Result<()> {
         GlossaryFormat::Plain
     });
 
-    match term {
-        Some(term) => {
-            let Lookup {
-                entry,
-                kind,
-                also_matches,
-            } = book.lookup(term).ok_or_else(|| {
-                // A miss is a failure, not an empty success. Suggestions go to
-                // stderr so stdout stays clean for the caller.
-                let suggestions = book.suggestions(term, 3);
-                if !suggestions.is_empty() {
-                    let names: Vec<&str> = suggestions.iter().map(|e| e.term.as_str()).collect();
-                    eprintln!("No glossary term matches `{term}`.");
-                    eprintln!("Did you mean: {}?", names.join(", "));
-                    eprintln!("Try `stellar-toolkit glossary list` for all terms.");
-                } else {
-                    eprintln!("No glossary term matches `{term}`.");
-                    eprintln!("Try `stellar-toolkit glossary list` for all terms.");
-                }
-                ToolkitError::Glossary(format!("no glossary term matches `{term}`"))
-            })?;
+    if let Some(term) = term {
+        let Lookup {
+            entry,
+            kind,
+            also_matches,
+        } = book.lookup(term).ok_or_else(|| {
+            // A miss is a failure, not an empty success. Suggestions go to
+            // stderr so stdout stays clean for the caller.
+            let suggestions = book.suggestions(term, 3);
+            if suggestions.is_empty() {
+                eprintln!("No glossary term matches `{term}`.");
+                eprintln!("Try `stellar-toolkit glossary list` for all terms.");
+            } else {
+                let names: Vec<&str> = suggestions.iter().map(|e| e.term.as_str()).collect();
+                eprintln!("No glossary term matches `{term}`.");
+                eprintln!("Did you mean: {}?", names.join(", "));
+                eprintln!("Try `stellar-toolkit glossary list` for all terms.");
+            }
+            ToolkitError::Glossary(format!("no glossary term matches `{term}`"))
+        })?;
 
-            match format {
-                GlossaryFormat::Json => {
-                    let payload = serde_json::json!({
-                        "query": term,
-                        "match": kind.label(),
-                        "entry": entry,
-                        "also_matches": also_matches,
-                    });
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&payload)
-                            .map_err(|e| ToolkitError::Glossary(e.to_string()))?
-                    );
-                }
-                GlossaryFormat::Plain => {
-                    println!("{}: {}", entry.term, entry.definition);
-                    for other in &also_matches {
-                        println!("{}: {}", other.term, other.definition);
-                    }
-                }
-                GlossaryFormat::Human => {
-                    println!("{}", entry.term);
-                    println!("{}", "=".repeat(entry.term.chars().count()));
-                    println!("{}", entry.definition);
-                    println!();
-                    println!("anchor: #{}", entry.anchor);
-                    if kind != crate::glossary::MatchKind::Exact {
-                        println!("matched by: {} (for `{term}`)", kind.label());
-                    }
-                    if !also_matches.is_empty() {
-                        let names: Vec<&str> =
-                            also_matches.iter().map(|e| e.term.as_str()).collect();
-                        println!("see also: {}", names.join(", "));
-                    }
+        match format {
+            GlossaryFormat::Json => {
+                let payload = serde_json::json!({
+                    "query": term,
+                    "match": kind.label(),
+                    "entry": entry,
+                    "also_matches": also_matches,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .map_err(|e| ToolkitError::Glossary(e.to_string()))?
+                );
+            }
+            GlossaryFormat::Plain => {
+                println!("{}: {}", entry.term, entry.definition);
+                for other in &also_matches {
+                    println!("{}: {}", other.term, other.definition);
                 }
             }
-            Ok(())
-        }
-        None => {
-            let entries: Vec<&GlossaryEntry> = book.entries.iter().collect();
-            match format {
-                GlossaryFormat::Json => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&book.entries)
-                            .map_err(|e| ToolkitError::Glossary(e.to_string()))?
-                    );
+            GlossaryFormat::Human => {
+                println!("{}", entry.term);
+                println!("{}", "=".repeat(entry.term.chars().count()));
+                println!("{}", entry.definition);
+                println!();
+                println!("anchor: #{}", entry.anchor);
+                if kind != crate::glossary::MatchKind::Exact {
+                    println!("matched by: {} (for `{term}`)", kind.label());
                 }
-                GlossaryFormat::Plain => {
-                    for e in entries {
-                        println!("{}: {}", e.term, e.definition);
-                    }
-                }
-                GlossaryFormat::Human => {
-                    println!("Glossary terms ({}):", entries.len());
-                    for e in entries {
-                        println!("  {:<40} #{}", e.term, e.anchor);
-                    }
+                if !also_matches.is_empty() {
+                    let names: Vec<&str> = also_matches.iter().map(|e| e.term.as_str()).collect();
+                    println!("see also: {}", names.join(", "));
                 }
             }
-            Ok(())
         }
+        Ok(())
+    } else {
+        let entries: Vec<&GlossaryEntry> = book.entries.iter().collect();
+        match format {
+            GlossaryFormat::Json => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&book.entries)
+                        .map_err(|e| ToolkitError::Glossary(e.to_string()))?
+                );
+            }
+            GlossaryFormat::Plain => {
+                for e in entries {
+                    println!("{}: {}", e.term, e.definition);
+                }
+            }
+            GlossaryFormat::Human => {
+                println!("Glossary terms ({}):", entries.len());
+                for e in entries {
+                    println!("  {:<40} #{}", e.term, e.anchor);
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1142,7 +1242,7 @@ fn run_env(cmd: &EnvCommand) -> Result<()> {
                         root.join(format!("{name}.toml")).display(),
                         config.env.soroban_rpc_url
                     ),
-                    Err(e) => println!("{:<6} {}", name, e),
+                    Err(e) => println!("{name:<6} {e}"),
                 }
             }
             Ok(())
@@ -1248,9 +1348,10 @@ fn cwd_root() -> PathBuf {
 
 fn normalize_workspace_root(workspace: &PathBuf) -> PathBuf {
     let start = if workspace.as_os_str().is_empty() || workspace == &PathBuf::from(".") {
-        std::env::var("CARGO_MANIFEST_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+        std::env::var("CARGO_MANIFEST_DIR").map_or_else(
+            |_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            PathBuf::from,
+        )
     } else {
         workspace.clone()
     };

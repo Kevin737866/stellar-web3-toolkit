@@ -4,7 +4,7 @@ use crate::idempotency::{IdempotencyKey, IdempotencyStore};
 use crate::monitor::{MonitoringConfig, SwapMonitor};
 use crate::preimage::PreimageManager;
 use crate::replay::{ReplayError, ReplayGuard, ReplayStats};
-use crate::swap::{AtomicSwap, SwapTemplate};
+use crate::swap::{AtomicSwap, SwapFailureReason, SwapTemplate};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -189,7 +189,7 @@ impl AtomicSwapCoordinator {
         let swap_id = Uuid::new_v4().to_string();
 
         // Calculate timeout ledger (simplified - in real implementation, get current ledger)
-        let current_ledger = 100000u32; // Placeholder
+        let current_ledger = 100_000u32; // Placeholder
         let timeout_ledger = current_ledger + (request.timeout_hours * 720); // ~720 ledgers per hour
 
         // Create atomic swap
@@ -335,6 +335,65 @@ impl AtomicSwapCoordinator {
         Ok(())
     }
 
+    /// Record why `swap_id` failed, so the swap carries a terminal reason (#391).
+    ///
+    /// This is the only way a swap reaches [`SwapStatus::Failed`](crate::SwapStatus::Failed)
+    /// through the coordinator: a status without a reason tells an operator
+    /// nothing, and a settlement flow that stopped is exactly the case where they
+    /// need to know whether to retry, refund or escalate.
+    ///
+    /// Returns `true` when the reason was recorded, `false` when the swap is
+    /// unknown or already carries one — the first reason is never overwritten.
+    pub async fn fail_swap(
+        &self,
+        swap_id: &str,
+        reason: SwapFailureReason,
+        current_ledger: u32,
+    ) -> Result<bool> {
+        let mut swaps = self.swaps.write().await;
+        let swap = swaps
+            .get_mut(swap_id)
+            .ok_or_else(|| AtomicSwapError::SwapNotFound {
+                swap_id: swap_id.to_string(),
+            })?;
+
+        // A swap that already settled or timed out is not a failure: refusing
+        // here keeps `Completed`/`Refunded`/`Expired` from being overwritten by a
+        // late error report. `Failed` is excluded so a swap marked failed
+        // without a reason (an older record) can still be given one.
+        if swap.status.is_terminal() && !matches!(swap.status, crate::swap::SwapStatus::Failed) {
+            return Err(AtomicSwapError::SwapAlreadyCompleted {
+                swap_id: swap_id.to_string(),
+            });
+        }
+
+        let recorded = swap.mark_failed(reason.clone(), current_ledger);
+        drop(swaps);
+
+        if recorded {
+            // The monitor keeps its own copy; propagate the reason there too so
+            // status output and the `Failed` event agree with the coordinator.
+            info!("Failed swap {}: {}", swap_id, reason);
+            self.monitor
+                .fail_swap(swap_id, reason, current_ledger)
+                .await;
+        }
+        Ok(recorded)
+    }
+
+    /// The terminal reason recorded for a failed swap (#391).
+    ///
+    /// `None` while the swap can still settle, or when it settled/timed out.
+    pub async fn terminal_reason(&self, swap_id: &str) -> Result<Option<String>> {
+        let swaps = self.swaps.read().await;
+        let swap = swaps
+            .get(swap_id)
+            .ok_or_else(|| AtomicSwapError::SwapNotFound {
+                swap_id: swap_id.to_string(),
+            })?;
+        Ok(swap.terminal_reason())
+    }
+
     /// Create a multi-hop swap through intermediary assets
     // A multi-hop route legitimately carries one set of arguments per hop.
     #[allow(clippy::too_many_arguments)]
@@ -394,7 +453,7 @@ impl AtomicSwapCoordinator {
             let next_participant = if is_last_hop {
                 participant.clone()
             } else {
-                format!("hop_{}", i)
+                format!("hop_{i}")
             };
             let next_asset = if is_last_hop {
                 participant_asset.clone()
@@ -641,6 +700,7 @@ impl AtomicSwapCoordinator {
         Ok(vec![])
     }
 
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // kept async so the oracle lookup can be awaited later
     async fn calculate_exchange_amount(
         &self,
         amount: i128,
@@ -737,7 +797,7 @@ mod tests {
 
         // Complete the swap
         coordinator
-            .complete_swap(response.swap_id, preimage, 101000)
+            .complete_swap(response.swap_id, preimage, 101_000)
             .await
             .unwrap();
 
@@ -1053,6 +1113,133 @@ mod tests {
             !coordinator.forget_idempotency_key(&key).await,
             "forgetting a key twice reports the second call as a no-op"
         );
+    }
+
+    #[tokio::test]
+    async fn a_failed_swap_exposes_a_terminal_reason_through_the_coordinator() {
+        use crate::swap::SwapFailureReason;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let coordinator = coordinator_with_usdc().await;
+        let swap_id = coordinator
+            .initiate_swap("initiator".to_string(), request_with_origin(None))
+            .await
+            .unwrap()
+            .swap_id;
+
+        assert!(
+            coordinator
+                .terminal_reason(&swap_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "a pending swap has no terminal reason"
+        );
+
+        let failed_events = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&failed_events);
+        coordinator
+            .monitor
+            .add_event_handler(move |event| {
+                if let crate::monitor::SwapEvent::Failed { reason_code, .. } = event {
+                    assert_eq!(reason_code, "retry_budget_exhausted");
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+            .await;
+
+        let reason = SwapFailureReason::RetryBudgetExhausted {
+            operation: "submit_htlc".to_string(),
+            attempts: 3,
+        };
+        assert!(coordinator
+            .fail_swap(&swap_id, reason.clone(), 101_500)
+            .await
+            .unwrap());
+
+        let swap = coordinator.get_swap(swap_id.clone()).await.unwrap();
+        assert_eq!(swap.status, crate::swap::SwapStatus::Failed);
+        assert_eq!(swap.failure().map(|f| &f.reason), Some(&reason));
+        assert_eq!(swap.failure().map(|f| f.ledger), Some(101_500));
+        assert_eq!(
+            coordinator.terminal_reason(&swap_id).await.unwrap(),
+            Some(reason.to_string())
+        );
+        assert_eq!(
+            failed_events.load(Ordering::SeqCst),
+            1,
+            "a recorded failure emits exactly one Failed event"
+        );
+
+        // A second report is a no-op: the first reason is the terminal one.
+        let late = SwapFailureReason::Abandoned {
+            detail: "operator".to_string(),
+        };
+        assert!(!coordinator
+            .fail_swap(&swap_id, late, 101_600)
+            .await
+            .unwrap());
+        assert_eq!(
+            coordinator.terminal_reason(&swap_id).await.unwrap(),
+            Some(reason.to_string())
+        );
+        assert_eq!(
+            failed_events.load(Ordering::SeqCst),
+            1,
+            "a duplicate report must not emit a second event"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_settled_swap_cannot_be_marked_failed() {
+        use crate::swap::SwapFailureReason;
+
+        let coordinator = coordinator_with_usdc().await;
+        let response = coordinator
+            .initiate_swap("initiator".to_string(), request_with_origin(None))
+            .await
+            .unwrap();
+        coordinator
+            .complete_swap(
+                response.swap_id.clone(),
+                response.preimage.clone().unwrap(),
+                101_000,
+            )
+            .await
+            .unwrap();
+
+        let error = coordinator
+            .fail_swap(
+                &response.swap_id,
+                SwapFailureReason::Abandoned {
+                    detail: "too late".to_string(),
+                },
+                101_100,
+            )
+            .await
+            .expect_err("a completed swap must not be overwritten by a failure");
+        assert!(matches!(
+            error,
+            AtomicSwapError::SwapAlreadyCompleted { .. }
+        ));
+        assert!(coordinator
+            .terminal_reason(&response.swap_id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn failing_an_unknown_swap_is_an_error_not_a_silent_success() {
+        use crate::swap::SwapFailureReason;
+
+        let coordinator = coordinator_with_usdc().await;
+        let error = coordinator
+            .fail_swap("does-not-exist", SwapFailureReason::CounterpartyTimeout, 1)
+            .await
+            .expect_err("an unknown swap cannot be failed");
+        assert!(matches!(error, AtomicSwapError::SwapNotFound { .. }));
+        assert!(coordinator.terminal_reason("does-not-exist").await.is_err());
     }
 
     #[tokio::test]

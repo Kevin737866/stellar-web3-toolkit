@@ -32,6 +32,7 @@ pub mod timelock;
 pub mod treasury_stream;
 pub mod ts_codegen;
 pub mod wallet;
+pub mod wasm_provenance;
 
 pub use anomaly::{
     catalog as anomaly_catalog, AnomalyDetector, AnomalyReport, AnomalyRule, Baseline, Direction,
@@ -80,4 +81,9 @@ pub use timelock::{
 };
 pub use treasury_stream::{
     StreamCancellation, StreamRelease, StreamStatus, Treasury, TreasuryStream,
+};
+pub use wasm_provenance::{
+    verify as verify_wasm_provenance, ArtifactProvenance, ArtifactStatus, ArtifactVerdict,
+    BuildInputs, ManifestError, ProvenanceManifest, ProvenanceReport, DEFAULT_MANIFEST,
+    DEFAULT_WASM_DIR, PROVENANCE_FILE, PROVENANCE_SCHEMA_VERSION,
 };

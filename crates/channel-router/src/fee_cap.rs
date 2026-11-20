@@ -18,15 +18,15 @@ use crate::{Channel, NetworkGraph, Route, RouteHop, RoutingError, MAX_ROUTE_HOPS
 use serde::{Deserialize, Serialize};
 
 /// Highest proportional fee rate (parts per million) a single channel may
-/// advertise. 5_000 ppm is 0.5% of the forwarded amount per hop.
+/// advertise. `5_000` ppm is 0.5% of the forwarded amount per hop.
 pub const MAX_CHANNEL_FEE_RATE_PPM: u32 = 5_000;
 
 /// Highest flat base fee (in stroops) a single channel may advertise.
-/// 100_000 stroops is 0.01 XLM per hop.
+/// `100_000` stroops is 0.01 XLM per hop.
 pub const MAX_CHANNEL_BASE_FEE: i128 = 100_000;
 
 /// Highest total route fee (parts per million of the payment amount).
-/// 20_000 ppm is 2% of the payment.
+/// `20_000` ppm is 2% of the payment.
 pub const MAX_ROUTE_FEE_PPM: u32 = 20_000;
 
 /// Absolute allowance added to the route fee cap. A route pays a flat base fee

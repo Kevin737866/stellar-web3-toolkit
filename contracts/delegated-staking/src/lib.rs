@@ -182,12 +182,7 @@ fn all_operators(env: &Env) -> Vec<Address> {
 ///
 /// A missing position is anchored at the *current* index rather than at zero, so
 /// a delegator cannot claim rewards that accrued before they joined.
-fn read_position(
-    env: &Env,
-    delegator: &Address,
-    operator: &Address,
-    index_now: i128,
-) -> Position {
+fn read_position(env: &Env, delegator: &Address, operator: &Address, index_now: i128) -> Position {
     let key = DataKey::Position(delegator.clone(), operator.clone());
     let record: Option<Position> = env.storage().persistent().get(&key);
     match record {
@@ -550,13 +545,11 @@ impl DelegatedStaking {
         let now = env.ledger().timestamp();
         let seconds = distributable_seconds(cfg.last_update, cfg.period_finish, now);
         let (delta, _) = reward_index_delta(cfg.reward_rate, seconds, cfg.total_staked);
-        position
-            .accrued
-            .saturating_add(accrued_rewards(
-                position.amount,
-                cfg.reward_per_token_stored.saturating_add(delta),
-                position.reward_per_token_paid,
-            ))
+        position.accrued.saturating_add(accrued_rewards(
+            position.amount,
+            cfg.reward_per_token_stored.saturating_add(delta),
+            position.reward_per_token_paid,
+        ))
     }
 
     // -- admin ---------------------------------------------------------------
@@ -566,7 +559,8 @@ impl DelegatedStaking {
         cfg.admin.require_auth();
         cfg.admin = new_admin.clone();
         set_config(&env, &cfg);
-        env.events().publish((symbol_short!("set_admin"),), new_admin);
+        env.events()
+            .publish((symbol_short!("set_admin"),), new_admin);
     }
 
     /// Blocks new delegations and reward funding. Exits stay open.
@@ -605,7 +599,8 @@ impl DelegatedStaking {
         list.push_back(operator.clone());
         env.storage().instance().set(&DataKey::Operators, &list);
 
-        env.events().publish((symbol_short!("add_op"), operator), commission_bps);
+        env.events()
+            .publish((symbol_short!("add_op"), operator), commission_bps);
     }
 
     /// Changes an operator's commission. Takes effect on the next claim or
@@ -621,7 +616,8 @@ impl DelegatedStaking {
             read_operator(&env, &operator).unwrap_or_else(|| panic!("unknown operator"));
         record.commission_bps = commission_bps;
         write_operator(&env, &record);
-        env.events().publish((symbol_short!("set_comm"), operator), commission_bps);
+        env.events()
+            .publish((symbol_short!("set_comm"), operator), commission_bps);
     }
 
     /// Stops new delegations to an operator. Existing positions can still be
@@ -633,7 +629,8 @@ impl DelegatedStaking {
             read_operator(&env, &operator).unwrap_or_else(|| panic!("unknown operator"));
         record.active = active;
         write_operator(&env, &record);
-        env.events().publish((symbol_short!("active"), operator), active);
+        env.events()
+            .publish((symbol_short!("active"), operator), active);
     }
 
     // -- rewards funding -----------------------------------------------------
@@ -673,8 +670,10 @@ impl DelegatedStaking {
         cfg.last_update = now;
         set_config(&env, &cfg);
 
-        env.events()
-            .publish((symbol_short!("fund"), funder), (amount, rate, cfg.period_finish));
+        env.events().publish(
+            (symbol_short!("fund"), funder),
+            (amount, rate, cfg.period_finish),
+        );
         rate
     }
 
@@ -703,8 +702,14 @@ impl DelegatedStaking {
 
         transfer_in(&env, &cfg.token, &delegator, amount);
 
-        position.amount = position.amount.checked_add(amount).expect("amount overflow");
-        cfg.total_staked = cfg.total_staked.checked_add(amount).expect("total overflow");
+        position.amount = position
+            .amount
+            .checked_add(amount)
+            .expect("amount overflow");
+        cfg.total_staked = cfg
+            .total_staked
+            .checked_add(amount)
+            .expect("total overflow");
         record.total_staked = record
             .total_staked
             .checked_add(amount)
@@ -735,10 +740,7 @@ impl DelegatedStaking {
         let mut position = read_position(&env, &delegator, &operator, cfg.reward_per_token_stored);
         auto_compound(&env, &mut cfg, &mut position, &mut record);
 
-        assert!(
-            position.amount >= amount,
-            "insufficient delegated balance"
-        );
+        assert!(position.amount >= amount, "insufficient delegated balance");
 
         position.amount -= amount;
         cfg.total_staked -= amount;
@@ -965,10 +967,7 @@ mod test {
     #[test]
     fn add_operator_rejects_duplicates_and_out_of_range_commission() {
         let f = Fixture::new();
-        assert!(f
-            .client
-            .try_add_operator(&f.operator, &300)
-            .is_err());
+        assert!(f.client.try_add_operator(&f.operator, &300).is_err());
         assert!(f
             .client
             .try_add_operator(&Address::generate(&f.env), &(MAX_COMMISSION_BPS + 1))
@@ -1030,10 +1029,7 @@ mod test {
         f.advance(100);
 
         // 100 seconds of rewards = 100 * ONE, split 25% / 75%.
-        assert_eq!(
-            f.client.pending_rewards(&f.alice, &f.operator),
-            25 * ONE
-        );
+        assert_eq!(f.client.pending_rewards(&f.alice, &f.operator), 25 * ONE);
         assert_eq!(f.client.pending_rewards(&f.bob, &f.operator), 75 * ONE);
         // The proposal is a projection: nothing has been credited yet.
         assert_eq!(f.client.rewards_credited(), 0);
@@ -1125,7 +1121,10 @@ mod test {
             .client
             .try_compound(&f.alice, &f.operator, &(95 * ONE + 1))
             .is_err());
-        assert_eq!(f.client.compound(&f.alice, &f.operator, &(95 * ONE)), 95 * ONE);
+        assert_eq!(
+            f.client.compound(&f.alice, &f.operator, &(95 * ONE)),
+            95 * ONE
+        );
     }
 
     #[test]
@@ -1198,7 +1197,10 @@ mod test {
         assert_eq!(f.client.position(&f.alice, &f.operator).amount, 0);
         assert_eq!(f.client.total_staked(), 0);
         assert!(f.client.delegator_operators(&f.alice).is_empty());
-        assert!(f.client.try_undelegate(&f.alice, &f.operator, &ONE).is_err());
+        assert!(f
+            .client
+            .try_undelegate(&f.alice, &f.operator, &ONE)
+            .is_err());
     }
 
     #[test]
@@ -1235,7 +1237,8 @@ mod test {
 
         // New activity stops.
         f.mint(&f.alice, 100 * ONE);
-        assert!(f.client
+        assert!(f
+            .client
             .try_delegate(&f.alice, &f.operator, &(10 * ONE))
             .is_err());
         let funder = Address::generate(&f.env);
@@ -1257,10 +1260,7 @@ mod test {
         f.client.set_operator_active(&f.operator, &false);
         assert!(!f.client.operator_of(&f.operator).unwrap().active);
 
-        assert!(f
-            .client
-            .try_delegate(&f.alice, &f.operator, &ONE)
-            .is_err());
+        assert!(f.client.try_delegate(&f.alice, &f.operator, &ONE).is_err());
 
         // Exit and claim still work.
         f.fund(100 * ONE, 100);
@@ -1415,7 +1415,10 @@ mod test {
 
         f.client.set_commission(&f.other_operator, &1_000);
         assert_eq!(
-            f.client.operator_of(&f.other_operator).unwrap().commission_bps,
+            f.client
+                .operator_of(&f.other_operator)
+                .unwrap()
+                .commission_bps,
             1_000
         );
         assert!(f

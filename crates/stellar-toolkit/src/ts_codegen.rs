@@ -15,6 +15,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 /// Soroban integer types that must be represented as `bigint` in TypeScript.
@@ -26,7 +27,7 @@ const SDK_MODULE: &str = "stellar-sdk";
 /// A single contract function parameter with its Soroban type.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ParamSpec {
-    /// Parameter name as declared by the contract (snake_case).
+    /// Parameter name as declared by the contract (`snake_case`).
     pub name: String,
     /// Soroban/Rust type, e.g. `i128`, `Address`, `Vec<Address>`.
     pub soroban_type: String,
@@ -36,6 +37,7 @@ pub struct ParamSpec {
 }
 
 impl ParamSpec {
+    #[must_use]
     pub fn new(name: &str, soroban_type: &str) -> Self {
         Self {
             name: name.to_string(),
@@ -44,6 +46,7 @@ impl ParamSpec {
         }
     }
 
+    #[must_use]
     pub fn optional(name: &str, soroban_type: &str) -> Self {
         Self {
             name: name.to_string(),
@@ -53,16 +56,19 @@ impl ParamSpec {
     }
 
     /// TypeScript annotation for this parameter.
+    #[must_use]
     pub fn ts_type(&self) -> String {
         ts_type_for(&self.soroban_type)
     }
 
     /// `nativeToScVal` type hint for this parameter.
+    #[must_use]
     pub fn scval_type(&self) -> String {
         scval_type_for(&self.soroban_type)
     }
 
     /// Identifier used for this parameter in the generated client.
+    #[must_use]
     pub fn identifier(&self) -> String {
         ts_identifier(&self.name)
     }
@@ -71,7 +77,7 @@ impl ParamSpec {
 /// A contract function exposed to clients.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FunctionSpec {
-    /// Function name as declared by the contract (snake_case).
+    /// Function name as declared by the contract (`snake_case`).
     pub name: String,
     /// Short doc comment copied into the generated client.
     #[serde(default)]
@@ -82,6 +88,7 @@ pub struct FunctionSpec {
 }
 
 impl FunctionSpec {
+    #[must_use]
     pub fn new(name: &str, doc: &str, params: Vec<ParamSpec>, returns: &str) -> Self {
         Self {
             name: name.to_string(),
@@ -92,6 +99,7 @@ impl FunctionSpec {
     }
 
     /// TypeScript return annotation.
+    #[must_use]
     pub fn ts_return(&self) -> String {
         if is_void(&self.returns) {
             "void".to_string()
@@ -101,6 +109,7 @@ impl FunctionSpec {
     }
 
     /// Whether the function returns a value that must be decoded.
+    #[must_use]
     pub fn returns_value(&self) -> bool {
         !is_void(&self.returns)
     }
@@ -109,7 +118,7 @@ impl FunctionSpec {
 /// Contract interface used as codegen input.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContractSpec {
-    /// Contract name in PascalCase, e.g. `AmmPool`.
+    /// Contract name in `PascalCase`, e.g. `AmmPool`.
     pub name: String,
     /// Deployed contract id, or a placeholder in generated clients.
     pub contract_id: String,
@@ -121,6 +130,7 @@ pub struct ContractSpec {
 impl ContractSpec {
     /// Bundled `contracts/amm-pool` interface used by the `codegen` commands
     /// when no spec file is supplied.
+    #[must_use]
     pub fn amm_pool() -> Self {
         Self {
             name: "AmmPool".to_string(),
@@ -239,6 +249,7 @@ impl ContractSpec {
     }
 
     /// Soroban RPC endpoint matching the configured network.
+    #[must_use]
     pub fn rpc_url(&self) -> String {
         if self.network_passphrase.starts_with("Test SDF Network") {
             "https://soroban-testnet.stellar.org".to_string()
@@ -255,6 +266,7 @@ pub struct ImportSet {
 }
 
 impl ImportSet {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -270,15 +282,16 @@ impl ImportSet {
 
     /// Render one `import { .. } from "..";` statement per module, with the
     /// modules and their symbols in deterministic (sorted) order.
+    #[must_use]
     pub fn render(&self) -> String {
         let mut out = String::new();
         for (module, symbols) in &self.modules {
             let list = symbols
                 .iter()
-                .map(|s| s.as_str())
+                .map(std::string::String::as_str)
                 .collect::<Vec<_>>()
                 .join(", ");
-            out.push_str(&format!("import {{ {list} }} from \"{module}\";\n"));
+            let _ = writeln!(out, "import {{ {list} }} from \"{module}\";");
         }
         out
     }
@@ -290,19 +303,22 @@ pub struct TsClientGenerator {
 }
 
 impl TsClientGenerator {
+    #[must_use]
     pub fn new(spec: ContractSpec) -> Self {
         Self { spec }
     }
 
+    #[must_use]
     pub fn spec(&self) -> &ContractSpec {
         &self.spec
     }
 
     /// Imports required by the generated client, deduplicated per module.
+    #[must_use]
     pub fn imports(&self) -> ImportSet {
         let mut imports = ImportSet::new();
         let has_args = self.spec.functions.iter().any(|f| !f.params.is_empty());
-        let has_results = self.spec.functions.iter().any(|f| f.returns_value());
+        let has_results = self.spec.functions.iter().any(FunctionSpec::returns_value);
         if has_args {
             imports.add_value("./scval", "toScVal");
         }
@@ -315,28 +331,29 @@ impl TsClientGenerator {
     }
 
     /// Render the client module source.
+    #[must_use]
     pub fn generate(&self) -> String {
         let mut out = String::new();
-        out.push_str(&format!(
-            "// Auto-generated by stellar-toolkit `codegen ts` for {}.\n",
+        let _ = writeln!(
+            out,
+            "// Auto-generated by stellar-toolkit `codegen ts` for {}.",
             self.spec.name
-        ));
+        );
         out.push_str("// 64-bit and wider Soroban integers are emitted as `bigint`.\n\n");
         out.push_str(&self.imports().render());
         out.push('\n');
-        out.push_str(&format!(
-            "export const CONTRACT_ID = \"{}\";\n",
+        let _ = writeln!(
+            out,
+            "export const CONTRACT_ID = \"{}\";",
             self.spec.contract_id
-        ));
-        out.push_str(&format!(
-            "export const NETWORK_PASSPHRASE = \"{}\";\n",
+        );
+        let _ = writeln!(
+            out,
+            "export const NETWORK_PASSPHRASE = \"{}\";",
             self.spec.network_passphrase
-        ));
-        out.push_str(&format!(
-            "export const RPC_URL = \"{}\";\n",
-            self.spec.rpc_url()
-        ));
-        out.push_str(&format!("\nexport class {}Client {{\n", self.spec.name));
+        );
+        let _ = writeln!(out, "export const RPC_URL = \"{}\";", self.spec.rpc_url());
+        let _ = writeln!(out, "\nexport class {}Client {{", self.spec.name);
         out.push_str("  readonly contract: Contract;\n\n");
         out.push_str("  constructor(\n");
         out.push_str("    readonly rpcClient: rpc.Server = new rpc.Server(RPC_URL),\n");
@@ -352,6 +369,7 @@ impl TsClientGenerator {
     }
 
     /// Generated artifacts as `(file name, source)` pairs.
+    #[must_use]
     pub fn files(&self) -> Vec<(String, String)> {
         vec![
             ("scval.ts".to_string(), scval_runtime_source()),
@@ -376,7 +394,7 @@ impl TsClientGenerator {
 
     fn push_method(&self, out: &mut String, f: &FunctionSpec) {
         if !f.doc.is_empty() {
-            out.push_str(&format!("  /** {} */\n", f.doc));
+            let _ = writeln!(out, "  /** {} */", f.doc);
         }
         let args: Vec<String> = f
             .params
@@ -387,12 +405,13 @@ impl TsClientGenerator {
             })
             .collect();
         let ret = f.ts_return();
-        out.push_str(&format!(
-            "  async {}({}): Promise<{}> {{\n",
+        let _ = writeln!(
+            out,
+            "  async {}({}): Promise<{}> {{",
             ts_identifier(&f.name),
             args.join(", "),
             ret
-        ));
+        );
         let call_args: Vec<String> = f
             .params
             .iter()
@@ -408,10 +427,10 @@ impl TsClientGenerator {
             )
         };
         if ret == "void" {
-            out.push_str(&format!("    await {invoke};\n"));
+            let _ = writeln!(out, "    await {invoke};");
         } else {
-            out.push_str(&format!("    const result = await {invoke};\n"));
-            out.push_str(&format!("    return fromScVal(result) as {ret};\n"));
+            let _ = writeln!(out, "    const result = await {invoke};");
+            let _ = writeln!(out, "    return fromScVal(result) as {ret};");
         }
         out.push_str("  }\n\n");
     }
@@ -441,6 +460,7 @@ fn scval_runtime_source() -> String {
 
 /// Map a Soroban type to its TypeScript equivalent. Integers of 64 bits and
 /// wider become `bigint` because they do not fit a JavaScript `number`.
+#[must_use]
 pub fn ts_type_for(soroban_type: &str) -> String {
     let t = soroban_type.trim();
     if t.is_empty() {
@@ -464,6 +484,7 @@ pub fn ts_type_for(soroban_type: &str) -> String {
 }
 
 /// `nativeToScVal` type hint for a Soroban type.
+#[must_use]
 pub fn scval_type_for(soroban_type: &str) -> String {
     let t = soroban_type.trim();
     if t.starts_with('(') && t.ends_with(')') {
@@ -605,6 +626,7 @@ fn kebab_case(name: &str) -> String {
 }
 
 /// Automated check #57: report duplicate imports in a generated module.
+#[must_use]
 pub fn audit_imports(source: &str) -> Vec<String> {
     let mut problems = Vec::new();
     let mut modules: BTreeMap<String, usize> = BTreeMap::new();
@@ -637,6 +659,7 @@ pub fn audit_imports(source: &str) -> Vec<String> {
 }
 
 /// Automated check #58: report wide Soroban integers generated as `number`.
+#[must_use]
 pub fn audit_bigint(source: &str) -> Vec<String> {
     let declared = declared_types(source);
     let mut problems = Vec::new();
@@ -660,6 +683,7 @@ pub fn audit_bigint(source: &str) -> Vec<String> {
 
 /// Automated check #58 (type map half): the Soroban to TypeScript map must
 /// never widen a 64-bit or wider integer to `number`.
+#[must_use]
 pub fn audit_type_map() -> Vec<String> {
     let mut problems = Vec::new();
     for t in WIDE_INT_TYPES {
@@ -683,6 +707,7 @@ pub fn audit_type_map() -> Vec<String> {
 
 /// Run every codegen check for `spec`; an empty result means the client passes
 /// both the import dedup check and the bigint mapping check.
+#[must_use]
 pub fn run_checks(spec: &ContractSpec) -> Vec<String> {
     let generator = TsClientGenerator::new(spec.clone());
     let mut problems = audit_type_map();

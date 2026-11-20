@@ -69,6 +69,7 @@ pub struct QuorumLiveness {
 
 impl QuorumLiveness {
     /// Whether settlement is currently possible.
+    #[must_use]
     pub fn is_reachable(&self) -> bool {
         self.reachable
     }
@@ -78,6 +79,7 @@ impl QuorumLiveness {
     /// Only meaningful while reachable; an unreachable bridge has no oracle to
     /// call critical, and this returns `false` there rather than overstating the
     /// problem.
+    #[must_use]
     pub fn every_online_oracle_is_critical(&self) -> bool {
         self.reachable && self.online_failure_tolerance == 0
     }

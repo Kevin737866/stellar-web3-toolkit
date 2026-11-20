@@ -91,10 +91,12 @@ impl ProposalMetadata {
         })
     }
 
+    #[must_use]
     pub fn title(&self) -> &str {
         &self.title
     }
 
+    #[must_use]
     pub fn description(&self) -> &str {
         &self.description
     }
@@ -105,6 +107,7 @@ impl ProposalMetadata {
 /// Returns `0` when either input is zero. Locks beyond [`MAX_LOCK_LEDGERS`] are
 /// treated as [`MAX_LOCK_LEDGERS`]. The result is in the same unit as
 /// `WEIGHT_SCALE` (a full-lock vote for `balance` 1 000 000 is 10 000 000).
+#[must_use]
 pub fn conviction_weight(balance: u64, lock_ledgers: u32) -> u128 {
     if balance == 0 || lock_ledgers == 0 {
         return 0;
@@ -128,6 +131,7 @@ pub fn conviction_weight(balance: u64, lock_ledgers: u32) -> u128 {
 ///
 /// A zero half-life decays to nothing immediately (there is no meaningful
 /// interpolation to do); zero elapsed ledgers returns the weight unchanged.
+#[must_use]
 pub fn decayed_weight(weight: u128, elapsed_ledgers: u32, half_life_ledgers: u32) -> u128 {
     if weight == 0 || elapsed_ledgers == 0 {
         return weight;
@@ -157,6 +161,7 @@ pub fn decayed_weight(weight: u128, elapsed_ledgers: u32, half_life_ledgers: u32
 ///
 /// Newton's method seeded from the bit length, so even `u128::MAX` converges
 /// without overflowing `n + 1`.
+#[must_use]
 pub fn isqrt(n: u128) -> u128 {
     if n < 2 {
         return n;
@@ -166,14 +171,13 @@ pub fn isqrt(n: u128) -> u128 {
     let mut root = 1u128 << bit_length.div_ceil(2);
 
     loop {
-        let next = (root + n / root) / 2;
+        let next = u128::midpoint(root, n / root);
         if next >= root {
             return root;
         }
         root = next;
     }
 }
-
 
 /// Shortest allowed proposal voting window in ledgers (issue #448).
 pub const MIN_VOTE_WINDOW_LEDGERS: u32 = 1;
@@ -241,14 +245,17 @@ impl VoteWindow {
         })
     }
 
+    #[must_use]
     pub fn start_ledger(self) -> u32 {
         self.start_ledger
     }
 
+    #[must_use]
     pub fn end_ledger(self) -> u32 {
         self.end_ledger
     }
 
+    #[must_use]
     pub fn duration(self) -> u32 {
         self.end_ledger - self.start_ledger
     }
@@ -261,6 +268,7 @@ pub struct ProposalBallotBox {
 }
 
 impl ProposalBallotBox {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -287,6 +295,7 @@ impl ProposalBallotBox {
         Ok(weight)
     }
 
+    #[must_use]
     pub fn has_voted(&self, proposal_id: u64, voter: &str) -> bool {
         self.seen.contains(&(proposal_id, voter.trim().to_string()))
     }

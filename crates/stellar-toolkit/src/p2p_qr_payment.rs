@@ -5,6 +5,7 @@
 
 use crate::error::{Result, ToolkitError};
 use serde::{Deserialize, Serialize};
+use std::fmt::Write as _;
 use url::Url;
 
 /// Represents a P2P QR Payment Request payload
@@ -32,6 +33,7 @@ pub struct P2PQRPaymentFlow;
 
 impl P2PQRPaymentFlow {
     /// Encodes a QR payment request into a standard `web+stellar:pay` URI
+    #[must_use]
     pub fn encode_qr_uri(request: &QRPaymentRequest) -> String {
         let mut uri = format!(
             "web+stellar:pay?destination={}&amount={}&asset_code={}",
@@ -41,13 +43,13 @@ impl P2PQRPaymentFlow {
         );
 
         if let Some(issuer) = &request.asset_issuer {
-            uri.push_str(&format!("&asset_issuer={}", urlencoding::encode(issuer)));
+            let _ = write!(uri, "&asset_issuer={}", urlencoding::encode(issuer));
         }
         if let Some(memo) = &request.memo {
-            uri.push_str(&format!("&memo={}", urlencoding::encode(memo)));
+            let _ = write!(uri, "&memo={}", urlencoding::encode(memo));
         }
         if let Some(exp) = request.expiration_timestamp {
-            uri.push_str(&format!("&exp={}", exp));
+            let _ = write!(uri, "&exp={exp}");
         }
 
         uri
@@ -56,13 +58,12 @@ impl P2PQRPaymentFlow {
     /// Parses a `web+stellar:pay` or `stellar:pay` QR URI into a `QRPaymentRequest`
     pub fn parse_qr_uri(uri_str: &str) -> Result<QRPaymentRequest> {
         let parsed_url = Url::parse(uri_str)
-            .map_err(|e| ToolkitError::Session(format!("Invalid QR URI: {}", e)))?;
+            .map_err(|e| ToolkitError::Session(format!("Invalid QR URI: {e}")))?;
 
         let scheme = parsed_url.scheme();
         if scheme != "stellar" && scheme != "web+stellar" {
             return Err(ToolkitError::Session(format!(
-                "Unsupported URI scheme: {}",
-                scheme
+                "Unsupported URI scheme: {scheme}"
             )));
         }
 
@@ -146,7 +147,7 @@ mod tests {
             asset_code: "USDC".to_string(),
             asset_issuer: Some("GISSUER1234567890".to_string()),
             memo: Some("Invoice #42".to_string()),
-            expiration_timestamp: Some(1700000000),
+            expiration_timestamp: Some(1_700_000_000),
         };
 
         let uri = P2PQRPaymentFlow::encode_qr_uri(&req);

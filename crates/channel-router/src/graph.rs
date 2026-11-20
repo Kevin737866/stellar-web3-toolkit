@@ -88,8 +88,7 @@ impl<'a> GraphView<'a> {
     pub fn get_edges(&self, node_id: &str) -> &[GraphEdge] {
         self.adjacency_cache
             .get(node_id)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
+            .map_or(&[][..], std::vec::Vec::as_slice)
     }
 
     /// Check if the view is still valid
@@ -129,7 +128,7 @@ impl<'a> GraphView<'a> {
         reachable
     }
 
-    /// Find all paths from source to destination up to max_length
+    /// Find all paths from source to destination up to `max_length`
     pub fn find_all_paths(
         &self,
         source: &str,
