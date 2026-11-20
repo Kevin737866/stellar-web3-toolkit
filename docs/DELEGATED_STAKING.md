@@ -121,3 +121,23 @@ enforcement against a commission raise, compounding and auto-compounding,
 pause/inactive exits, schedule roll-over, zero-stake windows, schedule expiry,
 solvency over a full lifecycle, and the emitted events. The pure math has its own
 suite in `contracts/delegated-staking/src/math.rs`.
+
+### Emergency Undelegation & Transfer Invariants (Issues #412, #414, #415, #417)
+
+- `fund_rewards`: Inbound reward token transfer is verified before advancing pool accumulators or committing new emission rates.
+- `emergency_undelegate(delegator, operator) -> i128`: Allows immediate exit of full staked principal even when the contract is paused or an operator is disabled, explicitly forfeiting accrued rewards without drawing on reward accounting.
+- Invariants: Operator total staked strictly matches the sum of active delegator positions; contract balance strictly satisfies `total_staked + (rewards_funded - rewards_paid_out)`.
+
+## Authorization and Revocation Flows (Issue #416)
+
+### Delegator Authorization
+- **Delegation (`delegate`)**: Requires delegator authentication. Accrues any pending rewards from prior intervals and increments user position.
+- **Undelegation (`undelegate`)**: Requires delegator authentication. Strictly verifies `amount <= position.amount`. Leaves accrued rewards intact or auto-compounds them if enabled.
+- **Reward Claims (`claim`)**: Requires delegator authentication. Deducts operator commission and transfers net reward to delegator.
+- **Auto-Compound Toggle (`set_auto_compound`)**: Delegator can enable or revoke auto-compounding at any time. When disabled, subsequent delegations or exits stop compounding accruals.
+- **Emergency Undelegation (`emergency_undelegate`)**: Forfeits pending rewards and exits principal immediately, even if the operator is inactive or the pool is paused.
+
+### Pause Behavior (Issue #410)
+When `set_paused(true)` is activated by the admin:
+- New deposits and reward stream funding are blocked.
+- All exits (`undelegate`, `emergency_undelegate`) and reward harvests (`claim`, `compound`) remain fully functional.
