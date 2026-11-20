@@ -5,10 +5,12 @@
 //! payment channels, as well as executing off-chain payments.
 
 pub mod reorg;
+pub mod signed;
 
 use parking_lot::RwLock;
 use reorg::{ReorgError, ReorgLog};
 use serde::{Deserialize, Serialize};
+use signed::SignedChannelState;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use thiserror::Error;
@@ -53,6 +55,19 @@ pub enum PaymentChannelError {
         "Channel {channel_id} has no state at or below ledger height {height}; resync from chain is required"
     )]
     NoStateForReorg { channel_id: String, height: u32 },
+
+    /// A settlement presented a state the channel has already superseded (#352).
+    ///
+    /// Carries both numbers so an operator can tell a stale copy from a
+    /// deliberately replayed one without reading the payload again.
+    #[error(
+        "Stale state for channel {channel_id}: presented sequence {presented} is not newer than the recorded sequence {recorded}"
+    )]
+    StaleState {
+        channel_id: String,
+        recorded: u32,
+        presented: u32,
+    },
 }
 
 /// Channel status
@@ -524,6 +539,128 @@ impl ChannelManager {
         Ok(state.state.clone())
     }
 
+    /// Register the counterparty's public key for this channel.
+    ///
+    /// Settlement ([`ChannelManager::settle_signed_state`]) verifies the
+    /// presented signature against this key, so it must be registered after the
+    /// handshake. Re-registering replaces the key, which is what a key rotation
+    /// looks like; settlement itself never changes it.
+    pub fn set_remote_public_key(
+        &self,
+        channel_id: &str,
+        public_key: Vec<u8>,
+    ) -> Result<(), PaymentChannelError> {
+        let mut channels = self.channels.write();
+        let channel = channels
+            .get_mut(channel_id)
+            .ok_or_else(|| PaymentChannelError::ChannelNotFound(channel_id.to_string()))?;
+
+        if public_key.is_empty() {
+            return Err(PaymentChannelError::InvalidState(
+                "the counterparty public key must not be empty".to_string(),
+            ));
+        }
+
+        channel.state.remote_public_key = public_key;
+        Ok(())
+    }
+
+    /// Settle the channel on a signed state, refusing anything the channel has
+    /// already superseded (#352).
+    ///
+    /// The counterparty presents the newest split both parties signed. The
+    /// call succeeds only when all of the following hold, and nothing is
+    /// written unless they do:
+    ///
+    /// * the channel exists and is [`ChannelStatus::Open`];
+    /// * `signed.channel_id` names this channel;
+    /// * `signature` verifies over [`SignedChannelState::digest`] against the
+    ///   channel's registered `remote_public_key` (so
+    ///   [`ChannelManager::set_remote_public_key`] must have run);
+    /// * both balances are non-negative and sum to the channel total;
+    /// * `signed.sequence_number` is **strictly newer** than the channel's
+    ///   recorded sequence — an equal or lower number is
+    ///   [`PaymentChannelError::StaleState`];
+    /// * `ledger_height` is newer than the channel's last recorded height
+    ///   ([`PaymentChannelError::ReorgDetected`] otherwise).
+    ///
+    /// On success the balances are applied, the channel's sequence number is
+    /// advanced to the signed one (gaps are allowed: a party may have missed
+    /// intermediate updates) and the channel moves to
+    /// [`ChannelStatus::Closing`], because a settled split is a terminal state
+    /// that is waiting on the on-chain confirmation.
+    pub fn settle_signed_state(
+        &self,
+        signed: &SignedChannelState,
+        signature: &[u8],
+        ledger_height: u32,
+    ) -> Result<LocalChannelState, PaymentChannelError> {
+        let mut channels = self.channels.write();
+        let channel = channels
+            .get_mut(&signed.channel_id)
+            .ok_or_else(|| PaymentChannelError::ChannelNotFound(signed.channel_id.clone()))?;
+
+        if channel.state.status != ChannelStatus::Open {
+            return Err(PaymentChannelError::ChannelClosed(
+                channel.state.status.to_string(),
+            ));
+        }
+
+        if channel.state.remote_public_key.is_empty() {
+            return Err(PaymentChannelError::InvalidState(format!(
+                "channel {} has no registered counterparty key; call set_remote_public_key first",
+                signed.channel_id
+            )));
+        }
+
+        // Authenticate before anything else: an unsigned state must not be able
+        // to learn the recorded sequence number from the error it gets back.
+        let verified = self.signer.verify(
+            &signed.digest(),
+            signature,
+            &channel.state.remote_public_key,
+        )?;
+        if !verified {
+            return Err(PaymentChannelError::SignatureError(format!(
+                "settlement for channel {} is not signed by the counterparty",
+                signed.channel_id
+            )));
+        }
+
+        let total = signed.total()?;
+        if total != channel.state.our_balance + channel.state.their_balance {
+            return Err(PaymentChannelError::InvalidState(format!(
+                "settlement for {} does not conserve the channel total: {total} != {}",
+                signed.channel_id,
+                channel.state.our_balance + channel.state.their_balance
+            )));
+        }
+
+        // The staleness rule: only a strictly newer state may settle. This is
+        // what stops a party from settling on an older, more favourable split
+        // after the channel has moved on.
+        if signed.sequence_number <= channel.state.sequence_number {
+            return Err(PaymentChannelError::StaleState {
+                channel_id: signed.channel_id.clone(),
+                recorded: channel.state.sequence_number,
+                presented: signed.sequence_number,
+            });
+        }
+
+        // A rejected height must leave the channel exactly as it was, so the
+        // height is validated before any mutation.
+        check_height(&signed.channel_id, &channel.history, ledger_height)?;
+
+        channel.state.our_balance = signed.balance_a;
+        channel.state.their_balance = signed.balance_b;
+        channel.state.sequence_number = signed.sequence_number;
+        channel.state.status = ChannelStatus::Closing;
+
+        record_state(&signed.channel_id, channel, ledger_height)?;
+
+        Ok(channel.state.clone())
+    }
+
     /// Rebalance a channel
     pub fn rebalance(
         &self,
@@ -945,6 +1082,220 @@ mod tests {
             manager.get_channel(&channel_id).unwrap().status,
             ChannelStatus::Open
         );
+    }
+
+    /// Signer that signs by echoing the message, and verifies by comparing the
+    /// signature to the message. Unlike [`TestSigner`] it can reject a
+    /// signature, which is what the settlement tests need.
+    struct EchoSigner;
+
+    impl SignatureSigner for EchoSigner {
+        fn sign(&self, message: &[u8]) -> Result<Vec<u8>, PaymentChannelError> {
+            Ok(message.to_vec())
+        }
+
+        fn verify(
+            &self,
+            message: &[u8],
+            signature: &[u8],
+            _public_key: &[u8],
+        ) -> Result<bool, PaymentChannelError> {
+            Ok(message == signature)
+        }
+
+        fn public_key(&self) -> Vec<u8> {
+            vec![9u8; 32]
+        }
+    }
+
+    /// A manager whose channel has a registered counterparty key, ready to
+    /// settle.
+    async fn manager_ready_to_settle() -> (ChannelManager, String) {
+        let manager = ChannelManager::with_history_depth(Box::new(EchoSigner), 8);
+        let state = manager
+            .create_channel("alice".to_string(), "bob".to_string(), 1_000, 1_000, 100, 0)
+            .await
+            .unwrap();
+        manager
+            .set_remote_public_key(&state.channel_id, vec![5u8; 32])
+            .unwrap();
+        (manager, state.channel_id)
+    }
+
+    fn signed(channel_id: &str, sequence_number: u32, a: i128, b: i128) -> SignedChannelState {
+        SignedChannelState::new(channel_id, sequence_number, a, b)
+    }
+
+    #[tokio::test]
+    async fn a_newer_signed_state_settles_the_channel() {
+        let (manager, channel_id) = manager_ready_to_settle().await;
+        let state = signed(&channel_id, 3, 1_200, 800);
+
+        let settled = manager
+            .settle_signed_state(&state, &state.digest(), 10)
+            .expect("a newer state must settle");
+
+        assert_eq!(settled.our_balance, 1_200);
+        assert_eq!(settled.their_balance, 800);
+        assert_eq!(settled.sequence_number, 3);
+        assert_eq!(settled.status, ChannelStatus::Closing);
+        assert_eq!(manager.recorded_heights(&channel_id).unwrap(), vec![0, 10]);
+    }
+
+    #[tokio::test]
+    async fn a_stale_signed_state_is_refused_and_changes_nothing() {
+        let (manager, channel_id) = manager_ready_to_settle().await;
+
+        // Move the channel on to sequence 5 through a normal payment.
+        for height in [10, 11, 12, 13, 14] {
+            manager
+                .execute_payment_at(&channel_id, 10, PaymentDirection::ToThem, height)
+                .unwrap();
+        }
+        let before = manager.get_channel(&channel_id).unwrap();
+        assert_eq!(before.sequence_number, 5);
+
+        // An old, more favourable split the counterparty kept from sequence 2.
+        let stale = signed(&channel_id, 2, 1_500, 500);
+        let error = manager
+            .settle_signed_state(&stale, &stale.digest(), 20)
+            .expect_err("a superseded state must not settle");
+        assert_eq!(
+            error,
+            PaymentChannelError::StaleState {
+                channel_id: channel_id.clone(),
+                recorded: 5,
+                presented: 2,
+            }
+        );
+
+        assert_eq!(
+            manager.get_channel(&channel_id).unwrap(),
+            before,
+            "a rejected settlement must leave the channel untouched"
+        );
+        assert_eq!(
+            manager.recorded_heights(&channel_id).unwrap().last(),
+            Some(&14),
+            "a rejected settlement must not record a snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_recorded_sequence_itself_is_stale() {
+        let (manager, channel_id) = manager_ready_to_settle().await;
+        manager
+            .execute_payment_at(&channel_id, 10, PaymentDirection::ToThem, 10)
+            .unwrap();
+
+        // Re-presenting the state the channel is already on is not progress.
+        let same = signed(&channel_id, 1, 990, 1_010);
+        let error = manager
+            .settle_signed_state(&same, &same.digest(), 11)
+            .expect_err("an equal sequence is not newer");
+        assert!(matches!(
+            error,
+            PaymentChannelError::StaleState {
+                recorded: 1,
+                presented: 1,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_sequence_gap_is_accepted() {
+        let (manager, channel_id) = manager_ready_to_settle().await;
+
+        // The counterparty may have missed intermediate updates, so the signed
+        // sequence only has to be newer, not exactly one more.
+        let state = signed(&channel_id, 9, 1_100, 900);
+        let settled = manager
+            .settle_signed_state(&state, &state.digest(), 10)
+            .unwrap();
+        assert_eq!(settled.sequence_number, 9);
+    }
+
+    #[tokio::test]
+    async fn an_unsigned_settlement_is_refused() {
+        let (manager, channel_id) = manager_ready_to_settle().await;
+        let state = signed(&channel_id, 3, 1_200, 800);
+        let before = manager.get_channel(&channel_id).unwrap();
+
+        let error = manager
+            .settle_signed_state(&state, &[0u8; 32], 10)
+            .expect_err("a bad signature must not settle");
+        assert!(matches!(error, PaymentChannelError::SignatureError(_)));
+        assert_eq!(manager.get_channel(&channel_id).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn settlement_requires_a_registered_counterparty_key() {
+        let manager = ChannelManager::with_history_depth(Box::new(EchoSigner), 8);
+        let state = manager
+            .create_channel("alice".to_string(), "bob".to_string(), 1_000, 1_000, 100, 0)
+            .await
+            .unwrap();
+
+        let settlement = signed(&state.channel_id, 3, 1_200, 800);
+        let error = manager
+            .settle_signed_state(&settlement, &settlement.digest(), 10)
+            .expect_err("without a counterparty key nothing can be verified");
+        assert!(matches!(error, PaymentChannelError::InvalidState(_)));
+    }
+
+    #[tokio::test]
+    async fn a_settlement_that_does_not_conserve_the_total_is_refused() {
+        let (manager, channel_id) = manager_ready_to_settle().await;
+
+        let state = signed(&channel_id, 3, 1_500, 900);
+        let error = manager
+            .settle_signed_state(&state, &state.digest(), 10)
+            .expect_err("the total must be conserved");
+        assert!(matches!(error, PaymentChannelError::InvalidState(_)));
+        assert_eq!(manager.get_channel(&channel_id).unwrap().sequence_number, 0);
+    }
+
+    #[tokio::test]
+    async fn a_settlement_for_another_channel_is_refused() {
+        let (manager, _) = manager_ready_to_settle().await;
+
+        let state = signed("someone-elses-channel", 3, 1_200, 800);
+        let error = manager
+            .settle_signed_state(&state, &state.digest(), 10)
+            .expect_err("a settlement is bound to its channel");
+        assert!(matches!(error, PaymentChannelError::ChannelNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn a_settlement_at_a_stale_height_is_refused() {
+        let (manager, channel_id) = manager_ready_to_settle().await;
+        manager
+            .execute_payment_at(&channel_id, 10, PaymentDirection::ToThem, 10)
+            .unwrap();
+
+        let state = signed(&channel_id, 3, 1_100, 900);
+        let error = manager
+            .settle_signed_state(&state, &state.digest(), 10)
+            .expect_err("the height must be newer than the last recorded one");
+        assert!(matches!(error, PaymentChannelError::ReorgDetected { .. }));
+        assert_eq!(manager.get_channel(&channel_id).unwrap().sequence_number, 1);
+    }
+
+    #[tokio::test]
+    async fn a_settled_channel_refuses_further_settlement() {
+        let (manager, channel_id) = manager_ready_to_settle().await;
+
+        let first = signed(&channel_id, 3, 1_200, 800);
+        manager
+            .settle_signed_state(&first, &first.digest(), 10)
+            .unwrap();
+
+        let second = signed(&channel_id, 4, 900, 1_100);
+        let error = manager
+            .settle_signed_state(&second, &second.digest(), 11)
+            .expect_err("settlement is terminal");
+        assert!(matches!(error, PaymentChannelError::ChannelClosed(_)));
     }
 
     #[test]

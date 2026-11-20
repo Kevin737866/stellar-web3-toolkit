@@ -1,3 +1,4 @@
+use crate::audit_allowlist;
 use crate::error::{Result, ToolkitError};
 use crate::help_text;
 use clap::{Parser, Subcommand};
@@ -72,6 +73,9 @@ pub enum ToolkitCommand {
     /// Informal verification: search for counterexamples to stated invariants
     #[command(subcommand)]
     Verify(VerifyCommand),
+    /// Contributor onboarding checklist progress (issue #194)
+    #[command(subcommand)]
+    Onboarding(OnboardingCommand),
     /// Print the command overview wrapped to the terminal width
     Help {
         /// Wrap width in columns (defaults to $COLUMNS, otherwise 100)
@@ -391,6 +395,37 @@ pub enum SecurityCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Check the `cargo audit` allowlist (issue #185)
+    Audit {
+        /// Allowlist to check; defaults to `audit-allowlist.toml` at the workspace root
+        #[arg(long)]
+        allowlist: Option<PathBuf>,
+        /// `cargo audit --json` output; when omitted the audit is run
+        #[arg(long)]
+        report: Option<PathBuf>,
+        /// Date to evaluate expiries against, as YYYY-MM-DD; defaults to today
+        #[arg(long)]
+        today: Option<String>,
+        /// Print the report as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum OnboardingCommand {
+    /// Report checklist progress from `docs/CONTRIBUTING_ONBOARDING.md`
+    Progress {
+        /// Checklist document; defaults to `docs/CONTRIBUTING_ONBOARDING.md`
+        #[arg(long)]
+        checklist: Option<PathBuf>,
+        /// Print the report as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        /// Exit non-zero unless every step is ticked
+        #[arg(long, default_value_t = false)]
+        require_complete: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -491,6 +526,7 @@ impl ToolkitCommand {
             Self::Env(cmd) => run_env(cmd),
             Self::Security(cmd) => run_security(cmd),
             Self::Verify(cmd) => run_verify(cmd),
+            Self::Onboarding(cmd) => run_onboarding(cmd),
             Self::Help { width } => {
                 let resolved = if *width == 0 {
                     help_text::help_width()
@@ -1307,6 +1343,123 @@ fn run_security(cmd: &SecurityCommand) -> Result<()> {
                 return Err(ToolkitError::ExecutionError(format!(
                     "{} finding(s) of committed secret material",
                     report.errors()
+                )));
+            }
+            Ok(())
+        }
+        SecurityCommand::Audit {
+            allowlist,
+            report,
+            today,
+            json,
+        } => {
+            let root = normalize_workspace_root(&PathBuf::from("."));
+            let allowlist_path = allowlist.as_ref().map_or_else(
+                || root.join(audit_allowlist::ALLOWLIST_PATH),
+                |p| resolve_path(&cwd_root(), p),
+            );
+
+            let entries = if allowlist_path.exists() {
+                let text = std::fs::read_to_string(&allowlist_path).map_err(|e| {
+                    ToolkitError::ExecutionError(format!(
+                        "cannot read {}: {e}",
+                        allowlist_path.display()
+                    ))
+                })?;
+                audit_allowlist::parse_allowlist(&text).map_err(ToolkitError::ExecutionError)?
+            } else {
+                Vec::new()
+            };
+
+            let audit_json = match report {
+                Some(path) => {
+                    let path = resolve_path(&cwd_root(), path);
+                    std::fs::read_to_string(&path).map_err(|e| {
+                        ToolkitError::ExecutionError(format!("cannot read {}: {e}", path.display()))
+                    })?
+                }
+                None => run_cargo_audit_json(&root)?,
+            };
+            let advisories = audit_allowlist::parse_audit_json(&audit_json)
+                .map_err(ToolkitError::ExecutionError)?;
+
+            let today = match today {
+                Some(text) => audit_allowlist::Date::parse(text).ok_or_else(|| {
+                    ToolkitError::ExecutionError(format!("--today {text} is not a YYYY-MM-DD date"))
+                })?,
+                None => audit_allowlist::Date::today(),
+            };
+
+            let checked = audit_allowlist::check(&entries, &advisories, today);
+            if *json {
+                println!("{}", checked.to_json());
+            } else {
+                print!("{}", checked.render());
+            }
+            if !checked.passed() {
+                return Err(ToolkitError::ExecutionError(format!(
+                    "{} audit allowlist error(s)",
+                    checked.errors()
+                )));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Run `cargo audit --json` and return its stdout.
+///
+/// `cargo audit` exits non-zero when it finds something, which is the normal
+/// case here: the output still carries the advisories the allowlist is checked
+/// against, so a non-zero status is not treated as an error on its own.
+fn run_cargo_audit_json(root: &PathBuf) -> Result<String> {
+    let output = Command::new("cargo")
+        .args(["audit", "--json"])
+        .current_dir(root)
+        .output()
+        .map_err(|e| {
+            ToolkitError::ExecutionError(format!(
+                "cannot run `cargo audit` (install it with `cargo install cargo-audit`): {e}"
+            ))
+        })?;
+    if output.stdout.is_empty() {
+        return Err(ToolkitError::ExecutionError(format!(
+            "`cargo audit` produced no JSON: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn run_onboarding(cmd: &OnboardingCommand) -> Result<()> {
+    use crate::onboarding::Checklist;
+    match cmd {
+        OnboardingCommand::Progress {
+            checklist,
+            json,
+            require_complete,
+        } => {
+            let path = match checklist {
+                Some(path) => resolve_path(&cwd_root(), path),
+                None => normalize_workspace_root(&PathBuf::from("."))
+                    .join(crate::onboarding::CHECKLIST_PATH),
+            };
+            let markdown = std::fs::read_to_string(&path).map_err(|e| {
+                ToolkitError::ExecutionError(format!("cannot read {}: {e}", path.display()))
+            })?;
+            let checklist = Checklist::parse(&markdown);
+
+            if *json {
+                println!("{}", checklist.to_json());
+            } else {
+                print!("{}", checklist.render());
+            }
+
+            if *require_complete && !checklist.complete() {
+                return Err(ToolkitError::ExecutionError(format!(
+                    "onboarding checklist is {}/{} complete",
+                    checklist.done(),
+                    checklist.total()
                 )));
             }
             Ok(())

@@ -79,6 +79,38 @@ the first creates the swap and records it, the second observes the record and
 replays it. The critical section only covers in-memory work and the monitor
 fan-out, and plain `initiate_swap` is unaffected — it does not take the lock.
 
+## Cross-chain nonces and failed initiations
+
+A cross-chain initiation carries a `(origin_chain, nonce)` pair that the
+coordinator's replay guard consumes exactly once (#238). The interaction with
+idempotency is subtle, and getting it wrong breaks the retry guarantee above.
+
+The nonce is **preflighted** before any work happens and only **consumed**
+immediately before the swap becomes visible:
+
+```text
+validate request
+  → preflight nonce   (reject a replay now; consume nothing)
+  → check assets, generate preimage, journal the swap
+  → consume nonce     (every fallible step has succeeded)
+  → publish swap
+```
+
+Consuming the nonce up front, as this code used to, meant that any later failure
+— an unsupported asset, a clock read during preimage generation, a journal write
+— left the nonce burned with no swap behind it. The caller's corrected retry was
+then refused as a replay, so the key-reuse guarantee documented above was not
+actually reachable for cross-chain swaps.
+
+If the monitor fan-out fails after the nonce is consumed, the swap is withdrawn
+and the nonce released, so the same intent can be retried. `ReplayGuard::release`
+only rewinds nonces still inside the tracking window; an older one is
+indistinguishable from a long-consumed nonce, and freeing it would reopen the
+replay hole the window exists to close.
+
+The rule in one line: **a nonce is spent only by an initiation that produced a
+swap.**
+
 ## What this does not do
 
 * It does not make **settlement** idempotent. `complete_swap` already refuses a

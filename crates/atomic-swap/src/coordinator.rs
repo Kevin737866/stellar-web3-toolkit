@@ -182,10 +182,13 @@ impl AtomicSwapCoordinator {
         // Validate request
         self.validate_swap_request(&request)?;
 
-        // Consume the cross-chain nonce before anything is created, so a
-        // replayed transfer is refused while the coordinator still has no side
-        // effects to undo (#238).
-        self.consume_cross_chain_nonce(&initiator, &request).await?;
+        // Reject a replayed cross-chain transfer before anything is created, so
+        // a rejected initiation has no side effects to undo (#238). The nonce is
+        // only *consumed* further down, immediately before the swap becomes
+        // visible: consuming it here would burn it for good if a later step
+        // failed, and the caller could then never retry (#394).
+        self.preflight_cross_chain_nonce(&initiator, &request)
+            .await?;
 
         // Check asset support
         let asset_registry = self.asset_registry.read().await;
@@ -235,8 +238,8 @@ impl AtomicSwapCoordinator {
         }
 
         // Add metadata
-        for (key, value) in request.metadata {
-            swap.add_metadata(key, value);
+        for (key, value) in &request.metadata {
+            swap.add_metadata(key.clone(), value.clone());
         }
 
         // Record the creation before it becomes visible in memory, so a restart
@@ -244,13 +247,26 @@ impl AtomicSwapCoordinator {
         self.journal
             .append(TransitionRecord::initiated(&swap, current_ledger))?;
 
+        // Consume the cross-chain nonce last, right before the swap is
+        // published. Every fallible step above has succeeded, so the nonce is
+        // only spent on an initiation that actually produced a swap. If the
+        // monitor fan-out below fails, the swap is withdrawn and the nonce
+        // released, so the caller can retry the same intent (#394).
+        self.consume_cross_chain_nonce(&initiator, &request).await?;
+
         // Store swap
         let mut swaps = self.swaps.write().await;
         swaps.insert(swap_id.clone(), swap.clone());
         drop(swaps);
 
         // Add to monitor
-        self.monitor.add_swap(swap.clone()).await?;
+        if let Err(error) = self.monitor.add_swap(swap.clone()).await {
+            let mut swaps = self.swaps.write().await;
+            swaps.remove(&swap_id);
+            drop(swaps);
+            self.release_cross_chain_nonce(&initiator, &request).await;
+            return Err(error);
+        }
 
         info!(
             "Initiated swap {} between {} and {}",
@@ -815,12 +831,37 @@ impl AtomicSwapCoordinator {
 
     // Private helper methods
 
-    /// Consume the request's cross-chain nonce, if it declares one.
+    /// Reject the request's cross-chain nonce if it could not be consumed,
+    /// without consuming it (#238, #394).
     ///
     /// A local swap carries neither field; a cross-chain swap carries both. Half
     /// an origin is a caller bug and is rejected rather than guessed at, because
     /// guessing wrong means either a replayed transfer or a legitimate one
     /// refused.
+    ///
+    /// Shares the shape checks with [`Self::consume_cross_chain_nonce`] so the
+    /// two cannot disagree about what a well-formed intent is.
+    async fn preflight_cross_chain_nonce(
+        &self,
+        initiator: &str,
+        request: &SwapRequest,
+    ) -> Result<()> {
+        match (&request.origin_chain, request.nonce) {
+            (Some(chain), Some(nonce)) => {
+                let mut replay = self.replay.write().await;
+                replay.preflight(chain, initiator, nonce)?;
+                Ok(())
+            }
+            (Some(_), None) => Err(ReplayError::IncompleteIntent { missing: "nonce" }.into()),
+            (None, Some(_)) => Err(ReplayError::IncompleteIntent {
+                missing: "origin chain",
+            }
+            .into()),
+            (None, None) => Ok(()),
+        }
+    }
+
+    /// Consume the request's cross-chain nonce, if it declares one.
     async fn consume_cross_chain_nonce(
         &self,
         initiator: &str,
@@ -838,6 +879,13 @@ impl AtomicSwapCoordinator {
             }
             .into()),
             (None, None) => Ok(()),
+        }
+    }
+
+    /// Give back a nonce consumed by an initiation that then failed (#394).
+    async fn release_cross_chain_nonce(&self, initiator: &str, request: &SwapRequest) {
+        if let (Some(chain), Some(nonce)) = (&request.origin_chain, request.nonce) {
+            self.replay.write().await.release(chain, initiator, nonce);
         }
     }
 
@@ -1088,6 +1136,111 @@ mod tests {
             .await
             .expect("another sender has its own nonce sequence");
         assert_eq!(coordinator.replay_stats().await.accepted, 4);
+    }
+
+    #[tokio::test]
+    async fn a_failed_initiation_does_not_burn_the_cross_chain_nonce() {
+        let coordinator = coordinator_with_usdc().await;
+
+        // A request that is well formed enough to pass the nonce preflight but
+        // is refused later, when its asset is checked.
+        let mut unsupported = request_with_origin(Some(("testnet", 7)));
+        unsupported.participant_asset = Asset::Custom("DOGE".to_string());
+
+        let error = coordinator
+            .initiate_swap("initiator".to_string(), unsupported)
+            .await
+            .expect_err("an unsupported asset is refused");
+        assert!(matches!(error, AtomicSwapError::UnsupportedAsset { .. }));
+        assert!(
+            !coordinator
+                .nonce_is_recorded("testnet", "initiator", 7)
+                .await,
+            "a failed initiation must not spend the nonce"
+        );
+
+        // The caller retries the same intent with a supported asset and the
+        // same nonce: it must be accepted, not reported as a replay.
+        let accepted = coordinator
+            .initiate_swap(
+                "initiator".to_string(),
+                request_with_origin(Some(("testnet", 7))),
+            )
+            .await
+            .expect("the nonce was never consumed, so the retry is accepted");
+        assert!(!accepted.swap_id.is_empty());
+        assert!(
+            coordinator
+                .nonce_is_recorded("testnet", "initiator", 7)
+                .await,
+            "the successful initiation consumes the nonce"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_nonce_is_only_spent_once_even_after_a_failed_attempt() {
+        let coordinator = coordinator_with_usdc().await;
+
+        let mut unsupported = request_with_origin(Some(("testnet", 3)));
+        unsupported.initiator_asset = Asset::Custom("NOPE".to_string());
+        coordinator
+            .initiate_swap("initiator".to_string(), unsupported)
+            .await
+            .expect_err("an unsupported asset is refused");
+
+        coordinator
+            .initiate_swap(
+                "initiator".to_string(),
+                request_with_origin(Some(("testnet", 3))),
+            )
+            .await
+            .expect("the retry is accepted");
+
+        // Now that a swap exists for it, the nonce really is spent.
+        let error = coordinator
+            .initiate_swap(
+                "initiator".to_string(),
+                request_with_origin(Some(("testnet", 3))),
+            )
+            .await
+            .expect_err("a nonce that produced a swap is replayed");
+        assert!(matches!(
+            error,
+            AtomicSwapError::Replay(ReplayError::Replayed { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_replayed_nonce_is_refused_before_anything_is_created() {
+        let coordinator = coordinator_with_usdc().await;
+        coordinator
+            .initiate_swap(
+                "initiator".to_string(),
+                request_with_origin(Some(("testnet", 9))),
+            )
+            .await
+            .unwrap();
+
+        let error = coordinator
+            .initiate_swap(
+                "initiator".to_string(),
+                request_with_origin(Some(("testnet", 9))),
+            )
+            .await
+            .expect_err("a replayed nonce is refused");
+        assert!(matches!(
+            error,
+            AtomicSwapError::Replay(ReplayError::Replayed { .. })
+        ));
+        assert_eq!(
+            coordinator
+                .list_swaps_for_participant("initiator".to_string())
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the rejected replay created nothing"
+        );
     }
 
     #[tokio::test]
