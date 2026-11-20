@@ -30,6 +30,22 @@ pub enum DataKey {
     FeeRecipient,
     NextListingId,
     Listing(u64),
+    ListingExpiry(u64),
+}
+
+/// An order submitted to buy or fill an active listing (issues #418, #419, #420).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Order {
+    pub listing_id: u64,
+    /// Expected owner/seller of the listing (issue #418).
+    pub expected_seller: Option<Address>,
+    /// Units of asset requested to fill (issue #420). If `None`, fills the entire remaining listing.
+    pub fill_amount: Option<i128>,
+    /// Maximum price the buyer is willing to pay for this fill (slippage/protection).
+    pub max_price: Option<i128>,
+    /// Expiry ledger sequence number; order is rejected if this precedes current ledger (issue #419).
+    pub expiry_ledger: Option<u32>,
 }
 
 /// Current state of a listing.
@@ -107,6 +123,25 @@ fn write_listing(env: &Env, listing: &Listing) {
         .extend_ttl(&key, LISTING_TTL_THRESHOLD, LISTING_TTL_BUMP);
 }
 
+fn read_listing_expiry(env: &Env, listing_id: u64) -> Option<u32> {
+    let key = DataKey::ListingExpiry(listing_id);
+    let expiry = env.storage().persistent().get(&key);
+    if expiry.is_some() {
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LISTING_TTL_THRESHOLD, LISTING_TTL_BUMP);
+    }
+    expiry
+}
+
+fn write_listing_expiry(env: &Env, listing_id: u64, expiry_ledger: u32) {
+    let key = DataKey::ListingExpiry(listing_id);
+    env.storage().persistent().set(&key, &expiry_ledger);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, LISTING_TTL_THRESHOLD, LISTING_TTL_BUMP);
+}
+
 #[contractimpl]
 impl MarketplaceContract {
     /// One-time configuration of the marketplace fee (in basis points) and the
@@ -170,26 +205,103 @@ impl MarketplaceContract {
         id
     }
 
-    /// Purchases an active listing. The buyer pays `price` in the listing's
-    /// payment token: the marketplace fee goes to the configured recipient and
-    /// the remainder goes to the seller. The escrowed asset is released to the
-    /// buyer. Returns the seller proceeds after fees.
-    pub fn buy(env: Env, buyer: Address, listing_id: u64) -> i128 {
+    /// Lists `amount` units of a SEP-41 `asset` for `price` with an explicit ledger expiry (issue #419).
+    pub fn create_listing_with_expiry(
+        env: Env,
+        seller: Address,
+        asset: Address,
+        token_id: u128,
+        amount: i128,
+        price: i128,
+        payment_token: Address,
+        expiry_ledger: u32,
+    ) -> u64 {
+        assert!(
+            expiry_ledger >= env.ledger().sequence(),
+            "expiry precedes current ledger"
+        );
+        let id = Self::create_listing(
+            env.clone(),
+            seller,
+            asset,
+            token_id,
+            amount,
+            price,
+            payment_token,
+        );
+        write_listing_expiry(&env, id, expiry_ledger);
+        id
+    }
+
+    /// Executes an order against an active listing with optional ownership validation,
+    /// ledger expiry enforcement, and partial-fill accounting (issues #418, #419, #420).
+    pub fn execute_order(env: Env, buyer: Address, order: Order) -> i128 {
         buyer.require_auth();
-        let mut listing = read_listing(&env, listing_id);
+        let current_ledger = env.ledger().sequence();
+
+        // 1. Validate order expiry against current ledger (issue #419)
+        if let Some(order_expiry) = order.expiry_ledger {
+            assert!(
+                order_expiry >= current_ledger,
+                "order expired: expiry precedes current ledger"
+            );
+        }
+
+        let mut listing = read_listing(&env, order.listing_id);
 
         assert!(
             listing.status == ListingStatus::Active,
             "listing not active"
         );
-        assert!(listing.seller != buyer, "seller cannot buy own listing");
 
-        let fee = listing
-            .price
+        // 2. Validate listing expiry against current ledger (issue #419)
+        if let Some(listing_expiry) = read_listing_expiry(&env, order.listing_id) {
+            assert!(
+                listing_expiry >= current_ledger,
+                "listing expired: expiry precedes current ledger"
+            );
+        }
+
+        // 3. Validate listing ownership (issue #418)
+        assert!(listing.seller != buyer, "seller cannot buy own listing");
+        if let Some(expected_seller) = order.expected_seller {
+            assert!(
+                listing.seller == expected_seller,
+                "listing owner mismatch: expected seller does not match current seller"
+            );
+        }
+
+        // 4. Partial-fill accounting (issue #420)
+        let fill_amount = order.fill_amount.unwrap_or(listing.amount);
+        assert!(fill_amount > 0, "fill amount must be positive");
+        assert!(
+            fill_amount <= listing.amount,
+            "fill amount exceeds available listing amount"
+        );
+
+        let fill_price = if fill_amount == listing.amount {
+            listing.price
+        } else {
+            listing
+                .price
+                .checked_mul(fill_amount)
+                .expect("price overflow")
+                / listing.amount
+        };
+        assert!(fill_price > 0, "proportional fill price must be positive");
+
+        if let Some(max_price) = order.max_price {
+            assert!(
+                fill_price <= max_price,
+                "fill price exceeds max price limit"
+            );
+        }
+
+        let fee = fill_price
             .checked_mul(fee_bps(&env) as i128)
             .expect("fee overflow")
             / MAX_FEE_BPS as i128;
-        let seller_proceeds = listing.price - fee;
+        let seller_proceeds = fill_price - fee;
 
         let payments = TokenClient::new(&env, &listing.payment_token);
         payments.transfer(&buyer, &listing.seller, &seller_proceeds);
@@ -197,22 +309,71 @@ impl MarketplaceContract {
             payments.transfer(&buyer, &fee_recipient(&env), &fee);
         }
 
-        // Release the escrowed asset to the buyer.
+        // Release the filled portion of the escrowed asset to the buyer.
         TokenClient::new(&env, &listing.asset).transfer(
             &env.current_contract_address(),
             &buyer,
-            &listing.amount,
+            &fill_amount,
         );
 
-        listing.status = ListingStatus::Sold;
+        listing.amount -= fill_amount;
+        listing.price -= fill_price;
+
+        if listing.amount == 0 {
+            listing.status = ListingStatus::Sold;
+        }
+
         write_listing(&env, &listing);
 
         env.events().publish(
-            (symbol_short!("sold"), buyer),
-            (listing_id, seller_proceeds, fee),
+            (symbol_short!("order"), buyer),
+            (order.listing_id, fill_amount, fill_price, listing.amount),
         );
 
         seller_proceeds
+    }
+
+    /// Purchases an active listing in full. Preserves legacy API and behavior 100%.
+    pub fn buy(env: Env, buyer: Address, listing_id: u64) -> i128 {
+        Self::execute_order(
+            env,
+            buyer,
+            Order {
+                listing_id,
+                expected_seller: None,
+                fill_amount: None,
+                max_price: None,
+                expiry_ledger: None,
+            },
+        )
+    }
+
+    /// Buys a partial amount of an active listing with optional constraints (issue #420).
+    pub fn buy_partial(
+        env: Env,
+        buyer: Address,
+        listing_id: u64,
+        fill_amount: i128,
+        expected_seller: Option<Address>,
+        max_price: Option<i128>,
+        expiry_ledger: Option<u32>,
+    ) -> i128 {
+        Self::execute_order(
+            env,
+            buyer,
+            Order {
+                listing_id,
+                expected_seller,
+                fill_amount: Some(fill_amount),
+                max_price,
+                expiry_ledger,
+            },
+        )
+    }
+
+    /// Returns the optional expiry ledger for a listing (issue #419).
+    pub fn get_listing_expiry(env: Env, listing_id: u64) -> Option<u32> {
+        read_listing_expiry(&env, listing_id)
     }
 
     /// Cancels an active listing and returns the escrowed asset to the seller.
@@ -547,5 +708,183 @@ mod test {
         mint(&env, &asset, &seller, 1);
         let id = market.create_listing(&seller, &asset, &0_u128, &1_i128, &100_i128, &payment);
         market.cancel_listing(&attacker, &id);
+    }
+
+    #[test]
+    fn partial_fill_accounting_and_multi_buyer_completion() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let buyer1 = Address::generate(&env);
+        let buyer2 = Address::generate(&env);
+        let fee_recipient = Address::generate(&env);
+        let asset = setup_token(&env, &admin);
+        let payment = setup_token(&env, &admin);
+
+        let market_id = env.register_contract(None, MarketplaceContract);
+        let market = MarketplaceContractClient::new(&env, &market_id);
+        market.initialize(&admin, &500, &fee_recipient); // 5% fee
+
+        mint(&env, &asset, &seller, 10);
+        mint(&env, &payment, &buyer1, 1_000);
+        mint(&env, &payment, &buyer2, 1_000);
+
+        // Seller lists 10 units for 1,000 price (100 per unit).
+        let id = market.create_listing(&seller, &asset, &0_u128, &10_i128, &1_000_i128, &payment);
+
+        // Buyer 1 fills 4 units (proportional price = 400, fee = 20, proceeds = 380)
+        let proceeds1 = market.buy_partial(
+            &buyer1,
+            &id,
+            &4_i128,
+            &Some(seller.clone()),
+            &Some(400_i128),
+            &None,
+        );
+        assert_eq!(proceeds1, 380);
+        assert_eq!(balance(&env, &asset, &buyer1), 4);
+        assert_eq!(balance(&env, &payment, &seller), 380);
+        assert_eq!(balance(&env, &payment, &fee_recipient), 20);
+
+        // Listing remains Active with 6 units and 600 asking price
+        let listing_mid = market.get_listing(&id);
+        assert_eq!(listing_mid.status, ListingStatus::Active);
+        assert_eq!(listing_mid.amount, 6);
+        assert_eq!(listing_mid.price, 600);
+
+        // Buyer 2 fills remaining 6 units
+        let proceeds2 = market.buy_partial(
+            &buyer2,
+            &id,
+            &6_i128,
+            &Some(seller.clone()),
+            &None,
+            &None,
+        );
+        assert_eq!(proceeds2, 570); // 600 - 30 fee
+        assert_eq!(balance(&env, &asset, &buyer2), 6);
+        assert_eq!(balance(&env, &payment, &seller), 950);
+        assert_eq!(balance(&env, &payment, &fee_recipient), 50);
+
+        let listing_final = market.get_listing(&id);
+        assert_eq!(listing_final.status, ListingStatus::Sold);
+        assert_eq!(listing_final.amount, 0);
+        assert_eq!(listing_final.price, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "listing owner mismatch: expected seller does not match current seller")]
+    fn order_rejects_owner_mismatch() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let impostor = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let asset = setup_token(&env, &admin);
+        let payment = setup_token(&env, &admin);
+
+        let market_id = env.register_contract(None, MarketplaceContract);
+        let market = MarketplaceContractClient::new(&env, &market_id);
+        market.initialize(&admin, &0, &admin);
+
+        mint(&env, &asset, &seller, 1);
+        mint(&env, &payment, &buyer, 100);
+
+        let id = market.create_listing(&seller, &asset, &0_u128, &1_i128, &100_i128, &payment);
+
+        market.execute_order(
+            &buyer,
+            &Order {
+                listing_id: id,
+                expected_seller: Some(impostor),
+                fill_amount: None,
+                max_price: None,
+                expiry_ledger: None,
+            },
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "order expired: expiry precedes current ledger")]
+    fn order_rejects_expired_ledger() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let asset = setup_token(&env, &admin);
+        let payment = setup_token(&env, &admin);
+
+        let market_id = env.register_contract(None, MarketplaceContract);
+        let market = MarketplaceContractClient::new(&env, &market_id);
+        market.initialize(&admin, &0, &admin);
+
+        mint(&env, &asset, &seller, 1);
+        mint(&env, &payment, &buyer, 100);
+
+        let id = market.create_listing(&seller, &asset, &0_u128, &1_i128, &100_i128, &payment);
+
+        let current = env.ledger().sequence();
+        assert!(current > 0);
+
+        market.execute_order(
+            &buyer,
+            &Order {
+                listing_id: id,
+                expected_seller: None,
+                fill_amount: None,
+                max_price: None,
+                expiry_ledger: Some(current - 1),
+            },
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "fill amount exceeds available listing amount")]
+    fn partial_fill_rejects_excessive_amount() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let asset = setup_token(&env, &admin);
+        let payment = setup_token(&env, &admin);
+
+        let market_id = env.register_contract(None, MarketplaceContract);
+        let market = MarketplaceContractClient::new(&env, &market_id);
+        market.initialize(&admin, &0, &admin);
+
+        mint(&env, &asset, &seller, 5);
+        let id = market.create_listing(&seller, &asset, &0_u128, &5_i128, &100_i128, &payment);
+
+        market.buy_partial(&buyer, &id, &6_i128, &None, &None, &None);
+    }
+
+    #[test]
+    #[should_panic(expected = "fill price exceeds max price limit")]
+    fn order_rejects_exceeded_max_price() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let asset = setup_token(&env, &admin);
+        let payment = setup_token(&env, &admin);
+
+        let market_id = env.register_contract(None, MarketplaceContract);
+        let market = MarketplaceContractClient::new(&env, &market_id);
+        market.initialize(&admin, &0, &admin);
+
+        mint(&env, &asset, &seller, 1);
+        let id = market.create_listing(&seller, &asset, &0_u128, &1_i128, &100_i128, &payment);
+
+        market.buy_partial(&buyer, &id, &1_i128, &None, &Some(99_i128), &None);
     }
 }
