@@ -18,12 +18,19 @@ pub struct ChannelState {
     pub balance_a: i128,
     /// Current balance of participant B
     pub balance_b: i128,
-    /// Total balance in the channel (should equal balance_a + balance_b)
+    /// Total balance in the channel (should equal `balance_a` + `balance_b`)
     pub total_balance: i128,
     /// Sequence number for state updates (for dispute resolution)
     pub sequence_number: u32,
     /// Whether this is a cooperative close
     pub is_cooperative_close: bool,
+    /// Sequence number the cooperative close was applied at (0 while open).
+    ///
+    /// The close is a settlement of last resort, so it has to survive a retry.
+    /// A retried close presents the same sequence number and balances; recording
+    /// the sequence is what lets the contract tell "the same close again" apart
+    /// from "a different close after one already landed" (#351).
+    pub close_sequence: u32,
     /// Timestamp when channel was closed (0 if open)
     pub close_time: u64,
     /// Timeout in seconds for unilateral close dispute period
@@ -58,6 +65,7 @@ impl ChannelState {
             total_balance: initial_balance_a + initial_balance_b,
             sequence_number: 0,
             is_cooperative_close: false,
+            close_sequence: 0,
             close_time: 0,
             timeout,
             created_at: env.ledger().timestamp(),

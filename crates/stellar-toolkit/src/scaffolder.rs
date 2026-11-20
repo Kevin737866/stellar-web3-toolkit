@@ -7,6 +7,7 @@
 //! follow the same layout.
 
 use crate::error::{Result, ToolkitError};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 /// Files that every scaffolded project must contain.
@@ -18,7 +19,7 @@ const OPTIONAL_FILES: [&str; 3] = ["src/test.rs", "tests", ".gitignore"];
 /// Rust edition used by the template.
 const TEMPLATE_EDITION: &str = "2021";
 
-const CONTRACT_LIB: &str = r##"#![no_std]
+const CONTRACT_LIB: &str = r"#![no_std]
 
 use soroban_sdk::{contract, contractimpl, contracttype, Env};
 
@@ -47,9 +48,9 @@ impl CounterContract {
         env.storage().instance().get(&DataKey::Counter).unwrap_or(0)
     }
 }
-"##;
+";
 
-const CONTRACT_TEST: &str = r##"#![cfg(test)]
+const CONTRACT_TEST: &str = r"#![cfg(test)]
 
 use super::*;
 use soroban_sdk::Env;
@@ -65,10 +66,10 @@ fn counts_up_from_zero() {
     assert_eq!(client.increment(), 2);
     assert_eq!(client.get(), 2);
 }
-"##;
+";
 
-const GITIGNORE: &str = r##"/target
-"##;
+const GITIGNORE: &str = r"/target
+";
 
 /// Options describing the project to scaffold.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +106,7 @@ impl ScaffoldOptions {
         self
     }
 
+    #[must_use]
     pub fn with_tests(mut self, include_tests: bool) -> Self {
         self.include_tests = include_tests;
         self
@@ -124,11 +126,13 @@ pub struct Scaffolder {
 }
 
 impl Scaffolder {
+    #[must_use]
     pub fn new(options: ScaffoldOptions) -> Self {
         Self { options }
     }
 
     /// Renders the template file set (without touching the filesystem).
+    #[must_use]
     pub fn render(&self) -> Vec<GeneratedFile> {
         let mut files = vec![
             GeneratedFile {
@@ -161,6 +165,7 @@ impl Scaffolder {
     }
 
     /// Renders the template and lints the result.
+    #[must_use]
     pub fn render_and_lint(&self) -> (Vec<GeneratedFile>, LintReport) {
         let files = self.render();
         let report = lint_template(&files);
@@ -207,7 +212,7 @@ testutils = ["soroban-sdk/testutils"]
 
     fn readme(&self) -> String {
         format!(
-            r#"# {name}
+            r"# {name}
 
 {description}
 
@@ -233,7 +238,7 @@ CI gate because it exits non-zero on error level findings:
 ```bash
 stellar-toolkit scaffold lint --dir .
 ```
-"#,
+",
             name = sanitize(&self.options.name),
             description = sanitize(&self.options.description),
         )
@@ -287,14 +292,17 @@ pub struct LintReport {
 
 impl LintReport {
     /// `true` when no error level finding was reported.
+    #[must_use]
     pub fn passed(&self) -> bool {
         self.errors() == 0
     }
 
+    #[must_use]
     pub fn errors(&self) -> usize {
         self.count(LintSeverity::Error)
     }
 
+    #[must_use]
     pub fn warnings(&self) -> usize {
         self.count(LintSeverity::Warning)
     }
@@ -306,6 +314,7 @@ impl LintReport {
             .count()
     }
 
+    #[must_use]
     pub fn render(&self) -> String {
         let mut out = format!(
             "template lint: {} file(s) checked, {} error(s), {} warning(s)\n",
@@ -318,10 +327,11 @@ impl LintReport {
                 LintSeverity::Error => "error",
                 LintSeverity::Warning => "warning",
             };
-            out.push_str(&format!(
-                "  {level} [{}] {}: {}\n",
+            let _ = writeln!(
+                out,
+                "  {level} [{}] {}: {}",
                 finding.rule, finding.file, finding.message
-            ));
+            );
         }
         if self.findings.is_empty() {
             out.push_str("  ok: template satisfies every rule\n");
@@ -365,6 +375,7 @@ pub fn lint_directory(root: &Path) -> Result<LintReport> {
 }
 
 /// Lints a rendered template file set.
+#[must_use]
 pub fn lint_template(files: &[GeneratedFile]) -> LintReport {
     let mut findings = Vec::new();
 
@@ -480,6 +491,7 @@ pub fn lint_template(files: &[GeneratedFile]) -> LintReport {
 
 /// Crate names must be kebab-case so they can be used as Cargo targets and
 /// turned into wasm file names.
+#[must_use]
 pub fn is_valid_crate_name(name: &str) -> bool {
     if name.is_empty() || name.len() > 64 {
         return false;
@@ -587,7 +599,7 @@ mod tests {
     #[test]
     fn test_lint_flags_missing_crate_type_and_no_std() {
         let mut files = rendered();
-        for file in files.iter_mut() {
+        for file in &mut files {
             if file.path == "Cargo.toml" {
                 file.contents = file.contents.replace("crate-type", "unused-key");
             }
@@ -628,7 +640,7 @@ mod tests {
     #[test]
     fn test_lint_flags_whitespace_hygiene() {
         let mut files = rendered();
-        for file in files.iter_mut() {
+        for file in &mut files {
             if file.path == "src/lib.rs" {
                 let trimmed = file.contents.trim_end().to_string();
                 file.contents = format!("{trimmed}   ");
@@ -648,7 +660,7 @@ mod tests {
     #[test]
     fn test_lint_accepts_workspace_manifests() {
         let mut files = rendered();
-        for file in files.iter_mut() {
+        for file in &mut files {
             if file.path == "Cargo.toml" {
                 file.contents = file
                     .contents

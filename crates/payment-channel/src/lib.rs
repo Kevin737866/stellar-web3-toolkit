@@ -237,6 +237,7 @@ impl ChannelManager {
     }
 
     /// Create a new payment channel
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // public API; funding will need an RPC round trip
     pub async fn create_channel(
         &self,
         our_address: String,
@@ -440,29 +441,69 @@ impl ChannelManager {
         self.ledger_height.fetch_add(1, Ordering::SeqCst) + 1
     }
 
-    /// Close a channel cooperatively
+    /// Close a channel cooperatively.
+    ///
+    /// Idempotent (#351): the first call moves the channel to
+    /// [`ChannelStatus::Closing`]. Calling it again — the retry a client makes
+    /// when the response to the first call was lost — returns that same state
+    /// without recording another snapshot, advancing the sequence number, or
+    /// consuming a ledger height.
+    ///
+    /// A channel that is not open and not already closing cooperatively (a
+    /// force close, a dispute) is refused with [`PaymentChannelError::InvalidState`].
     pub fn cooperative_close(
         &self,
         channel_id: &str,
     ) -> Result<LocalChannelState, PaymentChannelError> {
+        self.close_cooperatively(channel_id, None)
+    }
+
+    /// Close a channel cooperatively at a known ledger height.
+    ///
+    /// The height-aware twin of [`ChannelManager::cooperative_close`], for
+    /// callers that observed the close on chain. A retry of an already-applied
+    /// close is still idempotent and ignores `ledger_height`, because there is
+    /// no state left to record.
+    pub fn cooperative_close_at(
+        &self,
+        channel_id: &str,
+        ledger_height: u32,
+    ) -> Result<LocalChannelState, PaymentChannelError> {
+        self.close_cooperatively(channel_id, Some(ledger_height))
+    }
+
+    fn close_cooperatively(
+        &self,
+        channel_id: &str,
+        ledger_height: Option<u32>,
+    ) -> Result<LocalChannelState, PaymentChannelError> {
         let mut channels = self.channels.write();
-        let state = channels
+        let channel = channels
             .get_mut(channel_id)
             .ok_or_else(|| PaymentChannelError::ChannelNotFound(channel_id.to_string()))?;
 
-        if state.state.status != ChannelStatus::Open {
-            return Err(PaymentChannelError::InvalidState(format!(
-                "Cannot close channel in state {:?}",
-                state.state.status
-            )));
+        match channel.state.status {
+            // Already closed (or closing) cooperatively: the retry's intent is
+            // satisfied. Return the state the first call produced, untouched.
+            ChannelStatus::Closing | ChannelStatus::Closed => {
+                return Ok(channel.state.clone());
+            }
+            ChannelStatus::Open => {}
+            other => {
+                return Err(PaymentChannelError::InvalidState(format!(
+                    "Cannot close channel in state {other}"
+                )));
+            }
         }
 
-        let ledger_height = self.next_ledger_height();
-        check_height(channel_id, &state.history, ledger_height)?;
-        state.state.status = ChannelStatus::Closing;
-        record_state(channel_id, state, ledger_height)?;
+        // Only allocate a height for a close that will actually be applied, so a
+        // retry does not leave a gap in the recorded heights.
+        let ledger_height = ledger_height.unwrap_or_else(|| self.next_ledger_height());
+        check_height(channel_id, &channel.history, ledger_height)?;
+        channel.state.status = ChannelStatus::Closing;
+        record_state(channel_id, channel, ledger_height)?;
 
-        Ok(state.state.clone())
+        Ok(channel.state.clone())
     }
 
     /// Initiate a unilateral close
@@ -517,7 +558,7 @@ impl ChannelManager {
         use sha2::{Digest, Sha256};
 
         let mut sorted = [a, b].to_vec();
-        sorted.sort();
+        sorted.sort_unstable();
 
         let mut hasher = Sha256::new();
         hasher.update(sorted[0].as_bytes());
@@ -566,7 +607,9 @@ fn record_state(
                 recorded: last,
                 incoming: height,
             },
-            other => PaymentChannelError::InvalidState(other.to_string()),
+            other @ ReorgError::NoSnapshotAtOrBelow { .. } => {
+                PaymentChannelError::InvalidState(other.to_string())
+            }
         })?;
 
     Ok(())
@@ -806,6 +849,102 @@ mod tests {
             manager.record_channel_state(&channel_id, 7),
             Err(PaymentChannelError::ReorgDetected { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn cooperative_close_is_idempotent_on_retry() {
+        let (manager, channel_id) = manager_with_channel(8).await;
+
+        let first = manager.cooperative_close(&channel_id).unwrap();
+        assert_eq!(first.status, ChannelStatus::Closing);
+        let heights = manager.recorded_heights(&channel_id).unwrap();
+        assert_eq!(heights.len(), 2, "the close records one snapshot");
+
+        for _ in 0..3 {
+            let again = manager
+                .cooperative_close(&channel_id)
+                .expect("a retry of the same close must succeed");
+            assert_eq!(again, first, "a retry must not change the state");
+        }
+
+        assert_eq!(
+            manager.recorded_heights(&channel_id).unwrap(),
+            heights,
+            "a retry must not record another snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retry_at_a_known_height_is_also_idempotent() {
+        let (manager, channel_id) = manager_with_channel(8).await;
+
+        manager.cooperative_close_at(&channel_id, 10).unwrap();
+        assert_eq!(manager.recorded_heights(&channel_id).unwrap(), vec![0, 10]);
+
+        // The retry carries a height that was never applied; it must still be a
+        // no-op rather than a second close or a reorg rejection.
+        manager.cooperative_close_at(&channel_id, 11).unwrap();
+        assert_eq!(manager.recorded_heights(&channel_id).unwrap(), vec![0, 10]);
+    }
+
+    #[tokio::test]
+    async fn a_closed_channel_accepts_a_cooperative_close_retry() {
+        let (manager, channel_id) = manager_with_channel(8).await;
+
+        manager.cooperative_close(&channel_id).unwrap();
+        // Simulate the on-chain confirmation that moves the channel on.
+        {
+            let mut channels = manager.channels.write();
+            channels.get_mut(&channel_id).unwrap().state.status = ChannelStatus::Closed;
+        }
+
+        let state = manager.cooperative_close(&channel_id).unwrap();
+        assert_eq!(state.status, ChannelStatus::Closed);
+    }
+
+    #[tokio::test]
+    async fn a_force_closed_channel_refuses_a_cooperative_close() {
+        let (manager, channel_id) = manager_with_channel(8).await;
+
+        manager.initiate_unilateral_close(&channel_id).unwrap();
+
+        let err = manager.cooperative_close(&channel_id).unwrap_err();
+        assert!(matches!(err, PaymentChannelError::InvalidState(_)));
+        assert_eq!(
+            manager.get_channel(&channel_id).unwrap().status,
+            ChannelStatus::ForceClosed,
+            "a rejected close must not change the state"
+        );
+    }
+
+    #[tokio::test]
+    async fn closing_an_unknown_channel_reports_not_found() {
+        let (manager, _) = manager_with_channel(8).await;
+
+        assert!(matches!(
+            manager.cooperative_close("missing"),
+            Err(PaymentChannelError::ChannelNotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_retried_close_still_participates_in_reorg_rollback() {
+        let (manager, channel_id) = manager_with_channel(8).await;
+
+        manager.cooperative_close_at(&channel_id, 10).unwrap();
+        manager.cooperative_close_at(&channel_id, 10).unwrap();
+        assert_eq!(
+            manager.get_channel(&channel_id).unwrap().status,
+            ChannelStatus::Closing
+        );
+
+        // The fork is below the close, so the rollback reopens the channel.
+        let report = manager.handle_reorg(0);
+        assert!(report.is_clean());
+        assert_eq!(
+            manager.get_channel(&channel_id).unwrap().status,
+            ChannelStatus::Open
+        );
     }
 
     #[test]

@@ -127,6 +127,7 @@ impl AirdropLeaf {
 /// Hash of a single `(address, amount)` allocation.
 ///
 /// See the module docs for the exact preimage layout.
+#[must_use]
 pub fn leaf_hash(address: &str, amount: u64) -> Hash {
     let address = address.as_bytes();
     let mut hasher = Sha256::new();
@@ -141,6 +142,7 @@ pub fn leaf_hash(address: &str, amount: u64) -> Hash {
 /// Hash of an internal node, sorting the two children.
 ///
 /// Sorting is what makes the root a function of the leaf *set*.
+#[must_use]
 pub fn node_hash(left: Hash, right: Hash) -> Hash {
     let (l, r) = if left <= right {
         (left, right)
@@ -159,6 +161,7 @@ pub fn node_hash(left: Hash, right: Hash) -> Hash {
 ///
 /// `depth_for(0)` and `depth_for(1)` are both `0`: a single-leaf tree's root
 /// *is* its leaf and its proof is empty.
+#[must_use]
 pub fn depth_for(leaf_count: usize) -> usize {
     let mut depth = 0usize;
     let mut capacity = 1usize;
@@ -172,6 +175,7 @@ pub fn depth_for(leaf_count: usize) -> usize {
 /// Constant-time equality for 32-byte digests.
 ///
 /// The comparison does not short-circuit on the first differing byte.
+#[must_use]
 pub fn ct_eq(a: &Hash, b: &Hash) -> bool {
     let mut diff = 0u8;
     for i in 0..32 {
@@ -197,6 +201,7 @@ impl MerkleTree {
     /// depend on the input order. Duplicate `(address, amount)` pairs are the
     /// distributor's error: they occupy two leaves but a single
     /// [`MerkleTree::proof`] lookup resolves to the first of them.
+    #[must_use]
     pub fn new(leaves: &[AirdropLeaf]) -> Self {
         let mut sorted = leaves.to_vec();
         sorted.sort();
@@ -234,11 +239,13 @@ impl MerkleTree {
     }
 
     /// Number of leaves.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.levels[0].len()
     }
 
     /// True when the tree was built from an empty allocation list.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.levels[0].is_empty()
     }
@@ -246,16 +253,19 @@ impl MerkleTree {
     /// Number of sibling hashes a valid proof contains.
     ///
     /// Equal to [`depth_for`] of [`MerkleTree::len`].
+    #[must_use]
     pub fn depth(&self) -> usize {
         self.levels.len().saturating_sub(1)
     }
 
     /// The Merkle root, or `None` for an empty tree (which has no root).
+    #[must_use]
     pub fn root(&self) -> Option<Hash> {
         self.levels.last().and_then(|level| level.first().copied())
     }
 
     /// Position of an allocation in the sorted leaf order, if it is present.
+    #[must_use]
     pub fn index_of(&self, address: &str, amount: u64) -> Option<usize> {
         self.sorted_leaves
             .iter()
@@ -263,6 +273,7 @@ impl MerkleTree {
     }
 
     /// Build the sibling path for the leaf at `index` in sorted order.
+    #[must_use]
     pub fn proof(&self, index: usize) -> Option<Vec<Hash>> {
         if index >= self.len() {
             return None;
@@ -288,6 +299,7 @@ impl MerkleTree {
     }
 
     /// Build the sibling path for a specific `(address, amount)` allocation.
+    #[must_use]
     pub fn proof_for(&self, address: &str, amount: u64) -> Option<Vec<Hash>> {
         self.proof(self.index_of(address, amount)?)
     }
@@ -299,6 +311,7 @@ impl MerkleTree {
 /// `proof[proof.len() - 1]` is the node just below the root. The length of
 /// `proof` **must** equal `expected_depth` — a proof of the wrong length is
 /// rejected outright rather than being allowed to hash to some other root.
+#[must_use]
 pub fn verify_proof(
     leaf: &Hash,
     proof: &[Hash],

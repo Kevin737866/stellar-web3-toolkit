@@ -185,8 +185,7 @@ impl Alert {
                 new_sequence,
             } => {
                 format!(
-                    "BREACH ATTEMPT DETECTED on channel {}! Old seq: {}, New seq: {}",
-                    channel_id, old_sequence, new_sequence
+                    "BREACH ATTEMPT DETECTED on channel {channel_id}! Old seq: {old_sequence}, New seq: {new_sequence}"
                 )
             }
             AlertType::HtlcTimeoutWarning {
@@ -195,24 +194,20 @@ impl Alert {
                 blocks_remaining,
             } => {
                 format!(
-                    "HTLC {} in channel {} will timeout in {} blocks",
-                    htlc_id, channel_id, blocks_remaining
+                    "HTLC {htlc_id} in channel {channel_id} will timeout in {blocks_remaining} blocks"
                 )
             }
             AlertType::JusticeSubmitted {
                 channel_id,
                 tx_hash,
             } => {
-                format!(
-                    "Justice transaction submitted for channel {}. Tx: {}",
-                    channel_id, tx_hash
-                )
+                format!("Justice transaction submitted for channel {channel_id}. Tx: {tx_hash}")
             }
             AlertType::UnexpectedClose { channel_id, reason } => {
-                format!("Channel {} closed unexpectedly: {}", channel_id, reason)
+                format!("Channel {channel_id} closed unexpectedly: {reason}")
             }
             AlertType::HealthCheckFailed { component, error } => {
-                format!("Health check failed for {}: {}", component, error)
+                format!("Health check failed for {component}: {error}")
             }
         }
     }
@@ -310,6 +305,7 @@ impl Watchtower {
     }
 
     /// Start the watchtower service
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // public API; the loop it spawns is what awaits
     pub async fn start(&self) -> Result<(), WatchtowerError> {
         *self.state.is_running.write() = true;
 

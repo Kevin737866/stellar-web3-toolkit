@@ -67,3 +67,6 @@ required-features = ["resolver-api"]
 [lib]
 name = "stellar_did"
 path = "src/lib.rs"
+
+[lints]
+workspace = true

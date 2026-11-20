@@ -41,8 +41,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         participant: "GD5J6QF7GHXQUSWNSKN2UE4XENIH2NQCAQPQZJ56YRCZBKZWD4FAACEF".to_string(),
         initiator_asset: Asset::XLM,
         participant_asset: Asset::Custom("USDC".to_string()),
-        initiator_amount: 10_000_000, // 1 XLM in stroops
-        participant_amount: 9500000,  // 0.95 USDC
+        initiator_amount: 10_000_000,  // 1 XLM in stroops
+        participant_amount: 9_500_000, // 0.95 USDC
         timeout_hours: 24,
         // A local swap: no cross-chain nonce to consume.
         origin_chain: None,

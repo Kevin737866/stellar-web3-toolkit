@@ -54,8 +54,8 @@
 pub mod math;
 
 use math::{
-    acc_reward_delta, accrued, advance_index, distributable_seconds, pool_share,
-    remaining_rewards, reward_rate_for, PRECISION,
+    acc_reward_delta, accrued, advance_index, distributable_seconds, pool_share, remaining_rewards,
+    reward_rate_for,
 };
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token::TokenClient, Address, Env, Vec,
@@ -404,9 +404,11 @@ fn projected_acc(cfg: &Config, pool: &Pool, now: u64) -> i128 {
 
 fn pending_for(cfg: &Config, pool: &Pool, position: &Position, now: u64) -> i128 {
     let acc_now = projected_acc(cfg, pool, now);
-    position
-        .accrued
-        .saturating_add(accrued(position.amount, acc_now, position.acc_reward_per_share_paid))
+    position.accrued.saturating_add(accrued(
+        position.amount,
+        acc_now,
+        position.acc_reward_per_share_paid,
+    ))
 }
 
 /// The invariant that keeps the farm solvent.
@@ -573,7 +575,8 @@ impl YieldFarm {
         cfg.admin.require_auth();
         cfg.admin = new_admin.clone();
         set_config(&env, &cfg);
-        env.events().publish((symbol_short!("set_admin"),), new_admin);
+        env.events()
+            .publish((symbol_short!("set_admin"),), new_admin);
     }
 
     /// Blocks deposits and funding. Withdrawals and harvests stay open.
@@ -618,8 +621,10 @@ impl YieldFarm {
         ids.push_back(pool_id);
         env.storage().instance().set(&DataKey::PoolIds, &ids);
 
-        env.events()
-            .publish((symbol_short!("add_pool"), pool_id), (lp_token, alloc_point));
+        env.events().publish(
+            (symbol_short!("add_pool"), pool_id),
+            (lp_token, alloc_point),
+        );
     }
 
     /// Changes a pool's allocation weight. Settles every pool first, so the
@@ -724,7 +729,10 @@ impl YieldFarm {
 
         transfer_in(&env, &pool.lp_token, &user, amount);
 
-        position.amount = position.amount.checked_add(amount).expect("amount overflow");
+        position.amount = position
+            .amount
+            .checked_add(amount)
+            .expect("amount overflow");
         pool.total_staked = pool.total_staked.checked_add(amount).expect("TVL overflow");
 
         write_position(&env, &user, &position);
@@ -978,10 +986,7 @@ mod test {
         let f = Fixture::new();
         f.standard_farm();
         // Unknown pool.
-        assert!(f
-            .client
-            .try_deposit(&f.alice, &99, &(10 * ONE))
-            .is_err());
+        assert!(f.client.try_deposit(&f.alice, &99, &(10 * ONE)).is_err());
         // Non-positive amounts.
         f.mint(&f.lp_a, &f.alice, 10 * ONE);
         assert!(f.client.try_deposit(&f.alice, &1, &0).is_err());
@@ -1120,16 +1125,13 @@ mod test {
 
         f.advance(50);
         // Top up: 50 * ONE still streamed + 100 * ONE over 100s = 1.5 * ONE/s.
-        let rate = f.fund(100 * ONE, 100);
-        assert_eq!(rate, 1_500_000);
+        f.fund(100 * ONE, 100);
+        assert_eq!(f.client.reward_rate(), 1_500_000);
 
         f.advance(100);
 
         // 50s at the old rate + 100s at the new one.
-        assert_eq!(
-            f.client.pending_rewards(&f.alice, &1),
-            50 * ONE + 150 * ONE
-        );
+        assert_eq!(f.client.pending_rewards(&f.alice, &1), 50 * ONE + 150 * ONE);
         assert_eq!(f.client.rewards_funded(), 200 * ONE);
     }
 
@@ -1200,11 +1202,18 @@ mod test {
         f.mint(&f.reward_token, &funder, ONE);
         assert!(f.client.try_fund_rewards(&funder, &ONE, &100).is_err());
 
-        // Exits stay open.
+        // Exits stay open. The deposit moved Alice's 100 * ONE LP into the
+        // contract, and the 10 * ONE minted above is still in her wallet, so a
+        // full withdrawal returns the deposit on top of that balance.
+        let wallet_before = f.balance(&f.lp_a, &f.alice);
         f.advance(100);
         assert_eq!(f.client.harvest(&f.alice, &1, &0), 50 * ONE);
         f.client.withdraw(&f.alice, &1, &(100 * ONE));
-        assert_eq!(f.balance(&f.lp_a, &f.alice), 100 * ONE);
+        assert_eq!(
+            f.balance(&f.lp_a, &f.alice),
+            wallet_before + 100 * ONE,
+            "the paused farm must return every staked LP token"
+        );
     }
 
     #[test]
@@ -1215,10 +1224,7 @@ mod test {
 
         f.client.set_pool_active(&1, &false);
         assert!(!f.client.pool_of(&1).unwrap().active);
-        assert!(f
-            .client
-            .try_deposit(&f.alice, &1, &ONE)
-            .is_err());
+        assert!(f.client.try_deposit(&f.alice, &1, &ONE).is_err());
 
         f.advance(100);
         assert_eq!(f.client.harvest(&f.alice, &1, &0), 50 * ONE);

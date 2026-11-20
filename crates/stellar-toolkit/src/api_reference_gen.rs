@@ -5,6 +5,7 @@
 
 use crate::error::{Result, ToolkitError};
 use serde::{Deserialize, Serialize};
+use std::fmt::Write as _;
 
 /// Documented API Endpoint / Contract Function
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,6 +34,7 @@ impl Default for ApiReferenceGenerator {
 }
 
 impl ApiReferenceGenerator {
+    #[must_use]
     pub fn new(site_title: &str, version: &str) -> Self {
         Self {
             site_title: site_title.to_string(),
@@ -79,37 +81,35 @@ impl ApiReferenceGenerator {
     }
 
     /// Exports full API reference as a Markdown site file
+    #[must_use]
     pub fn generate_markdown_site(&self) -> String {
         let mut md = format!("# {}\n\n", self.site_title);
-        md.push_str(&format!("**Version**: {}\n\n", self.version));
+        let _ = write!(md, "**Version**: {}\n\n", self.version);
         md.push_str(
             "Complete API documentation reference for Soroban contracts and SDK crates.\n\n",
         );
         md.push_str("## Table of Contents\n\n");
 
         for doc in &self.functions {
-            md.push_str(&format!(
-                "- [{}]({}#user-content-{})\n",
+            let _ = writeln!(
+                md,
+                "- [{}](#user-content-{})",
                 doc.name,
-                "",
                 doc.name.to_lowercase().replace("::", "-")
-            ));
+            );
         }
 
         md.push_str("\n---\n\n");
 
         for doc in &self.functions {
-            md.push_str(&format!("### {}\n\n", doc.name));
-            md.push_str(&format!(
-                "*Module/Contract*: `{}`\n\n",
-                doc.module_or_contract
-            ));
-            md.push_str(&format!("{}\n\n", doc.description));
+            let _ = write!(md, "### {}\n\n", doc.name);
+            let _ = write!(md, "*Module/Contract*: `{}`\n\n", doc.module_or_contract);
+            let _ = write!(md, "{}\n\n", doc.description);
             md.push_str("**Parameters:**\n");
             for (param, ptype) in &doc.parameters {
-                md.push_str(&format!("- `{}`: `{}`\n", param, ptype));
+                let _ = writeln!(md, "- `{param}`: `{ptype}`");
             }
-            md.push_str(&format!("\n**Return Type:** `{}`\n\n", doc.return_type));
+            let _ = write!(md, "\n**Return Type:** `{}`\n\n", doc.return_type);
             md.push_str("```rust\n");
             md.push_str(&doc.example_call);
             md.push_str("\n```\n\n---\n\n");
@@ -122,7 +122,7 @@ impl ApiReferenceGenerator {
     pub fn save_docs_to_file(&self, file_path: &str) -> Result<()> {
         let content = self.generate_markdown_site();
         std::fs::write(file_path, content)
-            .map_err(|e| ToolkitError::Session(format!("Failed to write API docs: {}", e)))
+            .map_err(|e| ToolkitError::Session(format!("Failed to write API docs: {e}")))
     }
 }
 

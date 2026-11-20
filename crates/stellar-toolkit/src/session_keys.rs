@@ -105,6 +105,7 @@ impl SessionKey {
     }
 
     /// Checks whether the session key is currently valid (unexpired and unrevoked).
+    #[must_use]
     pub fn is_valid_at(&self, now: u64) -> bool {
         !self.is_revoked && self.policy.expires_at > now
     }
@@ -158,11 +159,13 @@ pub struct RecoveryRequest {
 
 impl RecoveryRequest {
     /// Number of distinct vetoes currently outstanding.
+    #[must_use]
     pub fn veto_count(&self) -> usize {
         self.vetoes.len()
     }
 
     /// Whether enough distinct vetoes have accumulated to block execution.
+    #[must_use]
     pub fn is_vetoed(&self) -> bool {
         self.vetoes.len() >= self.veto_threshold
     }
@@ -178,6 +181,7 @@ pub struct AccountAbstractionManager {
 }
 
 impl AccountAbstractionManager {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             sessions: HashMap::new(),
@@ -193,6 +197,7 @@ impl AccountAbstractionManager {
     }
 
     /// Retrieve a reference to a session key.
+    #[must_use]
     pub fn get_session(&self, session_id: &str) -> Option<&SessionKey> {
         self.sessions.get(session_id)
     }
@@ -276,12 +281,11 @@ impl AccountAbstractionManager {
         if !session.is_valid_at(now) {
             if session.is_revoked {
                 return Err(SessionError::SessionRevoked(session_id.to_string()));
-            } else {
-                return Err(SessionError::SessionExpired(
-                    session_id.to_string(),
-                    session.policy.expires_at,
-                ));
             }
+            return Err(SessionError::SessionExpired(
+                session_id.to_string(),
+                session.policy.expires_at,
+            ));
         }
 
         // Mock signature for abstraction layer testability
@@ -359,6 +363,7 @@ impl AccountAbstractionManager {
     }
 
     /// Retrieve a reference to an in-flight (or completed) recovery request.
+    #[must_use]
     pub fn get_recovery(&self, recovery_id: &str) -> Option<&RecoveryRequest> {
         self.recovery_requests.get(recovery_id)
     }
@@ -548,7 +553,7 @@ impl AccountAbstractionManager {
     pub fn is_recovery_vetoed(&self, recovery_id: &str) -> Result<bool> {
         self.recovery_requests
             .get(recovery_id)
-            .map(|r| r.is_vetoed())
+            .map(RecoveryRequest::is_vetoed)
             .ok_or_else(|| SessionError::SessionNotFound(recovery_id.to_string()))
     }
 }

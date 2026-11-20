@@ -134,18 +134,17 @@ mod test {
         // with "reference-types not enabled: zero byte expected".
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/wasm32v1-none/release/amm_pool.wasm");
-        let pool_wasm: std::vec::Vec<u8> = match std::fs::read(&path) {
-            Ok(w) => w,
-            Err(_) => {
-                // Skipping rather than failing keeps `cargo test` usable without a
-                // prior WASM build, but it also means this test proves nothing
-                // unless the build ran first. The CI `wasm` job therefore builds
-                // and then runs this test explicitly.
-                std::eprintln!(
-                    "skip create_pair_deploys_pool: run `cargo build -p amm-pool --target wasm32v1-none --release` first"
-                );
-                return;
-            }
+        let pool_wasm: std::vec::Vec<u8> = if let Ok(w) = std::fs::read(&path) {
+            w
+        } else {
+            // Skipping rather than failing keeps `cargo test` usable without a
+            // prior WASM build, but it also means this test proves nothing
+            // unless the build ran first. The CI `wasm` job therefore builds
+            // and then runs this test explicitly.
+            std::eprintln!(
+                "skip create_pair_deploys_pool: run `cargo build -p amm-pool --target wasm32v1-none --release` first"
+            );
+            return;
         };
 
         let env = Env::default();

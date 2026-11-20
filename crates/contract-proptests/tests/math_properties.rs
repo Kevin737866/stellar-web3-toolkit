@@ -8,8 +8,8 @@
 //! ```
 
 use amm_pool::math::{
-    amount_out, count_distinct_voters, flash_k_ok, liquidity_amounts_first_deposit, quote,
-    quorum_status, sqrt_u128, FEE_DEN, FEE_NUM,
+    amount_out, count_distinct_voters, flash_k_ok, liquidity_amounts_first_deposit, quorum_status,
+    quote, sqrt_u128, FEE_DEN, FEE_NUM,
 };
 use contract_proptests::{check_default, expect, Rng};
 
@@ -50,7 +50,12 @@ fn sqrt_u128_is_monotonic() {
             let b = rng.next_u128() >> 2;
             (a.min(b), a.max(b))
         },
-        |(low, high)| expect(sqrt_u128(*low) <= sqrt_u128(*high), "sqrt must not decrease"),
+        |(low, high)| {
+            expect(
+                sqrt_u128(*low) <= sqrt_u128(*high),
+                "sqrt must not decrease",
+            )
+        },
     );
 }
 
@@ -86,10 +91,13 @@ fn a_swap_output_is_monotonic_in_the_input() {
             let extra = rng.i128_in(0, 100_000);
             (small, small + extra, reserve_in, reserve_out)
         },
-        |(a, b, reserve_in, reserve_out)| expect(
-            amount_out(*a, *reserve_in, *reserve_out) <= amount_out(*b, *reserve_in, *reserve_out),
-            "output must not decrease as the input grows",
-        ),
+        |(a, b, reserve_in, reserve_out)| {
+            expect(
+                amount_out(*a, *reserve_in, *reserve_out)
+                    <= amount_out(*b, *reserve_in, *reserve_out),
+                "output must not decrease as the input grows",
+            )
+        },
     );
 }
 
@@ -110,7 +118,10 @@ fn the_fee_never_helps_the_trader() {
                 .expect("product")
                 .checked_div(*reserve_in)
                 .expect("reserve is positive");
-            expect(out <= fee_free, "a fee-bearing output must not beat the fee-free one")
+            expect(
+                out <= fee_free,
+                "a fee-bearing output must not beat the fee-free one",
+            )
         },
     );
 }
@@ -147,27 +158,36 @@ fn a_quote_is_monotonic_in_the_amount() {
             let extra = rng.i128_in(0, 10_000);
             (small, small + extra, reserve_a, reserve_b)
         },
-        |(a, b, reserve_a, reserve_b)| expect(
-            quote(*a, *reserve_a, *reserve_b) <= quote(*b, *reserve_a, *reserve_b),
-            "quote must not decrease as the amount grows",
-        ),
+        |(a, b, reserve_a, reserve_b)| {
+            expect(
+                quote(*a, *reserve_a, *reserve_b) <= quote(*b, *reserve_a, *reserve_b),
+                "quote must not decrease as the amount grows",
+            )
+        },
     );
 }
 
 #[test]
 fn the_first_deposit_mints_no_more_than_the_geometric_mean() {
     check_default(
-        "sqrt(a * b) never exceeds min(a, b)",
+        "the geometric mean of the deposits lies between them",
         |rng: &mut Rng| {
             let a = rng.i128_in(1, 1_000_000_000);
             let b = rng.i128_in(1, 1_000_000_000);
             (a, b)
         },
         |(a, b)| {
+            // The function is only defined for positive deposits; shrinking can
+            // reach 0, which is out of domain rather than a counterexample.
+            if *a <= 0 || *b <= 0 {
+                return Ok(());
+            }
             let liquidity = liquidity_amounts_first_deposit(*a, *b);
+            // The geometric mean is bounded by the two deposits, not by the
+            // smaller one: sqrt(1 * 4) == 2 > 1.
             expect(
-                liquidity <= (*a).min(*b),
-                "the minted liquidity must not exceed min(a, b)",
+                liquidity >= (*a).min(*b) && liquidity <= (*a).max(*b),
+                "the minted liquidity must lie between the two deposits",
             )?;
             let square = liquidity.checked_mul(liquidity);
             expect(

@@ -3,7 +3,7 @@
 //! Estimates the fee of a Soroban transaction from its resource profile and
 //! plans the fee bump transactions used to resubmit a transaction that was not
 //! included in a ledger because the network base fee moved. Fees are expressed in
-//! stroops (1 XLM = 10_000_000 stroops) to match the Stellar protocol.
+//! stroops (1 XLM = `10_000_000` stroops) to match the Stellar protocol.
 
 use crate::error::{Result, ToolkitError};
 use serde::{Deserialize, Serialize};
@@ -36,6 +36,7 @@ pub struct FeeSchedule {
 
 impl FeeSchedule {
     /// Conservative defaults for the public testnet fee model.
+    #[must_use]
     pub fn testnet_default() -> Self {
         Self {
             base_fee_stroops: 100,
@@ -96,6 +97,7 @@ pub struct FeeEstimate {
 }
 
 impl FeeEstimate {
+    #[must_use]
     pub fn total_xlm(&self) -> f64 {
         f64::from(self.total_stroops) / STROOPS_PER_XLM as f64
     }
@@ -116,11 +118,13 @@ pub struct FeeBump {
 
 impl FeeBump {
     /// Total amount the fee source has to hold for this attempt.
+    #[must_use]
     pub fn fee_source_pays(&self) -> u32 {
         self.outer_fee_stroops
     }
 
     /// Percentage the outer fee raises the fee the inner transaction was signed with.
+    #[must_use]
     pub fn percent_over_signed_fee(&self) -> u32 {
         if self.inner_fee_at_signing_stroops == 0 {
             return 0;
@@ -139,11 +143,13 @@ pub struct GasSimulator {
 }
 
 impl GasSimulator {
+    #[must_use]
     pub fn new(schedule: FeeSchedule) -> Self {
         Self { schedule }
     }
 
     /// Fee required to submit `profile` right now.
+    #[must_use]
     pub fn estimate(&self, profile: &TransactionProfile) -> FeeEstimate {
         let schedule = &self.schedule;
         let resource_fee = profile
@@ -225,6 +231,7 @@ impl GasSimulator {
     }
 
     /// True while another bump stays within `max_fee_stroops`.
+    #[must_use]
     pub fn is_bumpable(&self, fee_stroops: u32) -> bool {
         fee_stroops < self.schedule.max_fee_stroops
     }
@@ -232,6 +239,7 @@ impl GasSimulator {
     /// Escalating outer fees for automated retries. The ladder stops at
     /// `max_bumps` attempts, at `max_fee_stroops`, or as soon as a bump would no
     /// longer raise the fee.
+    #[must_use]
     pub fn bump_ladder(&self, start_fee_stroops: u32) -> Vec<FeeBump> {
         let schedule = &self.schedule;
         let signed_fee = start_fee_stroops.max(schedule.base_fee_stroops);
@@ -257,6 +265,7 @@ impl GasSimulator {
 }
 
 /// Formats stroops as a human readable XLM amount (7 decimal places).
+#[must_use]
 pub fn format_stroops(stroops: u32) -> String {
     let value = u64::from(stroops);
     let whole = value / STROOPS_PER_XLM;

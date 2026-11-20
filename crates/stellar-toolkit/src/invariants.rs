@@ -36,6 +36,7 @@ use crate::state_inspector::{Durability, StateEntry, StateInspector, StateQuery}
 use crate::timelock::{DelayKind, TimelockPolicy, MAX_PAUSE_DELAY, MIN_PAUSE_DELAY};
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
+use std::fmt::Write as _;
 
 /// Iterations per invariant when the caller does not choose a count.
 pub const DEFAULT_ITERATIONS: u64 = 512;
@@ -57,6 +58,7 @@ pub struct Prng {
 }
 
 impl Prng {
+    #[must_use]
     pub fn new(seed: u64) -> Self {
         Self {
             state: seed ^ 0x9E37_79B9_7F4A_7C15,
@@ -86,7 +88,7 @@ impl Prng {
             return low;
         }
         let span = (high - low) as u128 + 1;
-        let raw = ((self.next_u64() as u128) << 64) | self.next_u64() as u128;
+        let raw = (u128::from(self.next_u64()) << 64) | u128::from(self.next_u64());
         low + (raw % span) as i128
     }
 
@@ -127,42 +129,48 @@ pub struct InvariantReport {
 
 impl InvariantReport {
     /// True when no counterexample was found in the sampled space.
+    #[must_use]
     pub fn held(&self) -> bool {
         self.counterexamples.is_empty()
     }
 
     /// Reproduce command for the first counterexample.
+    #[must_use]
     pub fn reproduce_command(&self) -> Option<String> {
         self.counterexamples
             .first()
             .map(|c| format!("stellar-toolkit verify invariants --seed {}", c.seed))
     }
 
+    #[must_use]
     pub fn render(&self) -> String {
         let mut out = String::new();
         if self.held() {
-            out.push_str(&format!(
-                "  PASS  {:<38} {} iteration(s)\n",
+            let _ = writeln!(
+                out,
+                "  PASS  {:<38} {} iteration(s)",
                 self.name, self.iterations
-            ));
+            );
             return out;
         }
-        out.push_str(&format!(
-            "  FAIL  {:<38} {} counterexample(s) in {} iteration(s)\n",
+        let _ = writeln!(
+            out,
+            "  FAIL  {:<38} {} counterexample(s) in {} iteration(s)",
             self.name,
             self.counterexamples.len(),
             self.iterations
-        ));
-        out.push_str(&format!("        invariant: {}\n", self.description));
+        );
+        let _ = writeln!(out, "        invariant: {}", self.description);
         for case in &self.counterexamples {
-            out.push_str(&format!(
-                "        seed {} iteration {}: {}\n",
+            let _ = writeln!(
+                out,
+                "        seed {} iteration {}: {}",
                 case.seed, case.iteration, case.message
-            ));
-            out.push_str(&format!("          input: {}\n", case.input));
+            );
+            let _ = writeln!(out, "          input: {}", case.input);
         }
         if let Some(command) = self.reproduce_command() {
-            out.push_str(&format!("        reproduce: {command}\n"));
+            let _ = writeln!(out, "        reproduce: {command}");
         }
         out
     }
@@ -177,22 +185,27 @@ pub struct SuiteReport {
 }
 
 impl SuiteReport {
+    #[must_use]
     pub fn failed(&self) -> usize {
         self.reports.iter().filter(|r| !r.held()).count()
     }
 
+    #[must_use]
     pub fn passed(&self) -> bool {
         self.failed() == 0
     }
 
+    #[must_use]
     pub fn checked(&self) -> u64 {
         self.reports.iter().map(|r| r.iterations).sum()
     }
 
+    #[must_use]
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
     }
 
+    #[must_use]
     pub fn render(&self) -> String {
         let mut out = format!(
             "informal verification (seed {}, {} iteration(s) per invariant)\n",
@@ -201,13 +214,14 @@ impl SuiteReport {
         for report in &self.reports {
             out.push_str(&report.render());
         }
-        out.push_str(&format!(
-            "{} invariant(s): {} passed, {} failed, {} input(s) sampled\n",
+        let _ = writeln!(
+            out,
+            "{} invariant(s): {} passed, {} failed, {} input(s) sampled",
             self.reports.len(),
             self.reports.len() - self.failed(),
             self.failed(),
             self.checked()
-        ));
+        );
         out
     }
 }
@@ -367,7 +381,7 @@ fn page_case(prng: &mut Prng, _iteration: u64) -> PageCase {
         inspector.insert(StateEntry {
             contract_id: format!("C{}", prng.below(2)),
             durability,
-            key: format!("key/{:02}", index),
+            key: format!("key/{index:02}"),
             value: format!("{}", prng.next_u64()),
             ledger: 1 + prng.below(1_000) as u32,
             live_until_ledger: None,
@@ -640,7 +654,7 @@ fn run_flat_invariants(seed: u64, iterations: u64) -> Vec<InvariantReport> {
             if findings.is_empty() {
                 return Err("secret key in source was not reported".to_string());
             }
-            if !findings.iter().any(|f| f.is_error()) {
+            if !findings.iter().any(super::key_hygiene::Finding::is_error) {
                 return Err("secret key was reported as a non-error".to_string());
             }
             if findings
@@ -781,10 +795,11 @@ fn run_flat_invariants(seed: u64, iterations: u64) -> Vec<InvariantReport> {
 }
 
 /// Run the built-in suite.
+#[must_use]
 pub fn run_suite(seed: u64, iterations: u64) -> SuiteReport {
     let iterations = iterations.max(1);
     let mut reports: Vec<InvariantReport> = Vec::new();
-    for invariant in built_in_suite().iter_mut() {
+    for invariant in &mut built_in_suite() {
         reports.push(invariant.run(seed, iterations));
     }
     reports.extend(run_flat_invariants(seed, iterations));

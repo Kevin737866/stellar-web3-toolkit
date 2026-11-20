@@ -17,3 +17,6 @@ channel-router = { path = "../channel-router" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread"] }
+
+[lints]
+workspace = true

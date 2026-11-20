@@ -7,6 +7,7 @@
 
 use crate::invariants::{run_suite, SuiteReport, DEFAULT_SEED};
 use serde::{Deserialize, Serialize};
+use std::fmt::Write as _;
 
 /// A single assertion step executed by [`VerificationHarness`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,20 +34,22 @@ impl VerificationHarnessReport {
         let suite_ok = self
             .invariant_suite
             .as_ref()
-            .map(SuiteReport::passed)
-            .unwrap_or(true);
+            .is_none_or(SuiteReport::passed);
         steps_ok && suite_ok
     }
 
     /// Number of failed verification steps.
+    #[must_use]
     pub fn failed_steps(&self) -> usize {
         self.steps.iter().filter(|s| !s.passed).count()
     }
 
+    #[must_use]
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
     }
 
+    #[must_use]
     pub fn render(&self) -> String {
         let mut out = format!(
             "verification harness: {} (seed {})\n",
@@ -54,12 +57,9 @@ impl VerificationHarnessReport {
         );
         for step in &self.steps {
             let status = if step.passed { "PASS" } else { "FAIL" };
-            out.push_str(&format!(
-                "  {status}  {:<28} {}\n",
-                step.id, step.description
-            ));
+            let _ = writeln!(out, "  {status}  {:<28} {}", step.id, step.description);
             if let Some(details) = &step.details {
-                out.push_str(&format!("        {details}\n"));
+                let _ = writeln!(out, "        {details}");
             }
         }
         if let Some(suite) = &self.invariant_suite {
@@ -95,11 +95,13 @@ impl VerificationHarness {
         }
     }
 
+    #[must_use]
     pub fn with_seed(mut self, seed: u64) -> Self {
         self.seed = seed;
         self
     }
 
+    #[must_use]
     pub fn with_invariant_suite(mut self, iterations: u64) -> Self {
         self.invariant_iterations = Some(iterations.max(1));
         self
@@ -150,6 +152,7 @@ impl VerificationHarness {
     }
 
     /// Execute all registered assertions and any configured invariant suite.
+    #[must_use]
     pub fn run(&self) -> VerificationHarnessReport {
         let mut steps = Vec::with_capacity(self.assertions.len());
         for assertion in &self.assertions {
@@ -199,6 +202,7 @@ pub enum ComplianceCategory {
 }
 
 impl ComplianceCategory {
+    #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::NoStdContract => "no_std_contract",
@@ -242,6 +246,7 @@ impl ComplianceChecklist {
     }
 
     /// True when every mandatory item in the checklist is satisfied.
+    #[must_use]
     pub fn passed(&self) -> bool {
         self.items
             .iter()
@@ -250,6 +255,7 @@ impl ComplianceChecklist {
     }
 
     /// All mandatory items that have not been satisfied.
+    #[must_use]
     pub fn mandatory_failures(&self) -> Vec<&ComplianceItem> {
         self.items
             .iter()
@@ -258,6 +264,7 @@ impl ComplianceChecklist {
     }
 
     /// Completion score in basis points (`0..=10_000`).
+    #[must_use]
     pub fn score_bps(&self) -> u32 {
         if self.items.is_empty() {
             return 10_000;
@@ -266,10 +273,12 @@ impl ComplianceChecklist {
         ((satisfied * 10_000) / self.items.len() as u64) as u32
     }
 
+    #[must_use]
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
     }
 
+    #[must_use]
     pub fn render(&self) -> String {
         let mut out = format!(
             "compliance checklist: {} (score {} bps, passed={})\n",
@@ -284,10 +293,11 @@ impl ComplianceChecklist {
             } else {
                 "optional"
             };
-            out.push_str(&format!(
-                "  {mark} {:<24} ({:<9}) {}\n        evidence: {}\n",
+            let _ = writeln!(
+                out,
+                "  {mark} {:<24} ({:<9}) {}\n        evidence: {}",
                 item.id, req_tag, item.requirement, item.evidence
-            ));
+            );
         }
         out
     }
@@ -357,7 +367,8 @@ impl ComplianceChecklist {
             },
         });
 
-        let secret_findings = crate::key_hygiene::scan_text(std::path::Path::new("contract.rs"), source);
+        let secret_findings =
+            crate::key_hygiene::scan_text(std::path::Path::new("contract.rs"), source);
         let clean_secrets = secret_findings.iter().all(|f| !f.is_error());
         checklist.add_item(ComplianceItem {
             id: "SOROBAN-005".to_string(),
@@ -394,8 +405,7 @@ mod tests {
 
     #[test]
     fn verification_harness_reports_failed_assertion() {
-        let harness = VerificationHarness::standard_stub("broken-contract")
-            .with_seed(0);
+        let harness = VerificationHarness::standard_stub("broken-contract").with_seed(0);
         let report = harness.run();
         assert!(!report.passed());
         assert_eq!(report.failed_steps(), 1);
@@ -404,14 +414,14 @@ mod tests {
 
     #[test]
     fn compliance_checklist_passes_valid_soroban_source() {
-        let sample = r#"
+        let sample = r"
             #![no_std]
             pub fn deposit(env: Env, user: Address, amount: i128) {
                 user.require_auth();
                 let next = amount.checked_add(1).unwrap();
                 env.storage().persistent().extend_ttl(&user, 100, 200);
             }
-        "#;
+        ";
         let checklist = ComplianceChecklist::evaluate_contract_source("sample-pool", sample);
         assert!(checklist.passed(), "{}", checklist.render());
         assert_eq!(checklist.mandatory_failures().len(), 0);

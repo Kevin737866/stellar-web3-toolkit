@@ -12,6 +12,7 @@ use crate::theme::{Style, Theme};
 use ed25519_dalek::{Signature, Signer, SigningKey};
 use hmac::{Hmac, Mac};
 use sha2::Sha512;
+use std::fmt::Write as _;
 
 type HmacSha512 = Hmac<Sha512>;
 
@@ -158,25 +159,24 @@ fn encode_account(public_key: &[u8; 32]) -> String {
 /// reading as "less important", and in `off` mode this function returns the
 /// same text the CLI printed before theming existed, with no escape sequences
 /// at all.
+#[must_use]
 pub fn format_wallet_summary(wallet: &GeneratedWallet, theme: &Theme) -> String {
     let mut out = String::new();
     out.push_str(&theme.heading("Wallet"));
     out.push('\n');
-    out.push_str(&format!(
-        "  {}\n{}\n",
+    let _ = writeln!(
+        out,
+        "  {}\n{}",
         theme.key("Recovery phrase:"),
         wallet.mnemonic
-    ));
-    out.push_str(&format!(
-        "  {}\n{}\n",
+    );
+    let _ = writeln!(
+        out,
+        "  {}\n{}",
         theme.paint(Style::Secret, "Secret key:"),
         wallet.secret
-    ));
-    out.push_str(&format!(
-        "  {}\n{}\n",
-        theme.key("Account (G):"),
-        wallet.account
-    ));
+    );
+    let _ = writeln!(out, "  {}\n{}", theme.key("Account (G):"), wallet.account);
     out
 }
 

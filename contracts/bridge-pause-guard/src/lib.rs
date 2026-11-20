@@ -48,7 +48,7 @@ use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, E
 /// least one ledger before it can land, so it can never be silent.
 pub const MIN_PAUSE_DELAY: u32 = 1;
 
-/// Longest pause or unpause delay the contract accepts: 17_280 ledgers is about
+/// Longest pause or unpause delay the contract accepts: `17_280` ledgers is about
 /// a day at five-second ledgers. Past that the timelock stops being an emergency
 /// tool and starts being a way to freeze the bridge.
 pub const MAX_PAUSE_DELAY: u32 = 17_280;

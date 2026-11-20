@@ -32,7 +32,7 @@ const MAX_ROUNDS: u32 = 48;
 #[test]
 fn pool_accounting_invariants_hold_across_random_operation_sequences() {
     let config = Config::from_env();
-    let mut rng = Rng::new(config.seed ^ 0xA_11_0001);
+    let mut rng = Rng::new(config.seed ^ 0x0A11_0001);
 
     for round in 0..config.cases.min(MAX_ROUNDS) {
         let env = Env::default();
@@ -128,7 +128,7 @@ fn a_swap_never_pays_out_more_than_the_constant_product_allows() {
     // The same invariant as above but as a pure per-operation property, so a
     // failure pins down the arithmetic rather than the operation ordering.
     let config = Config::from_env();
-    let mut rng = Rng::new(config.seed ^ 0xB_22_0002);
+    let mut rng = Rng::new(config.seed ^ 0x0B22_0002);
 
     for round in 0..config.cases.min(MAX_ROUNDS) {
         let env = Env::default();
@@ -149,7 +149,9 @@ fn a_swap_never_pays_out_more_than_the_constant_product_allows() {
         let reserve_a = rng.i128_in(1_000 * ONE, 10_000 * ONE);
         let reserve_b = rng.i128_in(1_000 * ONE, 10_000 * ONE);
         let user = Address::generate(&env);
-        StellarAssetClient::new(&env, &token_a).mint(&user, &reserve_a);
+        // Mint enough for the liquidity plus the swap below, which spends from
+        // the same account.
+        StellarAssetClient::new(&env, &token_a).mint(&user, &(reserve_a * 2));
         StellarAssetClient::new(&env, &token_b).mint(&user, &reserve_b);
         pool.add_liquidity(&user, &reserve_a, &reserve_b, &0, &0);
 
@@ -172,6 +174,9 @@ fn a_swap_never_pays_out_more_than_the_constant_product_allows() {
             new_a.checked_mul(new_b).expect("k") >= k_before,
             "round {round}: k decreased"
         );
-        assert!(out < rb, "round {round}: the output must stay below the reserve");
+        assert!(
+            out < rb,
+            "round {round}: the output must stay below the reserve"
+        );
     }
 }

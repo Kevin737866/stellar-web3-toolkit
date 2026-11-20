@@ -19,3 +19,6 @@ royalty-splitter = { path = "../royalty-splitter" }
 [features]
 default = []
 testutils = ["soroban-sdk/testutils"]
+
+[lints]
+workspace = true
