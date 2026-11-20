@@ -1,0 +1,54 @@
+version: 2
+
+# Dependency update bot (issue #189).
+#
+# Cargo is the only ecosystem here, and it is grouped: one PR per dependency
+# kind keeps a weekly run reviewable instead of producing a dozen single-crate
+# PRs that each restart CI. Security updates are deliberately *not* grouped, so
+# a CVE fix can be merged on its own without waiting for unrelated bumps.
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    versioning-strategy: increase
+    commit-message:
+      prefix: "chore(deps)"
+      include: scope
+    # Only land a bump that keeps the workspace compiling, lint-clean and green.
+    groups:
+      patch-and-minor:
+        applies-to: version-updates
+        update-types:
+          - patch
+          - minor
+      major:
+        applies-to: version-updates
+        update-types:
+          - major
+    labels:
+      - infra
+      - tooling
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore(ci)"
+      include: scope
+    groups:
+      actions:
+        patterns:
+          - "*"
+    labels:
+      - infra
+      - tooling

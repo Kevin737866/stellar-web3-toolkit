@@ -79,4 +79,12 @@ pub enum AtomicSwapError {
         attempts: u32,
         max_retries: u32,
     },
+
+    /// A state transition could not be persisted before it was applied (#390).
+    ///
+    /// The transition is *not* applied when this is returned: the journal is the
+    /// source of truth, so a record that cannot be written must stop the
+    /// transition rather than leave memory and disk disagreeing.
+    #[error(transparent)]
+    Journal(#[from] crate::journal::JournalError),
 }

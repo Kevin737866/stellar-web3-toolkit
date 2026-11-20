@@ -14,6 +14,7 @@ pub mod example_gallery;
 pub mod gas_simulator;
 pub mod glossary;
 pub mod help_text;
+pub mod horizon;
 pub mod hsm;
 pub mod invariants;
 pub mod key_hygiene;
@@ -59,6 +60,9 @@ pub use error::{Result, ToolkitError};
 pub use example_gallery::{ContractExample, ExampleGalleryRegistry};
 pub use gas_simulator::{FeeBump, FeeEstimate, FeeSchedule, GasSimulator, TransactionProfile};
 pub use help_text::{help_width, render_command_help, wrap, HelpEntry};
+pub use horizon::{
+    page_path, paginate, Cursor, HorizonPage, HorizonPaginationError, DEFAULT_LIMIT, MAX_LIMIT,
+};
 pub use hsm::{ColdSigner, HsmError, SignRequest, StubHsm};
 pub use invariants::{run_suite, InvariantReport, Prng, SuiteReport};
 pub use key_hygiene::{
