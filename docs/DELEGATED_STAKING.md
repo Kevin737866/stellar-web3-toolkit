@@ -121,3 +121,9 @@ enforcement against a commission raise, compounding and auto-compounding,
 pause/inactive exits, schedule roll-over, zero-stake windows, schedule expiry,
 solvency over a full lifecycle, and the emitted events. The pure math has its own
 suite in `contracts/delegated-staking/src/math.rs`.
+
+### Emergency Undelegation & Transfer Invariants (Issues #412, #414, #415, #417)
+
+- `fund_rewards`: Inbound reward token transfer is verified before advancing pool accumulators or committing new emission rates.
+- `emergency_undelegate(delegator, operator) -> i128`: Allows immediate exit of full staked principal even when the contract is paused or an operator is disabled, explicitly forfeiting accrued rewards without drawing on reward accounting.
+- Invariants: Operator total staked strictly matches the sum of active delegator positions; contract balance strictly satisfies `total_staked + (rewards_funded - rewards_paid_out)`.

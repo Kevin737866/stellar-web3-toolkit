@@ -127,3 +127,9 @@ rate changes, empty and zero-weight pools, schedule expiry, the cross-pool
 `positions` view, pause/inactive exits, emergency withdrawal, solvency over a
 full lifecycle, and the emitted events. The pure math has its own suite in
 `contracts/yield-farm/src/math.rs`.
+
+### Emergency Withdrawal & Transfer Validation (Issues #412, #414, #415, #417)
+
+- `fund_rewards`: Transfer of reward tokens is executed and validated before any rate schedules, index adjustments, or farm storage keys are mutated.
+- `deposit`: Position tracking guarantees deduplicated position IDs and idempotent membership in `user_pools`.
+- `emergency_withdraw`: Forfeits accrued rewards and returns staked LP tokens directly to the user wallet, preserving system solvency invariants (`rewards_paid_out <= rewards_credited <= rewards_funded`).
