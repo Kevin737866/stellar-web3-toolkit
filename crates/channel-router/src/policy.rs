@@ -2,9 +2,128 @@
 //!
 //! Routing policies and constraints for the payment channel router.
 
-use crate::{Channel, NetworkGraph, Route, RouteHop, RouteRequest, RoutingError, MAX_ROUTE_HOPS};
+use crate::{
+    Channel, NetworkGraph, Route, RouteHop, RouteMetadata, RouteRequest, RoutingError,
+    MAX_ROUTE_HOPS,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+
+/// Detailed reasons why a route or channel violates a routing policy (Issue #365)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PolicyViolation {
+    MaxHopsExceeded {
+        actual_hops: usize,
+        limit: usize,
+    },
+    FeeBpsExceeded {
+        actual_bps: u32,
+        max_bps: u32,
+    },
+    BaseFeeExceeded {
+        base_fee: i128,
+        max_base_fee: i128,
+        channel_id: String,
+    },
+    FeeRateExceeded {
+        fee_rate: u32,
+        max_fee_rate: u32,
+        channel_id: String,
+    },
+    ExcludedNode {
+        node: String,
+    },
+    ExcludedChannel {
+        channel_id: String,
+    },
+    AmountBelowMinimum {
+        amount: i128,
+        min_amount: i128,
+    },
+    AmountAboveMaximum {
+        amount: i128,
+        max_amount: i128,
+    },
+}
+
+/// Report detailing the outcome of routing policy evaluation (Issue #365)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyCheckReport {
+    pub passed: bool,
+    pub violations: Vec<PolicyViolation>,
+}
+
+impl PolicyCheckReport {
+    pub fn ok() -> Self {
+        Self {
+            passed: true,
+            violations: Vec::new(),
+        }
+    }
+
+    pub fn failed(violations: Vec<PolicyViolation>) -> Self {
+        Self {
+            passed: false,
+            violations,
+        }
+    }
+
+    /// Provide human-readable summary of policy failure reasons
+    pub fn diagnostic(&self) -> String {
+        if self.passed {
+            "Policy check passed".to_string()
+        } else {
+            let details: Vec<String> = self
+                .violations
+                .iter()
+                .map(|v| match v {
+                    PolicyViolation::MaxHopsExceeded { actual_hops, limit } => {
+                        format!("hop count {} exceeds limit {}", actual_hops, limit)
+                    }
+                    PolicyViolation::FeeBpsExceeded {
+                        actual_bps,
+                        max_bps,
+                    } => {
+                        format!("fee {} bps exceeds maximum {} bps", actual_bps, max_bps)
+                    }
+                    PolicyViolation::BaseFeeExceeded {
+                        base_fee,
+                        max_base_fee,
+                        channel_id,
+                    } => {
+                        format!(
+                            "channel {} base fee {} exceeds maximum {}",
+                            channel_id, base_fee, max_base_fee
+                        )
+                    }
+                    PolicyViolation::FeeRateExceeded {
+                        fee_rate,
+                        max_fee_rate,
+                        channel_id,
+                    } => {
+                        format!(
+                            "channel {} fee rate {} ppm exceeds maximum {} ppm",
+                            channel_id, fee_rate, max_fee_rate
+                        )
+                    }
+                    PolicyViolation::ExcludedNode { node } => {
+                        format!("node {} is in policy excluded_nodes", node)
+                    }
+                    PolicyViolation::ExcludedChannel { channel_id } => {
+                        format!("channel {} is in policy excluded_channels", channel_id)
+                    }
+                    PolicyViolation::AmountBelowMinimum { amount, min_amount } => {
+                        format!("amount {} below minimum {}", amount, min_amount)
+                    }
+                    PolicyViolation::AmountAboveMaximum { amount, max_amount } => {
+                        format!("amount {} above maximum {}", amount, max_amount)
+                    }
+                })
+                .collect();
+            format!("Policy check failed: {}", details.join("; "))
+        }
+    }
+}
 
 /// Routing preferences and constraints
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,57 +242,78 @@ impl RoutingPolicy {
     }
 
     /// Check if a route meets the policy requirements
-    pub fn route_meets_requirements(
-        &self,
-        route: &Route,
-        request: &RouteRequest,
-    ) -> Result<(), RoutingError> {
-        // Check hop limit
-        if route.hops.len() > self.max_hops {
-            return Err(RoutingError::PathTooLong {
-                length: route.hops.len(),
-                max: self.max_hops,
-            });
-        }
+    /// Evaluate all policy constraints on a candidate route, reporting specific violations (Issue #365)
+    pub fn evaluate_route(&self, route: &Route, request: &RouteRequest) -> PolicyCheckReport {
+        let mut violations = Vec::new();
 
-        // Check fee percentage
-        let fee_percent = (route.total_fees as f64 / request.amount as f64 * 10000.0) as u32;
-        if fee_percent > self.max_fee_bps {
-            return Err(RoutingError::FeeExceedsBudget {
-                fee: route.total_fees,
-                budget: (request.amount as f64 * self.max_fee_bps as f64 / 10000.0) as i128,
-            });
-        }
-
-        // Check amount limits
         if request.amount < self.min_amount {
-            return Err(RoutingError::BelowDustLimit {
+            violations.push(PolicyViolation::AmountBelowMinimum {
                 amount: request.amount,
-                dust_limit: self.min_amount,
+                min_amount: self.min_amount,
             });
         }
 
         if request.amount > self.max_amount {
-            return Err(RoutingError::AmountExceedsMaximum {
+            violations.push(PolicyViolation::AmountAboveMaximum {
                 amount: request.amount,
                 max_amount: self.max_amount,
             });
         }
 
-        // Check excluded nodes
+        if route.hops.len() > self.max_hops {
+            violations.push(PolicyViolation::MaxHopsExceeded {
+                actual_hops: route.hops.len(),
+                limit: self.max_hops,
+            });
+        }
+
+        if request.amount > 0 {
+            let fee_percent = (route.total_fees as f64 / request.amount as f64 * 10000.0) as u32;
+            if fee_percent > self.max_fee_bps {
+                violations.push(PolicyViolation::FeeBpsExceeded {
+                    actual_bps: fee_percent,
+                    max_bps: self.max_fee_bps,
+                });
+            }
+        }
+
         for hop in &route.hops {
+            if self.excluded_channels.contains(&hop.channel_id) {
+                violations.push(PolicyViolation::ExcludedChannel {
+                    channel_id: hop.channel_id.clone(),
+                });
+            }
+
             if self.excluded_nodes.contains(&hop.node_id) {
-                return Err(RoutingError::NodeNotFound {
+                violations.push(PolicyViolation::ExcludedNode {
                     node: hop.node_id.clone(),
                 });
             }
         }
 
-        // Check excluded channels
-        for hop in &route.hops {
-            if self.excluded_channels.contains(&hop.channel_id) {
-                return Err(RoutingError::ChannelNotFound {
-                    channel_id: hop.channel_id.clone(),
+        if violations.is_empty() {
+            PolicyCheckReport::ok()
+        } else {
+            PolicyCheckReport::failed(violations)
+        }
+    }
+
+    /// Check if a route meets the policy requirements, returning an actionable error on failure (Issue #365)
+    pub fn route_meets_requirements(
+        &self,
+        route: &Route,
+        request: &RouteRequest,
+    ) -> Result<(), RoutingError> {
+        let report = self.evaluate_route(route, request);
+        if !report.passed {
+            return Err(RoutingError::PolicyCheckFailed(report.diagnostic()));
+        }
+
+        if let Some(budget) = request.max_fee_budget {
+            if route.total_fees > budget {
+                return Err(RoutingError::FeeExceedsBudget {
+                    fee: route.total_fees,
+                    budget,
                 });
             }
         }
@@ -342,5 +482,45 @@ mod tests {
         let policy = RoutingPolicy::high_value();
         assert!(policy.max_fee_bps < 1000);
         assert!(!policy.prefer_low_cltv);
+    }
+
+    #[test]
+    fn test_policy_violation_reporting() {
+        let mut policy = RoutingPolicy::default();
+        policy.max_hops = 1;
+        policy.excluded_nodes.insert("forbidden_node".to_string());
+
+        let route = Route {
+            hops: vec![
+                RouteHop::new("c1".to_string(), "forbidden_node".to_string(), 1000, 10, 40),
+                RouteHop::new("c2".to_string(), "n2".to_string(), 1000, 10, 40),
+            ],
+            total_amount: 1000,
+            total_fees: 20,
+            success_probability: 1.0,
+            metadata: RouteMetadata {
+                created_at: 0,
+                num_nodes: 3,
+                estimated_time_ms: 0,
+                is_direct: false,
+            },
+        };
+
+        let request = RouteRequest::new("n0".to_string(), "n2".to_string(), 1000);
+
+        let report = policy.evaluate_route(&route, &request);
+        assert!(!report.passed);
+        assert!(report
+            .violations
+            .iter()
+            .any(|v| matches!(v, PolicyViolation::MaxHopsExceeded { .. })));
+        assert!(report
+            .violations
+            .iter()
+            .any(|v| matches!(v, PolicyViolation::ExcludedNode { .. })));
+
+        let diagnostic = report.diagnostic();
+        assert!(diagnostic.contains("hop count 2 exceeds limit 1"));
+        assert!(diagnostic.contains("forbidden_node"));
     }
 }
