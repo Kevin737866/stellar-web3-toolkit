@@ -93,4 +93,45 @@ mod test {
         assert_eq!(after.saturating_sub(before), out);
         assert!(out > 9000);
     }
+
+    #[test]
+    fn router_multi_hop_swap_enforces_minimum_output() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let ta = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let tb = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let tc = env.register_stellar_asset_contract_v2(admin.clone()).address();
+
+        let pool_ab_id = env.register_contract(None, AmmPool);
+        let pool_ab = AmmPoolClient::new(&env, &pool_ab_id);
+        pool_ab.initialize(&admin, &ta, &tb);
+
+        let pool_bc_id = env.register_contract(None, AmmPool);
+        let pool_bc = AmmPoolClient::new(&env, &pool_bc_id);
+        pool_bc.initialize(&admin, &tb, &tc);
+
+        let u = Address::generate(&env);
+        soroban_sdk::token::StellarAssetClient::new(&env, &ta).mint(&u, &1_000_000);
+        soroban_sdk::token::StellarAssetClient::new(&env, &tb).mint(&u, &1_000_000);
+        soroban_sdk::token::StellarAssetClient::new(&env, &tc).mint(&u, &1_000_000);
+
+        pool_ab.add_liquidity(&u, &500_000, &500_000, &1, &1);
+        pool_bc.add_liquidity(&u, &500_000, &500_000, &1, &1);
+
+        let router_id = env.register_contract(None, AmmRouter);
+        let router = AmmRouterClient::new(&env, &router_id);
+
+        let path = soroban_sdk::vec![&env, ta.clone(), tb.clone(), tc.clone()];
+        let pools = soroban_sdk::vec![&env, pool_ab_id.clone(), pool_bc_id.clone()];
+
+        // Overly demanding minimum output across multi-hop must revert
+        assert!(router.try_swap_exact_tokens_for_tokens(&u, &path, &pools, &10_000, &50_000, &u).is_err());
+
+        // Reasonable minimum output succeeds
+        let out = router.swap_exact_tokens_for_tokens(&u, &path, &pools, &10_000, &1_000, &u);
+        assert!(out >= 1_000);
+        assert!(out > 8_000);
+    }
 }
