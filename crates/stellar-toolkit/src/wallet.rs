@@ -8,6 +8,8 @@
 //! account on testnet, and sign (build) transactions.
 
 use crate::error::{Result, ToolkitError};
+use aes_gcm::KeyInit;
+use zeroize::Zeroize;
 use crate::theme::{Style, Theme};
 use ed25519_dalek::{Signature, Signer, SigningKey};
 use hmac::{Hmac, Mac};
@@ -180,6 +182,146 @@ pub fn format_wallet_summary(wallet: &GeneratedWallet, theme: &Theme) -> String 
     out
 }
 
+
+/// Minimum passphrase length for an exported keystore.
+pub const KEYSTORE_MIN_PASSPHRASE_LENGTH: usize = 12;
+const KEYSTORE_VERSION: u32 = 1;
+const KEYSTORE_AAD: &[u8] = b"stellar-toolkit-keystore:v1";
+const KEYSTORE_SALT_LENGTH: usize = 16;
+const KEYSTORE_NONCE_LENGTH: usize = 12;
+const KEYSTORE_KDF_MEMORY_KIB: u32 = 19 * 1024;
+const KEYSTORE_KDF_ITERATIONS: u32 = 2;
+const KEYSTORE_KDF_PARALLELISM: u32 = 1;
+
+/// A decrypted wallet key. The recovery phrase is deliberately not included.
+pub struct ImportedKeystore {
+    pub secret: String,
+    pub account: String,
+}
+
+impl std::fmt::Debug for ImportedKeystore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImportedKeystore")
+            .field("secret", &crate::key_hygiene::mask_secret(&self.secret))
+            .field("account", &self.account)
+            .finish()
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeystoreDocument {
+    version: u32, kdf: String, memory_kib: u32, iterations: u32, parallelism: u32,
+    salt: String, cipher: String, nonce: String, ciphertext: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeystorePayload { secret: String, account: String }
+
+/// Encrypt a Stellar wallet key into portable JSON using Argon2id and AES-256-GCM.
+/// The mnemonic is intentionally excluded; the passphrase must be at least 12 characters.
+pub fn export_keystore(wallet: &GeneratedWallet, passphrase: &str) -> Result<String> {
+    validate_keystore_passphrase(passphrase)?;
+    let private = decode_secret(&wallet.secret)?;
+    let account = encode_account(SigningKey::from_bytes(&private).verifying_key().as_bytes());
+    if wallet.account != account {
+        return Err(ToolkitError::Wallet("wallet account does not match its secret key".into()));
+    }
+    let mut payload = serde_json::to_vec(&KeystorePayload {
+        secret: wallet.secret.clone(), account: wallet.account.clone(),
+    }).map_err(|_| ToolkitError::Wallet("could not serialize keystore payload".into()))?;
+
+    let mut salt = [0u8; KEYSTORE_SALT_LENGTH];
+    let mut nonce = [0u8; KEYSTORE_NONCE_LENGTH];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut salt);
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+    let key = derive_keystore_key(passphrase, &salt)?;
+    let cipher = aes_gcm::Aes256Gcm::new_from_slice(&key)
+        .map_err(|_| ToolkitError::Wallet("could not initialize keystore encryption".into()))?;
+    let mut key = key;
+    key.zeroize();
+    let encrypted = aes_gcm::aead::Aead::encrypt(
+        &cipher, aes_gcm::Nonce::from_slice(&nonce),
+        aes_gcm::aead::Payload { msg: &payload, aad: KEYSTORE_AAD },
+    ).map_err(|_| ToolkitError::Wallet("keystore encryption failed".into()))?;
+    payload.zeroize();
+
+    let document = KeystoreDocument {
+        version: KEYSTORE_VERSION, kdf: "argon2id".into(),
+        memory_kib: KEYSTORE_KDF_MEMORY_KIB, iterations: KEYSTORE_KDF_ITERATIONS,
+        parallelism: KEYSTORE_KDF_PARALLELISM, salt: hex::encode(salt),
+        cipher: "aes-256-gcm".into(), nonce: hex::encode(nonce),
+        ciphertext: hex::encode(encrypted),
+    };
+    serde_json::to_string_pretty(&document)
+        .map_err(|_| ToolkitError::Wallet("could not serialize keystore document".into()))
+}
+
+/// Decrypt and validate a keystore. Wrong passphrases, malformed data, unsupported
+/// parameters, authentication failures, and account/key mismatches are rejected.
+pub fn import_keystore(document: &str, passphrase: &str) -> Result<ImportedKeystore> {
+    validate_keystore_passphrase(passphrase)?;
+    let parsed: KeystoreDocument = serde_json::from_str(document)
+        .map_err(|_| ToolkitError::Wallet("invalid keystore JSON or schema".into()))?;
+    if parsed.version != KEYSTORE_VERSION || parsed.kdf != "argon2id"
+        || parsed.memory_kib != KEYSTORE_KDF_MEMORY_KIB
+        || parsed.iterations != KEYSTORE_KDF_ITERATIONS
+        || parsed.parallelism != KEYSTORE_KDF_PARALLELISM
+        || parsed.cipher != "aes-256-gcm" {
+        return Err(ToolkitError::Wallet("unsupported keystore version or cryptographic parameters".into()));
+    }
+    let salt = hex::decode(&parsed.salt)
+        .map_err(|_| ToolkitError::Wallet("invalid keystore salt encoding".into()))?;
+    let nonce = hex::decode(&parsed.nonce)
+        .map_err(|_| ToolkitError::Wallet("invalid keystore nonce encoding".into()))?;
+    let ciphertext = hex::decode(&parsed.ciphertext)
+        .map_err(|_| ToolkitError::Wallet("invalid keystore ciphertext encoding".into()))?;
+    if salt.len() != KEYSTORE_SALT_LENGTH || nonce.len() != KEYSTORE_NONCE_LENGTH || ciphertext.len() < 16 {
+        return Err(ToolkitError::Wallet("invalid keystore salt, nonce, or ciphertext length".into()));
+    }
+    let key = derive_keystore_key(passphrase, &salt)?;
+    let cipher = aes_gcm::Aes256Gcm::new_from_slice(&key)
+        .map_err(|_| ToolkitError::Wallet("could not initialize keystore decryption".into()))?;
+    let mut key = key;
+    key.zeroize();
+    let mut plaintext = aes_gcm::aead::Aead::decrypt(
+        &cipher, aes_gcm::Nonce::from_slice(&nonce),
+        aes_gcm::aead::Payload { msg: &ciphertext, aad: KEYSTORE_AAD },
+    ).map_err(|_| ToolkitError::Wallet("keystore authentication failed (wrong passphrase or damaged file)".into()))?;
+    let payload_result = serde_json::from_slice::<KeystorePayload>(&plaintext);
+    plaintext.zeroize();
+    let payload: KeystorePayload = payload_result
+        .map_err(|_| ToolkitError::Wallet("decrypted keystore payload has an invalid schema".into()))?;
+    let private = decode_secret(&payload.secret)?;
+    let expected = encode_account(SigningKey::from_bytes(&private).verifying_key().as_bytes());
+    if payload.account != expected {
+        return Err(ToolkitError::Wallet("keystore account does not match its secret key".into()));
+    }
+    Ok(ImportedKeystore { secret: payload.secret, account: payload.account })
+}
+
+fn validate_keystore_passphrase(passphrase: &str) -> Result<()> {
+    if passphrase.chars().count() < KEYSTORE_MIN_PASSPHRASE_LENGTH {
+        return Err(ToolkitError::Wallet(format!(
+            "keystore passphrase must contain at least {KEYSTORE_MIN_PASSPHRASE_LENGTH} characters"
+        )));
+    }
+    Ok(())
+}
+
+fn derive_keystore_key(passphrase: &str, salt: &[u8]) -> Result<[u8; 32]> {
+    let params = argon2::Params::new(KEYSTORE_KDF_MEMORY_KIB, KEYSTORE_KDF_ITERATIONS,
+        KEYSTORE_KDF_PARALLELISM, Some(32))
+        .map_err(|_| ToolkitError::Wallet("invalid keystore KDF parameters".into()))?;
+    let argon = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+    let mut key = [0u8; 32];
+    argon.hash_password_into(passphrase.as_bytes(), salt, &mut key)
+        .map_err(|_| ToolkitError::Wallet("keystore key derivation failed".into()))?;
+    Ok(key)
+}
+
+
 /// Fund an account on the Stellar testnet using the Friendbot faucet.
 pub fn fund_account(account: &str) -> Result<()> {
     let url = format!("https://friendbot.stellar.org?addr={account}");
@@ -209,6 +351,37 @@ pub fn fund_account(account: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keystore_export_import_roundtrip_and_redacts_debug() {
+        let wallet = generate_wallet().expect("generate");
+        let document = export_keystore(&wallet, "correct horse battery staple").expect("export");
+        assert!(!document.contains(&wallet.secret));
+        let imported = import_keystore(&document, "correct horse battery staple").expect("import");
+        assert_eq!(imported.secret, wallet.secret);
+        assert_eq!(imported.account, wallet.account);
+        assert!(!format!("{imported:?}").contains(&imported.secret));
+    }
+
+    #[test]
+    fn keystore_rejects_wrong_passphrase_and_tampering() {
+        let wallet = generate_wallet().expect("generate");
+        let document = export_keystore(&wallet, "correct horse battery staple").expect("export");
+        assert!(import_keystore(&document, "incorrect horse battery staple").is_err());
+        let mut value: serde_json::Value = serde_json::from_str(&document).unwrap();
+        value["ciphertext"] = serde_json::Value::String("00".repeat(64));
+        assert!(import_keystore(&serde_json::to_string(&value).unwrap(), "correct horse battery staple").is_err());
+    }
+
+    #[test]
+    fn keystore_rejects_short_passphrases_and_unknown_versions() {
+        let wallet = generate_wallet().expect("generate");
+        assert!(export_keystore(&wallet, "short").is_err());
+        let document = export_keystore(&wallet, "correct horse battery staple").expect("export");
+        let mut value: serde_json::Value = serde_json::from_str(&document).unwrap();
+        value["version"] = serde_json::json!(999);
+        assert!(import_keystore(&serde_json::to_string(&value).unwrap(), "correct horse battery staple").is_err());
+    }
 
     #[test]
     fn generate_and_recover_roundtrip() {
