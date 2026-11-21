@@ -8,6 +8,8 @@
 //! account on testnet, and sign (build) transactions.
 
 use crate::error::{Result, ToolkitError};
+use aes_gcm::KeyInit;
+use zeroize::Zeroize;
 use crate::theme::{Style, Theme};
 use ed25519_dalek::{Signature, Signer, SigningKey};
 use hmac::{Hmac, Mac};
@@ -226,7 +228,7 @@ pub fn export_keystore(wallet: &GeneratedWallet, passphrase: &str) -> Result<Str
     if wallet.account != account {
         return Err(ToolkitError::Wallet("wallet account does not match its secret key".into()));
     }
-    let payload = serde_json::to_vec(&KeystorePayload {
+    let mut payload = serde_json::to_vec(&KeystorePayload {
         secret: wallet.secret.clone(), account: wallet.account.clone(),
     }).map_err(|_| ToolkitError::Wallet("could not serialize keystore payload".into()))?;
 
@@ -237,10 +239,13 @@ pub fn export_keystore(wallet: &GeneratedWallet, passphrase: &str) -> Result<Str
     let key = derive_keystore_key(passphrase, &salt)?;
     let cipher = aes_gcm::Aes256Gcm::new_from_slice(&key)
         .map_err(|_| ToolkitError::Wallet("could not initialize keystore encryption".into()))?;
+    let mut key = key;
+    key.zeroize();
     let encrypted = aes_gcm::aead::Aead::encrypt(
         &cipher, aes_gcm::Nonce::from_slice(&nonce),
         aes_gcm::aead::Payload { msg: &payload, aad: KEYSTORE_AAD },
     ).map_err(|_| ToolkitError::Wallet("keystore encryption failed".into()))?;
+    payload.zeroize();
 
     let document = KeystoreDocument {
         version: KEYSTORE_VERSION, kdf: "argon2id".into(),
@@ -278,11 +283,15 @@ pub fn import_keystore(document: &str, passphrase: &str) -> Result<ImportedKeyst
     let key = derive_keystore_key(passphrase, &salt)?;
     let cipher = aes_gcm::Aes256Gcm::new_from_slice(&key)
         .map_err(|_| ToolkitError::Wallet("could not initialize keystore decryption".into()))?;
-    let plaintext = aes_gcm::aead::Aead::decrypt(
+    let mut key = key;
+    key.zeroize();
+    let mut plaintext = aes_gcm::aead::Aead::decrypt(
         &cipher, aes_gcm::Nonce::from_slice(&nonce),
         aes_gcm::aead::Payload { msg: &ciphertext, aad: KEYSTORE_AAD },
     ).map_err(|_| ToolkitError::Wallet("keystore authentication failed (wrong passphrase or damaged file)".into()))?;
-    let payload: KeystorePayload = serde_json::from_slice(&plaintext)
+    let payload_result = serde_json::from_slice::<KeystorePayload>(&plaintext);
+    plaintext.zeroize();
+    let payload: KeystorePayload = payload_result
         .map_err(|_| ToolkitError::Wallet("decrypted keystore payload has an invalid schema".into()))?;
     let private = decode_secret(&payload.secret)?;
     let expected = encode_account(SigningKey::from_bytes(&private).verifying_key().as_bytes());
