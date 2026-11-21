@@ -72,6 +72,7 @@ pub enum ThemeMode {
 
 impl ThemeMode {
     /// Canonical lowercase name.
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             ThemeMode::Dark => "dark",
@@ -83,6 +84,7 @@ impl ThemeMode {
 
     /// Parse a mode name, case-insensitively. `never` is an accepted alias for
     /// `off` because that is the spelling most users reach for.
+    #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "dark" => Some(ThemeMode::Dark),
@@ -159,6 +161,7 @@ pub struct ThemeEnv {
 
 impl ThemeEnv {
     /// Read the conventional environment variables and detect a TTY.
+    #[must_use]
     pub fn detect() -> Self {
         let is_set = |k: &str| std::env::var_os(k).is_some_and(|v| !v.is_empty());
         let forced = std::env::var("CLICOLOR_FORCE").is_ok_and(|v| v != "0");
@@ -188,6 +191,7 @@ impl Default for Theme {
 
 impl Theme {
     /// Resolve a mode against an environment snapshot. Pure.
+    #[must_use]
     pub fn resolve(mode: ThemeMode, env: ThemeEnv) -> Self {
         if mode == ThemeMode::Off {
             return Self {
@@ -212,10 +216,8 @@ impl Theme {
             };
         }
         let dark = match mode {
-            ThemeMode::Dark => true,
             ThemeMode::Light => false,
-            ThemeMode::Auto => true,
-            ThemeMode::Off => true,
+            ThemeMode::Dark | ThemeMode::Auto | ThemeMode::Off => true,
         };
         Self {
             mode,
@@ -226,6 +228,7 @@ impl Theme {
 
     /// Resolve using the real process environment and the
     /// `STELLAR_TOOLKIT_THEME` variable (falling back to `auto`).
+    #[must_use]
     pub fn from_env() -> Self {
         let raw = std::env::var("STELLAR_TOOLKIT_THEME").unwrap_or_default();
         let mode = ThemeMode::parse(&raw).unwrap_or(ThemeMode::Auto);
@@ -233,16 +236,19 @@ impl Theme {
     }
 
     /// Whether escape sequences will be emitted.
+    #[must_use]
     pub fn enabled(&self) -> bool {
         self.enabled
     }
 
     /// The requested mode, before resolution.
+    #[must_use]
     pub fn mode(&self) -> ThemeMode {
         self.mode
     }
 
     /// Whether the dark palette is in use.
+    #[must_use]
     pub fn is_dark(&self) -> bool {
         self.dark
     }
@@ -251,6 +257,7 @@ impl Theme {
     ///
     /// When colour is disabled this returns `text` unchanged and emits no
     /// escape sequence whatsoever.
+    #[must_use]
     pub fn paint(&self, style: Style, text: &str) -> String {
         let sgr = style.sgr(self.dark);
         if !self.enabled || sgr.is_empty() {
@@ -260,11 +267,13 @@ impl Theme {
     }
 
     /// Paint a field label, e.g. `Account (G)`.
+    #[must_use]
     pub fn key(&self, label: &str) -> String {
         self.paint(Style::Key, label)
     }
 
     /// Paint a section heading.
+    #[must_use]
     pub fn heading(&self, text: &str) -> String {
         self.paint(Style::Heading, text)
     }
@@ -391,7 +400,7 @@ mod tests {
                 let painted = t.paint(style, "SENTINEL");
                 assert_eq!(painted, "SENTINEL", "{style:?} must be verbatim");
                 assert!(!painted.contains('\x1b'));
-                assert!(!painted.contains("\x1b"));
+                assert!(!painted.contains('\x1b'));
             }
         }
     }

@@ -45,6 +45,7 @@ impl HelpEntry {
 ///
 /// The value is clamped to `[MIN_HELP_WIDTH, DEFAULT_HELP_WIDTH]` so a bogus or
 /// very small `COLUMNS` cannot produce a single character per line layout.
+#[must_use]
 pub fn help_width() -> usize {
     let detected = std::env::var("COLUMNS")
         .ok()
@@ -60,6 +61,7 @@ pub fn help_width() -> usize {
 /// Hard line breaks in the input are preserved, words longer than `width` (paths,
 /// URLs) are split instead of overflowing, and a width of `0` is treated as `1`
 /// so the function always terminates.
+#[must_use]
 pub fn wrap(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut lines: Vec<String> = Vec::new();
@@ -105,6 +107,7 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
 /// the description is long. Continuation lines are indented to the description
 /// column, which is what makes the table readable; they are the only lines that
 /// have to respect the column.
+#[must_use]
 pub fn render_entries(entries: &[HelpEntry], width: usize) -> String {
     let width = width.max(MIN_HELP_WIDTH);
     let label_width = entries
@@ -176,6 +179,7 @@ pub fn render_entries(entries: &[HelpEntry], width: usize) -> String {
 }
 
 /// Renders the wrapped command overview of the `stellar-toolkit` CLI.
+#[must_use]
 pub fn render_command_help(width: usize) -> String {
     let width = width.max(MIN_HELP_WIDTH);
     let app = App::command();

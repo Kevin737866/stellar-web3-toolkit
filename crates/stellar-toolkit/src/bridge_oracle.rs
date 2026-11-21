@@ -100,27 +100,32 @@ impl OracleSet {
     }
 
     /// The oracle identifiers, in configuration order.
+    #[must_use]
     pub fn oracles(&self) -> &[String] {
         &self.oracles
     }
 
     /// Confirmations required to release a transfer.
+    #[must_use]
     pub fn threshold(&self) -> u32 {
         self.threshold
     }
 
     /// Number of oracles in the set.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.oracles.len()
     }
 
     /// Whether the set is empty. Always `false` for a validated set; present for
     /// the `len`/`is_empty` convention.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.oracles.is_empty()
     }
 
     /// Whether `oracle` is a member of this set.
+    #[must_use]
     pub fn contains(&self, oracle: &str) -> bool {
         self.oracles.iter().any(|member| member == oracle)
     }
@@ -145,6 +150,7 @@ impl OracleSet {
     /// `max_age_ledgers` is a window, not a policy: the caller decides how much
     /// reordering and relayer lag to accept. `0` means only confirmations from
     /// `current_ledger` itself count.
+    #[must_use]
     pub fn evaluate(
         &self,
         transfer_id: &str,
@@ -270,6 +276,7 @@ pub enum QuorumVerdict {
 
 impl QuorumVerdict {
     /// The amount to release, if exactly one amount reached quorum.
+    #[must_use]
     pub fn confirmed_amount(&self) -> Option<i128> {
         match self {
             Self::Confirmed { amount, .. } => Some(*amount),
@@ -278,6 +285,7 @@ impl QuorumVerdict {
     }
 
     /// Whether the transfer may be released.
+    #[must_use]
     pub fn is_confirmed(&self) -> bool {
         matches!(self, Self::Confirmed { .. })
     }

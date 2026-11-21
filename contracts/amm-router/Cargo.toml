@@ -20,3 +20,6 @@ amm-pool = { path = "../amm-pool", features = ["testutils"] }
 [features]
 default = []
 testutils = ["soroban-sdk/testutils"]
+
+[lints]
+workspace = true

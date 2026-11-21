@@ -424,11 +424,14 @@ mod test {
         let leaf = claim_leaf(&env, &account, amount);
         assert_eq!(leaf, env.crypto().sha256(&spec).to_bytes());
 
-        let hex: std::string::String = leaf
-            .to_array()
-            .iter()
-            .map(|b| std::format!("{:02x}", b))
-            .collect();
+        let hex: std::string::String =
+            leaf.to_array()
+                .iter()
+                .fold(std::string::String::new(), |mut acc, b| {
+                    use std::fmt::Write as _;
+                    let _ = write!(acc, "{b:02x}");
+                    acc
+                });
         assert_eq!(
             hex,
             "a5429068f242de7668e5b645ddeb99499adda821ee2b368151d21b2a069b9e01"
@@ -682,7 +685,7 @@ mod test {
     fn zero_expiry_never_closes_the_campaign() {
         // Raise the TTL ceiling so the ledger can jump far ahead of any
         // plausible campaign length without archiving state.
-        let (env, _, token, client) = {
+        let (env, (), token, client) = {
             let env = Env::default();
             env.mock_all_auths();
             env.ledger().set_min_persistent_entry_ttl(1_000_000);

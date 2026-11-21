@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -19,14 +20,14 @@ pub struct MonitorConfig {
     pub horizon_url: String,
     pub soroban_rpc_url: String,
     pub network_passphrase: String,
-    /// Contract IDs or wasm filenames to monitor (e.g. "amm_pool.wasm")
+    /// Contract IDs or wasm filenames to monitor (e.g. "`amm_pool.wasm`")
     pub contracts: Vec<ContractRef>,
     pub poll_interval_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContractRef {
-    /// Logical name (e.g. amm_pool)
+    /// Logical name (e.g. `amm_pool`)
     pub name: String,
     /// Contract ID on testnet (optional — if absent we only check WASM hash)
     pub contract_id: Option<String>,
@@ -104,12 +105,14 @@ pub struct RestoreReport {
 
 impl RestoreReport {
     /// True when the snapshot can be trusted (nothing missing, nothing altered).
+    #[must_use]
     pub fn is_clean(&self) -> bool {
         self.mismatched.is_empty() && self.missing.is_empty()
     }
 }
 
 /// sha256 of `bytes` as lowercase hex.
+#[must_use]
 pub fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -118,22 +121,7 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 impl MonitorConfig {
-    // Dashboard config helpers; kept as part of the public surface.
-    #[allow(dead_code)]
-    pub fn from_toml(path: &Path) -> anyhow::Result<Self> {
-        let s = std::fs::read_to_string(path)?;
-        let v: toml_value::Table = toml::from_str(&s)?;
-        Self::from_table(v)
-    }
-
-    // Dashboard config helpers; kept as part of the public surface.
-    #[allow(dead_code)]
-    fn from_table(_tbl: toml_value::Table) -> anyhow::Result<Self> {
-        // Simplified parser — for production we would map config/test.toml fields.
-        // Fallback to defaults that point at testnet.
-        Ok(Self::testnet_default())
-    }
-
+    #[must_use]
     pub fn testnet_default() -> Self {
         Self {
             horizon_url: "https://horizon-testnet.stellar.org".to_string(),
@@ -222,6 +210,7 @@ pub struct MonitoringDashboard {
 }
 
 impl MonitoringDashboard {
+    #[must_use]
     pub fn new(config: MonitorConfig, workspace_root: PathBuf) -> Self {
         Self {
             config,
@@ -231,11 +220,13 @@ impl MonitoringDashboard {
 
     // Dashboard config helpers; kept as part of the public surface.
     #[allow(dead_code)]
+    #[must_use]
     pub fn with_testnet_defaults(workspace_root: PathBuf) -> Self {
         Self::new(MonitorConfig::testnet_default(), workspace_root)
     }
 
     /// Lightweight reachability check (HTTP GET with short timeout). Falls back to Unknown if ureq unavailable.
+    #[must_use]
     pub fn check_endpoint(&self, url: &str) -> Health {
         // Use ureq with timeout; if network is blocked in CI this returns Degraded, not failure.
         let result = ureq::get(url).timeout(Duration::from_secs(5)).call();
@@ -246,6 +237,7 @@ impl MonitoringDashboard {
         }
     }
 
+    #[must_use]
     pub fn check_contract(&self, cref: &ContractRef) -> ContractStatus {
         let observed = cref.wasm_path.as_ref().and_then(|rel| {
             let p = self.workspace_root.join(rel);
@@ -297,6 +289,7 @@ impl MonitoringDashboard {
         }
     }
 
+    #[must_use]
     pub fn generate_report(&self) -> DashboardReport {
         let horizon_status = self.check_endpoint(&self.config.horizon_url);
         let soroban_status = self.check_endpoint(&self.config.soroban_rpc_url);
@@ -339,6 +332,7 @@ impl MonitoringDashboard {
     }
 
     /// Prometheus text format for scraping (see monitoring/prometheus.yml)
+    #[must_use]
     pub fn prometheus_metrics(&self, report: &DashboardReport) -> String {
         let mut out = String::new();
         out.push_str(
@@ -346,37 +340,31 @@ impl MonitoringDashboard {
         );
         out.push_str("# TYPE stellar_contract_up gauge\n");
         for c in &report.contracts {
-            let up = if c.health == Health::Healthy { 1 } else { 0 };
-            out.push_str(&format!(
-                "stellar_contract_up{{contract_id=\"{}\"}} {up}\n",
+            let up = i32::from(c.health == Health::Healthy);
+            let _ = writeln!(
+                out,
+                "stellar_contract_up{{contract_id=\"{}\"}} {up}",
                 c.name
-            ));
+            );
         }
         out.push_str("# HELP stellar_contract_wasm_hash_mismatch 1 if WASM hash mismatch\n");
         out.push_str("# TYPE stellar_contract_wasm_hash_mismatch gauge\n");
         for c in &report.contracts {
-            let v = if c.hash_match == Some(false) { 1 } else { 0 };
-            out.push_str(&format!(
-                "stellar_contract_wasm_hash_mismatch{{contract_id=\"{}\"}} {v}\n",
+            let v = i32::from(c.hash_match == Some(false));
+            let _ = writeln!(
+                out,
+                "stellar_contract_wasm_hash_mismatch{{contract_id=\"{}\"}} {v}",
                 c.name
-            ));
+            );
         }
         out.push_str("# HELP stellar_horizon_up 1 if Horizon reachable\n");
         out.push_str("# TYPE stellar_horizon_up gauge\n");
-        let hu = if report.horizon_status == Health::Healthy {
-            1
-        } else {
-            0
-        };
-        out.push_str(&format!("stellar_horizon_up {hu}\n"));
+        let hu = i32::from(report.horizon_status == Health::Healthy);
+        let _ = writeln!(out, "stellar_horizon_up {hu}");
         out.push_str("# HELP stellar_soroban_up 1 if Soroban RPC reachable\n");
         out.push_str("# TYPE stellar_soroban_up gauge\n");
-        let su = if report.soroban_status == Health::Healthy {
-            1
-        } else {
-            0
-        };
-        out.push_str(&format!("stellar_soroban_up {su}\n"));
+        let su = i32::from(report.soroban_status == Health::Healthy);
+        let _ = writeln!(out, "stellar_soroban_up {su}");
         out
     }
 
@@ -412,7 +400,7 @@ impl MonitoringDashboard {
         let mut manifest = String::new();
         for name in SNAPSHOT_FILES {
             let bytes = std::fs::read(out_dir.join(name))?;
-            manifest.push_str(&format!("{}  {}\n", sha256_hex(&bytes), name));
+            let _ = writeln!(manifest, "{}  {}", sha256_hex(&bytes), name);
         }
         std::fs::write(out_dir.join(SNAPSHOT_CHECKSUMS), manifest)?;
         Ok((json_path, html_path))
@@ -484,26 +472,6 @@ fn chrono_like_now() -> String {
         .as_secs();
     // Simple epoch seconds string; tests just check non-empty
     format!("{now}")
-}
-
-// shim for toml parsing without adding toml crate? We use serde_json fallback.
-// Minimal toml stub to satisfy compiler when toml feature is absent.
-mod toml_value {
-    use std::collections::BTreeMap;
-    // Dashboard config helpers; kept as part of the public surface.
-    #[allow(dead_code)]
-    pub type Table = BTreeMap<String, String>;
-}
-
-mod toml {
-    use super::toml_value::Table;
-    use std::collections::BTreeMap;
-    // Dashboard config helpers; kept as part of the public surface.
-    #[allow(dead_code)]
-    pub fn from_str(_s: &str) -> Result<Table, anyhow::Error> {
-        // Very small stub — real parsing done via MonitorConfig::testnet_default fallback
-        Ok(BTreeMap::new())
-    }
 }
 
 #[cfg(test)]

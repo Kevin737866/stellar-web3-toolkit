@@ -1,3 +1,4 @@
+use crate::audit_allowlist;
 use crate::error::{Result, ToolkitError};
 use crate::help_text;
 use clap::{Parser, Subcommand};
@@ -72,6 +73,9 @@ pub enum ToolkitCommand {
     /// Informal verification: search for counterexamples to stated invariants
     #[command(subcommand)]
     Verify(VerifyCommand),
+    /// Contributor onboarding checklist progress (issue #194)
+    #[command(subcommand)]
+    Onboarding(OnboardingCommand),
     /// Print the command overview wrapped to the terminal width
     Help {
         /// Wrap width in columns (defaults to $COLUMNS, otherwise 100)
@@ -281,6 +285,36 @@ pub enum MonitoringCommand {
         #[arg(long)]
         checksums: Option<PathBuf>,
     },
+    /// Record the build inputs and artifact hashes of a WASM build (#182)
+    ProvenanceRecord {
+        /// Workspace root
+        #[arg(long, default_value = ".")]
+        workspace: PathBuf,
+        /// Directory holding the built `.wasm` artifacts
+        #[arg(long, default_value = crate::wasm_provenance::DEFAULT_WASM_DIR)]
+        wasm_dir: PathBuf,
+        /// Manifest to write
+        #[arg(long, default_value = crate::wasm_provenance::DEFAULT_MANIFEST)]
+        manifest: PathBuf,
+    },
+    /// Verify WASM artifacts against a recorded provenance manifest (#182)
+    ProvenanceVerify {
+        /// Workspace root
+        #[arg(long, default_value = ".")]
+        workspace: PathBuf,
+        /// Directory holding the built `.wasm` artifacts
+        #[arg(long, default_value = crate::wasm_provenance::DEFAULT_WASM_DIR)]
+        wasm_dir: PathBuf,
+        /// Manifest to verify against
+        #[arg(long, default_value = crate::wasm_provenance::DEFAULT_MANIFEST)]
+        manifest: PathBuf,
+        /// Print the report as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        /// Exit zero on explained drift (a build input changed) as well as a clean match
+        #[arg(long, default_value_t = false)]
+        allow_explained: bool,
+    },
     /// Verify a saved snapshot against its sha256 manifest (exits non-zero on mismatch)
     Restore {
         /// Snapshot directory containing dashboard.json, metrics.txt, report.html, checksums.sha256
@@ -360,6 +394,37 @@ pub enum SecurityCommand {
         /// Print the report as JSON
         #[arg(long, default_value_t = false)]
         json: bool,
+    },
+    /// Check the `cargo audit` allowlist (issue #185)
+    Audit {
+        /// Allowlist to check; defaults to `audit-allowlist.toml` at the workspace root
+        #[arg(long)]
+        allowlist: Option<PathBuf>,
+        /// `cargo audit --json` output; when omitted the audit is run
+        #[arg(long)]
+        report: Option<PathBuf>,
+        /// Date to evaluate expiries against, as YYYY-MM-DD; defaults to today
+        #[arg(long)]
+        today: Option<String>,
+        /// Print the report as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum OnboardingCommand {
+    /// Report checklist progress from `docs/CONTRIBUTING_ONBOARDING.md`
+    Progress {
+        /// Checklist document; defaults to `docs/CONTRIBUTING_ONBOARDING.md`
+        #[arg(long)]
+        checklist: Option<PathBuf>,
+        /// Print the report as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        /// Exit non-zero unless every step is ticked
+        #[arg(long, default_value_t = false)]
+        require_complete: bool,
     },
 }
 
@@ -461,6 +526,7 @@ impl ToolkitCommand {
             Self::Env(cmd) => run_env(cmd),
             Self::Security(cmd) => run_security(cmd),
             Self::Verify(cmd) => run_verify(cmd),
+            Self::Onboarding(cmd) => run_onboarding(cmd),
             Self::Help { width } => {
                 let resolved = if *width == 0 {
                     help_text::help_width()
@@ -477,8 +543,7 @@ impl ToolkitCommand {
 impl CodegenCommand {
     fn spec_path(&self) -> Option<&PathBuf> {
         match self {
-            Self::Ts { spec, .. } => spec.as_ref(),
-            Self::Check { spec } => spec.as_ref(),
+            Self::Ts { spec, .. } | Self::Check { spec } => spec.as_ref(),
         }
     }
 }
@@ -725,6 +790,81 @@ fn run_monitoring(cmd: &MonitoringCommand) -> Result<()> {
             }
             Ok(())
         }
+        MonitoringCommand::ProvenanceRecord {
+            workspace,
+            wasm_dir,
+            manifest,
+        } => {
+            let root = normalize_workspace_root(workspace);
+            let wasm_path = resolve_path(&root, wasm_dir);
+            let manifest_path = resolve_path(&root, manifest);
+            let recorded = crate::wasm_provenance::ProvenanceManifest::record(&root, &wasm_path)
+                .map_err(|e| {
+                    ToolkitError::ExecutionError(format!(
+                        "record provenance from {}: {e}",
+                        wasm_path.display()
+                    ))
+                })?;
+            recorded
+                .save(&manifest_path)
+                .map_err(|e| ToolkitError::ExecutionError(e.to_string()))?;
+            println!(
+                "Recorded {} artifact(s) to {}",
+                recorded.artifacts.len(),
+                manifest_path.display()
+            );
+            for (name, artifact) in &recorded.artifacts {
+                println!(
+                    "  {name}  sha256={}  {} bytes",
+                    artifact.sha256, artifact.size_bytes
+                );
+            }
+            Ok(())
+        }
+        MonitoringCommand::ProvenanceVerify {
+            workspace,
+            wasm_dir,
+            manifest,
+            json,
+            allow_explained,
+        } => {
+            let root = normalize_workspace_root(workspace);
+            let wasm_path = resolve_path(&root, wasm_dir);
+            let manifest_path = resolve_path(&root, manifest);
+            let recorded = crate::wasm_provenance::ProvenanceManifest::load(&manifest_path)
+                .map_err(|e| ToolkitError::ExecutionError(e.to_string()))?;
+            let report =
+                crate::wasm_provenance::verify(&recorded, &root, &wasm_path).map_err(|e| {
+                    ToolkitError::ExecutionError(format!("verify {}: {e}", wasm_path.display()))
+                })?;
+
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report)
+                        .map_err(|e| ToolkitError::ExecutionError(e.to_string()))?
+                );
+            } else {
+                for line in report.summary_lines() {
+                    println!("{line}");
+                }
+            }
+
+            let unexplained = report.unexplained().len();
+            if unexplained > 0 {
+                return Err(ToolkitError::ExecutionError(format!(
+                    "{unexplained} artifact(s) changed without a recorded input change"
+                )));
+            }
+            if !report.is_clean() && !*allow_explained {
+                return Err(ToolkitError::ExecutionError(
+                    "build inputs changed since the manifest was recorded; \
+                     rebuild and re-record, or pass --allow-explained"
+                        .to_string(),
+                ));
+            }
+            Ok(())
+        }
         MonitoringCommand::Restore { snapshot } => {
             let dir = resolve_path(&root, snapshot);
             let restore =
@@ -783,90 +923,86 @@ fn run_glossary(cmd: &GlossaryCommand) -> Result<()> {
         GlossaryFormat::Plain
     });
 
-    match term {
-        Some(term) => {
-            let Lookup {
-                entry,
-                kind,
-                also_matches,
-            } = book.lookup(term).ok_or_else(|| {
-                // A miss is a failure, not an empty success. Suggestions go to
-                // stderr so stdout stays clean for the caller.
-                let suggestions = book.suggestions(term, 3);
-                if !suggestions.is_empty() {
-                    let names: Vec<&str> = suggestions.iter().map(|e| e.term.as_str()).collect();
-                    eprintln!("No glossary term matches `{term}`.");
-                    eprintln!("Did you mean: {}?", names.join(", "));
-                    eprintln!("Try `stellar-toolkit glossary list` for all terms.");
-                } else {
-                    eprintln!("No glossary term matches `{term}`.");
-                    eprintln!("Try `stellar-toolkit glossary list` for all terms.");
-                }
-                ToolkitError::Glossary(format!("no glossary term matches `{term}`"))
-            })?;
+    if let Some(term) = term {
+        let Lookup {
+            entry,
+            kind,
+            also_matches,
+        } = book.lookup(term).ok_or_else(|| {
+            // A miss is a failure, not an empty success. Suggestions go to
+            // stderr so stdout stays clean for the caller.
+            let suggestions = book.suggestions(term, 3);
+            if suggestions.is_empty() {
+                eprintln!("No glossary term matches `{term}`.");
+                eprintln!("Try `stellar-toolkit glossary list` for all terms.");
+            } else {
+                let names: Vec<&str> = suggestions.iter().map(|e| e.term.as_str()).collect();
+                eprintln!("No glossary term matches `{term}`.");
+                eprintln!("Did you mean: {}?", names.join(", "));
+                eprintln!("Try `stellar-toolkit glossary list` for all terms.");
+            }
+            ToolkitError::Glossary(format!("no glossary term matches `{term}`"))
+        })?;
 
-            match format {
-                GlossaryFormat::Json => {
-                    let payload = serde_json::json!({
-                        "query": term,
-                        "match": kind.label(),
-                        "entry": entry,
-                        "also_matches": also_matches,
-                    });
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&payload)
-                            .map_err(|e| ToolkitError::Glossary(e.to_string()))?
-                    );
-                }
-                GlossaryFormat::Plain => {
-                    println!("{}: {}", entry.term, entry.definition);
-                    for other in &also_matches {
-                        println!("{}: {}", other.term, other.definition);
-                    }
-                }
-                GlossaryFormat::Human => {
-                    println!("{}", entry.term);
-                    println!("{}", "=".repeat(entry.term.chars().count()));
-                    println!("{}", entry.definition);
-                    println!();
-                    println!("anchor: #{}", entry.anchor);
-                    if kind != crate::glossary::MatchKind::Exact {
-                        println!("matched by: {} (for `{term}`)", kind.label());
-                    }
-                    if !also_matches.is_empty() {
-                        let names: Vec<&str> =
-                            also_matches.iter().map(|e| e.term.as_str()).collect();
-                        println!("see also: {}", names.join(", "));
-                    }
+        match format {
+            GlossaryFormat::Json => {
+                let payload = serde_json::json!({
+                    "query": term,
+                    "match": kind.label(),
+                    "entry": entry,
+                    "also_matches": also_matches,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .map_err(|e| ToolkitError::Glossary(e.to_string()))?
+                );
+            }
+            GlossaryFormat::Plain => {
+                println!("{}: {}", entry.term, entry.definition);
+                for other in &also_matches {
+                    println!("{}: {}", other.term, other.definition);
                 }
             }
-            Ok(())
-        }
-        None => {
-            let entries: Vec<&GlossaryEntry> = book.entries.iter().collect();
-            match format {
-                GlossaryFormat::Json => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&book.entries)
-                            .map_err(|e| ToolkitError::Glossary(e.to_string()))?
-                    );
+            GlossaryFormat::Human => {
+                println!("{}", entry.term);
+                println!("{}", "=".repeat(entry.term.chars().count()));
+                println!("{}", entry.definition);
+                println!();
+                println!("anchor: #{}", entry.anchor);
+                if kind != crate::glossary::MatchKind::Exact {
+                    println!("matched by: {} (for `{term}`)", kind.label());
                 }
-                GlossaryFormat::Plain => {
-                    for e in entries {
-                        println!("{}: {}", e.term, e.definition);
-                    }
-                }
-                GlossaryFormat::Human => {
-                    println!("Glossary terms ({}):", entries.len());
-                    for e in entries {
-                        println!("  {:<40} #{}", e.term, e.anchor);
-                    }
+                if !also_matches.is_empty() {
+                    let names: Vec<&str> = also_matches.iter().map(|e| e.term.as_str()).collect();
+                    println!("see also: {}", names.join(", "));
                 }
             }
-            Ok(())
         }
+        Ok(())
+    } else {
+        let entries: Vec<&GlossaryEntry> = book.entries.iter().collect();
+        match format {
+            GlossaryFormat::Json => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&book.entries)
+                        .map_err(|e| ToolkitError::Glossary(e.to_string()))?
+                );
+            }
+            GlossaryFormat::Plain => {
+                for e in entries {
+                    println!("{}: {}", e.term, e.definition);
+                }
+            }
+            GlossaryFormat::Human => {
+                println!("Glossary terms ({}):", entries.len());
+                for e in entries {
+                    println!("  {:<40} #{}", e.term, e.anchor);
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1142,7 +1278,7 @@ fn run_env(cmd: &EnvCommand) -> Result<()> {
                         root.join(format!("{name}.toml")).display(),
                         config.env.soroban_rpc_url
                     ),
-                    Err(e) => println!("{:<6} {}", name, e),
+                    Err(e) => println!("{name:<6} {e}"),
                 }
             }
             Ok(())
@@ -1211,6 +1347,123 @@ fn run_security(cmd: &SecurityCommand) -> Result<()> {
             }
             Ok(())
         }
+        SecurityCommand::Audit {
+            allowlist,
+            report,
+            today,
+            json,
+        } => {
+            let root = normalize_workspace_root(&PathBuf::from("."));
+            let allowlist_path = allowlist.as_ref().map_or_else(
+                || root.join(audit_allowlist::ALLOWLIST_PATH),
+                |p| resolve_path(&cwd_root(), p),
+            );
+
+            let entries = if allowlist_path.exists() {
+                let text = std::fs::read_to_string(&allowlist_path).map_err(|e| {
+                    ToolkitError::ExecutionError(format!(
+                        "cannot read {}: {e}",
+                        allowlist_path.display()
+                    ))
+                })?;
+                audit_allowlist::parse_allowlist(&text).map_err(ToolkitError::ExecutionError)?
+            } else {
+                Vec::new()
+            };
+
+            let audit_json = match report {
+                Some(path) => {
+                    let path = resolve_path(&cwd_root(), path);
+                    std::fs::read_to_string(&path).map_err(|e| {
+                        ToolkitError::ExecutionError(format!("cannot read {}: {e}", path.display()))
+                    })?
+                }
+                None => run_cargo_audit_json(&root)?,
+            };
+            let advisories = audit_allowlist::parse_audit_json(&audit_json)
+                .map_err(ToolkitError::ExecutionError)?;
+
+            let today = match today {
+                Some(text) => audit_allowlist::Date::parse(text).ok_or_else(|| {
+                    ToolkitError::ExecutionError(format!("--today {text} is not a YYYY-MM-DD date"))
+                })?,
+                None => audit_allowlist::Date::today(),
+            };
+
+            let checked = audit_allowlist::check(&entries, &advisories, today);
+            if *json {
+                println!("{}", checked.to_json());
+            } else {
+                print!("{}", checked.render());
+            }
+            if !checked.passed() {
+                return Err(ToolkitError::ExecutionError(format!(
+                    "{} audit allowlist error(s)",
+                    checked.errors()
+                )));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Run `cargo audit --json` and return its stdout.
+///
+/// `cargo audit` exits non-zero when it finds something, which is the normal
+/// case here: the output still carries the advisories the allowlist is checked
+/// against, so a non-zero status is not treated as an error on its own.
+fn run_cargo_audit_json(root: &PathBuf) -> Result<String> {
+    let output = Command::new("cargo")
+        .args(["audit", "--json"])
+        .current_dir(root)
+        .output()
+        .map_err(|e| {
+            ToolkitError::ExecutionError(format!(
+                "cannot run `cargo audit` (install it with `cargo install cargo-audit`): {e}"
+            ))
+        })?;
+    if output.stdout.is_empty() {
+        return Err(ToolkitError::ExecutionError(format!(
+            "`cargo audit` produced no JSON: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn run_onboarding(cmd: &OnboardingCommand) -> Result<()> {
+    use crate::onboarding::Checklist;
+    match cmd {
+        OnboardingCommand::Progress {
+            checklist,
+            json,
+            require_complete,
+        } => {
+            let path = match checklist {
+                Some(path) => resolve_path(&cwd_root(), path),
+                None => normalize_workspace_root(&PathBuf::from("."))
+                    .join(crate::onboarding::CHECKLIST_PATH),
+            };
+            let markdown = std::fs::read_to_string(&path).map_err(|e| {
+                ToolkitError::ExecutionError(format!("cannot read {}: {e}", path.display()))
+            })?;
+            let checklist = Checklist::parse(&markdown);
+
+            if *json {
+                println!("{}", checklist.to_json());
+            } else {
+                print!("{}", checklist.render());
+            }
+
+            if *require_complete && !checklist.complete() {
+                return Err(ToolkitError::ExecutionError(format!(
+                    "onboarding checklist is {}/{} complete",
+                    checklist.done(),
+                    checklist.total()
+                )));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1248,9 +1501,10 @@ fn cwd_root() -> PathBuf {
 
 fn normalize_workspace_root(workspace: &PathBuf) -> PathBuf {
     let start = if workspace.as_os_str().is_empty() || workspace == &PathBuf::from(".") {
-        std::env::var("CARGO_MANIFEST_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+        std::env::var("CARGO_MANIFEST_DIR").map_or_else(
+            |_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            PathBuf::from,
+        )
     } else {
         workspace.clone()
     };

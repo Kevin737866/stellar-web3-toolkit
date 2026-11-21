@@ -86,3 +86,43 @@ When preparing a Pull Request:
 - Include unit tests for any new features or bug fixes.
 - If introducing an architectural change, submit an [ADR](adr/template.md).
 - Link relevant GitHub issues using closing keywords (e.g. `Closes #144`).
+
+---
+
+## 5. Onboarding Checklist
+
+Work through this list in order. Tick each box (`- [x]`) as you finish it, so
+your progress is visible in the diff and a reviewer can see where you stopped.
+
+Check your progress at any time:
+
+```bash
+cargo run -p stellar-toolkit -- onboarding progress
+```
+
+### Environment
+
+- [ ] Rust toolchain installed and `rustc --version` reports 1.75 or later
+- [ ] `wasm32v1-none` target added with `rustup target add wasm32v1-none`
+- [ ] `rustfmt` and `clippy` components installed
+- [ ] `cargo build --workspace` succeeds on a clean checkout
+
+### First Run
+
+- [ ] `cargo test --workspace` passes locally
+- [ ] `cargo fmt --all -- --check` is clean
+- [ ] `cargo clippy --all-targets --all-features -- -D warnings` is clean
+- [ ] `cargo run -p stellar-toolkit -- security secrets` reports no findings
+
+### Orientation
+
+- [ ] Read `docs/GLOSSARY.md` and can look a term up with `glossary lookup`
+- [ ] Read the architecture overview in section 2 of this document
+- [ ] Found a `good first issue` and read its linked documentation
+
+### First Contribution
+
+- [ ] Forked the repository and created a feature branch
+- [ ] Opened a PR that links its issue with a closing keyword
+- [ ] CI is green on the PR
+

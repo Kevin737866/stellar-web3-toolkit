@@ -30,6 +30,10 @@ pub enum ToolkitError {
     Glossary(String),
     #[error("contract spec error: {0}")]
     ContractSpec(String),
+    #[error("horizon error: {0}")]
+    Horizon(String),
+    #[error("horizon pagination error: {0}")]
+    HorizonPagination(#[from] crate::horizon::HorizonPaginationError),
 }
 
 pub type Result<T> = std::result::Result<T, ToolkitError>;

@@ -19,3 +19,6 @@ collection-access-control = { path = "../collection-access-control" }
 [features]
 default = []
 testutils = ["soroban-sdk/testutils"]
+
+[lints]
+workspace = true

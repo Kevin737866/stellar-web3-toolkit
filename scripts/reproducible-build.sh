@@ -56,6 +56,22 @@ cat target/reproducible/wasm-checksums.txt
 echo ""
 echo "Checksums written to target/reproducible/wasm-checksums.txt"
 
+echo ""
+echo ">> Recording build provenance (issue #182)..."
+# The hashes above say *what* was built; the manifest also records the inputs
+# (toolchain, lockfile, commit) so a later mismatch can be told apart from a
+# regression. Failing to record is a warning, not a build failure: the checksums
+# above are still valid evidence on their own.
+if cargo run --quiet -p stellar-toolkit -- \
+     monitoring provenance-record \
+     --workspace "$ROOT" \
+     --wasm-dir target/wasm32v1-none/release \
+     --manifest target/reproducible/wasm-provenance.json; then
+  echo "Provenance written to target/reproducible/wasm-provenance.json"
+else
+  echo "WARNING: could not record provenance manifest"
+fi
+
 # Second build for drift detection
 echo ""
 echo ">> Verifying reproducibility (second build)..."

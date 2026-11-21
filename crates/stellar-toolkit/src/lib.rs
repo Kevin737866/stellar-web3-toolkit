@@ -4,6 +4,7 @@
 
 pub mod anomaly;
 pub mod api_reference_gen;
+pub mod audit_allowlist;
 pub mod bridge_oracle;
 pub mod cli;
 pub mod compliance;
@@ -14,12 +15,14 @@ pub mod example_gallery;
 pub mod gas_simulator;
 pub mod glossary;
 pub mod help_text;
+pub mod horizon;
 pub mod hsm;
 pub mod invariants;
 pub mod key_hygiene;
 pub mod merkle;
 pub mod migration_diff;
 pub mod monitoring_dashboard;
+pub mod onboarding;
 pub mod one_click_airdrop;
 pub mod oracle_resilience;
 pub mod p2p_qr_payment;
@@ -32,6 +35,7 @@ pub mod timelock;
 pub mod treasury_stream;
 pub mod ts_codegen;
 pub mod wallet;
+pub mod wasm_provenance;
 
 pub use anomaly::{
     catalog as anomaly_catalog, AnomalyDetector, AnomalyReport, AnomalyRule, Baseline, Direction,
@@ -58,6 +62,9 @@ pub use error::{Result, ToolkitError};
 pub use example_gallery::{ContractExample, ExampleGalleryRegistry};
 pub use gas_simulator::{FeeBump, FeeEstimate, FeeSchedule, GasSimulator, TransactionProfile};
 pub use help_text::{help_width, render_command_help, wrap, HelpEntry};
+pub use horizon::{
+    page_path, paginate, Cursor, HorizonPage, HorizonPaginationError, DEFAULT_LIMIT, MAX_LIMIT,
+};
 pub use hsm::{ColdSigner, HsmError, SignRequest, StubHsm};
 pub use invariants::{run_suite, InvariantReport, Prng, SuiteReport};
 pub use key_hygiene::{
@@ -80,4 +87,9 @@ pub use timelock::{
 };
 pub use treasury_stream::{
     StreamCancellation, StreamRelease, StreamStatus, Treasury, TreasuryStream,
+};
+pub use wasm_provenance::{
+    verify as verify_wasm_provenance, ArtifactProvenance, ArtifactStatus, ArtifactVerdict,
+    BuildInputs, ManifestError, ProvenanceManifest, ProvenanceReport, DEFAULT_MANIFEST,
+    DEFAULT_WASM_DIR, PROVENANCE_FILE, PROVENANCE_SCHEMA_VERSION,
 };

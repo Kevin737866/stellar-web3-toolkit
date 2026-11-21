@@ -47,6 +47,7 @@ use crate::monitoring_dashboard::AlertSeverity;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::Path;
 
 /// Samples required before a baseline is trusted. Below this the detector says
@@ -80,6 +81,7 @@ pub enum Direction {
 
 impl Direction {
     /// True when `z` is anomalous for this direction.
+    #[must_use]
     pub fn triggers(&self, z: f64, threshold: f64) -> bool {
         match self {
             Direction::Above => z >= threshold,
@@ -89,6 +91,7 @@ impl Direction {
     }
 
     /// How the direction reads in a sentence.
+    #[must_use]
     pub fn describe(&self) -> &'static str {
         match self {
             Direction::Above => "above",
@@ -135,6 +138,7 @@ impl AnomalyRule {
 /// The names are normalized, so the Prometheus series
 /// `stellar_contract_invocations_total` matches the rule
 /// `contract_invocations`.
+#[must_use]
 pub fn catalog() -> Vec<AnomalyRule> {
     vec![
         AnomalyRule::new(
@@ -198,6 +202,7 @@ pub fn catalog() -> Vec<AnomalyRule> {
 
 /// Strip the exporter's decoration so one rule matches every spelling of a
 /// metric: `stellar_contract_invocations_total` becomes `contract_invocations`.
+#[must_use]
 pub fn normalize_metric(name: &str) -> String {
     let name = name.strip_prefix("stellar_").unwrap_or(name);
     name.strip_suffix("_total").unwrap_or(name).to_string()
@@ -258,6 +263,7 @@ impl Series {
     }
 
     /// The sample the alerting path scores: the newest observation.
+    #[must_use]
     pub fn latest(&self) -> Option<f64> {
         self.values.last().copied()
     }
@@ -274,6 +280,7 @@ pub struct Baseline {
 
 impl Baseline {
     /// Learn a baseline from `window`, ignoring non-finite samples.
+    #[must_use]
     pub fn learn(window: &[f64]) -> Self {
         let mut finite: Vec<f64> = window.iter().copied().filter(|v| v.is_finite()).collect();
         if finite.is_empty() {
@@ -296,6 +303,7 @@ impl Baseline {
 
     /// Dispersion used in the score, floored so a flat baseline is not
     /// infinitely sensitive.
+    #[must_use]
     pub fn dispersion(&self, config: &DetectorConfig) -> f64 {
         let scaled = MAD_SCALE * self.mad;
         let floor = config
@@ -305,6 +313,7 @@ impl Baseline {
     }
 
     /// Robust z-score of `value` against this baseline.
+    #[must_use]
     pub fn robust_z(&self, value: f64, config: &DetectorConfig) -> f64 {
         (value - self.median) / self.dispersion(config)
     }
@@ -320,7 +329,7 @@ fn median_of(values: &mut [f64]) -> f64 {
     if values.len() % 2 == 1 {
         values[mid]
     } else {
-        (values[mid - 1] + values[mid]) / 2.0
+        f64::midpoint(values[mid - 1], values[mid])
     }
 }
 
@@ -342,10 +351,12 @@ pub struct MetricVerdict {
 }
 
 impl MetricVerdict {
+    #[must_use]
     pub fn fired(&self) -> bool {
         self.severity.is_some()
     }
 
+    #[must_use]
     pub fn is_quiet(&self) -> bool {
         !self.fired()
     }
@@ -363,14 +374,17 @@ pub struct AnomalyReport {
 }
 
 impl AnomalyReport {
+    #[must_use]
     pub fn fired(&self) -> Vec<&MetricVerdict> {
         self.verdicts.iter().filter(|v| v.fired()).collect()
     }
 
+    #[must_use]
     pub fn quiet(&self) -> Vec<&MetricVerdict> {
         self.verdicts.iter().filter(|v| v.is_quiet()).collect()
     }
 
+    #[must_use]
     pub fn count_of(&self, severity: AlertSeverity) -> usize {
         self.verdicts
             .iter()
@@ -379,6 +393,7 @@ impl AnomalyReport {
     }
 
     /// True when nothing fired at all.
+    #[must_use]
     pub fn is_quiet(&self) -> bool {
         self.fired().is_empty()
     }
@@ -388,25 +403,28 @@ impl AnomalyReport {
         let mut worst: Option<AlertSeverity> = None;
         for verdict in self.fired() {
             let severity = verdict.severity.clone().unwrap_or(AlertSeverity::Info);
-            if severity_rank(&severity) > worst.as_ref().map(severity_rank).unwrap_or(0) {
+            if severity_rank(&severity) > worst.as_ref().map_or(0, severity_rank) {
                 worst = Some(severity);
             }
         }
         worst
     }
 
+    #[must_use]
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
     }
 
+    #[must_use]
     pub fn render(&self) -> String {
         let mut out = String::new();
-        out.push_str(&format!(
-            "anomaly sweep ({} metric(s), baseline {} sample(s), min {} sample(s))\n",
+        let _ = writeln!(
+            out,
+            "anomaly sweep ({} metric(s), baseline {} sample(s), min {} sample(s))",
             self.verdicts.len() + self.unchecked_metrics.len(),
             self.config.baseline_window,
             self.config.min_samples
-        ));
+        );
 
         for verdict in &self.verdicts {
             let tag = match &verdict.severity {
@@ -415,26 +433,29 @@ impl AnomalyReport {
                 Some(AlertSeverity::Info) => "INFO",
                 None => "ok  ",
             };
-            out.push_str(&format!("  {tag}  {}\n", verdict.message));
+            let _ = writeln!(out, "  {tag}  {}", verdict.message);
         }
 
         for metric in &self.unchecked_metrics {
-            out.push_str(&format!(
-                "  skip  {metric}: no rule — add one to the catalogue if this metric matters\n"
-            ));
+            let _ = writeln!(
+                out,
+                "  skip  {metric}: no rule — add one to the catalogue if this metric matters"
+            );
         }
 
-        out.push_str(&format!(
-            "{} critical, {} warning, {} sampled metric(s) within baseline\n",
+        let _ = writeln!(
+            out,
+            "{} critical, {} warning, {} sampled metric(s) within baseline",
             self.count_of(AlertSeverity::Critical),
             self.count_of(AlertSeverity::Warning),
             self.quiet().len()
-        ));
+        );
         out
     }
 }
 
 /// Severity ordering used for `worst_severity` and `--fail-on`.
+#[must_use]
 pub fn severity_rank(severity: &AlertSeverity) -> u8 {
     match severity {
         AlertSeverity::Info => 1,
@@ -458,6 +479,7 @@ impl Default for AnomalyDetector {
 
 impl AnomalyDetector {
     /// A detector with the shipped catalogue and default tunables.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             rules: catalog(),
@@ -465,18 +487,21 @@ impl AnomalyDetector {
         }
     }
 
+    #[must_use]
     pub fn with_config(mut self, config: DetectorConfig) -> Self {
         self.config = config;
         self
     }
 
     /// Replace the catalogue, e.g. with a deployment's own metrics.
+    #[must_use]
     pub fn with_rules(mut self, rules: Vec<AnomalyRule>) -> Self {
         self.rules = rules;
         self
     }
 
     /// Add or override one rule.
+    #[must_use]
     pub fn with_rule(mut self, rule: AnomalyRule) -> Self {
         self.rules.retain(|r| r.metric != rule.metric);
         self.rules.push(rule);
@@ -485,6 +510,7 @@ impl AnomalyDetector {
 
     /// Scale every threshold, so a noisy deployment can be de-sensitised without
     /// rewriting the catalogue. A scale of `1.0` changes nothing.
+    #[must_use]
     pub fn with_threshold_scale(mut self, scale: f64) -> Self {
         if scale > 0.0 && scale.is_finite() {
             for rule in &mut self.rules {
@@ -494,20 +520,24 @@ impl AnomalyDetector {
         self
     }
 
+    #[must_use]
     pub fn rules(&self) -> &[AnomalyRule] {
         &self.rules
     }
 
+    #[must_use]
     pub fn config(&self) -> &DetectorConfig {
         &self.config
     }
 
+    #[must_use]
     pub fn rule_for(&self, metric: &str) -> Option<&AnomalyRule> {
         let normalized = normalize_metric(metric);
         self.rules.iter().find(|rule| rule.metric == normalized)
     }
 
     /// Score the newest sample of one series against its own history.
+    #[must_use]
     pub fn evaluate(&self, series: &Series) -> MetricVerdict {
         let metric = normalize_metric(&series.metric);
         let rule = self.rule_for(&series.metric);
@@ -614,6 +644,7 @@ impl AnomalyDetector {
     }
 
     /// Score the newest sample of every series, in the order given.
+    #[must_use]
     pub fn sweep(&self, series: &[Series]) -> AnomalyReport {
         let mut verdicts = Vec::with_capacity(series.len());
         let mut unchecked = Vec::new();
@@ -687,6 +718,7 @@ pub fn load_series(path: &Path) -> Result<Vec<Series>> {
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)] // the fixtures assert exact values they construct
 mod tests {
     use super::*;
 

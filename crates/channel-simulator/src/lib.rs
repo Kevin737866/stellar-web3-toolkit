@@ -154,11 +154,11 @@ impl Simulator {
 
         // Create nodes
         for i in 0..self.config.num_nodes {
-            let node_id = format!("node_{:03}", i);
+            let node_id = format!("node_{i:03}");
             let node = Node {
                 id: node_id.clone(),
                 public_key: Self::generate_random_bytes(32, &mut *rng),
-                alias: Some(format!("Node {}", i)),
+                alias: Some(format!("Node {i}")),
                 online: true,
                 last_seen: 0,
                 features: channel_router::NodeFeatures::default(),
@@ -210,8 +210,7 @@ impl Simulator {
             // makes the loop give up on pairs that are still free.
             let existing = nodes
                 .get(node_a)
-                .map(|n| n.channels.contains(node_b))
-                .unwrap_or(false);
+                .is_some_and(|n| n.channels.contains(node_b));
 
             if existing {
                 continue;
@@ -224,7 +223,7 @@ impl Simulator {
 
             // Create channel
             let channel = Channel {
-                id: format!("ch_{:06}", channels_created),
+                id: format!("ch_{channels_created:06}"),
                 node_a: node_a.clone(),
                 node_b: node_b.clone(),
                 capacity_a_to_b: balance,
@@ -263,6 +262,7 @@ impl Simulator {
     }
 
     /// Run the payment simulation
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // public API; a concurrent runner awaits this
     pub async fn run_simulation(&self) -> Result<SimulationStats, SimulatorError> {
         info!(
             "Starting simulation with {} payments",
@@ -339,10 +339,10 @@ impl Simulator {
         }
 
         // Update statistics
-        let avg_path = if !path_lengths.is_empty() {
-            path_lengths.iter().sum::<usize>() as f64 / path_lengths.len() as f64
-        } else {
+        let avg_path = if path_lengths.is_empty() {
             0.0
+        } else {
+            path_lengths.iter().sum::<usize>() as f64 / path_lengths.len() as f64
         };
 
         let max_path = path_lengths.iter().max().copied().unwrap_or(0);

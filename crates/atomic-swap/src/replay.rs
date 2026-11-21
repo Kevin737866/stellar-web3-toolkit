@@ -237,19 +237,17 @@ impl NonceWindow {
 
     /// Consume `nonce`, returning `Err` with the reason when it is not usable.
     fn accept(&mut self, nonce: u64, max_ahead: u64) -> std::result::Result<(), WindowRejection> {
+        self.check(nonce, max_ahead)?;
+
         match self.highest() {
             None => {
                 self.highest = nonce;
                 self.seen = 1;
                 self.initialised = true;
-                Ok(())
             }
             Some(highest) => {
                 if nonce > highest {
                     let advance = nonce - highest;
-                    if advance > max_ahead {
-                        return Err(WindowRejection::TooFarAhead { highest, max_ahead });
-                    }
                     self.seen = if advance >= NONCE_WINDOW {
                         0
                     } else {
@@ -257,6 +255,30 @@ impl NonceWindow {
                     };
                     self.seen |= 1; // bit 0 == the new highest nonce
                     self.highest = nonce;
+                } else {
+                    let offset = highest - nonce;
+                    self.seen |= 1u64 << offset;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Decide whether `nonce` is usable without consuming it.
+    ///
+    /// The single source of truth for [`NonceWindow::accept`], so a caller can
+    /// preflight an intent (see [`ReplayGuard::preflight`]) and get exactly the
+    /// answer the consuming call will give.
+    fn check(&self, nonce: u64, max_ahead: u64) -> std::result::Result<(), WindowRejection> {
+        match self.highest() {
+            None => Ok(()),
+            Some(highest) => {
+                if nonce > highest {
+                    let advance = nonce - highest;
+                    if advance > max_ahead {
+                        return Err(WindowRejection::TooFarAhead { highest, max_ahead });
+                    }
                     return Ok(());
                 }
 
@@ -266,11 +288,9 @@ impl NonceWindow {
                         lowest: highest - (NONCE_WINDOW - 1),
                     });
                 }
-                let bit = 1u64 << offset;
-                if self.seen & bit != 0 {
+                if self.seen & (1u64 << offset) != 0 {
                     return Err(WindowRejection::Duplicate);
                 }
-                self.seen |= bit;
                 Ok(())
             }
         }
@@ -365,7 +385,6 @@ impl ReplayGuard {
         nonce: u64,
     ) -> std::result::Result<(), ReplayError> {
         let domain = ReplayDomain::new(chain, sender);
-        let label = domain.label();
 
         if !self.domains.contains_key(&domain) && self.domains.len() >= self.max_domains {
             return Err(ReplayError::RegistryFull {
@@ -379,36 +398,124 @@ impl ReplayGuard {
                 self.stats.accepted += 1;
                 Ok(())
             }
-            Err(rejection) => {
-                let error = match rejection {
-                    WindowRejection::Duplicate => {
-                        self.stats.replayed += 1;
-                        ReplayError::Replayed {
-                            domain: label,
-                            nonce,
-                        }
+            Err(rejection) => Err(self.record_rejection(chain, sender, nonce, rejection)),
+        }
+    }
+
+    /// Report whether `nonce` could be consumed for `(chain, sender)`, without
+    /// consuming it.
+    ///
+    /// Used to reject a replayed intent *before* any side effect, so a caller
+    /// that fails later does not leave the nonce burned. The answer is
+    /// identical to what [`ReplayGuard::check_and_record`] would return at the
+    /// same moment, because both go through [`NonceWindow::check`].
+    ///
+    /// A refusal here is still counted in [`ReplayGuard::stats`]: a replayed
+    /// intent is exactly the signal an operator needs to see, and it must not
+    /// disappear just because the caller preflighted.
+    pub fn preflight(
+        &mut self,
+        chain: &str,
+        sender: &str,
+        nonce: u64,
+    ) -> std::result::Result<(), ReplayError> {
+        let domain = ReplayDomain::new(chain, sender);
+
+        if !self.domains.contains_key(&domain) && self.domains.len() >= self.max_domains {
+            return Err(ReplayError::RegistryFull {
+                max_domains: self.max_domains,
+            });
+        }
+
+        let Some(window) = self.domains.get(&domain) else {
+            return Ok(());
+        };
+
+        match window.check(nonce, self.max_ahead) {
+            Ok(()) => Ok(()),
+            Err(rejection) => Err(self.record_rejection(chain, sender, nonce, rejection)),
+        }
+    }
+
+    /// Give a consumed nonce back, so a later attempt can use it again.
+    ///
+    /// Only valid for a nonce that was consumed by an initiation which then
+    /// failed before producing a swap. If `nonce` was the highest in the
+    /// window, the window is rewound to the highest nonce still marked
+    /// consumed; otherwise just its bit is cleared. Returns whether anything
+    /// changed.
+    ///
+    /// A nonce that fell out of the window cannot be released: it is
+    /// indistinguishable from one consumed long ago, and treating it as free
+    /// would reopen the replay hole the window exists to close.
+    pub fn release(&mut self, chain: &str, sender: &str, nonce: u64) -> bool {
+        let domain = ReplayDomain::new(chain, sender);
+        let Some(window) = self.domains.get_mut(&domain) else {
+            return false;
+        };
+
+        match window.highest() {
+            Some(highest) if nonce > highest => false,
+            Some(highest) => {
+                let offset = highest - nonce;
+                if offset >= NONCE_WINDOW {
+                    return false;
+                }
+                let bit = 1u64 << offset;
+                if window.seen & bit == 0 {
+                    return false;
+                }
+                window.seen &= !bit;
+
+                if nonce == highest {
+                    // Rewind to the highest nonce still marked consumed.
+                    if let Some(offset) =
+                        (0..NONCE_WINDOW).find(|offset| window.seen & (1u64 << offset) != 0)
+                    {
+                        window.highest = highest - offset;
+                    } else {
+                        window.highest = 0;
+                        window.seen = 0;
+                        window.initialised = false;
                     }
-                    WindowRejection::Stale { lowest } => {
-                        self.stats.stale += 1;
-                        ReplayError::StaleNonce {
-                            domain: label,
-                            nonce,
-                            lowest,
-                        }
-                    }
-                    WindowRejection::TooFarAhead { highest, max_ahead } => {
-                        self.stats.too_far_ahead += 1;
-                        ReplayError::TooFarAhead {
-                            domain: label,
-                            nonce,
-                            highest,
-                            max_ahead,
-                        }
-                    }
-                };
-                self.stats.domains_tracked = self.domains.len();
-                Err(error)
+                }
+                true
             }
+            None => false,
+        }
+    }
+
+    /// Count a rejection and map it to the public error.
+    fn record_rejection(
+        &mut self,
+        chain: &str,
+        sender: &str,
+        nonce: u64,
+        rejection: WindowRejection,
+    ) -> ReplayError {
+        match rejection {
+            WindowRejection::Duplicate => self.stats.replayed += 1,
+            WindowRejection::Stale { .. } => self.stats.stale += 1,
+            WindowRejection::TooFarAhead { .. } => self.stats.too_far_ahead += 1,
+        }
+        self.stats.domains_tracked = self.domains.len();
+        let label = ReplayDomain::new(chain, sender).label();
+        match rejection {
+            WindowRejection::Duplicate => ReplayError::Replayed {
+                domain: label,
+                nonce,
+            },
+            WindowRejection::Stale { lowest } => ReplayError::StaleNonce {
+                domain: label,
+                nonce,
+                lowest,
+            },
+            WindowRejection::TooFarAhead { highest, max_ahead } => ReplayError::TooFarAhead {
+                domain: label,
+                nonce,
+                highest,
+                max_ahead,
+            },
         }
     }
 
@@ -665,6 +772,112 @@ mod tests {
         assert_eq!(guard.forget_domains_below(100), 1);
         assert_eq!(guard.stats().domains_tracked, 1);
         assert_eq!(guard.highest_nonce("testnet", "GBOB"), Some(500));
+    }
+
+    #[test]
+    fn preflight_agrees_with_consume_without_consuming() {
+        let mut guard = ReplayGuard::new();
+        guard.check_and_record("testnet", "GALICE", 5).unwrap();
+
+        // A fresh nonce preflights cleanly and stays unconsumed.
+        assert!(guard.preflight("testnet", "GALICE", 6).is_ok());
+        assert!(!guard.is_recorded("testnet", "GALICE", 6));
+        assert_eq!(guard.stats().accepted, 1, "a preflight consumes nothing");
+        assert_eq!(guard.stats().replayed, 0);
+
+        // A used nonce is reported exactly as the consuming call would report it.
+        let preflight_error = guard
+            .preflight("testnet", "GALICE", 5)
+            .expect_err("a used nonce cannot be preflighted");
+        assert!(matches!(preflight_error, ReplayError::Replayed { .. }));
+        assert_eq!(
+            guard.stats().replayed,
+            1,
+            "a refused preflight is still counted, so an operator sees the replay"
+        );
+
+        // The consuming call reports the same error for the same reason.
+        let consume_error = guard
+            .check_and_record("testnet", "GALICE", 5)
+            .expect_err("a used nonce cannot be consumed");
+        assert_eq!(preflight_error, consume_error);
+    }
+
+    #[test]
+    fn releasing_the_highest_nonce_rewinds_the_window() {
+        let mut guard = ReplayGuard::new();
+        guard.check_and_record("testnet", "GALICE", 10).unwrap();
+        guard.check_and_record("testnet", "GALICE", 11).unwrap();
+        assert_eq!(guard.highest_nonce("testnet", "GALICE"), Some(11));
+
+        // Releasing the highest rewinds to the newest still-consumed nonce.
+        assert!(guard.release("testnet", "GALICE", 11));
+        assert!(!guard.is_recorded("testnet", "GALICE", 11));
+        assert_eq!(guard.highest_nonce("testnet", "GALICE"), Some(10));
+
+        // ...and it can be consumed again.
+        guard.check_and_record("testnet", "GALICE", 11).unwrap();
+        assert!(guard.is_recorded("testnet", "GALICE", 11));
+    }
+
+    #[test]
+    fn releasing_a_middle_nonce_only_clears_its_bit() {
+        let mut guard = ReplayGuard::new();
+        for nonce in [10, 11, 12] {
+            guard.check_and_record("testnet", "GALICE", nonce).unwrap();
+        }
+
+        assert!(guard.release("testnet", "GALICE", 11));
+        assert!(!guard.is_recorded("testnet", "GALICE", 11));
+        assert_eq!(
+            guard.highest_nonce("testnet", "GALICE"),
+            Some(12),
+            "releasing a middle nonce does not move the top"
+        );
+        assert!(guard.is_recorded("testnet", "GALICE", 10));
+        assert!(guard.is_recorded("testnet", "GALICE", 12));
+    }
+
+    #[test]
+    fn releasing_the_only_nonce_clears_the_domain() {
+        let mut guard = ReplayGuard::new();
+        guard.check_and_record("testnet", "GALICE", 4).unwrap();
+        assert!(guard.release("testnet", "GALICE", 4));
+        assert_eq!(guard.highest_nonce("testnet", "GALICE"), None);
+        // The domain starts from scratch, so a much lower nonce is accepted.
+        guard.check_and_record("testnet", "GALICE", 1).unwrap();
+        assert_eq!(guard.highest_nonce("testnet", "GALICE"), Some(1));
+    }
+
+    #[test]
+    fn releasing_an_unconsumed_or_unknown_nonce_changes_nothing() {
+        let mut guard = ReplayGuard::new();
+        guard.check_and_record("testnet", "GALICE", 5).unwrap();
+
+        assert!(!guard.release("testnet", "GALICE", 9), "never consumed");
+        assert!(
+            !guard.release("testnet", "GALICE", 1),
+            "inside the window but unset"
+        );
+        assert!(!guard.release("mainnet", "GALICE", 5), "unknown domain");
+        assert!(guard.is_recorded("testnet", "GALICE", 5));
+    }
+
+    #[test]
+    fn a_nonce_outside_the_window_cannot_be_released() {
+        let mut guard = ReplayGuard::new();
+        for nonce in 0..(NONCE_WINDOW + 5) {
+            guard
+                .check_and_record("testnet", "GALICE", nonce)
+                .unwrap_or_else(|e| panic!("nonce {nonce} rejected: {e}"));
+        }
+        // Nonce 0 fell out of the window; treating it as free would reopen the
+        // replay hole the window exists to close.
+        assert!(!guard.release("testnet", "GALICE", 0));
+        assert_eq!(
+            guard.highest_nonce("testnet", "GALICE"),
+            Some(NONCE_WINDOW + 4)
+        );
     }
 
     #[test]

@@ -251,3 +251,39 @@ For an external review of key handling, the evidence to request is:
 - [`docs/THREAT_MODEL.md`](THREAT_MODEL.md) — contract-level attack surface
 - [`docs/INFRA_RUNBOOK.md`](INFRA_RUNBOOK.md) — release and deploy runbook
 - [`SECURITY.md`](../SECURITY.md) — disclosure policy and SLA
+
+
+## 8. Encrypted local keystore files (issue #329)
+
+The wallet API can export a generated wallet to an encrypted JSON keystore and
+restore its Stellar signing key later. The keystore contains the secret key and
+public account identifier; it deliberately does **not** contain the BIP-39
+recovery phrase. Keep a separate offline recovery-phrase backup.
+
+~~~rust
+use stellar_toolkit::wallet::{export_keystore, import_keystore, generate_wallet};
+
+let wallet = generate_wallet()?;
+let encrypted_json = export_keystore(&wallet, "a-long-unique-passphrase")?;
+// Store encrypted_json as a local file with restrictive filesystem permissions.
+
+let restored = import_keystore(&encrypted_json, "a-long-unique-passphrase")?;
+assert_eq!(restored.account, wallet.account);
+assert_eq!(restored.secret, wallet.secret);
+~~~
+
+Format version 1 uses Argon2id (19 MiB memory, two iterations, one lane) to
+derive a 256-bit key and AES-256-GCM for authenticated encryption. Every export
+uses a fresh 16-byte random salt and 12-byte random nonce. The algorithm,
+parameters, version, salt, nonce, and ciphertext are stored in JSON. Import
+accepts only the supported version and exact KDF/cipher parameters; it rejects
+unknown fields, malformed lengths, incorrect passphrases, authentication
+failures, and account/key mismatches. Authentication data is domain-separated
+with a versioned associated-data string.
+
+Use a unique passphrase of at least 12 characters. Do not put passphrases in
+command-line arguments, source control, logs, or issue comments. The library
+API accepts the passphrase in memory; applications should obtain it from a
+private prompt or secret manager and should create files with owner-only
+permissions. A decrypted key remains sensitive process memory and should be
+kept only as long as required.

@@ -12,6 +12,94 @@ pub enum SwapStatus {
     Failed,
 }
 
+impl SwapStatus {
+    /// True once the swap can never change state again.
+    ///
+    /// `Failed` is terminal by definition: the swap stopped without settling and
+    /// without a timeout refund, so the only useful thing left to know is *why*
+    /// ([`AtomicSwap::failure`]).
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            SwapStatus::Completed | SwapStatus::Refunded | SwapStatus::Expired | SwapStatus::Failed
+        )
+    }
+
+    /// Stable identifier used in logs, events and monitoring output.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SwapStatus::Pending => "pending",
+            SwapStatus::Completed => "completed",
+            SwapStatus::Refunded => "refunded",
+            SwapStatus::Expired => "expired",
+            SwapStatus::Failed => "failed",
+        }
+    }
+}
+
+/// Why a swap reached [`SwapStatus::Failed`] (#391).
+///
+/// A failed swap is a swap that neither settled nor timed out: the participant
+/// funded a leg and the coordination flow stopped. `SwapStatus::Failed` alone
+/// says "it did not work", which is useless to an operator deciding between
+/// retrying, refunding, or escalating to the counterparty. This type is the
+/// terminal answer, recorded once and never rewritten.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SwapFailureReason {
+    /// The leg could not be funded or settled on chain.
+    ChainActionFailed { operation: String, detail: String },
+    /// The coordination retry budget for an operation was exhausted (#215).
+    RetryBudgetExhausted { operation: String, attempts: u32 },
+    /// The counterparty never funded its leg before the timeout ledger.
+    CounterpartyTimeout,
+    /// A caller or operator abandoned the swap before it settled.
+    Abandoned { detail: String },
+}
+
+impl SwapFailureReason {
+    /// Stable identifier for grouping failures in monitoring.
+    ///
+    /// Deliberately coarse: the free-form `detail` fields are for humans, this
+    /// is the value a dashboard groups by.
+    pub fn code(&self) -> &'static str {
+        match self {
+            SwapFailureReason::ChainActionFailed { .. } => "chain_action_failed",
+            SwapFailureReason::RetryBudgetExhausted { .. } => "retry_budget_exhausted",
+            SwapFailureReason::CounterpartyTimeout => "counterparty_timeout",
+            SwapFailureReason::Abandoned { .. } => "abandoned",
+        }
+    }
+}
+
+impl std::fmt::Display for SwapFailureReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SwapFailureReason::ChainActionFailed { operation, detail } => {
+                write!(f, "chain action `{operation}` failed: {detail}")
+            }
+            SwapFailureReason::RetryBudgetExhausted {
+                operation,
+                attempts,
+            } => write!(
+                f,
+                "retry budget exhausted for `{operation}` after {attempts} attempt(s)"
+            ),
+            SwapFailureReason::CounterpartyTimeout => {
+                write!(f, "counterparty did not fund before the timeout ledger")
+            }
+            SwapFailureReason::Abandoned { detail } => write!(f, "abandoned: {detail}"),
+        }
+    }
+}
+
+/// A terminal failure and the ledger it was recorded at.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SwapFailure {
+    pub reason: SwapFailureReason,
+    /// Ledger the failure was observed at, not the ledger it was caused at.
+    pub ledger: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SwapDirection {
     InitiatorToParticipant,
@@ -42,6 +130,13 @@ pub struct AtomicSwap {
     /// replay guard. `None` for a purely local swap.
     pub origin_nonce: Option<u64>,
     pub metadata: HashMap<String, String>,
+    /// Terminal reason this swap failed (#391). Set exactly once, by
+    /// [`AtomicSwap::mark_failed`]; `None` for every other status.
+    ///
+    /// `default` so a swap serialised before #391 still deserialises; such a
+    /// record reports `Failed` without a reason rather than failing to load.
+    #[serde(default)]
+    pub failure: Option<SwapFailure>,
 }
 
 impl AtomicSwap {
@@ -79,6 +174,7 @@ impl AtomicSwap {
             origin_chain: None,
             origin_nonce: None,
             metadata: HashMap::new(),
+            failure: None,
         }
     }
 
@@ -130,8 +226,37 @@ impl AtomicSwap {
         self.status = SwapStatus::Expired;
     }
 
-    pub fn mark_failed(&mut self) {
+    /// Mark the swap failed and record *why* (#391).
+    ///
+    /// The first reason wins. A swap that already carries a failure keeps it, so
+    /// a late, less specific observation cannot overwrite the reason an operator
+    /// is acting on. Returns `false` when a reason was already recorded.
+    pub fn mark_failed(&mut self, reason: SwapFailureReason, ledger: u32) -> bool {
         self.status = SwapStatus::Failed;
+        if self.failure.is_some() {
+            return false;
+        }
+        self.failure = Some(SwapFailure { reason, ledger });
+        true
+    }
+
+    /// The terminal failure reason, if this swap failed (#391).
+    pub fn failure(&self) -> Option<&SwapFailure> {
+        self.failure.as_ref()
+    }
+
+    /// Stable, log-friendly description of why the swap stopped.
+    ///
+    /// `None` while the swap can still settle. For a failed swap this is the
+    /// recorded reason; a swap whose status was set to `Failed` by hand (a
+    /// deserialised record from before #391, say) reports that it failed without
+    /// a reason rather than inventing one.
+    pub fn terminal_reason(&self) -> Option<String> {
+        match (&self.status, &self.failure) {
+            (SwapStatus::Failed, Some(failure)) => Some(failure.reason.to_string()),
+            (SwapStatus::Failed, None) => Some("failed without a recorded reason".to_string()),
+            _ => None,
+        }
     }
 
     pub fn add_metadata(&mut self, key: String, value: String) {
@@ -304,6 +429,122 @@ mod tests {
         assert!(swap.is_completed());
         assert!(!swap.can_complete(5000));
         assert!(!swap.can_refund(5000));
+    }
+
+    fn sample_swap() -> AtomicSwap {
+        AtomicSwap::new(
+            "swap-391".to_string(),
+            "initiator".to_string(),
+            "participant".to_string(),
+            Asset::XLM,
+            Asset::Custom("USDC".to_string()),
+            1_000,
+            500,
+            "a".repeat(64),
+            10_000,
+            1_000,
+        )
+    }
+
+    #[test]
+    fn a_failed_swap_carries_its_terminal_reason() {
+        let mut swap = sample_swap();
+        assert!(swap.terminal_reason().is_none());
+
+        let reason = SwapFailureReason::RetryBudgetExhausted {
+            operation: "submit_htlc".to_string(),
+            attempts: 3,
+        };
+        assert!(swap.mark_failed(reason.clone(), 9_000));
+
+        assert_eq!(swap.status, SwapStatus::Failed);
+        assert!(swap.status.is_terminal());
+        assert_eq!(swap.failure().map(|f| &f.reason), Some(&reason));
+        assert_eq!(swap.failure().map(|f| f.ledger), Some(9_000));
+        assert_eq!(
+            swap.terminal_reason().as_deref(),
+            Some("retry budget exhausted for `submit_htlc` after 3 attempt(s)")
+        );
+    }
+
+    #[test]
+    fn the_first_failure_reason_wins() {
+        let mut swap = sample_swap();
+        let first = SwapFailureReason::ChainActionFailed {
+            operation: "fund".to_string(),
+            detail: "sequence number too low".to_string(),
+        };
+        let second = SwapFailureReason::Abandoned {
+            detail: "operator gave up".to_string(),
+        };
+
+        assert!(swap.mark_failed(first.clone(), 2_000));
+        assert!(
+            !swap.mark_failed(second, 3_000),
+            "a recorded reason must not be overwritten"
+        );
+        assert_eq!(swap.failure().map(|f| &f.reason), Some(&first));
+        assert_eq!(swap.failure().map(|f| f.ledger), Some(2_000));
+    }
+
+    #[test]
+    fn a_settled_swap_has_no_terminal_reason() {
+        let mut swap = sample_swap();
+        swap.mark_completed("preimage".to_string(), 5_000);
+        assert!(swap.terminal_reason().is_none());
+        assert!(swap.failure().is_none());
+    }
+
+    #[test]
+    fn a_pre_391_record_still_deserialises() {
+        let mut swap = sample_swap();
+        swap.mark_completed("preimage".to_string(), 5_000);
+        let mut value = serde_json::to_value(&swap).unwrap();
+        // A record written before the field existed.
+        value.as_object_mut().unwrap().remove("failure");
+
+        let restored: AtomicSwap = serde_json::from_value(value).unwrap();
+        assert!(restored.failure().is_none());
+        assert!(restored.terminal_reason().is_none());
+    }
+
+    #[test]
+    fn a_failed_swap_without_a_reason_still_reports_failure() {
+        let mut swap = sample_swap();
+        swap.status = SwapStatus::Failed;
+        assert_eq!(
+            swap.terminal_reason().as_deref(),
+            Some("failed without a recorded reason")
+        );
+    }
+
+    #[test]
+    fn every_failure_reason_has_a_stable_code_and_message() {
+        let reasons = [
+            SwapFailureReason::ChainActionFailed {
+                operation: "fund".to_string(),
+                detail: "boom".to_string(),
+            },
+            SwapFailureReason::RetryBudgetExhausted {
+                operation: "submit_htlc".to_string(),
+                attempts: 1,
+            },
+            SwapFailureReason::CounterpartyTimeout,
+            SwapFailureReason::Abandoned {
+                detail: "operator".to_string(),
+            },
+        ];
+        let codes: Vec<&str> = reasons.iter().map(SwapFailureReason::code).collect();
+        assert_eq!(
+            codes,
+            vec![
+                "chain_action_failed",
+                "retry_budget_exhausted",
+                "counterparty_timeout",
+                "abandoned"
+            ]
+        );
+        assert!(reasons.iter().all(|r| !r.to_string().is_empty()));
     }
 
     #[test]

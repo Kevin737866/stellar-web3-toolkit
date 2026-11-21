@@ -8,7 +8,7 @@
 //!
 //! This harness is instead a few hundred lines of `std`-only Rust:
 //!
-//! * [`Rng`] — a deterministic SplitMix64 generator with range helpers. Default
+//! * [`Rng`] — a deterministic `SplitMix64` generator with range helpers. Default
 //!   `rand` is not used so a run is reproducible on any machine and a
 //!   counterexample can be replayed from the seed alone.
 //! * [`Config`] — iteration count and seed, overridable from the environment
@@ -44,9 +44,9 @@ pub const DEFAULT_SEED: u64 = 0x5EED_1234_ABCD_0001;
 /// Default number of generated cases per property.
 pub const DEFAULT_CASES: u32 = 256;
 
-/// Deterministic SplitMix64 generator.
+/// Deterministic `SplitMix64` generator.
 ///
-/// SplitMix64 is used rather than a linear congruential generator because it
+/// `SplitMix64` is used rather than a linear congruential generator because it
 /// passes enough statistical tests for input generation while staying short
 /// enough to audit, and it has no period/seed pitfalls of the "seed 0 produces
 /// all zeroes" kind.
@@ -175,11 +175,22 @@ impl Config {
 
 /// A generated input that knows how to get simpler.
 ///
-/// `shrink` returns the next smaller candidate, or `None` when already minimal.
-/// [`check`] walks this chain greedily, restarting whenever a smaller input also
-/// fails, so the reported counterexample is a local minimum.
+/// [`check`] walks the candidates greedily, restarting from the first one that
+/// still fails, so the reported counterexample is a local minimum: no single
+/// simplification of it fails.
 pub trait Candidate: Clone + std::fmt::Debug {
+    /// The next smaller candidate, or `None` when already minimal.
     fn shrink(&self) -> Option<Self>;
+
+    /// Every candidate worth trying, simplest first.
+    ///
+    /// Defaults to the single [`Candidate::shrink`] step. Types with more than
+    /// one useful simplification override this: halving alone stalls on values
+    /// just above the failure threshold, so integers also step down by one, and
+    /// a vector can drop an element as well as shrink one.
+    fn shrink_candidates(&self) -> Vec<Self> {
+        self.shrink().into_iter().collect()
+    }
 }
 
 impl Candidate for bool {
@@ -200,6 +211,18 @@ impl Candidate for i128 {
             Some(self / 2)
         }
     }
+    fn shrink_candidates(&self) -> Vec<Self> {
+        if *self == 0 {
+            return Vec::new();
+        }
+        let half = self / 2;
+        let step = self - self.signum();
+        if half == step {
+            vec![half]
+        } else {
+            vec![half, step]
+        }
+    }
 }
 
 impl Candidate for u128 {
@@ -208,6 +231,18 @@ impl Candidate for u128 {
             None
         } else {
             Some(self / 2)
+        }
+    }
+    fn shrink_candidates(&self) -> Vec<Self> {
+        if *self == 0 {
+            return Vec::new();
+        }
+        let half = self / 2;
+        let step = self - 1;
+        if half == step {
+            vec![half]
+        } else {
+            vec![half, step]
         }
     }
 }
@@ -220,6 +255,18 @@ impl Candidate for u64 {
             Some(self / 2)
         }
     }
+    fn shrink_candidates(&self) -> Vec<Self> {
+        if *self == 0 {
+            return Vec::new();
+        }
+        let half = self / 2;
+        let step = self - 1;
+        if half == step {
+            vec![half]
+        } else {
+            vec![half, step]
+        }
+    }
 }
 
 impl Candidate for u32 {
@@ -230,49 +277,104 @@ impl Candidate for u32 {
             Some(self / 2)
         }
     }
+    fn shrink_candidates(&self) -> Vec<Self> {
+        if *self == 0 {
+            return Vec::new();
+        }
+        let half = self / 2;
+        let step = self - 1;
+        if half == step {
+            vec![half]
+        } else {
+            vec![half, step]
+        }
+    }
 }
 
 impl<A: Candidate, B: Candidate> Candidate for (A, B) {
     fn shrink(&self) -> Option<Self> {
-        if let Some(a) = self.0.shrink() {
-            return Some((a, self.1.clone()));
+        self.shrink_candidates().into_iter().next()
+    }
+
+    fn shrink_candidates(&self) -> Vec<Self> {
+        let mut out = Vec::new();
+        for a in self.0.shrink_candidates() {
+            out.push((a, self.1.clone()));
         }
-        self.1.shrink().map(|b| (self.0.clone(), b))
+        for b in self.1.shrink_candidates() {
+            out.push((self.0.clone(), b));
+        }
+        out
     }
 }
 
 impl<A: Candidate, B: Candidate, C: Candidate> Candidate for (A, B, C) {
     fn shrink(&self) -> Option<Self> {
-        if let Some(a) = self.0.shrink() {
-            return Some((a, self.1.clone(), self.2.clone()));
+        self.shrink_candidates().into_iter().next()
+    }
+
+    fn shrink_candidates(&self) -> Vec<Self> {
+        let mut out = Vec::new();
+        for a in self.0.shrink_candidates() {
+            out.push((a, self.1.clone(), self.2.clone()));
         }
-        if let Some(b) = self.1.shrink() {
-            return Some((self.0.clone(), b, self.2.clone()));
+        for b in self.1.shrink_candidates() {
+            out.push((self.0.clone(), b, self.2.clone()));
         }
-        self.2
-            .shrink()
-            .map(|c| (self.0.clone(), self.1.clone(), c))
+        for c in self.2.shrink_candidates() {
+            out.push((self.0.clone(), self.1.clone(), c));
+        }
+        out
+    }
+}
+
+impl<A: Candidate, B: Candidate, C: Candidate, D: Candidate> Candidate for (A, B, C, D) {
+    fn shrink(&self) -> Option<Self> {
+        self.shrink_candidates().into_iter().next()
+    }
+
+    fn shrink_candidates(&self) -> Vec<Self> {
+        let mut out = Vec::new();
+        for a in self.0.shrink_candidates() {
+            out.push((a, self.1.clone(), self.2.clone(), self.3.clone()));
+        }
+        for b in self.1.shrink_candidates() {
+            out.push((self.0.clone(), b, self.2.clone(), self.3.clone()));
+        }
+        for c in self.2.shrink_candidates() {
+            out.push((self.0.clone(), self.1.clone(), c, self.3.clone()));
+        }
+        for d in self.3.shrink_candidates() {
+            out.push((self.0.clone(), self.1.clone(), self.2.clone(), d));
+        }
+        out
     }
 }
 
 impl<T: Candidate> Candidate for Vec<T> {
     fn shrink(&self) -> Option<Self> {
-        // Prefer simplifying an element over truncating: a shorter list can hide
-        // the element that actually triggers the failure.
+        self.shrink_candidates().into_iter().next()
+    }
+
+    fn shrink_candidates(&self) -> Vec<Self> {
+        let mut out = Vec::new();
+        // Drop one element at a time before simplifying any: a shorter
+        // counterexample is easier to read, and removing an element keeps every
+        // other element intact, so it cannot hide the one that triggers the
+        // failure.
+        for i in 0..self.len() {
+            let mut candidate = self.clone();
+            candidate.remove(i);
+            out.push(candidate);
+        }
         for (i, element) in self.iter().enumerate() {
-            if let Some(smaller) = element.shrink() {
+            for smaller in element.shrink_candidates() {
                 let mut candidate = self.clone();
                 candidate[i] = smaller;
-                return Some(candidate);
+                out.push(candidate);
             }
         }
-        if self.len() <= 1 {
-            None
-        } else {
-            let mut candidate = self.clone();
-            candidate.pop();
-            Some(candidate)
-        }
+        out
     }
 }
 
@@ -283,20 +385,16 @@ where
     P: FnMut(&C) -> Result<(), String>,
 {
     let mut current = input.clone();
-    // Each improvement restarts the walk, so the result cannot depend on the
-    // order `shrink` happens to enumerate candidates in.
+    // Take the simplest candidate that still fails and start over, so the walk
+    // never gets stuck on a candidate whose own simplifications pass.
     loop {
-        let mut improved = false;
-        let mut candidate = current.clone();
-        while let Some(smaller) = candidate.shrink() {
-            if property(&smaller).is_err() {
-                current = smaller.clone();
-                improved = true;
-            }
-            candidate = smaller;
-        }
-        if !improved {
-            return current;
+        let next = current
+            .shrink_candidates()
+            .into_iter()
+            .find(|candidate| property(candidate).is_err());
+        match next {
+            Some(smaller) => current = smaller,
+            None => return current,
         }
     }
 }
@@ -324,7 +422,10 @@ where
                  minimal counterexample: {minimal:?}\n  \
                  generated input:       {input:?}\n  \
                  replay with PROPERTY_SEED={} PROPERTY_CASES={}",
-                config.cases, config.seed, config.seed, case + 1,
+                config.cases,
+                config.seed,
+                config.seed,
+                case + 1,
             );
         }
     }
@@ -337,7 +438,7 @@ where
     C: Candidate,
     P: FnMut(&C) -> Result<(), String>,
 {
-    check(name, &Config::from_env(), generate, property)
+    check(name, &Config::from_env(), generate, property);
 }
 
 /// Convenience: assert a boolean condition inside a property.
@@ -393,15 +494,17 @@ mod test {
 
     #[test]
     fn passing_properties_run_every_case() {
-        let config = Config {
-            cases: 50,
-            seed: 3,
-        };
+        let config = Config { cases: 50, seed: 3 };
         let mut seen = 0;
-        check("always true", &config, |rng| rng.i128_in(0, 10), |_| {
-            seen += 1;
-            Ok(())
-        });
+        check(
+            "always true",
+            &config,
+            |rng| rng.i128_in(0, 10),
+            |_| {
+                seen += 1;
+                Ok(())
+            },
+        );
         assert_eq!(seen, 50);
     }
 

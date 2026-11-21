@@ -101,16 +101,20 @@ pub fn get_all_channels(env: &Env) -> Vec<BytesN<32>> {
     Vec::new(env)
 }
 
-/// Check if there are any active HTLCs in a channel's HTLC map
-pub fn has_active_htlcs(env: &Env, htlcs: &Map<Val, Val>) -> Result<bool, PaymentChannelError> {
+/// Check if there are any active HTLCs in a channel's HTLC map.
+///
+/// Entries that cannot be decoded are skipped rather than surfaced as an error:
+/// the map is contract-owned, so a bad entry means storage corruption, and the
+/// caller's decision (refuse to close) is the same either way.
+pub fn has_active_htlcs(env: &Env, htlcs: &Map<Val, Val>) -> bool {
     for (_, val) in htlcs.iter() {
         if let Ok(htlc) = HTLCInfo::try_from_val(env, &val) {
             if !htlc.is_claimed && !htlc.is_refunded {
-                return Ok(true);
+                return true;
             }
         }
     }
-    Ok(false)
+    false
 }
 
 /// Get count of active HTLCs

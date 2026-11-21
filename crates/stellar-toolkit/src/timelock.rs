@@ -36,6 +36,7 @@ pub enum DelayKind {
 }
 
 impl DelayKind {
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Pause => "pause",
@@ -73,6 +74,13 @@ pub enum TimelockError {
         current_ledger: u32,
         effective_ledger: u32,
     },
+    #[error("required quorum must be greater than zero")]
+    ZeroQuorumRequirement,
+    #[error("role {role:?} may not perform governance action {action:?}")]
+    UnauthorizedGovernanceAction {
+        role: GovernanceRole,
+        action: GovernanceAction,
+    },
 }
 
 impl TimelockPolicy {
@@ -101,14 +109,17 @@ impl TimelockPolicy {
         })
     }
 
+    #[must_use]
     pub fn pause_delay(self) -> u32 {
         self.pause_delay
     }
 
+    #[must_use]
     pub fn unpause_delay(self) -> u32 {
         self.unpause_delay
     }
 
+    #[must_use]
     pub fn delay(self, kind: DelayKind) -> u32 {
         match kind {
             DelayKind::Pause => self.pause_delay,
@@ -120,12 +131,14 @@ impl TimelockPolicy {
     ///
     /// Saturating rather than wrapping: near the end of the ledger range a
     /// request must become *never* actionable, not actionable immediately.
+    #[must_use]
     pub fn effective_ledger(self, requested_ledger: u32, kind: DelayKind) -> u32 {
         requested_ledger.saturating_add(self.delay(kind))
     }
 
     /// Whether a request made in `requested_ledger` may be activated at
     /// `current_ledger`.
+    #[must_use]
     pub fn is_effective(self, requested_ledger: u32, kind: DelayKind, current_ledger: u32) -> bool {
         current_ledger >= self.effective_ledger(requested_ledger, kind)
     }
@@ -151,7 +164,6 @@ impl TimelockPolicy {
         Ok(effective)
     }
 }
-
 
 /// Snapshot of vote totals and quorum progress returned by proposal queries (issue #456).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -214,8 +226,11 @@ pub fn authorize_governance_action(
     action: GovernanceAction,
 ) -> Result<(), TimelockError> {
     match (role, action) {
-        (GovernanceRole::EmergencyGuardian | GovernanceRole::TimelockAdmin, GovernanceAction::EmergencyVeto) => Ok(()),
-        (GovernanceRole::TimelockAdmin, GovernanceAction::ExecuteUpgrade) => Ok(()),
+        (
+            GovernanceRole::EmergencyGuardian | GovernanceRole::TimelockAdmin,
+            GovernanceAction::EmergencyVeto,
+        )
+        | (GovernanceRole::TimelockAdmin, GovernanceAction::ExecuteUpgrade) => Ok(()),
         _ => Err(TimelockError::UnauthorizedGovernanceAction { role, action }),
     }
 }

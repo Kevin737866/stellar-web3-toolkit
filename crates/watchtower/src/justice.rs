@@ -37,6 +37,22 @@ pub enum JusticeTxStatus {
     Dropped,
 }
 
+/// Breach evidence that has passed [`JusticeService::validate_breach`] (#371).
+///
+/// Holding this type is the proof that the invariants were checked; the justice
+/// flow takes it rather than a raw [`BreachAttempt`] so that a claim can never
+/// be built from unvalidated input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BreachEvidence {
+    pub channel_id: String,
+    pub breach_tx_hash: String,
+    pub detected_at: u64,
+    pub old_sequence: u32,
+    pub new_sequence: u32,
+    /// `old_balance_a + old_balance_b`, which the new state must match.
+    pub total_balance: i128,
+}
+
 /// Justice service for submitting breach response transactions
 #[derive(Clone)]
 pub struct JusticeService {
@@ -70,9 +86,15 @@ impl JusticeService {
         &self,
         breach: &BreachAttempt,
     ) -> Result<JusticeTransaction, JusticeError> {
+        // The evidence is checked before anything is built or submitted: a
+        // justice transaction is a claim against the breacher, so a malformed
+        // or internally inconsistent breach must be refused here rather than
+        // published and contested on chain (#371).
+        let evidence = self.validate_breach(breach)?;
+
         info!(
             "Submitting justice transaction for breach on channel {}",
-            breach.channel_id
+            evidence.channel_id
         );
 
         // Build the justice transaction
@@ -94,7 +116,88 @@ impl JusticeService {
         Ok(justice_tx)
     }
 
+    /// Check that `breach` is internally consistent before it is acted on
+    /// (#371).
+    ///
+    /// Returns the checked evidence on success. Every failure is
+    /// [`JusticeError::InvalidBreach`] with a reason naming the field that was
+    /// rejected, so an operator can tell bad input from a real breach.
+    ///
+    /// The invariants, in order:
+    ///
+    /// * the channel id and breach transaction hash are non-empty — without
+    ///   them the response cannot be attributed or submitted;
+    /// * `detected_at` is non-zero — a zero timestamp means the detector never
+    ///   stamped the evidence;
+    /// * `new_sequence` is strictly greater than `old_sequence` — a breach is
+    ///   the publication of a *newer* sequence that supersedes the honest one;
+    ///   an equal or lower sequence is not evidence of anything;
+    /// * every balance is non-negative;
+    /// * the balances are conserved: `old_a + old_b == new_a + new_b`. A
+    ///   justice claim cannot create or destroy funds, so a discrepancy means
+    ///   the two states do not describe the same channel.
+    pub fn validate_breach(&self, breach: &BreachAttempt) -> Result<BreachEvidence, JusticeError> {
+        if breach.channel_id.trim().is_empty() {
+            return Err(JusticeError::InvalidBreach(
+                "channel_id must not be empty".to_string(),
+            ));
+        }
+        if breach.breach_tx_hash.trim().is_empty() {
+            return Err(JusticeError::InvalidBreach(
+                "breach_tx_hash must not be empty".to_string(),
+            ));
+        }
+        if breach.detected_at == 0 {
+            return Err(JusticeError::InvalidBreach(
+                "detected_at must be a non-zero timestamp".to_string(),
+            ));
+        }
+        if breach.new_sequence <= breach.old_sequence {
+            return Err(JusticeError::InvalidBreach(format!(
+                "new_sequence ({}) must be greater than old_sequence ({})",
+                breach.new_sequence, breach.old_sequence
+            )));
+        }
+
+        for (name, balance) in [
+            ("old_balance_a", breach.old_balance_a),
+            ("old_balance_b", breach.old_balance_b),
+            ("new_balance_a", breach.new_balance_a),
+            ("new_balance_b", breach.new_balance_b),
+        ] {
+            if balance < 0 {
+                return Err(JusticeError::InvalidBreach(format!(
+                    "{name} must be non-negative, got {balance}"
+                )));
+            }
+        }
+
+        let old_total = breach
+            .old_balance_a
+            .checked_add(breach.old_balance_b)
+            .ok_or_else(|| JusticeError::InvalidBreach("old balances overflow i128".to_string()))?;
+        let new_total = breach
+            .new_balance_a
+            .checked_add(breach.new_balance_b)
+            .ok_or_else(|| JusticeError::InvalidBreach("new balances overflow i128".to_string()))?;
+        if old_total != new_total {
+            return Err(JusticeError::InvalidBreach(format!(
+                "balances are not conserved: old total {old_total}, new total {new_total}"
+            )));
+        }
+
+        Ok(BreachEvidence {
+            channel_id: breach.channel_id.clone(),
+            breach_tx_hash: breach.breach_tx_hash.clone(),
+            detected_at: breach.detected_at,
+            old_sequence: breach.old_sequence,
+            new_sequence: breach.new_sequence,
+            total_balance: old_total,
+        })
+    }
+
     /// Build a justice transaction for a breach attempt
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // kept async so signing/submission can be awaited later
     async fn build_justice_transaction(
         &self,
         breach: &BreachAttempt,
@@ -180,12 +283,13 @@ fn current_timestamp() -> u64 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_justice_transaction_creation() {
-        let _service =
-            JusticeService::new("http://localhost".to_string(), "test".to_string(), 100_000);
+    fn service() -> JusticeService {
+        JusticeService::new("http://localhost".to_string(), "test".to_string(), 100_000)
+    }
 
-        let _breach = BreachAttempt {
+    /// A breach that satisfies every invariant.
+    fn valid_breach() -> BreachAttempt {
+        BreachAttempt {
             channel_id: "test_channel".to_string(),
             old_sequence: 1,
             new_sequence: 5,
@@ -195,9 +299,121 @@ mod tests {
             new_balance_b: 500,
             breach_tx_hash: "breach_tx".to_string(),
             detected_at: 1000,
-        };
+        }
+    }
 
-        // This would be async in production
-        // let result = service.submit_justice(&breach);
+    fn invalid(reason_fragment: &str, breach: &BreachAttempt) {
+        let err = service()
+            .validate_breach(breach)
+            .expect_err("breach should have been rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains(reason_fragment),
+            "expected the error to mention {reason_fragment:?}, got {message:?}"
+        );
+    }
+
+    #[test]
+    fn test_justice_transaction_creation() {
+        let _service =
+            JusticeService::new("http://localhost".to_string(), "test".to_string(), 100_000);
+
+        let _breach = valid_breach();
+    }
+
+    #[test]
+    fn a_consistent_breach_yields_evidence() {
+        let evidence = service().validate_breach(&valid_breach()).unwrap();
+
+        assert_eq!(evidence.channel_id, "test_channel");
+        assert_eq!(evidence.breach_tx_hash, "breach_tx");
+        assert_eq!(evidence.old_sequence, 1);
+        assert_eq!(evidence.new_sequence, 5);
+        assert_eq!(evidence.total_balance, 2000);
+    }
+
+    #[test]
+    fn an_empty_channel_id_is_rejected() {
+        let mut breach = valid_breach();
+        breach.channel_id = "   ".to_string();
+        invalid("channel_id", &breach);
+    }
+
+    #[test]
+    fn an_empty_breach_tx_hash_is_rejected() {
+        let mut breach = valid_breach();
+        breach.breach_tx_hash = String::new();
+        invalid("breach_tx_hash", &breach);
+    }
+
+    #[test]
+    fn a_missing_detection_timestamp_is_rejected() {
+        let mut breach = valid_breach();
+        breach.detected_at = 0;
+        invalid("detected_at", &breach);
+    }
+
+    #[test]
+    fn a_non_advancing_sequence_is_rejected() {
+        let mut same = valid_breach();
+        same.new_sequence = same.old_sequence;
+        invalid("new_sequence", &same);
+
+        let mut backwards = valid_breach();
+        backwards.new_sequence = 0;
+        invalid("new_sequence", &backwards);
+    }
+
+    #[test]
+    fn a_negative_balance_is_rejected() {
+        let mut breach = valid_breach();
+        breach.new_balance_b = -1;
+        breach.new_balance_a = 2001; // keeps the totals equal
+        invalid("new_balance_b", &breach);
+    }
+
+    #[test]
+    fn unbalanced_states_are_rejected() {
+        let mut breach = valid_breach();
+        breach.new_balance_a = 1501;
+        invalid("not conserved", &breach);
+    }
+
+    #[test]
+    fn balance_overflow_is_rejected() {
+        let mut breach = valid_breach();
+        breach.old_balance_a = i128::MAX;
+        breach.old_balance_b = 1;
+        breach.new_balance_a = i128::MAX;
+        breach.new_balance_b = 1;
+        invalid("overflow", &breach);
+    }
+
+    #[tokio::test]
+    async fn submitting_an_invalid_breach_records_nothing() {
+        let service = service();
+        let mut breach = valid_breach();
+        breach.new_balance_a = 9_999;
+
+        let err = service.submit_justice(&breach).await.unwrap_err();
+        assert!(matches!(err, JusticeError::InvalidBreach(_)));
+        assert!(
+            service.get_pending().is_empty(),
+            "a rejected breach must not leave a pending justice transaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn submitting_valid_evidence_records_a_pending_transaction() {
+        let service = service();
+        let tx = service.submit_justice(&valid_breach()).await.unwrap();
+
+        assert_eq!(tx.channel_id, "test_channel");
+        assert_eq!(tx.status, JusticeTxStatus::Submitted);
+        assert_eq!(service.get_pending().len(), 1);
+        assert_eq!(
+            service.check_status(&tx.tx_hash),
+            Some(JusticeTxStatus::Submitted)
+        );
     }
 }

@@ -118,11 +118,12 @@ impl Preimage {
     ///
     /// Uses volatile writes plus a sequentially consistent compiler fence so
     /// dead-store elimination cannot elide the scrub before deallocation.
+    #[allow(unsafe_code)] // the single audited `unsafe` block in the workspace
     pub fn zeroize(&mut self) {
-        for byte in self.data.iter_mut() {
+        for byte in &mut self.data {
             // SAFETY: `byte` is a valid, aligned mutable reference into `self.data`.
             unsafe {
-                std::ptr::write_volatile(byte as *mut u8, 0u8);
+                std::ptr::write_volatile(std::ptr::from_mut::<u8>(byte), 0u8);
             }
         }
         std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
@@ -188,7 +189,7 @@ impl PreimageManager {
 
     /// Zeroize and clear all stored preimages (#214)
     pub fn clear(&mut self) {
-        for preimage in self.generated_preimages.iter_mut() {
+        for preimage in &mut self.generated_preimages {
             preimage.zeroize();
         }
         self.generated_preimages.clear();

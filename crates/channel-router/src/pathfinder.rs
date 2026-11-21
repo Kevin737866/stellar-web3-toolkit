@@ -132,7 +132,7 @@ impl Pathfinder {
                             channel.cltv_delta,
                         ));
 
-                        if new_cost < *dist.get(neighbor).map(|(c, _)| c).unwrap_or(&i128::MAX) {
+                        if new_cost < *dist.get(neighbor).map_or(&i128::MAX, |(c, _)| c) {
                             dist.insert((*neighbor).clone(), (new_cost, new_path));
                             pq.push((*neighbor).clone(), Reverse(new_cost));
                         }
@@ -160,7 +160,7 @@ impl Pathfinder {
 
         let heuristic = |node: &str| -> i128 {
             // Simple heuristic: assume minimum fee per hop
-            let hops = if node == request.destination { 0 } else { 1 };
+            let hops = i32::from(node != request.destination);
             hops as i128 * 10 // Minimum 10 units per hop
         };
 
@@ -182,9 +182,8 @@ impl Pathfinder {
 
             if let Some(neighbors) = graph.adjacency.get(&current) {
                 for (neighbor, channel_id) in neighbors {
-                    let channel = match graph.channels.get(channel_id) {
-                        Some(c) => c,
-                        None => continue,
+                    let Some(channel) = graph.channels.get(channel_id) else {
+                        continue;
                     };
 
                     if self.fee_cap.check_channel(channel).is_err() {

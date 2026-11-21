@@ -71,6 +71,8 @@ pub enum PaymentChannelError {
     PathTooLong = 28,
     /// Amount exceeds maximum
     AmountExceedsMaximum = 29,
+    /// Presented state is not newer than the channel's recorded sequence (#352)
+    StaleState = 30,
 }
 
 impl TryFrom<u32> for PaymentChannelError {
@@ -107,6 +109,7 @@ impl TryFrom<u32> for PaymentChannelError {
             27 => Ok(PaymentChannelError::RoutingFailed),
             28 => Ok(PaymentChannelError::PathTooLong),
             29 => Ok(PaymentChannelError::AmountExceedsMaximum),
+            30 => Ok(PaymentChannelError::StaleState),
             _ => Err(Error::from_contract_error(value)),
         }
     }
@@ -145,6 +148,7 @@ impl PaymentChannelError {
             PaymentChannelError::RoutingFailed => "Routing failed",
             PaymentChannelError::PathTooLong => "Payment path too long",
             PaymentChannelError::AmountExceedsMaximum => "Amount exceeds maximum allowed",
+            PaymentChannelError::StaleState => "State is older than the recorded sequence",
         }
     }
 }

@@ -112,14 +112,14 @@ pub enum StreamStatus {
 
 impl StreamStatus {
     /// Amount already released to the recipient, across every status.
+    #[must_use]
     pub fn released(&self) -> i128 {
         match self {
             Self::NotStarted { .. } => 0,
             Self::Active {
                 vested, pending, ..
             } => vested - pending,
-            Self::Completed { released } => *released,
-            Self::Cancelled { released, .. } => *released,
+            Self::Completed { released } | Self::Cancelled { released, .. } => *released,
         }
     }
 
@@ -127,6 +127,7 @@ impl StreamStatus {
     ///
     /// Zero for a cancelled stream: its unvested balance went back to the
     /// treasury rather than remaining claimable.
+    #[must_use]
     pub fn pending(&self) -> i128 {
         match self {
             Self::NotStarted { .. } | Self::Completed { .. } | Self::Cancelled { .. } => 0,
@@ -223,6 +224,7 @@ impl TreasuryStream {
     /// Tranche `k` vests at `start_at + k * interval_secs`, so tranche 0 vests
     /// the instant the stream starts. The `+ 1` accounts for that; `interval_secs`
     /// is validated to be non-zero at open time, so there is no division by zero.
+    #[must_use]
     pub fn vested_tranches(&self, now: u64) -> u32 {
         if now < self.start_at {
             return 0;
@@ -279,11 +281,13 @@ impl Treasury {
     }
 
     /// Current spendable balance, in stroops.
+    #[must_use]
     pub fn balance(&self) -> i128 {
         self.balance
     }
 
     /// Number of open (not yet cancelled) streams.
+    #[must_use]
     pub fn open_stream_count(&self) -> usize {
         self.streams
             .values()
@@ -292,6 +296,7 @@ impl Treasury {
     }
 
     /// Total currently escrowed across all live streams.
+    #[must_use]
     pub fn escrowed(&self) -> i128 {
         self.streams
             .values()

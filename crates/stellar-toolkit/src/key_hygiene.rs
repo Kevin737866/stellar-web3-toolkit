@@ -25,6 +25,7 @@
 //! `docs/KEY_MANAGEMENT.md`).
 
 use serde::{Deserialize, Serialize};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 /// Longest file the scanner will read, in bytes. Anything larger is reported as
@@ -39,6 +40,22 @@ const TEMPLATE_SUFFIXES: [&str; 4] = [".example", ".sample", ".template", ".dist
 
 /// Inline escape hatch, for documentation that must show a real format.
 pub const ALLOW_MARKER: &str = "key-hygiene: allow";
+
+/// Values that read as a placeholder rather than a real credential.
+const PLACEHOLDERS: [&str; 12] = [
+    "changeme",
+    "change_me",
+    "placeholder",
+    "redacted",
+    "todo",
+    "example",
+    "dummy",
+    "test_key",
+    "not_a_real",
+    "secret_here",
+    "insert_",
+    "replace_me",
+];
 
 /// What kind of material was found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,6 +74,7 @@ pub enum SecretKind {
 }
 
 impl SecretKind {
+    #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::StellarSecretKey => "stellar_secret_key",
@@ -68,6 +86,7 @@ impl SecretKind {
     }
 
     /// Whether a hit of this kind fails the scan.
+    #[must_use]
     pub fn is_error(&self) -> bool {
         !matches!(self, Self::RecoveryPhraseCandidate)
     }
@@ -84,6 +103,7 @@ pub enum Confidence {
 }
 
 impl Confidence {
+    #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::High => "high",
@@ -106,6 +126,7 @@ pub struct Finding {
 }
 
 impl Finding {
+    #[must_use]
     pub fn is_error(&self) -> bool {
         self.kind.is_error()
     }
@@ -122,19 +143,23 @@ pub struct ScanReport {
 }
 
 impl ScanReport {
+    #[must_use]
     pub fn errors(&self) -> usize {
         self.findings.iter().filter(|f| f.is_error()).count()
     }
 
+    #[must_use]
     pub fn warnings(&self) -> usize {
         self.findings.len() - self.errors()
     }
 
     /// True when nothing that must not be committed was found.
+    #[must_use]
     pub fn passed(&self) -> bool {
         self.errors() == 0
     }
 
+    #[must_use]
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
     }
@@ -142,16 +167,19 @@ impl ScanReport {
     /// Convert the scan report into a SARIF v2.1.0 log structure (#204).
     ///
     /// Secret values remain masked in every SARIF result message and property bag.
+    #[must_use]
     pub fn to_sarif(&self) -> SarifLog {
         SarifLog::from_scan_report(self)
     }
 
     /// Serialize the scan report as a pretty-printed SARIF v2.1.0 JSON document (#204).
+    #[must_use]
     pub fn to_sarif_json(&self) -> String {
         serde_json::to_string_pretty(&self.to_sarif())
             .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
     }
 
+    #[must_use]
     pub fn render(&self) -> String {
         let mut out = String::new();
         for finding in &self.findings {
@@ -159,21 +187,23 @@ impl ScanReport {
                 Some(line) => format!("{}:{line}", finding.path),
                 None => finding.path.clone(),
             };
-            out.push_str(&format!(
-                "{:<7} {:<28} {}\n        {}\n",
+            let _ = writeln!(
+                out,
+                "{:<7} {:<28} {}\n        {}",
                 finding.confidence.as_str(),
                 finding.kind.as_str(),
                 location,
                 finding.message
-            ));
+            );
         }
-        out.push_str(&format!(
-            "scanned {} file(s), skipped {} — {} error(s), {} warning(s)\n",
+        let _ = writeln!(
+            out,
+            "scanned {} file(s), skipped {} — {} error(s), {} warning(s)",
             self.files_scanned,
             self.files_skipped,
             self.errors(),
             self.warnings()
-        ));
+        );
         if self.findings.is_empty() {
             out.push_str("no secret material found\n");
         }
@@ -263,6 +293,7 @@ pub struct SarifRegion {
 
 impl SecretKind {
     /// Stable SARIF rule identifier for this finding kind.
+    #[must_use]
     pub fn rule_id(&self) -> &'static str {
         match self {
             Self::StellarSecretKey => "KH001",
@@ -275,6 +306,7 @@ impl SecretKind {
 }
 
 impl SarifLog {
+    #[must_use]
     pub fn from_scan_report(report: &ScanReport) -> Self {
         let rules = [
             (
@@ -357,6 +389,7 @@ impl SarifLog {
 
 /// Mask a value so it can appear in a report: prefix and last four characters
 /// only. Short values are masked completely.
+#[must_use]
 pub fn mask_secret(value: &str) -> String {
     let chars: Vec<char> = value.chars().collect();
     if chars.len() <= 8 {
@@ -368,6 +401,7 @@ pub fn mask_secret(value: &str) -> String {
 }
 
 /// True when `value` is an obvious placeholder rather than a real secret.
+#[must_use]
 pub fn is_placeholder(value: &str) -> bool {
     let trimmed = value.trim().trim_matches(|c| c == '"' || c == '\'').trim();
     if trimmed.is_empty() {
@@ -380,7 +414,7 @@ pub fn is_placeholder(value: &str) -> bool {
     if trimmed.starts_with("${") && trimmed.ends_with('}') {
         return true;
     }
-    if trimmed.starts_with("$") {
+    if trimmed.starts_with('$') {
         return true;
     }
     if trimmed.starts_with("{{") && trimmed.ends_with("}}") {
@@ -395,25 +429,12 @@ pub fn is_placeholder(value: &str) -> bool {
     if lowered.contains("your_") || lowered.contains("your-") {
         return true;
     }
-    const PLACEHOLDERS: [&str; 12] = [
-        "changeme",
-        "change_me",
-        "placeholder",
-        "redacted",
-        "todo",
-        "example",
-        "dummy",
-        "test_key",
-        "not_a_real",
-        "secret_here",
-        "insert_",
-        "replace_me",
-    ];
     PLACEHOLDERS.iter().any(|p| lowered.contains(p))
 }
 
 /// True when `token` is shaped like a Stellar secret key: `S` followed by 55
 /// base32 characters.
+#[must_use]
 pub fn looks_like_secret_key(token: &str) -> bool {
     let mut chars = token.chars();
     if chars.next() != Some('S') {
@@ -482,6 +503,7 @@ fn literal_value(raw: &str) -> Option<String> {
 }
 
 /// Scan one file's text. `path` is only used for the report.
+#[must_use]
 pub fn scan_text(path: &Path, text: &str) -> Vec<Finding> {
     let path_str = path.display().to_string();
     let file_name = path
@@ -611,6 +633,7 @@ fn is_word_run(text: &str) -> bool {
 }
 
 /// Scan `roots` recursively.
+#[must_use]
 pub fn scan_paths(roots: &[PathBuf]) -> ScanReport {
     let mut report = ScanReport {
         roots: roots.iter().map(|r| r.display().to_string()).collect(),
@@ -636,7 +659,10 @@ fn walk(dir: &Path, report: &mut ScanReport) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    let mut paths: Vec<PathBuf> = entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(std::result::Result::ok)
+        .map(|e| e.path())
+        .collect();
     paths.sort();
     for path in paths {
         let name = path
@@ -871,6 +897,9 @@ mod tests {
 
         let json = report.to_sarif_json();
         assert!(json.contains("\"version\": \"2.1.0\""));
-        assert!(!json.contains(&key), "SARIF output must never contain raw secret");
+        assert!(
+            !json.contains(&key),
+            "SARIF output must never contain raw secret"
+        );
     }
 }
