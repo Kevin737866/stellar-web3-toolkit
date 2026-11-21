@@ -368,6 +368,96 @@ impl PaymentChannel {
         Ok(())
     }
 
+    /// Settle the channel on a state both participants signed (#352).
+    ///
+    /// Settlement is where the "newest state wins" rule has to be enforced
+    /// against the counterparty, not just locally. `signed_sequence` is part of
+    /// the signed payload, so a party that kept an older, more favourable split
+    /// cannot present it once the channel has moved on:
+    ///
+    /// * `signed_sequence` must be **strictly newer** than
+    ///   `ChannelState::sequence_number`, otherwise
+    ///   [`PaymentChannelError::StaleState`];
+    /// * the two balances must be non-negative and sum to the channel total;
+    /// * the channel must be open and free of outstanding HTLCs.
+    ///
+    /// On success the split is applied, the sequence number advances to
+    /// `signed_sequence` (gaps are allowed, because a participant may have
+    /// missed intermediate updates), and the channel is marked settled.
+    ///
+    /// # Signatures
+    ///
+    /// `signature_a` and `signature_b` are part of the channel ABI but are not
+    /// verified yet, matching [`PaymentChannel::update_state`] and
+    /// [`PaymentChannel::cooperative_close`]. The payload they will cover is the
+    /// one [`payment_channel::signed::SignedChannelState::digest`] defines:
+    ///
+    /// ```text
+    /// "stellar-payment-channel/signed-state/v1"
+    /// || len(channel_id) as u64 BE || channel_id bytes
+    /// || signed_sequence as u32 BE
+    /// || new_balance_a as i128 BE
+    /// || new_balance_b as i128 BE
+    /// ```
+    ///
+    /// The staleness check does not depend on that verification landing: it is
+    /// enforced against the stored sequence number, so an old state is refused
+    /// whether or not its signature has been checked.
+    pub fn settle_signed_state(
+        env: Env,
+        channel_id: BytesN<32>,
+        new_balance_a: i128,
+        new_balance_b: i128,
+        signed_sequence: u32,
+        signature_a: BytesN<64>,
+        signature_b: BytesN<64>,
+    ) -> Result<(), PaymentChannelError> {
+        // Both signatures are part of the channel ABI but are not verified yet.
+        let _ = (signature_a, signature_b);
+        let mut state = state::get_channel_state(&env, &channel_id)?;
+
+        if state.is_cooperative_close {
+            return Err(PaymentChannelError::ChannelAlreadyClosed);
+        }
+
+        if new_balance_a < 0 || new_balance_b < 0 {
+            return Err(PaymentChannelError::InvalidBalance);
+        }
+        let total = new_balance_a
+            .checked_add(new_balance_b)
+            .ok_or(PaymentChannelError::BalanceMismatch)?;
+        if total != state.total_balance {
+            return Err(PaymentChannelError::BalanceMismatch);
+        }
+
+        if state::has_active_htlcs(&env, &state.htlcs) {
+            return Err(PaymentChannelError::ActiveHtlcsExist);
+        }
+
+        // Only a strictly newer state may settle. An equal sequence would let a
+        // replayed copy of the current state rewrite the split, and a lower one
+        // would move funds backwards.
+        if signed_sequence <= state.sequence_number {
+            return Err(PaymentChannelError::StaleState);
+        }
+
+        state.balance_a = new_balance_a;
+        state.balance_b = new_balance_b;
+        state.sequence_number = signed_sequence;
+        state.is_cooperative_close = true;
+        state.close_time = env.ledger().timestamp();
+        state.close_sequence = signed_sequence;
+
+        state::store_channel_state(&env, &channel_id, &state);
+
+        env.events().publish(
+            ("channel_settled", channel_id),
+            (signed_sequence, state.close_time),
+        );
+
+        Ok(())
+    }
+
     /// Initiate unilateral close of the channel
     pub fn initiate_unilateral_close(
         env: Env,

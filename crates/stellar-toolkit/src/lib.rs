@@ -4,6 +4,7 @@
 
 pub mod anomaly;
 pub mod api_reference_gen;
+pub mod audit_allowlist;
 pub mod bridge_oracle;
 pub mod cli;
 pub mod compliance;
@@ -21,6 +22,7 @@ pub mod key_hygiene;
 pub mod merkle;
 pub mod migration_diff;
 pub mod monitoring_dashboard;
+pub mod onboarding;
 pub mod one_click_airdrop;
 pub mod oracle_resilience;
 pub mod p2p_qr_payment;

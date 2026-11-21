@@ -1,0 +1,47 @@
+# Cargo audit allowlist (issue #185).
+#
+# `cargo audit` runs in CI and reports advisories against Cargo.lock. This file
+# records the ones this workspace accepts, and why. It is checked by
+#
+#     cargo run -p stellar-toolkit -- security audit
+#
+# which enforces four rules:
+#
+#   1. every entry carries a reason a reviewer can act on;
+#   2. every entry may carry an expiry, and a lapsed entry is reported;
+#   3. every advisory the audit reports must be suppressed here, so a new one
+#      cannot slip in unnoticed;
+#   4. an entry for an advisory the audit no longer reports is reported as
+#      stale, so the list cannot grow forever.
+#
+# Only advisories with no reachable fix belong here. Pinning, `cargo update` and
+# a dependency bump are always preferable: this file went from 15 advisories to
+# 1 by updating reqwest to 0.12, not by suppressing them.
+#
+# Adding an entry:
+#
+#   [[deny.ignore]]
+#   id = "RUSTSEC-YYYY-NNNN"
+#   reason = "why this workspace is not affected, and what would make it affected"
+#   expires = "YYYY-MM-DD"   # optional, but expected for anything not permanent
+#
+# `docs/CARGO_AUDIT_ALLOWLIST.md` explains the process.
+
+# Transitive through the Stellar toolchain, not through our own code:
+# soroban-sdk 21 -> soroban-env-host -> k256 -> elliptic-curve -> crypto-bigint
+# 0.5.5. The fix landed in crypto-bigint 0.7.6, which is a different semver
+# major: nothing in the 0.5.x line can take it, so only a soroban-sdk release
+# that moves off k256/elliptic-curve 0.13 will clear this.
+#
+# Not reachable in the deployed contracts: the constant-time arithmetic in
+# crypto-bigint is used by k256 for ECDSA secp256k1, while the contracts verify
+# Ed25519 signatures through the Soroban host's own implementation. No
+# secret-dependent crypto-bigint operation runs in this workspace's own code.
+#
+# This becomes wrong if we start doing secp256k1 ECDSA in a contract or in
+# `crates/` on values an attacker can time. Remove this entry as soon as a
+# soroban-sdk release picks up crypto-bigint 0.7.
+[[deny.ignore]]
+id = "RUSTSEC-2026-0387"
+reason = "soroban-sdk pins k256/elliptic-curve 0.13 (crypto-bigint 0.5.x); secp256k1 constant-time paths are not used by our Ed25519 contracts"
+expires = "2027-05-31"
