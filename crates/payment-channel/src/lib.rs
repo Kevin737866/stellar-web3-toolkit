@@ -53,6 +53,9 @@ pub enum PaymentChannelError {
         "Channel {channel_id} has no state at or below ledger height {height}; resync from chain is required"
     )]
     NoStateForReorg { channel_id: String, height: u32 },
+
+    #[error("Unauthorized participant: {0}")]
+    UnauthorizedParticipant(String),
 }
 
 /// Channel status
@@ -359,6 +362,206 @@ impl ChannelManager {
         Ok(channel.state.clone())
     }
 
+    /// Set or update the remote participant's public key for authorization verification.
+    pub fn set_remote_public_key(
+        &self,
+        channel_id: &str,
+        remote_public_key: Vec<u8>,
+    ) -> Result<(), PaymentChannelError> {
+        let mut channels = self.channels.write();
+        let channel = channels
+            .get_mut(channel_id)
+            .ok_or_else(|| PaymentChannelError::ChannelNotFound(channel_id.to_string()))?;
+        channel.state.remote_public_key = remote_public_key;
+        Ok(())
+    }
+
+    /// Sign the channel's current state update for exchange with the counterparty.
+    pub fn sign_state_update(
+        &self,
+        channel_id: &str,
+        ledger_height: u32,
+    ) -> Result<Vec<u8>, PaymentChannelError> {
+        let channels = self.channels.read();
+        let channel = channels
+            .get(channel_id)
+            .ok_or_else(|| PaymentChannelError::ChannelNotFound(channel_id.to_string()))?;
+
+        let digest = compute_state_digest(
+            channel_id,
+            channel.state.sequence_number,
+            &channel.state.our_address,
+            channel.state.our_balance,
+            &channel.state.their_address,
+            channel.state.their_balance,
+            ledger_height,
+        );
+
+        self.signer.sign(&digest)
+    }
+
+    /// Sign a proposed state update commitment.
+    pub fn sign_proposed_state(
+        &self,
+        channel_id: &str,
+        sequence_number: u32,
+        our_balance: i128,
+        their_balance: i128,
+        ledger_height: u32,
+    ) -> Result<Vec<u8>, PaymentChannelError> {
+        let channels = self.channels.read();
+        let channel = channels
+            .get(channel_id)
+            .ok_or_else(|| PaymentChannelError::ChannelNotFound(channel_id.to_string()))?;
+
+        let digest = compute_state_digest(
+            channel_id,
+            sequence_number,
+            &channel.state.our_address,
+            our_balance,
+            &channel.state.their_address,
+            their_balance,
+            ledger_height,
+        );
+
+        self.signer.sign(&digest)
+    }
+
+    /// Apply a state update proposed by the counterparty after validating participant authorization.
+    ///
+    /// Validates:
+    /// 1. Channel exists and is currently Open.
+    /// 2. Ledger height is monotonic (reorg safety).
+    /// 3. Balance conservation and non-negativity.
+    /// 4. Cryptographic signature of the remote participant against `remote_public_key`.
+    ///
+    /// If verification fails, returns an actionable error and leaves the channel completely untouched.
+    pub fn apply_signed_state_update(
+        &self,
+        channel_id: &str,
+        new_our_balance: i128,
+        new_their_balance: i128,
+        remote_signature: &[u8],
+        ledger_height: u32,
+    ) -> Result<LocalChannelState, PaymentChannelError> {
+        let mut channels = self.channels.write();
+        let channel = channels
+            .get_mut(channel_id)
+            .ok_or_else(|| PaymentChannelError::ChannelNotFound(channel_id.to_string()))?;
+
+        if channel.state.status != ChannelStatus::Open {
+            return Err(PaymentChannelError::ChannelClosed(
+                channel.state.status.to_string(),
+            ));
+        }
+
+        if new_our_balance < 0 || new_their_balance < 0 {
+            return Err(PaymentChannelError::InvalidState(
+                "Balances cannot be negative".to_string(),
+            ));
+        }
+
+        let expected_total = channel.state.our_balance + channel.state.their_balance;
+        if new_our_balance + new_their_balance != expected_total {
+            return Err(PaymentChannelError::InvalidState(format!(
+                "Total balance mismatch: expected {}, got {}",
+                expected_total,
+                new_our_balance + new_their_balance
+            )));
+        }
+
+        check_height(channel_id, &channel.history, ledger_height)?;
+
+        if channel.state.remote_public_key.is_empty() {
+            return Err(PaymentChannelError::SignatureError(
+                "Remote public key not set for channel".to_string(),
+            ));
+        }
+
+        let next_sequence = channel.state.sequence_number + 1;
+        let digest = compute_state_digest(
+            channel_id,
+            next_sequence,
+            &channel.state.our_address,
+            new_our_balance,
+            &channel.state.their_address,
+            new_their_balance,
+            ledger_height,
+        );
+
+        let valid = self.signer.verify(
+            &digest,
+            remote_signature,
+            &channel.state.remote_public_key,
+        )?;
+
+        if !valid {
+            return Err(PaymentChannelError::SignatureError(
+                "Invalid participant authorization signature".to_string(),
+            ));
+        }
+
+        channel.state.our_balance = new_our_balance;
+        channel.state.their_balance = new_their_balance;
+        channel.state.sequence_number = next_sequence;
+
+        record_state(channel_id, channel, ledger_height)?;
+
+        Ok(channel.state.clone())
+    }
+
+    /// Execute an off-chain payment while validating counterparty authorization.
+    pub fn execute_authorized_payment_at(
+        &self,
+        channel_id: &str,
+        amount: i128,
+        direction: PaymentDirection,
+        remote_signature: &[u8],
+        ledger_height: u32,
+    ) -> Result<LocalChannelState, PaymentChannelError> {
+        let (new_our, new_their) = {
+            let channels = self.channels.read();
+            let channel = channels
+                .get(channel_id)
+                .ok_or_else(|| PaymentChannelError::ChannelNotFound(channel_id.to_string()))?;
+
+            match direction {
+                PaymentDirection::ToThem => {
+                    if channel.state.our_balance < amount {
+                        return Err(PaymentChannelError::InsufficientBalance {
+                            have: channel.state.our_balance,
+                            need: amount,
+                        });
+                    }
+                    (
+                        channel.state.our_balance - amount,
+                        channel.state.their_balance + amount,
+                    )
+                }
+                PaymentDirection::ToUs => {
+                    if channel.state.their_balance < amount {
+                        return Err(PaymentChannelError::InsufficientBalance {
+                            have: channel.state.their_balance,
+                            need: amount,
+                        });
+                    }
+                    (
+                        channel.state.our_balance + amount,
+                        channel.state.their_balance - amount,
+                    )
+                }
+            }
+        };
+
+        self.apply_signed_state_update(
+            channel_id,
+            new_our,
+            new_their,
+            remote_signature,
+            ledger_height,
+        )
+    }
+
     /// Anchor the channel's current state at `ledger_height` without changing
     /// it, for updates applied outside this manager (a handshake, an on-chain
     /// confirmation, an imported channel state).
@@ -526,6 +729,43 @@ impl ChannelManager {
 
         hex::encode(result)
     }
+}
+
+/// Deterministically compute the SHA-256 digest of a state update commitment.
+///
+/// Binds channel ID, sequence number, balances, and ledger height under a distinct domain tag.
+/// Address ordering is canonicalized so all participants compute the identical digest regardless
+/// of local point-of-view.
+pub fn compute_state_digest(
+    channel_id: &str,
+    sequence_number: u32,
+    our_address: &str,
+    our_balance: i128,
+    their_address: &str,
+    their_balance: i128,
+    ledger_height: u32,
+) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"STELLAR_PAYMENT_CHANNEL_STATE_UPDATE:");
+    hasher.update(channel_id.as_bytes());
+    hasher.update(&sequence_number.to_be_bytes());
+    if our_address <= their_address {
+        hasher.update(our_address.as_bytes());
+        hasher.update(&our_balance.to_be_bytes());
+        hasher.update(their_address.as_bytes());
+        hasher.update(&their_balance.to_be_bytes());
+    } else {
+        hasher.update(their_address.as_bytes());
+        hasher.update(&their_balance.to_be_bytes());
+        hasher.update(our_address.as_bytes());
+        hasher.update(&our_balance.to_be_bytes());
+    }
+    hasher.update(&ledger_height.to_be_bytes());
+    let res = hasher.finalize();
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(&res);
+    digest
 }
 
 /// Reject an update that claims a height the channel has already passed.
@@ -821,5 +1061,193 @@ mod tests {
     fn test_hex_encoding() {
         let data = vec![0xde, 0xad, 0xbe, 0xef];
         assert_eq!(hex::encode(data), "deadbeef");
+    }
+
+    struct StrictTestSigner {
+        pubkey: Vec<u8>,
+    }
+
+    impl StrictTestSigner {
+        fn new(pubkey: Vec<u8>) -> Self {
+            StrictTestSigner { pubkey }
+        }
+    }
+
+    impl SignatureSigner for StrictTestSigner {
+        fn sign(&self, message: &[u8]) -> Result<Vec<u8>, PaymentChannelError> {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(message);
+            hasher.update(&self.pubkey);
+            Ok(hasher.finalize().to_vec())
+        }
+
+        fn verify(
+            &self,
+            message: &[u8],
+            signature: &[u8],
+            public_key: &[u8],
+        ) -> Result<bool, PaymentChannelError> {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(message);
+            hasher.update(public_key);
+            let expected = hasher.finalize().to_vec();
+            Ok(signature == expected)
+        }
+
+        fn public_key(&self) -> Vec<u8> {
+            self.pubkey.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_signed_state_update_accepts_valid_signature() {
+        let manager = ChannelManager::with_history_depth(Box::new(StrictTestSigner::new(vec![1; 32])), 8);
+        let remote_signer = StrictTestSigner::new(vec![2; 32]);
+        let state = manager
+            .create_channel("alice".to_string(), "bob".to_string(), 1_000, 1_000, 100, 0)
+            .await
+            .unwrap();
+
+        manager.set_remote_public_key(&state.channel_id, remote_signer.public_key()).unwrap();
+
+        // Remote party (Bob) signs an update: Alice 800, Bob 1200 at sequence 1, height 5
+        let digest = compute_state_digest(&state.channel_id, 1, "alice", 800, "bob", 1200, 5);
+        let signature = remote_signer.sign(&digest).unwrap();
+
+        let updated = manager
+            .apply_signed_state_update(&state.channel_id, 800, 1200, &signature, 5)
+            .unwrap();
+
+        assert_eq!(updated.our_balance, 800);
+        assert_eq!(updated.their_balance, 1200);
+        assert_eq!(updated.sequence_number, 1);
+        assert_eq!(manager.recorded_heights(&state.channel_id).unwrap(), vec![0, 5]);
+    }
+
+    #[tokio::test]
+    async fn apply_signed_state_update_rejects_corrupted_signature_without_mutation() {
+        let manager = ChannelManager::with_history_depth(Box::new(StrictTestSigner::new(vec![1; 32])), 8);
+        let remote_signer = StrictTestSigner::new(vec![2; 32]);
+        let state = manager
+            .create_channel("alice".to_string(), "bob".to_string(), 1_000, 1_000, 100, 0)
+            .await
+            .unwrap();
+
+        manager.set_remote_public_key(&state.channel_id, remote_signer.public_key()).unwrap();
+
+        // Sign with wrong/foreign key
+        let wrong_signer = StrictTestSigner::new(vec![99; 32]);
+        let digest = compute_state_digest(&state.channel_id, 1, "alice", 800, "bob", 1200, 5);
+        let bad_signature = wrong_signer.sign(&digest).unwrap();
+
+        let err = manager
+            .apply_signed_state_update(&state.channel_id, 800, 1200, &bad_signature, 5)
+            .unwrap_err();
+
+        assert!(matches!(err, PaymentChannelError::SignatureError(_)));
+
+        // Channel state must remain pristine
+        let untouched = manager.get_channel(&state.channel_id).unwrap();
+        assert_eq!(untouched.our_balance, 1_000);
+        assert_eq!(untouched.their_balance, 1_000);
+        assert_eq!(untouched.sequence_number, 0);
+        assert_eq!(manager.recorded_heights(&state.channel_id).unwrap(), vec![0]);
+    }
+
+    #[tokio::test]
+    async fn apply_signed_state_update_rejects_balance_mismatch() {
+        let manager = ChannelManager::with_history_depth(Box::new(StrictTestSigner::new(vec![1; 32])), 8);
+        let remote_signer = StrictTestSigner::new(vec![2; 32]);
+        let state = manager
+            .create_channel("alice".to_string(), "bob".to_string(), 1_000, 1_000, 100, 0)
+            .await
+            .unwrap();
+
+        manager.set_remote_public_key(&state.channel_id, remote_signer.public_key()).unwrap();
+
+        let digest = compute_state_digest(&state.channel_id, 1, "alice", 1_500, "bob", 1_500, 5);
+        let sig = remote_signer.sign(&digest).unwrap();
+
+        let err = manager
+            .apply_signed_state_update(&state.channel_id, 1_500, 1_500, &sig, 5)
+            .unwrap_err();
+
+        assert!(matches!(err, PaymentChannelError::InvalidState(_)));
+    }
+
+    #[tokio::test]
+    async fn execute_authorized_payment_verifies_signature() {
+        let manager = ChannelManager::with_history_depth(Box::new(StrictTestSigner::new(vec![1; 32])), 8);
+        let remote_signer = StrictTestSigner::new(vec![2; 32]);
+        let state = manager
+            .create_channel("alice".to_string(), "bob".to_string(), 1_000, 1_000, 100, 0)
+            .await
+            .unwrap();
+
+        manager.set_remote_public_key(&state.channel_id, remote_signer.public_key()).unwrap();
+
+        // Payment of 200 to them produces our 800, their 1200
+        let digest = compute_state_digest(&state.channel_id, 1, "alice", 800, "bob", 1200, 10);
+        let valid_sig = remote_signer.sign(&digest).unwrap();
+
+        let updated = manager
+            .execute_authorized_payment_at(&state.channel_id, 200, PaymentDirection::ToThem, &valid_sig, 10)
+            .unwrap();
+
+        assert_eq!(updated.our_balance, 800);
+        assert_eq!(updated.their_balance, 1200);
+        assert_eq!(updated.sequence_number, 1);
+    }
+
+    #[tokio::test]
+    async fn integration_two_party_reciprocal_authorization_exchange() {
+        let alice_signer = StrictTestSigner::new(vec![10; 32]);
+        let bob_signer = StrictTestSigner::new(vec![20; 32]);
+
+        let alice_manager = ChannelManager::with_history_depth(Box::new(StrictTestSigner::new(vec![10; 32])), 8);
+        let bob_manager = ChannelManager::with_history_depth(Box::new(StrictTestSigner::new(vec![20; 32])), 8);
+
+        let ch_alice = alice_manager
+            .create_channel("alice".to_string(), "bob".to_string(), 1_000, 1_000, 100, 0)
+            .await
+            .unwrap();
+        let ch_bob = bob_manager
+            .create_channel("bob".to_string(), "alice".to_string(), 1_000, 1_000, 100, 0)
+            .await
+            .unwrap();
+
+        assert_eq!(ch_alice.channel_id, ch_bob.channel_id);
+        let ch_id = ch_alice.channel_id.clone();
+
+        alice_manager.set_remote_public_key(&ch_id, bob_signer.public_key()).unwrap();
+        bob_manager.set_remote_public_key(&ch_id, alice_signer.public_key()).unwrap();
+
+        // Alice pays 150 to Bob at height 1.
+        // Proposed new balances: Alice 850, Bob 1150.
+        // Bob authorizes the proposed state:
+        let bob_sig = bob_manager
+            .sign_proposed_state(&ch_id, 1, 1150, 850, 1)
+            .unwrap();
+
+        // Alice applies Bob's authorization:
+        let alice_state = alice_manager
+            .apply_signed_state_update(&ch_id, 850, 1150, &bob_sig, 1)
+            .unwrap();
+
+        // Alice signs her updated state and gives it to Bob:
+        let alice_sig = alice_manager.sign_state_update(&ch_id, 1).unwrap();
+
+        // Bob applies Alice's authorization:
+        let bob_state = bob_manager
+            .apply_signed_state_update(&ch_id, 1150, 850, &alice_sig, 1)
+            .unwrap();
+
+        assert_eq!(alice_state.our_balance, 850);
+        assert_eq!(alice_state.their_balance, 1150);
+        assert_eq!(bob_state.our_balance, 1150);
+        assert_eq!(bob_state.their_balance, 850);
+        assert_eq!(alice_state.sequence_number, bob_state.sequence_number);
     }
 }

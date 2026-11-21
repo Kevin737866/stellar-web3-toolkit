@@ -120,6 +120,10 @@ impl PaymentChannel {
     ) -> Result<(), PaymentChannelError> {
         let mut state = state::get_channel_state(&env, &channel_id)?;
 
+        if state.close_time != 0 {
+            return Err(PaymentChannelError::ChannelAlreadyClosed);
+        }
+
         if new_balance_a < 0 || new_balance_b < 0 {
             return Err(PaymentChannelError::InvalidBalance);
         }
@@ -127,6 +131,9 @@ impl PaymentChannel {
         if new_total != state.total_balance {
             return Err(PaymentChannelError::BalanceMismatch);
         }
+
+        state.participant_a.require_auth();
+        state.participant_b.require_auth();
 
         state.balance_a = new_balance_a;
         state.balance_b = new_balance_b;
@@ -151,6 +158,10 @@ impl PaymentChannel {
     ) -> Result<BytesN<32>, PaymentChannelError> {
         let mut state = state::get_channel_state(&env, &channel_id)?;
 
+        if state.close_time != 0 {
+            return Err(PaymentChannelError::ChannelAlreadyClosed);
+        }
+
         if amount <= 0 {
             return Err(PaymentChannelError::InvalidHtlcAmount);
         }
@@ -163,6 +174,8 @@ impl PaymentChannel {
         if state.balance_a < amount {
             return Err(PaymentChannelError::InsufficientBalance);
         }
+
+        state.participant_a.require_auth();
 
         // Generate HTLC ID
         let mut htlc_data = Bytes::new(&env);
@@ -226,6 +239,8 @@ impl PaymentChannel {
             return Err(PaymentChannelError::HtlcExpired);
         }
 
+        htlc.receiver.require_auth();
+
         // Verify the preimage hashes to the hashlock
         let preimage_bytes = Bytes::from_slice(&env, &preimage.to_array());
         let computed_hash: BytesN<32> = env.crypto().sha256(&preimage_bytes).into();
@@ -273,6 +288,8 @@ impl PaymentChannel {
             return Err(PaymentChannelError::HtlcNotExpired);
         }
 
+        htlc.sender.require_auth();
+
         htlc.is_refunded = true;
         state.balance_a += htlc.amount;
 
@@ -297,6 +314,10 @@ impl PaymentChannel {
     ) -> Result<(), PaymentChannelError> {
         let mut state = state::get_channel_state(&env, &channel_id)?;
 
+        if state.close_time != 0 {
+            return Err(PaymentChannelError::ChannelAlreadyClosed);
+        }
+
         if final_balance_a < 0 || final_balance_b < 0 {
             return Err(PaymentChannelError::InvalidBalance);
         }
@@ -304,6 +325,9 @@ impl PaymentChannel {
         if total != state.total_balance {
             return Err(PaymentChannelError::BalanceMismatch);
         }
+
+        state.participant_a.require_auth();
+        state.participant_b.require_auth();
 
         state.balance_a = final_balance_a;
         state.balance_b = final_balance_b;
@@ -329,9 +353,15 @@ impl PaymentChannel {
     ) -> Result<u64, PaymentChannelError> {
         let mut state = state::get_channel_state(&env, &channel_id)?;
 
+        if state.close_time != 0 {
+            return Err(PaymentChannelError::ChannelAlreadyClosed);
+        }
+
         if initiator != state.participant_a && initiator != state.participant_b {
             return Err(PaymentChannelError::UnauthorizedParticipant);
         }
+
+        initiator.require_auth();
 
         let has_active = state::has_active_htlcs(&env, &state.htlcs)?;
         if has_active {
@@ -385,16 +415,24 @@ impl PaymentChannel {
     ) -> Result<(), PaymentChannelError> {
         let mut state = state::get_channel_state(&env, &channel_id)?;
 
+        if state.close_time != 0 {
+            return Err(PaymentChannelError::ChannelAlreadyClosed);
+        }
+
         if top_up_amount <= 0 {
             return Err(PaymentChannelError::InvalidBalance);
         }
 
+        if participant != state.participant_a && participant != state.participant_b {
+            return Err(PaymentChannelError::UnauthorizedParticipant);
+        }
+
+        participant.require_auth();
+
         if participant == state.participant_a {
             state.balance_a += top_up_amount;
-        } else if participant == state.participant_b {
-            state.balance_b += top_up_amount;
         } else {
-            return Err(PaymentChannelError::UnauthorizedParticipant);
+            state.balance_b += top_up_amount;
         }
 
         state.total_balance += top_up_amount;
@@ -427,5 +465,103 @@ impl PaymentChannel {
         }
 
         HtlcList { entries }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::{testutils::Address as _, Env};
+
+    fn setup_channel(env: &Env) -> (PaymentChannelClient<'_>, Address, Address, BytesN<32>) {
+        let contract_id = env.register_contract(None, PaymentChannel);
+        let client = PaymentChannelClient::new(env, &contract_id);
+        let p_a = Address::generate(env);
+        let p_b = Address::generate(env);
+        let channel_id = client.initialize(&p_a, &p_b, &1_000, &1_000, &100, &0);
+        (client, p_a, p_b, channel_id)
+    }
+
+    #[test]
+    fn test_update_state_success() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _p_a, _p_b, channel_id) = setup_channel(&env);
+        let dummy_sig = BytesN::from_array(&env, &[0u8; 64]);
+
+        client.update_state(&channel_id, &1_200, &800, &dummy_sig, &dummy_sig);
+        let state = client.get_channel_state(&channel_id);
+        assert_eq!(state.balance_a, 1_200);
+        assert_eq!(state.balance_b, 800);
+        assert_eq!(state.sequence_number, 1);
+    }
+
+    #[test]
+    fn test_update_state_balance_mismatch() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _p_a, _p_b, channel_id) = setup_channel(&env);
+        let dummy_sig = BytesN::from_array(&env, &[0u8; 64]);
+
+        let res = client.try_update_state(&channel_id, &1_500, &800, &dummy_sig, &dummy_sig);
+        assert_eq!(res, Err(Ok(PaymentChannelError::BalanceMismatch)));
+    }
+
+    #[test]
+    fn test_update_state_negative_balance() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _p_a, _p_b, channel_id) = setup_channel(&env);
+        let dummy_sig = BytesN::from_array(&env, &[0u8; 64]);
+
+        let res = client.try_update_state(&channel_id, &-100, &2_100, &dummy_sig, &dummy_sig);
+        assert_eq!(res, Err(Ok(PaymentChannelError::InvalidBalance)));
+    }
+
+    #[test]
+    fn test_update_state_channel_already_closed() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _p_a, _p_b, channel_id) = setup_channel(&env);
+        let dummy_sig = BytesN::from_array(&env, &[0u8; 64]);
+
+        client.cooperative_close(&channel_id, &1_000, &1_000, &dummy_sig, &dummy_sig);
+        let res = client.try_update_state(&channel_id, &1_200, &800, &dummy_sig, &dummy_sig);
+        assert_eq!(res, Err(Ok(PaymentChannelError::ChannelAlreadyClosed)));
+    }
+
+    #[test]
+    fn test_unilateral_close_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _p_a, _p_b, channel_id) = setup_channel(&env);
+        let stranger = Address::generate(&env);
+
+        let res = client.try_initiate_unilateral_close(&channel_id, &stranger);
+        assert_eq!(res, Err(Ok(PaymentChannelError::UnauthorizedParticipant)));
+    }
+
+    #[test]
+    fn test_top_up_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _p_a, _p_b, channel_id) = setup_channel(&env);
+        let stranger = Address::generate(&env);
+
+        let res = client.try_top_up(&channel_id, &500, &stranger);
+        assert_eq!(res, Err(Ok(PaymentChannelError::UnauthorizedParticipant)));
+    }
+
+    #[test]
+    fn test_top_up_success() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, p_a, _p_b, channel_id) = setup_channel(&env);
+
+        client.top_up(&channel_id, &500, &p_a);
+        let state = client.get_channel_state(&channel_id);
+        assert_eq!(state.balance_a, 1_500);
+        assert_eq!(state.total_balance, 2_500);
+        assert_eq!(state.sequence_number, 1);
     }
 }
