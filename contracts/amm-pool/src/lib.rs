@@ -5,7 +5,9 @@
 // `dead_code` under `clippy -D warnings`.
 pub mod math;
 
-use math::{amount_out, flash_k_ok, liquidity_amounts_first_deposit, quote};
+use math::{
+    amount_out, checked_mint_lp_shares, checked_redeem_amounts, flash_k_ok, quote,
+};
 use soroban_sdk::token::{TokenClient, TokenInterface};
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, IntoVal, String};
 
@@ -162,14 +164,8 @@ fn burn_lp_withdraw(env: &Env, from: Address, amount: i128) {
     let (reserve_a, reserve_b) = reserves(env);
     let supply = total_lp(env);
     assert!(amount > 0 && supply > 0, "burn w");
-    let amount_a = amount
-        .saturating_mul(reserve_a)
-        .checked_div(supply)
-        .unwrap();
-    let amount_b = amount
-        .saturating_mul(reserve_b)
-        .checked_div(supply)
-        .unwrap();
+    let (amount_a, amount_b) =
+        checked_redeem_amounts(amount, reserve_a, reserve_b, supply).expect("redeem");
     grow_cumulative(env);
     burn_lp(env, from.clone(), amount);
     let (ta, tb) = get_tokens(env);
@@ -177,8 +173,8 @@ fn burn_lp_withdraw(env: &Env, from: Address, amount: i128) {
     TokenClient::new(env, &tb).transfer(&pool, &from, &amount_b);
     set_reserves(
         env,
-        reserve_a.saturating_sub(amount_a),
-        reserve_b.saturating_sub(amount_b),
+        reserve_a.checked_sub(amount_a).expect("reserve_a underflow"),
+        reserve_b.checked_sub(amount_b).expect("reserve_b underflow"),
     );
     grow_cumulative(env);
 }
@@ -227,6 +223,10 @@ impl AmmPool {
         )
     }
 
+    /// Deposits `token_a` and `token_b` and mints LP shares.
+    ///
+    /// LP share minting rounds **down** (floor) via `checked_mint_lp_shares` so
+    /// depositors never receive more shares than backed by their proportional deposit.
     pub fn add_liquidity(
         env: Env,
         user: Address,
@@ -257,33 +257,31 @@ impl AmmPool {
 
         assert!(amount_a >= min_a && amount_b >= min_b, "slippage add");
 
+        let supply = total_lp(&env);
+        let liq =
+            checked_mint_lp_shares(amount_a, amount_b, reserve_a, reserve_b, supply).expect("liq");
+        assert!(liq > 0, "liq");
+
         TokenClient::new(&env, &ta).transfer(&user, &pool, &amount_a);
         TokenClient::new(&env, &tb).transfer(&user, &pool, &amount_b);
 
         grow_cumulative(&env);
-
-        let liq = if total_lp(&env) == 0 {
-            liquidity_amounts_first_deposit(amount_a, amount_b)
-        } else {
-            let l1 = amount_a
-                .saturating_mul(total_lp(&env))
-                .checked_div(reserve_a)
-                .unwrap_or(0);
-            let l2 = amount_b
-                .saturating_mul(total_lp(&env))
-                .checked_div(reserve_b)
-                .unwrap_or(0);
-            l1.min(l2)
-        };
-        assert!(liq > 0, "liq");
-        let new_a = reserve_a.saturating_add(amount_a);
-        let new_b = reserve_b.saturating_add(amount_b);
+        let new_a = reserve_a
+            .checked_add(amount_a)
+            .expect("reserve_a overflow");
+        let new_b = reserve_b
+            .checked_add(amount_b)
+            .expect("reserve_b overflow");
         set_reserves(&env, new_a, new_b);
         mint_lp(&env, user, liq);
         grow_cumulative(&env);
         liq
     }
 
+    /// Burns `lp_amount` LP shares and redeems proportional `token_a` and `token_b`.
+    ///
+    /// Token redemption rounds **down** (floor) via `checked_redeem_amounts` so
+    /// redeemers cannot withdraw more reserves than their proportional share entitles them to.
     pub fn remove_liquidity(
         env: Env,
         user: Address,
@@ -298,14 +296,8 @@ impl AmmPool {
         let supply = total_lp(&env);
         assert!(supply > 0, "supply");
 
-        let amount_a = lp_amount
-            .saturating_mul(reserve_a)
-            .checked_div(supply)
-            .unwrap();
-        let amount_b = lp_amount
-            .saturating_mul(reserve_b)
-            .checked_div(supply)
-            .unwrap();
+        let (amount_a, amount_b) =
+            checked_redeem_amounts(lp_amount, reserve_a, reserve_b, supply).expect("redeem");
         assert!(amount_a >= min_a && amount_b >= min_b, "slippage rm");
 
         grow_cumulative(&env);
@@ -317,8 +309,8 @@ impl AmmPool {
 
         set_reserves(
             &env,
-            reserve_a.saturating_sub(amount_a),
-            reserve_b.saturating_sub(amount_b),
+            reserve_a.checked_sub(amount_a).expect("reserve_a underflow"),
+            reserve_b.checked_sub(amount_b).expect("reserve_b underflow"),
         );
         grow_cumulative(&env);
         (amount_a, amount_b)
@@ -578,5 +570,63 @@ mod test {
         let _ = pool.swap(&ta, &u, &1);
         let (c1, d1, _) = pool.observe();
         assert!(c1 > c0 || d1 > d0);
+    }
+
+    #[test]
+    fn lp_minting_and_redemption_round_down() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (ta, tb) = setup_tokens(&env);
+        let pool_id = env.register_contract(None, AmmPool);
+        let pool = AmmPoolClient::new(&env, &pool_id);
+        let factory = Address::generate(&env);
+        pool.initialize(&factory, &ta, &tb);
+
+        let u1 = Address::generate(&env);
+        let u2 = Address::generate(&env);
+        mint(&env, ta.clone(), u1.clone(), 10_000);
+        mint(&env, tb.clone(), u1.clone(), 10_000);
+        mint(&env, ta.clone(), u2.clone(), 10_000);
+        mint(&env, tb.clone(), u2.clone(), 10_000);
+
+        // First deposit: floor(sqrt(100 * 101)) = floor(sqrt(10100)) = 100
+        let lp1 = pool.add_liquidity(&u1, &100, &101, &1, &1);
+        assert_eq!(lp1, 100);
+
+        // Second deposit: 33 / 100 * 100 = 33, quote_b = floor(33 * 101 / 100) = 33
+        // l1 = floor(33 * 100 / 100) = 33, l2 = floor(33 * 100 / 101) = 32 -> min = 32
+        let lp2 = pool.add_liquidity(&u2, &33, &100, &1, &1);
+        assert_eq!(lp2, 32);
+
+        // Redeem 1 LP out of 132 total:
+        // reserves = (133, 134) -> floor(133 / 132) = 1, floor(134 / 132) = 1
+        let (out_a, out_b) = pool.remove_liquidity(&u2, &1, &1, &1);
+        assert_eq!((out_a, out_b), (1, 1));
+        assert_eq!(pool.get_reserves(), (132, 133));
+    }
+
+    #[test]
+    fn lp_redemption_rejects_invalid_and_slippage_bounds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (ta, tb) = setup_tokens(&env);
+        let pool_id = env.register_contract(None, AmmPool);
+        let pool = AmmPoolClient::new(&env, &pool_id);
+        let factory = Address::generate(&env);
+        pool.initialize(&factory, &ta, &tb);
+
+        let u = Address::generate(&env);
+        mint(&env, ta.clone(), u.clone(), 10_000);
+        mint(&env, tb.clone(), u.clone(), 10_000);
+        let lp = pool.add_liquidity(&u, &100, &101, &1, &1);
+        assert_eq!(lp, 100);
+
+        // Zero LP amount rejected
+        assert!(pool.try_remove_liquidity(&u, &0, &0, &0).is_err());
+        // Exceeding balance / supply rejected
+        assert!(pool.try_remove_liquidity(&u, &101, &0, &0).is_err());
+        // Slippage bound above rounded-down output (floor(1 * 101 / 100) = 1, not 2) rejected
+        assert!(pool.try_remove_liquidity(&u, &1, &1, &2).is_err());
+        assert_eq!(pool.get_reserves(), (100, 101));
     }
 }

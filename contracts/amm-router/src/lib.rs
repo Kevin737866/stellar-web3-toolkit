@@ -93,4 +93,46 @@ mod test {
         assert_eq!(after.saturating_sub(before), out);
         assert!(out > 9000);
     }
+
+    #[test]
+    fn router_swap_and_lp_rounding_preserves_reserves() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let ta = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let tb = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+
+        let pool_id = env.register_contract(None, AmmPool);
+        let pool = AmmPoolClient::new(&env, &pool_id);
+        let factory = Address::generate(&env);
+        pool.initialize(&factory, &ta, &tb);
+
+        let u = Address::generate(&env);
+        let router_id = env.register_contract(None, AmmRouter);
+        let router = AmmRouterClient::new(&env, &router_id);
+
+        soroban_sdk::token::StellarAssetClient::new(&env, &ta).mint(&u, &1_000_000);
+        soroban_sdk::token::StellarAssetClient::new(&env, &tb).mint(&u, &1_000_000);
+
+        let lp = pool.add_liquidity(&u, &400_000, &400_001, &1, &1);
+        assert_eq!(lp, 400_000);
+
+        let path = soroban_sdk::vec![&env, ta.clone(), tb.clone()];
+        let pools = soroban_sdk::vec![&env, pool_id.clone()];
+        let _out = router.swap_exact_tokens_for_tokens(&u, &path, &pools, &10_000, &1, &u);
+
+        let (ra_mid, rb_mid) = pool.get_reserves();
+        let (redeem_a, redeem_b) = pool.remove_liquidity(&u, &1, &1, &0);
+        assert_eq!(redeem_a, ra_mid / lp);
+        assert_eq!(redeem_b, rb_mid / lp);
+        assert_eq!(
+            pool.get_reserves(),
+            (ra_mid - redeem_a, rb_mid - redeem_b)
+        );
+    }
 }
