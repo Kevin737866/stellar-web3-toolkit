@@ -372,8 +372,12 @@ fn take_accrued(cfg: &Config, position: &mut Position, commission_bps: u32) -> (
     (net, commission)
 }
 
-/// Re-stakes a position's accrued rewards in place when auto-compound is on.
-/// Returns the amount compounded.
+/// Settles a position's accrued rewards and, when `auto_compound` is on,
+/// re-stakes the net reward in place.
+///
+/// Always settles first even when `auto_compound` is off so that subsequent
+/// balance changes (`delegate` or `undelegate`) only apply to future
+/// intervals rather than retroactively scaling prior intervals.
 fn auto_compound(
     env: &Env,
     cfg: &mut Config,
@@ -381,6 +385,7 @@ fn auto_compound(
     operator: &mut Operator,
 ) -> i128 {
     if !position.auto_compound {
+        settle(cfg, position);
         return 0;
     }
     let (net, commission) = take_accrued(cfg, position, operator.commission_bps);
@@ -679,8 +684,11 @@ impl DelegatedStaking {
 
     // -- delegator actions ---------------------------------------------------
 
-    /// Delegates `amount` to `operator`. When auto-compound is on, rewards
-    /// accrued so far are re-staked first, so the new stake also earns on them.
+    /// Delegates `amount` to `operator`.
+    ///
+    /// Rewards accrued over any prior deposit interval are always settled first
+    /// (and re-staked when auto-compound is on), so the new stake only accrues
+    /// rewards from this timestamp onward.
     pub fn delegate(env: Env, delegator: Address, operator: Address, amount: i128) -> i128 {
         delegator.require_auth();
         assert!(amount > 0, "amount must be positive");
@@ -1490,5 +1498,134 @@ mod test {
             .client
             .try_delegate(&f.other_operator, &f.operator, &(10 * ONE))
             .is_err());
+    }
+
+    #[test]
+    fn multiple_deposit_intervals_accrue_per_interval_without_auto_compound() {
+        let f = Fixture::new();
+        // 1 token/second for 1_000 seconds.
+        f.fund(1_000 * ONE, 1_000);
+        f.mint(&f.alice, 300 * ONE);
+
+        // Interval 1: 100 * ONE staked for 50s -> 50 * ONE accrued.
+        f.client.delegate(&f.alice, &f.operator, &(100 * ONE));
+        f.advance(50);
+
+        // Interval 2: top up by 100 * ONE (total 200 * ONE) for 50s -> 50 * ONE more.
+        f.client.delegate(&f.alice, &f.operator, &(100 * ONE));
+        let pos = f.client.position(&f.alice, &f.operator);
+        assert_eq!(pos.amount, 200 * ONE);
+        assert_eq!(pos.accrued, 50 * ONE);
+
+        f.advance(50);
+        assert_eq!(f.client.pending_rewards(&f.alice, &f.operator), 100 * ONE);
+
+        // Claiming pays 95 * ONE (5% commission) and remains solvent.
+        let net = f.client.claim(&f.alice, &f.operator, &0);
+        assert_eq!(net, 95 * ONE);
+        assert_eq!(f.balance(&f.operator), 5 * ONE);
+        assert!(
+            f.client.rewards_paid_out() + f.client.rewards_compounded()
+                <= f.client.rewards_credited()
+        );
+    }
+
+    #[test]
+    fn multiple_deposit_and_undelegate_intervals_preserve_prior_accrual() {
+        let f = Fixture::new();
+        f.fund(1_000 * ONE, 1_000);
+        f.mint(&f.alice, 200 * ONE);
+
+        // Interval 1: 100 * ONE for 40s -> 40 * ONE.
+        f.client.delegate(&f.alice, &f.operator, &(100 * ONE));
+        f.advance(40);
+
+        // Interval 2: +100 * ONE (200 * ONE total) for 40s -> 40 * ONE.
+        f.client.delegate(&f.alice, &f.operator, &(100 * ONE));
+        f.advance(40);
+
+        // Interval 3: undelegate 150 * ONE (50 * ONE left) for 20s -> 20 * ONE.
+        f.client.undelegate(&f.alice, &f.operator, &(150 * ONE));
+        assert_eq!(f.client.position(&f.alice, &f.operator).accrued, 80 * ONE);
+        f.advance(20);
+
+        assert_eq!(f.client.pending_rewards(&f.alice, &f.operator), 100 * ONE);
+        let net = f.client.claim(&f.alice, &f.operator, &0);
+        assert_eq!(net, 95 * ONE);
+    }
+
+    #[test]
+    fn multi_user_multi_interval_delegation_does_not_dilute_or_overpay() {
+        let f = Fixture::new();
+        f.fund(1_000 * ONE, 1_000);
+        f.mint(&f.alice, 300 * ONE);
+        f.mint(&f.bob, 300 * ONE);
+
+        // Interval 1 (50s): Alice 100, Bob 100 -> 25 each.
+        f.client.delegate(&f.alice, &f.other_operator, &(100 * ONE));
+        f.client.delegate(&f.bob, &f.other_operator, &(100 * ONE));
+        f.advance(50);
+
+        // Interval 2 (50s): Alice adds 200 (now 300 vs Bob 100) -> 37.5 Alice, 12.5 Bob.
+        f.client.delegate(&f.alice, &f.other_operator, &(200 * ONE));
+        f.advance(50);
+
+        assert_eq!(
+            f.client.pending_rewards(&f.alice, &f.other_operator),
+            62_500_000
+        );
+        assert_eq!(
+            f.client.pending_rewards(&f.bob, &f.other_operator),
+            37_500_000
+        );
+
+        let a_net = f.client.claim(&f.alice, &f.other_operator, &0);
+        let b_net = f.client.claim(&f.bob, &f.other_operator, &0);
+        assert_eq!(a_net + b_net, 100 * ONE);
+        assert!(f.client.rewards_paid_out() <= f.client.rewards_credited());
+    }
+
+    #[test]
+    fn integration_multi_interval_staking_with_topup_and_auto_compound_toggle() {
+        let f = Fixture::new();
+        f.fund(100 * ONE, 100); // 1 * ONE/s for 100s
+        f.mint(&f.alice, 200 * ONE);
+
+        // Interval 1: 100 * ONE without auto-compound for 40s -> 40 * ONE accrued.
+        f.client
+            .delegate(&f.alice, &f.other_operator, &(100 * ONE));
+        f.advance(40);
+
+        // Interval 2: second deposit settles 40 * ONE, then enable auto-compound.
+        f.client
+            .delegate(&f.alice, &f.other_operator, &(100 * ONE));
+        f.client
+            .set_auto_compound(&f.alice, &f.other_operator, &true);
+        f.advance(60);
+
+        // Schedule ended at t+100; total earned = 100 * ONE.
+        assert_eq!(
+            f.client.pending_rewards(&f.alice, &f.other_operator),
+            100 * ONE
+        );
+
+        // Top up schedule and trigger auto-compound via partial undelegate of 50 * ONE.
+        f.fund(100 * ONE, 100);
+        f.client
+            .undelegate(&f.alice, &f.other_operator, &(50 * ONE));
+        // 200 + 100 (compounded) - 50 (undelegated) = 250 * ONE.
+        assert_eq!(
+            f.client.position(&f.alice, &f.other_operator).amount,
+            250 * ONE
+        );
+        assert_eq!(f.client.rewards_compounded(), 100 * ONE);
+
+        f.advance(100);
+        assert_eq!(f.client.claim(&f.alice, &f.other_operator, &0), 100 * ONE);
+        assert!(
+            f.client.rewards_paid_out() + f.client.rewards_compounded()
+                <= f.client.rewards_credited()
+        );
+        assert!(f.client.rewards_credited() <= f.client.rewards_funded());
     }
 }
