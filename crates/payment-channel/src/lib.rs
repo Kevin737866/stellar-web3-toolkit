@@ -1696,8 +1696,14 @@ mod tests {
         let alice_signer = StrictTestSigner::new(vec![10; 32]);
         let bob_signer = StrictTestSigner::new(vec![20; 32]);
 
-        let alice_manager = ChannelManager::with_history_depth(Box::new(StrictTestSigner::new(vec![10; 32])), 8);
-        let bob_manager = ChannelManager::with_history_depth(Box::new(StrictTestSigner::new(vec![20; 32])), 8);
+        let alice_manager = ChannelManager::with_history_depth(
+            Box::new(StrictTestSigner::new(vec![10; 32])),
+            8,
+        );
+        let bob_manager = ChannelManager::with_history_depth(
+            Box::new(StrictTestSigner::new(vec![20; 32])),
+            8,
+        );
 
         let ch_alice = alice_manager
             .create_channel("alice".to_string(), "bob".to_string(), 1_000, 1_000, 100, 0)
