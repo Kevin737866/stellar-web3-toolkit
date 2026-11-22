@@ -749,9 +749,26 @@ impl YieldFarm {
     ///
     /// Deliberately callable while paused or when the pool is inactive, so a
     /// depositor can always exit.
+    ///
+    /// # Errors
+    ///
+    /// * Panics with `"amount must be positive"` if `amount <= 0`.
+    /// * Panics with `"unknown pool"` if `pool_id` is not registered.
+    /// * Panics with `"insufficient staked balance"` if `amount` exceeds the
+    ///   user's staked `position.amount`, before any state updates occur.
     pub fn withdraw(env: Env, user: Address, pool_id: u32, amount: i128) -> i128 {
         user.require_auth();
         assert!(amount > 0, "amount must be positive");
+
+        // Validate against the user's staked balance before settling so a
+        // rejected over-withdrawal never writes partial state updates.
+        let existing_pool = read_pool(&env, pool_id).unwrap_or_else(|| panic!("unknown pool"));
+        let existing_position =
+            read_position(&env, pool_id, &user, existing_pool.acc_reward_per_share);
+        assert!(
+            existing_position.amount >= amount,
+            "insufficient staked balance"
+        );
 
         let (cfg, mut pool) = settle_one(&env, pool_id);
         let mut position = read_position(&env, pool_id, &user, pool.acc_reward_per_share);
@@ -759,7 +776,10 @@ impl YieldFarm {
         assert!(position.amount >= amount, "insufficient staked balance");
 
         position.amount -= amount;
-        pool.total_staked -= amount;
+        pool.total_staked = pool
+            .total_staked
+            .checked_sub(amount)
+            .expect("pool balance underflow");
 
         if !write_position(&env, &user, &position) {
             untrack_user_pool(&env, &user, pool_id);
@@ -1344,5 +1364,94 @@ mod test {
         ] {
             assert!(names.contains(&expected), "missing {expected:?}");
         }
+    }
+
+    #[test]
+    fn withdraw_boundary_exact_and_one_over_preserves_state() {
+        let f = Fixture::new();
+        f.standard_farm();
+        f.deposit(&f.alice, 1, &f.lp_a, 100 * ONE);
+        f.advance(50);
+
+        // One unit over staked balance is rejected with no state mutation.
+        assert!(f
+            .client
+            .try_withdraw(&f.alice, &1, &(100 * ONE + 1))
+            .is_err());
+        assert_eq!(f.client.position(&f.alice, &1).amount, 100 * ONE);
+        assert_eq!(f.client.pool_of(&1).unwrap().total_staked, 100 * ONE);
+        assert_eq!(f.client.rewards_credited(), 0);
+        assert_eq!(f.balance(&f.lp_a, &f.alice), 0);
+
+        // Exact balance withdrawal succeeds.
+        let remaining = f.client.withdraw(&f.alice, &1, &(100 * ONE));
+        assert_eq!(remaining, 0);
+        assert_eq!(f.balance(&f.lp_a, &f.alice), 100 * ONE);
+        assert_eq!(f.client.pool_of(&1).unwrap().total_staked, 0);
+    }
+
+    #[test]
+    fn withdraw_rejects_zero_balance_and_excess_after_partial() {
+        let f = Fixture::new();
+        f.standard_farm();
+        // Bob has never deposited.
+        assert!(f.client.try_withdraw(&f.bob, &1, &1).is_err());
+        assert!(f.client.try_withdraw(&f.alice, &1, &0).is_err());
+        assert!(f.client.try_withdraw(&f.alice, &1, &-5).is_err());
+
+        f.deposit(&f.alice, 1, &f.lp_a, 100 * ONE);
+        assert_eq!(f.client.withdraw(&f.alice, &1, &(70 * ONE)), 30 * ONE);
+        // Remaining is 30 * ONE; requesting 30 * ONE + 1 must fail.
+        assert!(f
+            .client
+            .try_withdraw(&f.alice, &1, &(30 * ONE + 1))
+            .is_err());
+        assert_eq!(f.client.position(&f.alice, &1).amount, 30 * ONE);
+    }
+
+    #[test]
+    fn withdraw_while_paused_enforces_staked_balance_limit() {
+        let f = Fixture::new();
+        f.standard_farm();
+        f.deposit(&f.alice, 1, &f.lp_a, 50 * ONE);
+        f.client.set_paused(&true);
+
+        assert!(f
+            .client
+            .try_withdraw(&f.alice, &1, &(50 * ONE + 1))
+            .is_err());
+        assert_eq!(f.client.withdraw(&f.alice, &1, &(50 * ONE)), 0);
+        assert_eq!(f.balance(&f.lp_a, &f.alice), 50 * ONE);
+    }
+
+    #[test]
+    fn integration_farm_over_withdrawal_harvest_and_emergency_exit() {
+        let f = Fixture::new();
+        f.standard_farm();
+        f.deposit(&f.alice, 1, &f.lp_a, 100 * ONE);
+        f.deposit(&f.bob, 1, &f.lp_a, 100 * ONE);
+
+        f.advance(40);
+        // Over-withdrawal fails without altering Alice's stake or pending rewards.
+        assert!(f
+            .client
+            .try_withdraw(&f.alice, &1, &(100 * ONE + 1))
+            .is_err());
+        assert_eq!(f.client.position(&f.alice, &1).amount, 100 * ONE);
+        assert_eq!(f.client.pending_rewards(&f.alice, &1), 10 * ONE);
+
+        // Partial withdraw + harvest preserves and pays accrued rewards.
+        assert_eq!(f.client.withdraw(&f.alice, &1, &(60 * ONE)), 40 * ONE);
+        assert_eq!(f.client.harvest(&f.alice, &1, &0), 10 * ONE);
+        assert_eq!(f.balance(&f.lp_a, &f.alice), 60 * ONE);
+        assert_eq!(f.balance(&f.reward_token, &f.alice), 10 * ONE);
+
+        // Advance more, then emergency_withdraw exits remaining LP and forfeits new accrual.
+        f.advance(20);
+        let emg = f.client.emergency_withdraw(&f.alice, &1);
+        assert_eq!(emg, 40 * ONE);
+        assert_eq!(f.balance(&f.lp_a, &f.alice), 100 * ONE);
+        assert_eq!(f.client.pending_rewards(&f.alice, &1), 0);
+        assert!(f.client.rewards_paid_out() <= f.client.rewards_credited());
     }
 }

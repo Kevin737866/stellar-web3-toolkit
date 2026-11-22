@@ -316,12 +316,8 @@ fn transfer_out(env: &Env, token: &Address, to: &Address, amount: i128) {
 // Reward accounting
 // ---------------------------------------------------------------------------
 
-/// Advances the global index up to `now` and returns the fresh config.
-///
-/// Time with nothing staked is consumed without crediting anything, so rewards
-/// funded while the pool is empty are not handed to whoever joins next — that
-/// would let a new depositor collect the entire backlog.
-fn update_pool(env: &Env) -> Config {
+/// Computes the next global index state up to `now` without writing storage.
+fn compute_pool_update(env: &Env) -> Config {
     let mut cfg = config(env);
     let now = env.ledger().timestamp();
     let seconds = distributable_seconds(cfg.last_update, cfg.period_finish, now);
@@ -341,6 +337,16 @@ fn update_pool(env: &Env) -> Config {
     if now > cfg.last_update {
         cfg.last_update = now;
     }
+    cfg
+}
+
+/// Advances the global index up to `now` and returns the fresh config.
+///
+/// Time with nothing staked is consumed without crediting anything, so rewards
+/// funded while the pool is empty are not handed to whoever joins next — that
+/// would let a new depositor collect the entire backlog.
+fn update_pool(env: &Env) -> Config {
+    let cfg = compute_pool_update(env);
     set_config(env, &cfg);
     cfg
 }
@@ -730,21 +736,68 @@ impl DelegatedStaking {
     /// Deliberately callable while paused or when the operator is inactive, so a
     /// delegator can always exit. Accrued rewards are auto-compounded first when
     /// that flag is on, so the exit does not strand them.
+    ///
+    /// # Errors
+    ///
+    /// * Panics with `"amount must be positive"` if `amount <= 0`.
+    /// * Panics with `"unknown operator"` if `operator` is not registered.
+    /// * Panics with `"insufficient delegated balance"` if `amount` exceeds the
+    ///   delegator's staked balance (including auto-compounded rewards when
+    ///   enabled), before any state writes or commission transfers occur.
     pub fn undelegate(env: Env, delegator: Address, operator: Address, amount: i128) -> i128 {
         delegator.require_auth();
         assert!(amount > 0, "amount must be positive");
 
         let mut record =
             read_operator(&env, &operator).unwrap_or_else(|| panic!("unknown operator"));
-        let mut cfg = update_pool(&env);
+        let mut cfg = compute_pool_update(&env);
         let mut position = read_position(&env, &delegator, &operator, cfg.reward_per_token_stored);
-        auto_compound(&env, &mut cfg, &mut position, &mut record);
+
+        // Compute any auto-compound in memory first so an over-withdrawal fails
+        // before any storage writes or operator commission transfers occur.
+        let (compounded_net, commission) = if position.auto_compound {
+            let (net, comm) = take_accrued(&cfg, &mut position, record.commission_bps);
+            if net > 0 {
+                position.amount = position.amount.checked_add(net).expect("amount overflow");
+            }
+            (net, comm)
+        } else {
+            (0, 0)
+        };
 
         assert!(position.amount >= amount, "insufficient delegated balance");
 
+        if commission > 0 {
+            cfg.rewards_paid_out = cfg
+                .rewards_paid_out
+                .checked_add(commission)
+                .expect("paid overflow");
+            transfer_out(&env, &cfg.token, &record.address, commission);
+        }
+        if compounded_net > 0 {
+            cfg.total_staked = cfg
+                .total_staked
+                .checked_add(compounded_net)
+                .expect("total overflow");
+            cfg.rewards_compounded = cfg
+                .rewards_compounded
+                .checked_add(compounded_net)
+                .expect("compounded overflow");
+            record.total_staked = record
+                .total_staked
+                .checked_add(compounded_net)
+                .expect("operator overflow");
+        }
+
         position.amount -= amount;
-        cfg.total_staked -= amount;
-        record.total_staked -= amount;
+        cfg.total_staked = cfg
+            .total_staked
+            .checked_sub(amount)
+            .expect("total balance underflow");
+        record.total_staked = record
+            .total_staked
+            .checked_sub(amount)
+            .expect("operator balance underflow");
 
         if !write_position(&env, &position) {
             untrack_delegator_operator(&env, &delegator, &operator);
@@ -1490,5 +1543,119 @@ mod test {
             .client
             .try_delegate(&f.other_operator, &f.operator, &(10 * ONE))
             .is_err());
+    }
+
+    #[test]
+    fn undelegate_boundary_exact_and_one_over_preserves_state() {
+        let f = Fixture::new();
+        f.fund(1_000 * ONE, 1_000);
+        f.mint(&f.alice, 100 * ONE);
+        f.client.delegate(&f.alice, &f.operator, &(100 * ONE));
+        f.advance(50);
+
+        // One unit over staked balance is rejected with no state mutation.
+        assert!(f
+            .client
+            .try_undelegate(&f.alice, &f.operator, &(100 * ONE + 1))
+            .is_err());
+        assert_eq!(f.client.position(&f.alice, &f.operator).amount, 100 * ONE);
+        assert_eq!(f.client.total_staked(), 100 * ONE);
+        assert_eq!(
+            f.client.operator_of(&f.operator).unwrap().total_staked,
+            100 * ONE
+        );
+        assert_eq!(f.client.rewards_credited(), 0);
+        assert_eq!(f.balance(&f.alice), 0);
+
+        // Exact balance withdrawal succeeds.
+        assert_eq!(
+            f.client.undelegate(&f.alice, &f.operator, &(100 * ONE)),
+            100 * ONE
+        );
+        assert_eq!(f.balance(&f.alice), 100 * ONE);
+        assert_eq!(f.client.total_staked(), 0);
+    }
+
+    #[test]
+    fn undelegate_rejects_zero_balance_and_excess_after_partial() {
+        let f = Fixture::new();
+        // Bob has never delegated.
+        assert!(f
+            .client
+            .try_undelegate(&f.bob, &f.operator, &ONE)
+            .is_err());
+        assert!(f.client.try_undelegate(&f.alice, &f.operator, &0).is_err());
+        assert!(f.client.try_undelegate(&f.alice, &f.operator, &-5).is_err());
+
+        f.mint(&f.alice, 100 * ONE);
+        f.client.delegate(&f.alice, &f.operator, &(100 * ONE));
+        assert_eq!(
+            f.client.undelegate(&f.alice, &f.operator, &(60 * ONE)),
+            60 * ONE
+        );
+        // Remaining is 40 * ONE; requesting 40 * ONE + 1 must fail.
+        assert!(f
+            .client
+            .try_undelegate(&f.alice, &f.operator, &(40 * ONE + 1))
+            .is_err());
+        assert_eq!(f.client.position(&f.alice, &f.operator).amount, 40 * ONE);
+    }
+
+    #[test]
+    fn undelegate_with_auto_compound_rejects_excess_without_side_effects() {
+        let f = Fixture::new();
+        f.fund(1_000 * ONE, 1_000);
+        f.mint(&f.alice, 100 * ONE);
+        f.client.set_auto_compound(&f.alice, &f.operator, &true);
+        f.client.delegate(&f.alice, &f.operator, &(100 * ONE));
+        f.advance(100);
+
+        // 100 * ONE gross reward -> 95 * ONE net + 5 * ONE commission; max withdrawable = 195 * ONE.
+        assert!(f
+            .client
+            .try_undelegate(&f.alice, &f.operator, &(195 * ONE + 1))
+            .is_err());
+        // No commission paid, no rewards compounded, principal intact.
+        assert_eq!(f.balance(&f.operator), 0);
+        assert_eq!(f.client.rewards_paid_out(), 0);
+        assert_eq!(f.client.rewards_compounded(), 0);
+        assert_eq!(f.client.position(&f.alice, &f.operator).amount, 100 * ONE);
+
+        // Exact post-compound balance succeeds.
+        assert_eq!(
+            f.client.undelegate(&f.alice, &f.operator, &(195 * ONE)),
+            195 * ONE
+        );
+        assert_eq!(f.balance(&f.alice), 195 * ONE);
+        assert_eq!(f.balance(&f.operator), 5 * ONE);
+    }
+
+    #[test]
+    fn integration_delegation_over_withdrawal_and_claim_workflow() {
+        let f = Fixture::new();
+        f.fund(1_000 * ONE, 1_000);
+        f.mint(&f.alice, 100 * ONE);
+        f.client.delegate(&f.alice, &f.operator, &(100 * ONE));
+
+        f.advance(100);
+        // Over-withdrawal fails without disturbing principal or rewards.
+        assert!(f
+            .client
+            .try_undelegate(&f.alice, &f.operator, &(100 * ONE + 1))
+            .is_err());
+        assert_eq!(f.client.pending_rewards(&f.alice, &f.operator), 100 * ONE);
+
+        // Claim rewards, then undelegate full principal.
+        let net = f.client.claim(&f.alice, &f.operator, &0);
+        assert_eq!(net, 95 * ONE);
+        f.client.undelegate(&f.alice, &f.operator, &(100 * ONE));
+
+        assert_eq!(f.balance(&f.alice), 195 * ONE);
+        assert_eq!(f.balance(&f.operator), 5 * ONE);
+        assert_eq!(f.client.total_staked(), 0);
+        assert!(
+            f.client.rewards_paid_out() + f.client.rewards_compounded()
+                <= f.client.rewards_credited()
+        );
     }
 }
