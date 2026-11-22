@@ -7,7 +7,7 @@ pub mod math;
 
 use math::{amount_out, flash_k_ok, liquidity_amounts_first_deposit, quote};
 use soroban_sdk::token::{TokenClient, TokenInterface};
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, IntoVal, String};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, IntoVal, String};
 
 #[contracttype]
 #[derive(Clone)]
@@ -79,6 +79,25 @@ fn reserves(env: &Env) -> (i128, i128) {
 fn set_reserves(env: &Env, a: i128, b: i128) {
     write_i128(env, DataKey::ReserveA, a);
     write_i128(env, DataKey::ReserveB, b);
+}
+
+/// Emit reserve changes after a successful pool swap.
+///
+/// Topic: `("reserves",)`
+/// Data: `(old_reserve_a, old_reserve_b, new_reserve_a, new_reserve_b)`
+///
+/// Additive event: callers that do not inspect contract events are unaffected.
+fn emit_reserve_change(
+    env: &Env,
+    old_reserve_a: i128,
+    old_reserve_b: i128,
+    new_reserve_a: i128,
+    new_reserve_b: i128,
+) {
+    env.events().publish(
+        (symbol_short!("reserves"),),
+        (old_reserve_a, old_reserve_b, new_reserve_a, new_reserve_b),
+    );
 }
 
 fn total_lp(env: &Env) -> i128 {
@@ -324,7 +343,12 @@ impl AmmPool {
         (amount_a, amount_b)
     }
 
-    /// Assumes `token_in` already transferred to this pool in this transaction.
+    /// Executes a constant-product swap, assuming `token_in` was already transferred to this pool.
+    ///
+    /// On success, updates reserves, transfers `token_out` to `to`, updates TWAP cumulative
+    /// reserves, and emits `("reserves",)` with `(old_a, old_b, new_a, new_b)`.
+    /// Reverts without emitting events if `to == pool`, `amount_in <= 0`, `out < min_out`, or
+    /// reserves are insufficient.
     pub fn swap(env: Env, token_in: Address, to: Address, min_out: i128) -> i128 {
         assert!(to != env.current_contract_address(), "to");
         let pool = env.current_contract_address();
@@ -349,20 +373,29 @@ impl AmmPool {
         assert!(out < reserve_out, "out");
 
         grow_cumulative(&env);
-        let new_in = reserve_in.saturating_add(amount_in);
-        let new_out = reserve_out.saturating_sub(out);
-        if token_in == ta {
-            set_reserves(&env, new_in, new_out);
+        let new_in = reserve_in
+            .checked_add(amount_in)
+            .expect("reserve overflow");
+        let new_out = reserve_out
+            .checked_sub(out)
+            .expect("reserve underflow");
+        let (new_a, new_b) = if token_in == ta {
+            (new_in, new_out)
         } else {
-            set_reserves(&env, new_out, new_in);
-        }
+            (new_out, new_in)
+        };
+        set_reserves(&env, new_a, new_b);
 
         TokenClient::new(&env, &token_out).transfer(&pool, &to, &out);
         grow_cumulative(&env);
+        emit_reserve_change(&env, reserve_a, reserve_b, new_a, new_b);
         out
     }
 
     /// Flash swap: sends assets out, invokes `on_flash` on `callback`, then enforces constant-product K (fee on repaid leg).
+    ///
+    /// On success, updates reserves to the post-repayment balances and emits `("reserves",)`
+    /// with `(old_a, old_b, bal_a, bal_b)`.
     pub fn flash_swap(
         env: Env,
         recipient: Address,
@@ -404,6 +437,7 @@ impl AmmPool {
         );
         set_reserves(&env, bal_a, bal_b);
         grow_cumulative(&env);
+        emit_reserve_change(&env, old_a, old_b, bal_a, bal_b);
     }
 }
 
@@ -489,8 +523,9 @@ impl TokenInterface for AmmPool {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::testutils::{Address as _, Ledger as _};
+    use soroban_sdk::testutils::{Address as _, Events as _, Ledger as _};
     use soroban_sdk::token::{StellarAssetClient, TokenClient};
+    use soroban_sdk::{Symbol, TryFromVal};
 
     fn setup_tokens(env: &Env) -> (Address, Address) {
         let admin = Address::generate(env);
@@ -578,5 +613,138 @@ mod test {
         let _ = pool.swap(&ta, &u, &1);
         let (c1, d1, _) = pool.observe();
         assert!(c1 > c0 || d1 > d0);
+    }
+
+    fn collect_reserve_events(
+        env: &Env,
+        pool_id: &Address,
+    ) -> soroban_sdk::Vec<(i128, i128, i128, i128)> {
+        let mut out = soroban_sdk::Vec::new(env);
+        let target = symbol_short!("reserves");
+        for (contract, topics, data) in env.events().all() {
+            if &contract != pool_id || topics.len() != 1 {
+                continue;
+            }
+            if let Ok(sym) = Symbol::try_from_val(env, &topics.get(0).unwrap()) {
+                if sym == target {
+                    let payload =
+                        <(i128, i128, i128, i128)>::try_from_val(env, &data).unwrap();
+                    out.push_back(payload);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn swap_emits_reserve_changes() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (ta, tb) = setup_tokens(&env);
+        let pool_id = env.register_contract(None, AmmPool);
+        let pool = AmmPoolClient::new(&env, &pool_id);
+        let factory = Address::generate(&env);
+        pool.initialize(&factory, &ta, &tb);
+
+        let u = Address::generate(&env);
+        mint(&env, ta.clone(), u.clone(), 10_000_000);
+        mint(&env, tb.clone(), u.clone(), 10_000_000);
+        pool.add_liquidity(&u, &1_000_000, &2_000_000, &1, &1);
+
+        // Swap token A -> token B
+        TokenClient::new(&env, &ta).transfer(&u, &pool_id, &100_000);
+        let out_b = pool.swap(&ta, &u, &1);
+        let (ra_after_1, rb_after_1) = pool.get_reserves();
+        assert_eq!(ra_after_1, 1_100_000);
+        assert_eq!(rb_after_1, 2_000_000 - out_b);
+
+        let ev1 = collect_reserve_events(&env, &pool_id);
+        assert_eq!(ev1.len(), 1);
+        assert_eq!(
+            ev1.get(0).unwrap(),
+            (1_000_000, 2_000_000, ra_after_1, rb_after_1)
+        );
+
+        // Swap token B -> token A
+        TokenClient::new(&env, &tb).transfer(&u, &pool_id, &50_000);
+        let out_a = pool.swap(&tb, &u, &1);
+        let (ra_after_2, rb_after_2) = pool.get_reserves();
+        assert_eq!(ra_after_2, ra_after_1 - out_a);
+        assert_eq!(rb_after_2, rb_after_1 + 50_000);
+
+        let ev2 = collect_reserve_events(&env, &pool_id);
+        assert_eq!(ev2.len(), 1);
+        assert_eq!(
+            ev2.get(0).unwrap(),
+            (ra_after_1, rb_after_1, ra_after_2, rb_after_2)
+        );
+    }
+
+    #[test]
+    fn failed_swap_does_not_emit_reserve_changes() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (ta, tb) = setup_tokens(&env);
+        let pool_id = env.register_contract(None, AmmPool);
+        let pool = AmmPoolClient::new(&env, &pool_id);
+        let factory = Address::generate(&env);
+        pool.initialize(&factory, &ta, &tb);
+
+        let u = Address::generate(&env);
+        mint(&env, ta.clone(), u.clone(), 10_000_000);
+        mint(&env, tb.clone(), u.clone(), 10_000_000);
+        pool.add_liquidity(&u, &1_000_000, &1_000_000, &1, &1);
+
+        // Zero amount_in fails
+        assert!(pool.try_swap(&ta, &u, &1).is_err());
+        assert_eq!(collect_reserve_events(&env, &pool_id).len(), 0);
+        assert_eq!(pool.get_reserves(), (1_000_000, 1_000_000));
+
+        // Slippage failure does not emit
+        TokenClient::new(&env, &ta).transfer(&u, &pool_id, &10_000);
+        assert!(pool.try_swap(&ta, &u, &1_000_000).is_err());
+        assert_eq!(collect_reserve_events(&env, &pool_id).len(), 0);
+        assert_eq!(pool.get_reserves(), (1_000_000, 1_000_000));
+    }
+
+    #[contract]
+    pub struct MockFlashReceiver;
+
+    #[contractimpl]
+    impl MockFlashReceiver {
+        pub fn on_flash(env: Env, pool: Address, _recipient: Address, a_out: i128, _b_out: i128) {
+            let token_a = AmmPoolClient::new(&env, &pool).token_a();
+            // Repay principal + >0.3% fee
+            let repay = a_out + (a_out * 5) / 1000 + 1;
+            TokenClient::new(&env, &token_a).transfer(&env.current_contract_address(), &pool, &repay);
+        }
+    }
+
+    #[test]
+    fn flash_swap_emits_reserve_changes() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (ta, tb) = setup_tokens(&env);
+        let pool_id = env.register_contract(None, AmmPool);
+        let pool = AmmPoolClient::new(&env, &pool_id);
+        let factory = Address::generate(&env);
+        pool.initialize(&factory, &ta, &tb);
+
+        let u = Address::generate(&env);
+        mint(&env, ta.clone(), u.clone(), 10_000_000);
+        mint(&env, tb.clone(), u.clone(), 10_000_000);
+        pool.add_liquidity(&u, &1_000_000, &1_000_000, &1, &1);
+
+        let receiver = env.register_contract(None, MockFlashReceiver);
+        mint(&env, ta.clone(), receiver.clone(), 100_000);
+
+        pool.flash_swap(&receiver, &50_000, &0, &receiver);
+        let (new_a, new_b) = pool.get_reserves();
+        assert!(new_a > 1_000_000);
+        assert_eq!(new_b, 1_000_000);
+
+        let events = collect_reserve_events(&env, &pool_id);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events.get(0).unwrap(), (1_000_000, 1_000_000, new_a, new_b));
     }
 }

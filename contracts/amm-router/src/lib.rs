@@ -54,7 +54,8 @@ impl AmmRouter {
 mod test {
     use super::*;
     use amm_pool::{AmmPool, AmmPoolClient};
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::{Address as _, Events as _};
+    use soroban_sdk::{symbol_short, Symbol, TryFromVal};
 
     #[test]
     fn router_single_pool_swap() {
@@ -92,5 +93,55 @@ mod test {
         let after = TokenClient::new(&env, &tb).balance(&u);
         assert_eq!(after.saturating_sub(before), out);
         assert!(out > 9000);
+    }
+
+    #[test]
+    fn router_swap_emits_pool_reserve_changes() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let ta = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let tb = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+
+        let pool_id = env.register_contract(None, AmmPool);
+        let pool = AmmPoolClient::new(&env, &pool_id);
+        let factory = Address::generate(&env);
+        pool.initialize(&factory, &ta, &tb);
+
+        let u = Address::generate(&env);
+        let router_id = env.register_contract(None, AmmRouter);
+        let router = AmmRouterClient::new(&env, &router_id);
+
+        soroban_sdk::token::StellarAssetClient::new(&env, &ta).mint(&u, &1_000_000);
+        soroban_sdk::token::StellarAssetClient::new(&env, &tb).mint(&u, &1_000_000);
+        pool.add_liquidity(&u, &400_000, &400_000, &1, &1);
+
+        let path = soroban_sdk::vec![&env, ta.clone(), tb.clone()];
+        let pools = soroban_sdk::vec![&env, pool_id.clone()];
+        let out = router.swap_exact_tokens_for_tokens(&u, &path, &pools, &10_000, &1, &u);
+        let (new_a, new_b) = pool.get_reserves();
+        assert_eq!(new_a, 410_000);
+        assert_eq!(new_b, 400_000 - out);
+
+        let mut found = false;
+        let target = symbol_short!("reserves");
+        for (contract, topics, data) in env.events().all() {
+            if contract == pool_id && topics.len() == 1 {
+                if let Ok(sym) = Symbol::try_from_val(&env, &topics.get(0).unwrap()) {
+                    if sym == target {
+                        let payload =
+                            <(i128, i128, i128, i128)>::try_from_val(&env, &data).unwrap();
+                        assert_eq!(payload, (400_000, 400_000, new_a, new_b));
+                        found = true;
+                    }
+                }
+            }
+        }
+        assert!(found, "expected reserve change event from pool");
     }
 }
