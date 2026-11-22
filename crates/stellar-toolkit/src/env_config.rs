@@ -668,4 +668,145 @@ require_multisig = true
         assert!(rendered.contains("dev"));
         assert!(rendered.contains("prod"));
     }
+
+    // ── JSON output mode (issue #308) ────────────────────────────────────────
+
+    /// A clean report serialises to valid JSON and contains the expected keys.
+    #[test]
+    fn to_json_produces_valid_json_for_a_passing_report() {
+        let report = validate_directory(&workspace_config_dir(), None).expect("configs");
+        assert!(report.passed(), "checked-in configs must be valid");
+
+        let json = report.to_json();
+
+        // Must parse without error.
+        let value: serde_json::Value =
+            serde_json::from_str(&json).expect("to_json must produce valid JSON");
+
+        // Top-level must be an object with a `configs` array.
+        let configs = value
+            .get("configs")
+            .and_then(|v| v.as_array())
+            .expect("JSON must have a `configs` array");
+
+        assert_eq!(
+            configs.len(),
+            ENVIRONMENTS.len(),
+            "one entry per environment"
+        );
+
+        // Each entry must have `name`, `path`, and `findings`.
+        for entry in configs {
+            assert!(entry.get("name").is_some(), "entry missing `name`");
+            assert!(entry.get("path").is_some(), "entry missing `path`");
+            assert!(
+                entry
+                    .get("findings")
+                    .and_then(|v| v.as_array())
+                    .is_some(),
+                "entry missing `findings` array"
+            );
+        }
+    }
+
+    /// A report with errors serialises severity as `"error"` (lowercase) and
+    /// the offending field appears in the output.
+    #[test]
+    fn to_json_serialises_error_findings_correctly() {
+        let mut config = EnvConfig::load(&workspace_config_dir(), "prod").expect("prod");
+        // Inject a known error: auto_fund on mainnet.
+        config.deploy.auto_fund = true;
+
+        let findings = config.validate();
+        let report = EnvValidationReport {
+            configs: vec![EnvValidation {
+                name: "prod".to_string(),
+                path: workspace_config_dir().join("prod.toml"),
+                findings,
+            }],
+        };
+
+        assert!(!report.passed(), "injected error must make the report fail");
+
+        let json = report.to_json();
+        let value: serde_json::Value =
+            serde_json::from_str(&json).expect("to_json must produce valid JSON");
+
+        let first_findings = value["configs"][0]["findings"]
+            .as_array()
+            .expect("findings array");
+
+        // Find the auto_fund finding.
+        let auto_fund_finding = first_findings
+            .iter()
+            .find(|f| f["field"].as_str() == Some("deploy.auto_fund"))
+            .expect("deploy.auto_fund finding must be present in JSON");
+
+        assert_eq!(
+            auto_fund_finding["severity"].as_str(),
+            Some("error"),
+            "severity must be lowercase `error` in JSON output"
+        );
+        assert!(
+            auto_fund_finding["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("auto_fund"),
+            "message should mention the offending setting"
+        );
+    }
+
+    /// A report with only warnings serialises severity as `"warning"`.
+    #[test]
+    fn to_json_serialises_warning_findings_correctly() {
+        let mut config = EnvConfig::load(&workspace_config_dir(), "prod").expect("prod");
+        // Drop the monitoring block: mainnet without monitoring is a warning.
+        config.monitoring = None;
+
+        let findings = config.validate();
+        // Confirm we actually produced a warning, not an error.
+        let has_warning = findings
+            .iter()
+            .any(|f| f.field == "monitoring" && f.severity == Severity::Warning);
+        assert!(has_warning, "expected a monitoring warning on mainnet");
+
+        let report = EnvValidationReport {
+            configs: vec![EnvValidation {
+                name: "prod".to_string(),
+                path: workspace_config_dir().join("prod.toml"),
+                findings,
+            }],
+        };
+
+        let json = report.to_json();
+        let value: serde_json::Value =
+            serde_json::from_str(&json).expect("to_json must produce valid JSON");
+
+        let monitoring_finding = value["configs"][0]["findings"]
+            .as_array()
+            .expect("findings array")
+            .iter()
+            .find(|f| f["field"].as_str() == Some("monitoring"))
+            .expect("monitoring finding must be present");
+
+        assert_eq!(
+            monitoring_finding["severity"].as_str(),
+            Some("warning"),
+            "severity must be lowercase `warning` in JSON output"
+        );
+    }
+
+    /// Validating a single environment with `--env` emits only that entry in
+    /// the JSON output, not all three.
+    #[test]
+    fn to_json_respects_single_env_filter() {
+        let report = validate_directory(&workspace_config_dir(), Some("dev")).expect("dev only");
+        let json = report.to_json();
+        let value: serde_json::Value =
+            serde_json::from_str(&json).expect("valid JSON");
+
+        let configs = value["configs"].as_array().expect("configs array");
+        assert_eq!(configs.len(), 1, "only one environment should be present");
+        assert_eq!(configs[0]["name"].as_str(), Some("dev"));
+    }
 }
