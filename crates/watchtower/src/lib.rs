@@ -240,6 +240,13 @@ pub struct WatchtowerStats {
     pub breach_attempts_detected: u64,
     /// Total justice transactions submitted
     pub justice_txs_submitted: u64,
+    /// Total justice actions persisted before submission (issue #368).
+    ///
+    /// This counter is incremented when a [`justice::JusticeAction`] is
+    /// durably stored to the backend. It differs from `justice_txs_submitted`
+    /// because a persisted action is not always immediately submitted (e.g. on
+    /// a network error the action stays `Pending` and can be retried).
+    pub justice_actions_persisted: u64,
     /// Total alerts generated
     pub alerts_generated: u64,
     /// Last scan timestamp
@@ -283,6 +290,7 @@ impl Watchtower {
             config.stellar_rpc_url.clone(),
             config.network_passphrase.clone(),
             config.justice_fee_budget,
+            Arc::clone(&storage),
         );
 
         let state = Arc::new(WatchtowerState {
@@ -346,6 +354,11 @@ impl Watchtower {
                                 if config.auto_justice {
                                     if let Err(e) = justice.submit_justice(&breach).await {
                                         error!("Failed to submit justice: {:?}", e);
+                                    } else {
+                                        // submit_justice persists before submitting;
+                                        // bump the persisted counter on success (issue #368).
+                                        let mut stats = state.stats.write();
+                                        stats.justice_actions_persisted += 1;
                                     }
                                 }
                             }
@@ -455,6 +468,26 @@ impl Watchtower {
         );
 
         Ok(report)
+    }
+
+    /// Retrieve all justice actions that are still `Pending` from storage.
+    ///
+    /// An operator calls this after a process restart or network outage to find
+    /// breach responses that were persisted but not yet submitted, then passes
+    /// the results to [`Self::retry_pending_justice`] to replay them.
+    pub fn pending_justice_actions(
+        &self,
+    ) -> Result<Vec<justice::JusticeAction>, WatchtowerError> {
+        self.storage
+            .get_pending_justice_actions()
+            .map_err(|e| WatchtowerError::StorageError(e.to_string()))
+    }
+
+    /// Replay all `Pending` justice actions (issue #368 operator recovery path).
+    ///
+    /// Returns the count of actions successfully submitted on this call.
+    pub async fn retry_pending_justice(&self) -> usize {
+        self.justice.retry_pending_actions().await
     }
 
     /// Get current watchtower status
