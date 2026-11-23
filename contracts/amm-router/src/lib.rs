@@ -11,7 +11,11 @@ pub struct AmmRouter;
 #[contractimpl]
 impl AmmRouter {
     /// Multi-hop swap: `path[k]` is the input asset for `pools[k]`.
+    ///
     /// The router receives `amount_in` of `path[0]` from `user`, then routes through each pool.
+    /// Each hop invokes `AmmPool::swap`, applying a 0.3% (30 basis points, `997 / 1000` parts per thousand)
+    /// input fee with floor rounding (truncation toward zero) per hop; fees compound across hops and
+    /// `amount_out_min` is enforced against the final hop's floored output.
     pub fn swap_exact_tokens_for_tokens(
         env: Env,
         user: Address,

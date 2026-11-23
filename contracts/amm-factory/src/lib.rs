@@ -62,6 +62,10 @@ impl AmmFactory {
     }
 
     /// Create a new constant-product pair; anyone may call (permissionless pool creation).
+    ///
+    /// Deployed pools use `AmmPool`'s constant-product curve with a fixed 0.3%
+    /// (30 basis points, `997 / 1000` parts per thousand) swap and flash-swap fee,
+    /// floor rounding (truncation toward zero) on swap outputs and LP shares, and no factory protocol fee.
     pub fn create_pair(env: Env, token_a: Address, token_b: Address) -> Address {
         assert!(token_a != token_b, "identical");
         let (t0, t1) = sort_tokens(token_a.clone(), token_b.clone());
