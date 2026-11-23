@@ -203,4 +203,49 @@ mod test {
         let (ra, rb) = pool.get_reserves();
         assert!(ra > 0 && rb > 0);
     }
+
+    #[test]
+    fn init_is_idempotent_for_the_same_configuration() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let factory_id = env.register_contract(None, AmmFactory);
+        let factory = AmmFactoryClient::new(&env, &factory_id);
+        let admin = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[9u8; 32]);
+
+        factory.init(&admin, &hash);
+        factory.init(&admin, &hash);
+
+        assert_eq!(factory.admin(), admin);
+        assert_eq!(factory.pool_wasm_hash(), hash);
+    }
+
+    #[test]
+    #[should_panic(expected = "factory already initialized with different config")]
+    fn init_rejects_a_different_configuration() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let factory_id = env.register_contract(None, AmmFactory);
+        let factory = AmmFactoryClient::new(&env, &factory_id);
+        let admin = Address::generate(&env);
+        let other_admin = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[9u8; 32]);
+
+        factory.init(&admin, &hash);
+        factory.init(&other_admin, &hash);
+    }
+
+    #[test]
+    fn pair_salt_is_stable_for_canonical_pair_order_and_unique_per_pair() {
+        let env = Env::default();
+        let a = Address::generate(&env);
+        let b = Address::generate(&env);
+        let c = Address::generate(&env);
+        let (a0, a1) = sort_tokens(a.clone(), b.clone());
+        let (b0, b1) = sort_tokens(b, a);
+        let (c0, c1) = sort_tokens(a, c);
+
+        assert_eq!(pair_salt(&env, &a0, &a1), pair_salt(&env, &b0, &b1));
+        assert_ne!(pair_salt(&env, &a0, &a1), pair_salt(&env, &c0, &c1));
+    }
 }
