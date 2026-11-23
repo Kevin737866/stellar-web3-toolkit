@@ -211,4 +211,45 @@ mod math_tests {
     fn rate_rejects_zero_amount() {
         let _ = reward_rate_for(0, 100);
     }
+
+    #[test]
+    fn acc_delta_keeps_exact_shares_at_the_precision_boundary() {
+        // A single base unit split across PRECISION staked units lands as an
+        // accumulator delta of 1 and is still fully credited.
+        assert_eq!(acc_reward_delta(1, PRECISION), (1, 1));
+        // The same unit split across three stakes floors below one base unit.
+        let (delta, credited) = acc_reward_delta(1, 3);
+        assert_eq!(delta, PRECISION / 3);
+        assert_eq!(credited, 0);
+        assert_eq!(accrued(1, delta, 0), 0);
+    }
+
+    #[test]
+    fn per_position_rounding_never_exceeds_the_pool_credit() {
+        // A share split across deliberately uneven positions. Every position
+        // floors its own accrual, so the total handed out can only trail the
+        // amount the pool credited.
+        let share = 1_000_003i128;
+        let total = 10_000_000i128;
+        let stakes = [1i128, 7, 12_345, 999_999, total - 1 - 7 - 12_345 - 999_999];
+        let (delta, credited) = acc_reward_delta(share, total);
+        let mut accrued_total = 0;
+        for amount in stakes {
+            accrued_total += accrued(amount, delta, 0);
+        }
+        assert!(accrued_total <= credited, "{accrued_total} > {credited}");
+        assert!(credited <= share);
+    }
+
+    #[test]
+    fn a_high_ratio_pool_pays_every_base_unit_of_its_share() {
+        // The share equals the stake, so the accumulator moves by exactly
+        // PRECISION and a 999:1 split resolves to whole base units.
+        let share = 1_000;
+        let total = 1_000;
+        let (delta, credited) = acc_reward_delta(share, total);
+        assert_eq!(delta, PRECISION);
+        assert_eq!(credited, share);
+        assert_eq!(accrued(999, delta, 0) + accrued(1, delta, 0), credited);
+    }
 }
