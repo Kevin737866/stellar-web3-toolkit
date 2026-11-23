@@ -118,7 +118,7 @@ jobs:
           sudo apt-get install -y pkg-config libssl-dev
       - name: Contract property suite (seeded)
         # `contract-proptests` is a std harness the wasm builds exclude; it carries
-        # the randomized operation-sequence invariants for the contracts.
+        # named scenario workflows and randomized contract invariants.
         env:
           PROPERTY_CASES: "1024"
           PROPERTY_SEED: "20260929"

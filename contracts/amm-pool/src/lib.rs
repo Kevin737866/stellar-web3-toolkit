@@ -23,6 +23,7 @@ pub enum DataKey {
     CumB,
     Bal(Address),
     Allow(AllowKey),
+    FlashSwapActive,
 }
 
 #[contracttype]
@@ -79,6 +80,16 @@ fn reserves(env: &Env) -> (i128, i128) {
 fn set_reserves(env: &Env, a: i128, b: i128) {
     write_i128(env, DataKey::ReserveA, a);
     write_i128(env, DataKey::ReserveB, b);
+}
+
+fn assert_not_in_flash_swap(env: &Env) {
+    assert!(
+        !env.storage()
+            .instance()
+            .get(&DataKey::FlashSwapActive)
+            .unwrap_or(false),
+        "reentrant call during flash swap"
+    );
 }
 
 fn total_lp(env: &Env) -> i128 {
@@ -235,6 +246,7 @@ impl AmmPool {
         min_a: i128,
         min_b: i128,
     ) -> i128 {
+        assert_not_in_flash_swap(&env);
         user.require_auth();
         assert!(amount_a_desired > 0 && amount_b_desired > 0, "amounts");
         let pool = env.current_contract_address();
@@ -291,6 +303,7 @@ impl AmmPool {
         min_a: i128,
         min_b: i128,
     ) -> (i128, i128) {
+        assert_not_in_flash_swap(&env);
         user.require_auth();
         assert!(lp_amount > 0, "lp");
         let pool = env.current_contract_address();
@@ -326,6 +339,7 @@ impl AmmPool {
 
     /// Assumes `token_in` already transferred to this pool in this transaction.
     pub fn swap(env: Env, token_in: Address, to: Address, min_out: i128) -> i128 {
+        assert_not_in_flash_swap(&env);
         assert!(to != env.current_contract_address(), "to");
         let pool = env.current_contract_address();
         let (ta, tb) = get_tokens(&env);
@@ -370,6 +384,7 @@ impl AmmPool {
         amount_b_out: i128,
         callback: Address,
     ) {
+        assert_not_in_flash_swap(&env);
         assert!(amount_a_out >= 0 && amount_b_out >= 0, "out amt");
         assert!(amount_a_out > 0 || amount_b_out > 0, "need out");
         let pool = env.current_contract_address();
@@ -381,6 +396,9 @@ impl AmmPool {
             "liquidity out"
         );
 
+        env.storage()
+            .instance()
+            .set(&DataKey::FlashSwapActive, &true);
         grow_cumulative(&env);
 
         if amount_a_out > 0 {
@@ -404,6 +422,7 @@ impl AmmPool {
         );
         set_reserves(&env, bal_a, bal_b);
         grow_cumulative(&env);
+        env.storage().instance().remove(&DataKey::FlashSwapActive);
     }
 }
 
@@ -415,6 +434,7 @@ impl TokenInterface for AmmPool {
     }
 
     fn approve(env: Env, from: Address, spender: Address, amount: i128, expiration_ledger: u32) {
+        assert_not_in_flash_swap(&env);
         from.require_auth();
         allowance_store(
             &env,
@@ -432,6 +452,7 @@ impl TokenInterface for AmmPool {
     }
 
     fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+        assert_not_in_flash_swap(&env);
         from.require_auth();
         assert!(amount > 0, "amt");
         let b = lp_balance_read(&env, &from);
@@ -442,6 +463,7 @@ impl TokenInterface for AmmPool {
     }
 
     fn transfer_from(env: Env, spender: Address, from: Address, to: Address, amount: i128) {
+        assert_not_in_flash_swap(&env);
         spender.require_auth();
         assert!(amount > 0, "amt");
         let mut al = allowance_load(&env, from.clone(), spender.clone());
@@ -459,11 +481,13 @@ impl TokenInterface for AmmPool {
     }
 
     fn burn(env: Env, from: Address, amount: i128) {
+        assert_not_in_flash_swap(&env);
         from.require_auth();
         burn_lp_withdraw(&env, from, amount);
     }
 
     fn burn_from(env: Env, spender: Address, from: Address, amount: i128) {
+        assert_not_in_flash_swap(&env);
         spender.require_auth();
         let mut al = allowance_load(&env, from.clone(), spender.clone());
         let eff = allowance_effective(&env, &al);
@@ -491,6 +515,46 @@ mod test {
     use super::*;
     use soroban_sdk::testutils::{Address as _, Ledger as _};
     use soroban_sdk::token::{StellarAssetClient, TokenClient};
+
+    #[contracttype]
+    #[derive(Clone)]
+    enum CallbackKey {
+        TokenA,
+    }
+
+    #[contract]
+    struct ReentrantFlashCallback;
+
+    #[contractimpl]
+    impl ReentrantFlashCallback {
+        pub fn set_token_a(env: Env, token_a: Address) {
+            env.storage().instance().set(&CallbackKey::TokenA, &token_a);
+        }
+
+        pub fn on_flash(
+            env: Env,
+            pool_id: Address,
+            recipient: Address,
+            amount_a_out: i128,
+            amount_b_out: i128,
+        ) {
+            assert_eq!(amount_b_out, 0, "test callback expects no token B output");
+            let callback_id = env.current_contract_address();
+            let pool = AmmPoolClient::new(&env, &pool_id);
+            assert!(
+                pool.try_flash_swap(&recipient, &1, &0, &callback_id)
+                    .is_err(),
+                "nested flash swap should be rejected"
+            );
+
+            let token_a: Address = env
+                .storage()
+                .instance()
+                .get(&CallbackKey::TokenA)
+                .expect("token A configured");
+            TokenClient::new(&env, &token_a).transfer(&recipient, &pool_id, &(amount_a_out + 4));
+        }
+    }
 
     fn setup_tokens(env: &Env) -> (Address, Address) {
         let admin = Address::generate(env);
@@ -578,5 +642,45 @@ mod test {
         let _ = pool.swap(&ta, &u, &1);
         let (c1, d1, _) = pool.observe();
         assert!(c1 > c0 || d1 > d0);
+    }
+
+    #[test]
+    fn flash_swap_rejects_reentrant_pool_mutations() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (ta, tb) = setup_tokens(&env);
+        let pool_id = env.register_contract(None, AmmPool);
+        let pool = AmmPoolClient::new(&env, &pool_id);
+        let factory = Address::generate(&env);
+        pool.initialize(&factory, &ta, &tb);
+
+        let liquidity_provider = Address::generate(&env);
+        mint(&env, ta.clone(), liquidity_provider.clone(), 10_000_000);
+        mint(&env, tb.clone(), liquidity_provider.clone(), 10_000_000);
+        pool.add_liquidity(&liquidity_provider, &1_000_000, &1_000_000, &0, &0);
+
+        let callback_id = env.register_contract(None, ReentrantFlashCallback);
+        ReentrantFlashCallbackClient::new(&env, &callback_id).set_token_a(&ta);
+        mint(&env, ta, callback_id.clone(), 4);
+        pool.flash_swap(&callback_id, &1_000, &0, &callback_id);
+
+        assert_eq!(pool.get_reserves(), (1_000_004, 1_000_000));
+    }
+
+    #[test]
+    fn active_flash_swap_guard_rejects_lp_token_mutations() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let pool_id = env.register_contract(None, AmmPool);
+        env.as_contract(&pool_id, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::FlashSwapActive, &true);
+        });
+
+        let pool = AmmPoolClient::new(&env, &pool_id);
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+        assert!(pool.try_approve(&owner, &spender, &1, &10).is_err());
     }
 }
