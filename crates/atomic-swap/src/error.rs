@@ -13,6 +13,26 @@ pub enum AtomicSwapError {
     #[error("Swap has expired: {swap_id}")]
     SwapExpired { swap_id: String },
 
+    /// A refund was requested while the swap was still inside its settlement
+    /// window, before the timeout ledger had passed (#396).
+    ///
+    /// At this point the preimage path is still open, so refunding would let a
+    /// participant claw back funds while the counterparty could still settle.
+    /// The timeout and current ledgers are included so an operator knows exactly
+    /// how long to wait.
+    ///
+    /// Compatibility: this is a new, distinct error. Before #396 the refund path
+    /// returned `SwapExpired` for this case, which claimed a timeout that had
+    /// not happened.
+    #[error(
+        "Cannot refund swap {swap_id}: timeout ledger {timeout_ledger} has not passed (current ledger {current_ledger})"
+    )]
+    RefundBeforeTimeout {
+        swap_id: String,
+        timeout_ledger: u32,
+        current_ledger: u32,
+    },
+
     #[error("Swap already completed: {swap_id}")]
     SwapAlreadyCompleted { swap_id: String },
 
