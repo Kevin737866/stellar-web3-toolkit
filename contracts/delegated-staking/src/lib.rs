@@ -35,6 +35,9 @@
 //! * `pause` blocks new delegations and new reward funding, but never blocks
 //!   `undelegate` or `claim`, so a pause cannot trap funds — the same property
 //!   the token locker relies on.
+//! * Pausing does not stop an existing reward schedule: delegators continue to
+//!   accrue and may claim rewards while paused. This preserves the existing
+//!   `set_paused` interface and requires no configuration change.
 //! * Setting an operator inactive stops new delegations to it but leaves exits
 //!   and claims open, so an operator can never strand its delegators.
 //!
@@ -563,7 +566,8 @@ impl DelegatedStaking {
             .publish((symbol_short!("set_admin"),), new_admin);
     }
 
-    /// Blocks new delegations and reward funding. Exits stay open.
+    /// Blocks new delegations and reward funding. Existing schedules keep
+    /// accruing, and claims and exits stay open.
     pub fn set_paused(env: Env, paused: bool) {
         let mut cfg = config(&env);
         cfg.admin.require_auth();
@@ -758,7 +762,9 @@ impl DelegatedStaking {
         amount
     }
 
-    /// Pays out accrued rewards, minus the operator's commission.
+    /// Pays out accrued rewards, minus the operator's commission. Claims remain
+    /// available while the contract is paused, and the active reward schedule
+    /// continues accruing until its scheduled finish.
     ///
     /// `min_out` is the slippage guard against the operator's commission moving
     /// between the quote and this transaction landing.
@@ -1245,10 +1251,20 @@ mod test {
         f.mint(&funder, ONE);
         assert!(f.client.try_fund_rewards(&funder, &ONE, &100).is_err());
 
-        // Exits stay open.
-        assert_eq!(f.client.claim(&f.alice, &f.operator, &0), 95 * ONE);
+        // The schedule keeps accruing while paused, and a failed slippage
+        // check leaves the full claim available for a later transaction.
+        f.advance(100);
+        assert_eq!(f.client.pending_rewards(&f.alice, &f.operator), 200 * ONE);
+        assert!(f
+            .client
+            .try_claim(&f.alice, &f.operator, &(191 * ONE))
+            .is_err());
+        assert_eq!(f.client.pending_rewards(&f.alice, &f.operator), 200 * ONE);
+        assert_eq!(f.client.rewards_paid_out(), 0);
+
+        assert_eq!(f.client.claim(&f.alice, &f.operator, &0), 190 * ONE);
         f.client.undelegate(&f.alice, &f.operator, &(100 * ONE));
-        assert_eq!(f.balance(&f.alice), 95 * ONE + 200 * ONE);
+        assert_eq!(f.balance(&f.alice), 190 * ONE + 200 * ONE);
     }
 
     #[test]

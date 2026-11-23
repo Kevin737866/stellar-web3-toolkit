@@ -42,6 +42,9 @@
 //! * `rewards_paid_out <= rewards_credited <= rewards_funded`; the pool split and
 //!   the per-position accrual both floor, so dust can only ever stay behind.
 //! * `pause` blocks deposits and funding but never withdrawals or harvests.
+//!   Existing reward schedules continue while paused, and users may harvest
+//!   rewards accrued during the pause. This preserves the existing `set_paused`
+//!   interface and requires no configuration change.
 //! * Deactivating a pool blocks new deposits but leaves exits and harvests open.
 //! * `emergency_withdraw` returns the LP but forfeits pending rewards, so a
 //!   distrusted pool can be exited without draining reward accounting.
@@ -579,7 +582,8 @@ impl YieldFarm {
             .publish((symbol_short!("set_admin"),), new_admin);
     }
 
-    /// Blocks deposits and funding. Withdrawals and harvests stay open.
+    /// Blocks deposits and funding. Existing schedules keep accruing, and
+    /// withdrawals and harvests stay open.
     pub fn set_paused(env: Env, paused: bool) {
         let mut cfg = config(&env);
         cfg.admin.require_auth();
@@ -773,8 +777,10 @@ impl YieldFarm {
         position.amount
     }
 
-    /// Pays out pending rewards. `min_out` guards against a live rate falling
-    /// below the quote between the read and the transaction landing.
+    /// Pays out pending rewards, including while the farm is paused. Existing
+    /// schedules continue accruing until their scheduled finish. `min_out`
+    /// guards against a live rate falling below the quote between the read and
+    /// the transaction landing.
     pub fn harvest(env: Env, user: Address, pool_id: u32, min_out: i128) -> i128 {
         user.require_auth();
         assert!(min_out >= 0, "min_out must not be negative");
@@ -805,9 +811,9 @@ impl YieldFarm {
     }
 
     /// Returns the full LP balance without harvesting, forfeiting pending
-    /// rewards. The escape hatch for a pool that is misbehaving, since paying
-    /// out the accrual would draw on reward accounting the pool can no longer be
-    /// trusted with.
+    /// rewards, even while the farm is paused. The escape hatch for a pool that
+    /// is misbehaving, since paying out the accrual would draw on reward
+    /// accounting the pool can no longer be trusted with.
     pub fn emergency_withdraw(env: Env, user: Address, pool_id: u32) -> i128 {
         user.require_auth();
 
@@ -1097,6 +1103,25 @@ mod test {
     }
 
     #[test]
+    fn paused_emergency_withdraw_returns_lp_and_forfeits_rewards() {
+        let f = Fixture::new();
+        f.standard_farm();
+        f.deposit(&f.alice, 1, &f.lp_a, 100 * ONE);
+        f.client.set_paused(&true);
+        f.advance(100);
+
+        assert_eq!(f.client.pending_rewards(&f.alice, &1), 50 * ONE);
+        assert_eq!(f.client.emergency_withdraw(&f.alice, &1), 100 * ONE);
+
+        assert_eq!(f.balance(&f.lp_a, &f.alice), 100 * ONE);
+        assert_eq!(f.balance(&f.lp_a, &f.contract()), 0);
+        assert_eq!(f.client.pending_rewards(&f.alice, &1), 0);
+        assert_eq!(f.client.rewards_paid_out(), 0);
+        assert_eq!(f.client.pool_of(&1).unwrap().total_staked, 0);
+        assert!(f.client.user_pools(&f.alice).is_empty());
+    }
+
+    #[test]
     fn changing_an_allocation_does_not_reweight_an_elapsed_window() {
         let f = Fixture::new();
         f.standard_farm();
@@ -1207,6 +1232,10 @@ mod test {
         // full withdrawal returns the deposit on top of that balance.
         let wallet_before = f.balance(&f.lp_a, &f.alice);
         f.advance(100);
+        assert_eq!(f.client.pending_rewards(&f.alice, &1), 50 * ONE);
+        assert!(f.client.try_harvest(&f.alice, &1, &(50 * ONE + 1)).is_err());
+        assert_eq!(f.client.pending_rewards(&f.alice, &1), 50 * ONE);
+        assert_eq!(f.client.rewards_paid_out(), 0);
         assert_eq!(f.client.harvest(&f.alice, &1, &0), 50 * ONE);
         f.client.withdraw(&f.alice, &1, &(100 * ONE));
         assert_eq!(
