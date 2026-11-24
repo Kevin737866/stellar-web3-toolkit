@@ -628,6 +628,77 @@ fn run_flat_invariants(seed: u64, iterations: u64) -> Vec<InvariantReport> {
     ));
 
     reports.push(check(
+        "state::page_cursors_visit_each_entry_once",
+        "walking opaque page cursors must yield the filtered entries exactly once, in order",
+        seed,
+        iterations,
+        page_case,
+        |case| {
+            let query = StateQuery::new()
+                .with_page_size(case.page_size)
+                .including_temporary(case.include_temporary);
+            let expected: Vec<String> = case
+                .inspector
+                .filtered(&query)
+                .iter()
+                .map(|e| e.key.clone())
+                .collect();
+
+            let mut visited = Vec::new();
+            let mut token: Option<String> = None;
+            let mut pages = 0;
+            loop {
+                let page = match &token {
+                    None => case.inspector.page(&query),
+                    Some(current) => case
+                        .inspector
+                        .page_from_token(&query, current)
+                        .map_err(|e| format!("opaque cursor was rejected: {e}"))?,
+                };
+                pages += 1;
+                if pages > expected.len() + 1 {
+                    return Err(format!("cursor walk did not terminate after {pages} pages"));
+                }
+                let expected_next = if page.has_more {
+                    Some(page.offset + page.entries.len())
+                } else {
+                    None
+                };
+                if page.next_cursor != expected_next
+                    || page.next_page_token.is_some() != page.has_more
+                {
+                    return Err(format!(
+                        "page {pages} disagrees with itself about the next cursor"
+                    ));
+                }
+                if page.total != expected.len() {
+                    return Err(format!(
+                        "page {pages} reports total {} but the filter matched {}",
+                        page.total,
+                        expected.len()
+                    ));
+                }
+                let next_token = page.next_page_token.clone();
+                visited.extend(page.entries.iter().map(|e| e.key.clone()));
+                match next_token {
+                    Some(next) => token = Some(next),
+                    None => break,
+                }
+            }
+
+            if visited != expected {
+                return Err(format!(
+                    "cursor walk visited {} of {} entry/entries (page size {})",
+                    visited.len(),
+                    expected.len(),
+                    case.page_size
+                ));
+            }
+            Ok(())
+        },
+    ));
+
+    reports.push(check(
         "key_hygiene::every_generated_secret_key_is_flagged",
         "an encoded Stellar secret key must always be detected, and masked in the report",
         seed,

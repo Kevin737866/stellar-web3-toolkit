@@ -250,6 +250,9 @@ pub enum InspectCommand {
         /// Cursor returned by the previous page
         #[arg(long, default_value_t = 0)]
         cursor: usize,
+        /// Opaque cursor from the previous page's `next_page_token`
+        #[arg(long)]
+        page_cursor: Option<String>,
         /// JSON state export to read instead of the built-in sample
         #[arg(long)]
         input: Option<PathBuf>,
@@ -1290,19 +1293,25 @@ fn run_inspect(cmd: &InspectCommand) -> Result<()> {
             include_temporary,
             page_size,
             cursor,
+            page_cursor,
             input,
             all_pages,
             json,
         } => {
-            let inspector = match input {
+            let (inspector, loaded_line) = match input {
                 Some(input) => {
                     let path = resolve_path(&cwd_root(), input);
                     let mut from_file = StateInspector::new();
                     let added = from_file.load(&path)?;
-                    println!("loaded {added} state entry/entries from {}", path.display());
-                    from_file
+                    (
+                        from_file,
+                        Some(format!(
+                            "loaded {added} state entry/entries from {}",
+                            path.display()
+                        )),
+                    )
                 }
-                None => StateInspector::sample(),
+                None => (StateInspector::sample(), None),
             };
             if inspector.is_empty() {
                 return Err(ToolkitError::ExecutionError(
@@ -1319,6 +1328,28 @@ fn run_inspect(cmd: &InspectCommand) -> Result<()> {
             }
             if let Some(prefix) = key_prefix {
                 query = query.with_key_prefix(prefix.clone());
+            }
+            if let Some(token) = page_cursor {
+                if *cursor != 0 {
+                    return Err(ToolkitError::ExecutionError(
+                        "use either --cursor <offset> or --page-cursor <token>, not both"
+                            .to_string(),
+                    ));
+                }
+                if *all_pages {
+                    return Err(ToolkitError::ExecutionError(
+                        "--page-cursor cannot be combined with --all-pages; walk one page at a time"
+                            .to_string(),
+                    ));
+                }
+                // Validate before printing anything so a rejected cursor
+                // cannot look like a page that was read successfully.
+                inspector
+                    .validate_page_token(&query, token)
+                    .map_err(|e| ToolkitError::ExecutionError(e.to_string()))?;
+            }
+            if let Some(line) = loaded_line {
+                println!("{line}");
             }
             println!(
                 "filter matched {} of {} entries",
@@ -1340,7 +1371,12 @@ fn run_inspect(cmd: &InspectCommand) -> Result<()> {
                 return Ok(());
             }
 
-            let page = inspector.page(&query);
+            let page = match page_cursor {
+                Some(token) => inspector
+                    .page_from_token(&query, token)
+                    .map_err(|e| ToolkitError::ExecutionError(e.to_string()))?,
+                None => inspector.page(&query),
+            };
             if *json {
                 println!("{}", page.to_json());
                 return Ok(());

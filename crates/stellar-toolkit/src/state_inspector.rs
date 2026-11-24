@@ -1,20 +1,62 @@
-//! Paginated contract state inspector (issue #244).
+//! Paginated contract state inspector (issues #244, #313).
 //!
 //! Reads a contract state export (the entries returned by `getLedgerEntries` /
-//! `getEvents` style queries) and serves it page by page with an opaque cursor,
-//! so that inspecting a contract with thousands of keys stays readable and
-//! scriptable.
+//! `getEvents` style queries) and serves it page by page, so that inspecting a
+//! contract with thousands of keys stays readable and scriptable.
+//!
+//! Each page carries two cursors:
+//!
+//! * `next_cursor` is the legacy zero-based offset, kept for the existing
+//!   `--cursor` CLI flag and its output format;
+//! * `next_page_token` is an opaque [`PageCursor`] that binds the offset to the
+//!   filter and page size used to issue it. Feeding that token back with
+//!   `--page-cursor` resumes the walk, while a token from another filter (or a
+//!   corrupted one) is rejected instead of silently starting a different page.
 
 use crate::error::{Result, ToolkitError};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
+use std::fmt::{self, Write as _};
 use std::path::Path;
 
 /// Number of entries returned when the caller does not pick a page size.
 pub const DEFAULT_PAGE_SIZE: usize = 20;
 /// Hard cap for a single page, keeping output (and terminals) sane.
 pub const MAX_PAGE_SIZE: usize = 200;
+
+/// Prefix of an encoded [`PageCursor`].
+pub const PAGE_CURSOR_PREFIX: &str = "s1.";
+/// Version encoded in a [`PageCursor`]; bump it when the payload layout changes.
+const PAGE_CURSOR_VERSION: u8 = 1;
+/// version + offset + page size + temp flag + two 8-byte string lengths + checksum.
+const MIN_CURSOR_LEN: usize = 1 + 8 + 4 + 1 + 8 + 8 + 4;
+/// Length marker for an absent optional string in a cursor payload.
+const NO_STRING: u64 = u64::MAX;
+
+/// Why a page cursor could not be used.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PageCursorError {
+    #[error(
+        "page cursor `{0}` is malformed; copy the `next_page_token` value from the previous page"
+    )]
+    Malformed(String),
+    #[error("page cursor has version {found}, but this build understands version {expected}")]
+    UnsupportedVersion { found: u8, expected: u8 },
+    #[error("page cursor failed its integrity check; it was truncated or edited")]
+    Corrupt,
+    #[error(
+        "page cursor was issued for {field} `{issued}`, but this query uses `{actual}`; restart the walk with the original filters"
+    )]
+    QueryMismatch {
+        field: &'static str,
+        issued: String,
+        actual: String,
+    },
+    #[error(
+        "page cursor offset {offset} is past the {total} entries matching this query; the state export may have changed since the cursor was issued"
+    )]
+    OffsetOutOfRange { offset: usize, total: usize },
+}
 
 /// Storage bucket an entry lives in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -140,6 +182,243 @@ impl StateQuery {
     }
 }
 
+/// An opaque, self-validating cursor for the next page of a state query.
+///
+/// The token encodes its offset, page size, filter (`contract_id`, `key_prefix`
+/// and `include_temporary`) and a checksum. It is safe to hand to another
+/// process but unsafe to mix with a different query: [`PageCursor::parse`]
+/// rejects a mismatch rather than returning a page the caller did not ask for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageCursor {
+    offset: usize,
+    page_size: usize,
+    include_temporary: bool,
+    contract_id: Option<String>,
+    key_prefix: Option<String>,
+    encoded: String,
+}
+
+impl PageCursor {
+    /// Encodes a cursor for `offset` under `query`.
+    #[must_use]
+    pub fn issue(query: &StateQuery, offset: usize) -> Self {
+        let mut payload = Vec::with_capacity(MIN_CURSOR_LEN + 64);
+        payload.push(PAGE_CURSOR_VERSION);
+        payload.extend_from_slice(&(offset as u64).to_be_bytes());
+        payload.extend_from_slice(&(query.page_size() as u32).to_be_bytes());
+        payload.push(u8::from(query.include_temporary()));
+        push_string(&mut payload, query.contract_id());
+        push_string(&mut payload, query.key_prefix());
+        payload.extend_from_slice(&checksum(&payload).to_be_bytes());
+
+        Self {
+            offset,
+            page_size: query.page_size(),
+            include_temporary: query.include_temporary(),
+            contract_id: query.contract_id().map(str::to_string),
+            key_prefix: query.key_prefix().map(str::to_string),
+            encoded: format!("{PAGE_CURSOR_PREFIX}{}", hex::encode(payload)),
+        }
+    }
+
+    /// Decodes `token` and checks it against the query that will consume it.
+    pub fn parse(token: &str, query: &StateQuery) -> Result<Self> {
+        let body = token
+            .strip_prefix(PAGE_CURSOR_PREFIX)
+            .ok_or_else(|| malformed(token))?;
+        let bytes = hex::decode(body).map_err(|_| malformed(token))?;
+        if bytes.len() < MIN_CURSOR_LEN {
+            return Err(malformed(token));
+        }
+        let (payload, tail) = bytes.split_at(bytes.len() - 4);
+        let expected = u32::from_be_bytes([tail[0], tail[1], tail[2], tail[3]]);
+        if checksum(payload) != expected {
+            return Err(PageCursorError::Corrupt.into());
+        }
+        let version = payload[0];
+        if version != PAGE_CURSOR_VERSION {
+            return Err(PageCursorError::UnsupportedVersion {
+                found: version,
+                expected: PAGE_CURSOR_VERSION,
+            }
+            .into());
+        }
+
+        let mut rest = &payload[1..];
+        let raw_offset = take_u64(&mut rest, token)?;
+        let raw_page_size = take_u32(&mut rest, token)?;
+        let include_temporary = match take_u8(&mut rest, token)? {
+            0 => false,
+            1 => true,
+            _ => return Err(malformed(token)),
+        };
+        let contract_id = take_string(&mut rest, token)?;
+        let key_prefix = take_string(&mut rest, token)?;
+        if !rest.is_empty() {
+            return Err(malformed(token));
+        }
+
+        let offset = usize::try_from(raw_offset).map_err(|_| malformed(token))?;
+        let page_size = usize::try_from(raw_page_size).map_err(|_| malformed(token))?;
+        same_scope(
+            "contract",
+            contract_id.as_deref(),
+            query.contract_id(),
+            "all contracts",
+        )?;
+        same_scope(
+            "key prefix",
+            key_prefix.as_deref(),
+            query.key_prefix(),
+            "no key prefix",
+        )?;
+        let issued_temp = if include_temporary { "true" } else { "false" };
+        let actual_temp = if query.include_temporary() {
+            "true"
+        } else {
+            "false"
+        };
+        same_scope(
+            "include_temporary",
+            Some(issued_temp),
+            Some(actual_temp),
+            "",
+        )?;
+        let issued_size = page_size.to_string();
+        let actual_size = query.page_size().to_string();
+        same_scope(
+            "page size",
+            Some(issued_size.as_str()),
+            Some(actual_size.as_str()),
+            "",
+        )?;
+
+        Ok(Self {
+            offset,
+            page_size,
+            include_temporary,
+            contract_id,
+            key_prefix,
+            encoded: token.to_string(),
+        })
+    }
+
+    /// Zero-based index of the first entry on the addressed page.
+    #[must_use]
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+
+    /// Page size the token was issued for.
+    #[must_use]
+    pub fn page_size(&self) -> usize {
+        self.page_size
+    }
+
+    /// The encoded token, suitable for `--page-cursor`.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.encoded
+    }
+}
+
+impl fmt::Display for PageCursor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.encoded)
+    }
+}
+
+fn checksum(bytes: &[u8]) -> u32 {
+    let mut hash = 0x811c9dc5_u32;
+    for byte in bytes {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
+fn push_string(payload: &mut Vec<u8>, value: Option<&str>) {
+    match value {
+        None => payload.extend_from_slice(&NO_STRING.to_be_bytes()),
+        Some(value) => {
+            payload.extend_from_slice(&(value.len() as u64).to_be_bytes());
+            payload.extend_from_slice(value.as_bytes());
+        }
+    }
+}
+
+fn malformed(token: &str) -> ToolkitError {
+    PageCursorError::Malformed(token.to_string()).into()
+}
+
+fn take_u8<'a>(rest: &mut &'a [u8], token: &str) -> Result<u8> {
+    if rest.is_empty() {
+        return Err(malformed(token));
+    }
+    let value = rest[0];
+    *rest = &rest[1..];
+    Ok(value)
+}
+
+fn take_u64<'a>(rest: &mut &'a [u8], token: &str) -> Result<u64> {
+    if rest.len() < 8 {
+        return Err(malformed(token));
+    }
+    let (head, tail) = rest.split_at(8);
+    *rest = tail;
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(head);
+    Ok(u64::from_be_bytes(bytes))
+}
+
+fn take_u32<'a>(rest: &mut &'a [u8], token: &str) -> Result<u32> {
+    if rest.len() < 4 {
+        return Err(malformed(token));
+    }
+    let (head, tail) = rest.split_at(4);
+    *rest = tail;
+    let mut bytes = [0_u8; 4];
+    bytes.copy_from_slice(head);
+    Ok(u32::from_be_bytes(bytes))
+}
+
+fn take_string<'a>(rest: &mut &'a [u8], token: &str) -> Result<Option<String>> {
+    let length = take_u64(rest, token)?;
+    if length == NO_STRING {
+        return Ok(None);
+    }
+    let length = usize::try_from(length).map_err(|_| malformed(token))?;
+    if rest.len() < length {
+        return Err(malformed(token));
+    }
+    let (bytes, tail) = rest.split_at(length);
+    *rest = tail;
+    let value = std::str::from_utf8(bytes).map_err(|_| malformed(token))?;
+    Ok(Some(value.to_string()))
+}
+
+fn same_scope(
+    field: &'static str,
+    issued: Option<&str>,
+    actual: Option<&str>,
+    none_label: &str,
+) -> Result<()> {
+    if issued == actual {
+        return Ok(());
+    }
+    let describe = |value: Option<&str>| {
+        value
+            .map(str::to_string)
+            .unwrap_or_else(|| none_label.to_string())
+    };
+    Err(PageCursorError::QueryMismatch {
+        field,
+        issued: describe(issued),
+        actual: describe(actual),
+    }
+    .into())
+}
+
 /// One page of state entries plus the cursor needed to fetch the next one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatePage {
@@ -151,8 +430,11 @@ pub struct StatePage {
     /// Zero based index of the first entry on this page.
     pub offset: usize,
     pub entries: Vec<StateEntry>,
-    /// Cursor to pass to the next request, `None` on the last page.
+    /// Legacy numeric cursor to pass to the next request, `None` on the last page.
     pub next_cursor: Option<usize>,
+    /// Opaque cursor bound to this query, `None` on the last page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_page_token: Option<String>,
     pub has_more: bool,
 }
 
@@ -197,6 +479,9 @@ impl StatePage {
             out.push_str("end of results\n");
         } else if let Some(cursor) = self.next_cursor {
             let _ = writeln!(out, "next cursor: {cursor}");
+            if let Some(token) = &self.next_page_token {
+                let _ = writeln!(out, "next page token: {token}");
+            }
         }
         out
     }
@@ -279,19 +564,49 @@ impl StateInspector {
         self.filtered(query).len()
     }
 
-    /// Returns the page addressed by the query cursor. A cursor past the end
-    /// yields an empty last page instead of an error.
+    /// Returns the page addressed by the query's legacy numeric cursor. A
+    /// cursor past the end yields an empty last page instead of an error.
+    ///
+    /// This method does not consume opaque tokens; use [`Self::page_from_token`]
+    /// for those.
     pub fn page(&self, query: &StateQuery) -> StatePage {
+        self.page_at(query, query.cursor().min(self.total(query)))
+    }
+
+    /// Validates an opaque token against `query` and the current result set.
+    ///
+    /// Call this before producing output when a token is supplied by a caller,
+    /// so a rejected cursor never leaves a half-written page behind.
+    pub fn validate_page_token(&self, query: &StateQuery, token: &str) -> Result<PageCursor> {
+        let cursor = PageCursor::parse(token, query)?;
+        let total = self.total(query);
+        if cursor.offset() > total {
+            return Err(PageCursorError::OffsetOutOfRange {
+                offset: cursor.offset(),
+                total,
+            }
+            .into());
+        }
+        Ok(cursor)
+    }
+
+    /// Returns the page addressed by a token from a previous [`StatePage`].
+    pub fn page_from_token(&self, query: &StateQuery, token: &str) -> Result<StatePage> {
+        let cursor = self.validate_page_token(query, token)?;
+        Ok(self.page_at(query, cursor.offset()))
+    }
+
+    fn page_at(&self, query: &StateQuery, offset: usize) -> StatePage {
         let matching = self.filtered(query);
         let total = matching.len();
         let page_size = query.page_size().max(1);
-        let offset = query.cursor().min(total);
         let end = offset.saturating_add(page_size).min(total);
         let entries = matching[offset..end]
             .iter()
             .map(|entry| (*entry).clone())
             .collect::<Vec<_>>();
         let next_cursor = if end < total { Some(end) } else { None };
+        let next_page_token = next_cursor.map(|next| PageCursor::issue(query, next).to_string());
 
         StatePage {
             contract_id: query.contract_id().map(str::to_string),
@@ -301,6 +616,7 @@ impl StateInspector {
             offset,
             entries,
             next_cursor,
+            next_page_token,
             has_more: next_cursor.is_some(),
         }
     }
@@ -591,5 +907,247 @@ mod tests {
         let json = page.to_json();
         assert!(json.contains("\"next_cursor\": 2"));
         assert!(json.contains("\"has_more\": true"));
+    }
+
+    fn keys(page: &StatePage) -> Vec<String> {
+        page.entries.iter().map(|entry| entry.key.clone()).collect()
+    }
+
+    /// Re-encode a cursor payload, refreshing its checksum (for negative tests).
+    fn reencode(mut payload: Vec<u8>) -> String {
+        payload.extend_from_slice(&checksum(&payload).to_be_bytes());
+        format!("{PAGE_CURSOR_PREFIX}{}", hex::encode(payload))
+    }
+
+    #[test]
+    fn test_opaque_cursor_walks_every_page_once() {
+        let inspector = sample();
+        let query = StateQuery::new().with_page_size(2);
+        let mut token: Option<String> = None;
+        let mut visited = Vec::new();
+        let mut pages = 0;
+        loop {
+            let page = match &token {
+                None => inspector.page(&query),
+                Some(current) => inspector.page_from_token(&query, current).unwrap(),
+            };
+            assert_eq!(page.page_size, 2);
+            visited.extend(keys(&page));
+            pages += 1;
+            assert!(pages <= 5, "cursor walk failed to terminate");
+            match page.next_page_token {
+                Some(next) => {
+                    let decoded = PageCursor::parse(&next, &query).unwrap();
+                    assert_eq!(decoded.offset(), page.offset + page.entries.len());
+                    token = Some(next);
+                }
+                None => break,
+            }
+        }
+
+        assert_eq!(pages, 3);
+        let expected: Vec<String> = inspector
+            .filtered(&query)
+            .iter()
+            .map(|entry| entry.key.clone())
+            .collect();
+        assert_eq!(visited, expected);
+    }
+
+    #[test]
+    fn test_opaque_cursor_round_trip_preserves_filters() {
+        let inspector = sample();
+        let query = StateQuery::new()
+            .for_contract("CDEMO7POOLCONTRACTID")
+            .with_key_prefix("Reserves/")
+            .including_temporary(true)
+            .with_page_size(1);
+        let first = inspector.page(&query);
+        let token = first
+            .next_page_token
+            .clone()
+            .expect("another reserve follows");
+        let decoded = PageCursor::parse(&token, &query).unwrap();
+        assert_eq!(decoded.offset(), 1);
+        assert_eq!(decoded.page_size(), 1);
+        assert_eq!(decoded.as_str(), token);
+
+        let second = inspector.page_from_token(&query, &token).unwrap();
+        assert_eq!(keys(&second), vec!["Reserves/B".to_string()]);
+        assert!(second.next_page_token.is_none());
+    }
+
+    #[test]
+    fn test_page_cursor_boundaries() {
+        let inspector = sample();
+        let query = StateQuery::new().with_page_size(2);
+        let last = inspector.page(&query.clone().with_cursor(4));
+        assert_eq!(keys(&last), vec!["Reserves/B".to_string()]);
+        assert!(last.next_page_token.is_none());
+
+        // A token pointing exactly at the end yields an empty terminal page.
+        let end_token = PageCursor::issue(&query, 5).to_string();
+        let empty = inspector.page_from_token(&query, &end_token).unwrap();
+        assert!(empty.entries.is_empty());
+        assert!(empty.next_page_token.is_none());
+        assert!(empty.is_last_page());
+
+        // An empty result set never issues a cursor.
+        let no_matches = StateQuery::new().with_key_prefix("no-such-key");
+        let page = inspector.page(&no_matches);
+        assert_eq!(page.total, 0);
+        assert!(page.next_page_token.is_none());
+    }
+
+    #[test]
+    fn test_page_cursor_rejects_malformed_and_tampered_tokens() {
+        let inspector = sample();
+        let query = StateQuery::new().with_page_size(2);
+        for bad in ["", "not-a-cursor", "s1.zz", "s1.00"] {
+            let err = inspector.page_from_token(&query, bad).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ToolkitError::StateInspection(PageCursorError::Malformed(_))
+                ),
+                "expected a malformed-cursor error for {bad:?}, got {err:?}"
+            );
+        }
+
+        let token = inspector.page(&query).next_page_token.unwrap();
+        let mut corrupted = token.clone();
+        let last = corrupted.pop().unwrap();
+        corrupted.push(if last == '0' { '1' } else { '0' });
+        let err = inspector.page_from_token(&query, &corrupted).unwrap_err();
+        assert!(matches!(
+            err,
+            ToolkitError::StateInspection(PageCursorError::Corrupt)
+        ));
+
+        let bytes = hex::decode(token.strip_prefix(PAGE_CURSOR_PREFIX).unwrap()).unwrap();
+        let mut payload = bytes[..bytes.len() - 4].to_vec();
+        payload[0] = 2; // unknown version, with a valid checksum
+        let err = inspector
+            .page_from_token(&query, &reencode(payload.clone()))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ToolkitError::StateInspection(PageCursorError::UnsupportedVersion {
+                found: 2,
+                expected: 1
+            })
+        ));
+
+        payload[0] = PAGE_CURSOR_VERSION;
+        payload.push(0xFF); // trailing junk is not a valid payload
+        let err = inspector
+            .page_from_token(&query, &reencode(payload))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ToolkitError::StateInspection(PageCursorError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn test_page_cursor_rejects_changed_query() {
+        let inspector = sample();
+        let query = StateQuery::new().with_page_size(2);
+        let token = inspector.page(&query).next_page_token.unwrap();
+
+        let changed_size = query.clone().with_page_size(3);
+        let err = inspector
+            .page_from_token(&changed_size, &token)
+            .unwrap_err();
+        assert!(matches!(
+            &err,
+            ToolkitError::StateInspection(PageCursorError::QueryMismatch {
+                field: "page size",
+                ..
+            })
+        ));
+        assert!(err.to_string().contains("page size"));
+
+        let scoped = query.clone().for_contract("CDEMO7POOLCONTRACTID");
+        let err = inspector.page_from_token(&scoped, &token).unwrap_err();
+        assert!(matches!(
+            &err,
+            ToolkitError::StateInspection(PageCursorError::QueryMismatch {
+                field: "contract",
+                ..
+            })
+        ));
+        assert!(err.to_string().contains("all contracts"));
+
+        let prefixed = query.clone().with_key_prefix("Reserves/");
+        let err = inspector.page_from_token(&prefixed, &token).unwrap_err();
+        assert!(matches!(
+            &err,
+            ToolkitError::StateInspection(PageCursorError::QueryMismatch {
+                field: "key prefix",
+                ..
+            })
+        ));
+
+        let with_temporary = query.including_temporary(true);
+        let err = inspector
+            .page_from_token(&with_temporary, &token)
+            .unwrap_err();
+        assert!(matches!(
+            &err,
+            ToolkitError::StateInspection(PageCursorError::QueryMismatch {
+                field: "include_temporary",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_page_cursor_rejects_stale_offset() {
+        let inspector = sample();
+        let query = StateQuery::new().with_page_size(2);
+        let token = PageCursor::issue(&query, 8).to_string();
+        let err = inspector.page_from_token(&query, &token).unwrap_err();
+        assert!(matches!(
+            err,
+            ToolkitError::StateInspection(PageCursorError::OffsetOutOfRange {
+                offset: 8,
+                total: 5
+            })
+        ));
+
+        // The same token is unusable against a smaller export.
+        let smaller = StateInspector::from_json(
+            r#"[{"contract_id":"CPOOL","durability":"persistent","key":"A","value":"1","ledger":7}]"#,
+        )
+        .unwrap();
+        let err = smaller.page_from_token(&query, &token).unwrap_err();
+        assert!(matches!(
+            err,
+            ToolkitError::StateInspection(PageCursorError::OffsetOutOfRange { total: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn test_legacy_numeric_cursor_and_output_remain_compatible() {
+        let inspector = sample();
+        let query = StateQuery::new().with_page_size(2);
+        let page = inspector.page(&query.clone().with_cursor(999));
+        assert!(page.entries.is_empty());
+        assert!(page.is_last_page());
+
+        let page = inspector.page(&query);
+        assert_eq!(page.next_cursor, Some(2));
+        let text = page.render();
+        assert!(text.contains("next cursor: 2"));
+        assert!(text.contains("next page token: s1."));
+        let json = page.to_json();
+        assert!(json.contains("\"next_cursor\": 2"));
+        assert!(json.contains("\"next_page_token\""));
+
+        // The last page keeps the old JSON shape: no token is emitted.
+        let last = inspector.page(&query.with_cursor(4));
+        assert!(!last.to_json().contains("next_page_token"));
+        assert!(last.render().contains("end of results"));
     }
 }
