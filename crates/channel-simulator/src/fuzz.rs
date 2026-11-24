@@ -39,6 +39,7 @@ use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
+use std::time::{Duration, Instant};
 
 /// Every topology shape the generator knows about.
 pub const ALL_TOPOLOGIES: [TopologyType; 7] = [
@@ -51,6 +52,11 @@ pub const ALL_TOPOLOGIES: [TopologyType; 7] = [
     TopologyType::Ring,
 ];
 
+/// Upper bound on a configured wall-clock budget for one fuzz run, in
+/// milliseconds (24 hours). A larger value is rejected rather than clamped, so
+/// a run cannot be configured to hang for an unbounded amount of time.
+pub const MAX_FUZZ_DURATION_MS: u64 = 86_400_000;
+
 /// How to fuzz.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TopologyFuzzConfig {
@@ -59,6 +65,18 @@ pub struct TopologyFuzzConfig {
     /// Master seed. Each iteration derives its own deterministic seed from it,
     /// so a failure is reproducible from `(seed, iteration)` alone.
     pub seed: u64,
+    /// Optional wall-clock budget for the whole run, in milliseconds.
+    ///
+    /// The budget is checked between iterations, so a run stops as soon as the
+    /// budget is spent instead of after `iterations` topologies, and reports
+    /// [`FuzzTermination::DurationBudgetExceeded`].
+    ///
+    /// # Compatibility
+    ///
+    /// `None` (the default) preserves the previous behavior: the run is bounded
+    /// by `iterations` alone.
+    #[serde(default)]
+    pub max_duration_ms: Option<u64>,
     /// Smallest node count to generate. Values below 3 are the interesting
     /// degenerate cases, so they are in range rather than excluded.
     pub min_nodes: usize,
@@ -81,6 +99,27 @@ impl Default for TopologyFuzzConfig {
             max_nodes: 40,
             payments_per_topology: 25,
             disconnection: None,
+            max_duration_ms: None,
+        }
+    }
+}
+
+/// Why a fuzz run stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum FuzzTermination {
+    /// Every configured iteration ran.
+    #[default]
+    Completed,
+    /// The run stopped early because `max_duration_ms` was exhausted.
+    DurationBudgetExceeded,
+}
+
+impl FuzzTermination {
+    /// Stable name for reports and logs.
+    pub fn name(self) -> &'static str {
+        match self {
+            FuzzTermination::Completed => "completed",
+            FuzzTermination::DurationBudgetExceeded => "duration-budget-exceeded",
         }
     }
 }
@@ -92,6 +131,9 @@ pub struct FuzzFailure {
     pub iteration: usize,
     /// Seed for that iteration, so it can be replayed in isolation.
     pub seed: u64,
+    /// Master seed of the run that produced the failure, so the whole run can
+    /// be replayed as well as the single iteration.
+    pub run_seed: u64,
     /// Topology being generated.
     pub topology: TopologyType,
     /// Which check failed.
@@ -100,9 +142,33 @@ pub struct FuzzFailure {
     pub detail: String,
 }
 
+impl FuzzFailure {
+    /// A one-line replay instruction naming both the run seed and the iteration
+    /// seed, so a failure can be reproduced without guessing what to pass.
+    pub fn replay_hint(&self) -> String {
+        format!(
+            "replay with seed={:#018x} iteration={} (run seed={:#018x}, topology={}, invariant={})",
+            self.seed,
+            self.iteration,
+            self.run_seed,
+            self.topology_name(),
+            self.invariant
+        )
+    }
+}
+
 /// Summary of a fuzz run.
 #[derive(Debug, Clone, Default)]
 pub struct FuzzReport {
+    /// Master seed the run was configured with. Always reported, so a clean run
+    /// and a failing one are equally replayable.
+    pub seed: u64,
+    /// Wall-clock time the run took, in milliseconds.
+    pub elapsed_ms: u64,
+    /// Why the run stopped.
+    pub termination: FuzzTermination,
+    /// The wall-clock budget the run was configured with, for reports.
+    pub max_duration_ms: Option<u64>,
     /// Topologies generated.
     pub iterations: usize,
     /// Routes whose invariants were checked.
@@ -129,6 +195,12 @@ impl FuzzReport {
         self.failures.is_empty()
     }
 
+    /// Whether the run stopped at the duration budget instead of running every
+    /// configured iteration.
+    pub fn was_truncated(&self) -> bool {
+        self.termination == FuzzTermination::DurationBudgetExceeded
+    }
+
     /// Fraction of topologies that had at least one route, as a percentage.
     pub fn routable_percent(&self) -> f64 {
         if self.iterations == 0 {
@@ -137,11 +209,16 @@ impl FuzzReport {
         self.routable_topologies as f64 / self.iterations as f64 * 100.0
     }
 
-    /// Human-readable summary, including the first few failures.
+    /// Human-readable summary, including the seed and the first few failures.
+    ///
+    /// The seed is always in the first line, so pasting the summary into a bug
+    /// report is enough to replay the run.
     pub fn summarize(&self) -> String {
         let mut summary = format!(
-            "topology fuzz: {} topologies, {} payments attempted, {} routes found over {} searches, {} routes checked, {:.1}% of topologies routable, {} failures",
+            "topology fuzz: seed={:#018x} {} topologies in {}ms, {} payments attempted, {} routes found over {} searches, {} routes checked, {:.1}% of topologies routable, {} failures",
+            self.seed,
             self.iterations,
+            self.elapsed_ms,
             self.payments_attempted,
             self.routes_found,
             self.route_attempts,
@@ -150,11 +227,20 @@ impl FuzzReport {
             self.failures.len()
         );
 
+        if self.was_truncated() {
+            let _ = write!(
+                summary,
+                "\n  run stopped early: duration budget of {}ms exhausted; replay with a smaller `iterations` or a larger budget",
+                self.max_duration_ms.unwrap_or_default()
+            );
+        }
+
         for failure in self.failures.iter().take(5) {
             let _ = write!(
                 summary,
-                "\n  [{} seed={}] {}: {}",
+                "\n  [{} iteration={} seed={:#018x}] {}: {}",
                 failure.topology_name(),
+                failure.iteration,
                 failure.seed,
                 failure.invariant,
                 failure.detail
@@ -427,6 +513,28 @@ pub fn verify_route(
     Ok(())
 }
 
+/// Validate the inputs that bound a fuzz run.
+///
+/// Rejects rather than clamps: a zero or absurdly large budget is a caller
+/// mistake, and silently substituting a different one would make the run's
+/// duration depend on something the caller never asked for.
+pub fn validate_run_limits(config: &TopologyFuzzConfig) -> Result<(), SimulatorError> {
+    if let Some(ref disconnection) = config.disconnection {
+        disconnection.validate()?;
+    }
+
+    match config.max_duration_ms {
+        Some(0) => Err(SimulatorError::InvalidConfig(
+            "max_duration_ms must be >= 1 when set; omit it for a run bounded only by `iterations`"
+                .to_string(),
+        )),
+        Some(ms) if ms > MAX_FUZZ_DURATION_MS => Err(SimulatorError::InvalidConfig(format!(
+            "max_duration_ms ({ms}) exceeds the maximum bound ({MAX_FUZZ_DURATION_MS})"
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// Randomized topology fuzzer.
 pub struct TopologyFuzzer {
     config: TopologyFuzzConfig,
@@ -440,9 +548,7 @@ impl TopologyFuzzer {
 
     /// Create a fuzzer after validating its configuration.
     pub fn try_new(config: TopologyFuzzConfig) -> Result<Self, SimulatorError> {
-        if let Some(ref disconnection) = config.disconnection {
-            disconnection.validate()?;
-        }
+        validate_run_limits(&config)?;
         Ok(TopologyFuzzer { config })
     }
 
@@ -453,20 +559,34 @@ impl TopologyFuzzer {
 
     /// Validate configuration and run the fuzzer.
     pub fn try_run(&self) -> Result<FuzzReport, SimulatorError> {
-        if let Some(ref disconnection) = self.config.disconnection {
-            disconnection.validate()?;
-        }
+        validate_run_limits(&self.config)?;
         Ok(self.run())
     }
 
-    /// Generate and check topologies until the iteration budget is exhausted.
+    /// Generate and check topologies until the iteration count or the optional
+    /// wall-clock budget is exhausted.
+    ///
+    /// The budget is checked between iterations, so the run always stops on an
+    /// iteration boundary and the report says why it stopped.
     pub fn run(&self) -> FuzzReport {
-        let mut report = FuzzReport::default();
+        let started = Instant::now();
+        let budget = self.config.max_duration_ms.map(Duration::from_millis);
+        let mut report = FuzzReport {
+            seed: self.config.seed,
+            max_duration_ms: self.config.max_duration_ms,
+            ..FuzzReport::default()
+        };
 
         for iteration in 0..self.config.iterations {
+            if budget.is_some_and(|limit| started.elapsed() >= limit) {
+                report.termination = FuzzTermination::DurationBudgetExceeded;
+                break;
+            }
+
             self.run_iteration(iteration, &mut report);
         }
 
+        report.elapsed_ms = started.elapsed().as_millis() as u64;
         report
     }
 
@@ -482,6 +602,7 @@ impl TopologyFuzzer {
                 report.failures.push(FuzzFailure {
                     iteration,
                     seed,
+                    run_seed: self.config.seed,
                     topology,
                     invariant: "config",
                     detail: err.to_string(),
@@ -491,8 +612,7 @@ impl TopologyFuzzer {
         }
 
         let sim_config = self.random_sim_config(&mut rng);
-        let (mut graph, mut nodes) =
-            NetworkTopology::new(sim_config, topology).generate(&mut rng);
+        let (mut graph, mut nodes) = NetworkTopology::new(sim_config, topology).generate(&mut rng);
 
         report.iterations += 1;
 
@@ -500,6 +620,7 @@ impl TopologyFuzzer {
             report.failures.push(FuzzFailure {
                 iteration,
                 seed,
+                run_seed: self.config.seed,
                 topology,
                 invariant: "topology",
                 detail,
@@ -509,7 +630,11 @@ impl TopologyFuzzer {
         }
 
         let mut routed_here = false;
-        let mut tracker = self.config.disconnection.as_ref().map(|_| DisconnectionTracker::new());
+        let mut tracker = self
+            .config
+            .disconnection
+            .as_ref()
+            .map(|_| DisconnectionTracker::new());
 
         for payment_index in 0..self.config.payments_per_topology {
             if let (Some(churn_cfg), Some(churn_tracker)) =
@@ -521,6 +646,7 @@ impl TopologyFuzzer {
                         report.failures.push(FuzzFailure {
                             iteration,
                             seed,
+                            run_seed: self.config.seed,
                             topology,
                             invariant: "recovery",
                             detail: format!("payment {payment_index}: {err}"),
@@ -540,6 +666,7 @@ impl TopologyFuzzer {
                         report.failures.push(FuzzFailure {
                             iteration,
                             seed,
+                            run_seed: self.config.seed,
                             topology,
                             invariant: "disconnection",
                             detail: format!("payment {payment_index}: {err}"),
@@ -551,6 +678,7 @@ impl TopologyFuzzer {
                     report.failures.push(FuzzFailure {
                         iteration,
                         seed,
+                        run_seed: self.config.seed,
                         topology,
                         invariant: "topology_after_churn",
                         detail: format!("payment {payment_index}: {detail}"),
@@ -559,18 +687,15 @@ impl TopologyFuzzer {
                 }
             }
 
-            let payment = self.random_payment(&graph, &mut rng);
-            let (request, pathfinder) = match payment {
-                Some(request) => (request, Pathfinder::new()),
-                // Fewer than two nodes, or no channels at all: nothing to route.
-                None => {
-                    if self.config.disconnection.is_some() {
-                        // With churn enabled, nodes may recover on later steps.
-                        continue;
-                    }
-                    break;
+            // Fewer than two nodes, or no channels at all: nothing to route.
+            let Some(request) = self.random_payment(&graph, &mut rng) else {
+                if self.config.disconnection.is_some() {
+                    // With churn enabled, nodes may recover on later steps.
+                    continue;
                 }
+                break;
             };
+            let pathfinder = Pathfinder::new();
 
             report.payments_attempted += 1;
             report.route_attempts += 3;
@@ -593,6 +718,7 @@ impl TopologyFuzzer {
                     report.failures.push(FuzzFailure {
                         iteration,
                         seed,
+                        run_seed: self.config.seed,
                         topology,
                         invariant: "route",
                         detail: format!("payment {payment_index} via {algorithm}: {detail}"),
@@ -600,9 +726,7 @@ impl TopologyFuzzer {
                 }
 
                 if self.config.disconnection.is_some() {
-                    let source_online = nodes
-                        .get(&request.source)
-                        .is_some_and(|n| n.node.online);
+                    let source_online = nodes.get(&request.source).is_some_and(|n| n.node.online);
                     let offline_hop = route
                         .hops
                         .iter()
@@ -611,6 +735,7 @@ impl TopologyFuzzer {
                         report.failures.push(FuzzFailure {
                             iteration,
                             seed,
+                            run_seed: self.config.seed,
                             topology,
                             invariant: "route_offline_node",
                             detail: format!(
@@ -636,6 +761,7 @@ impl TopologyFuzzer {
                         report.failures.push(FuzzFailure {
                             iteration,
                             seed,
+                            run_seed: self.config.seed,
                             topology,
                             invariant: "final_recovery",
                             detail: err.to_string(),
@@ -647,6 +773,7 @@ impl TopologyFuzzer {
                     report.failures.push(FuzzFailure {
                         iteration,
                         seed,
+                        run_seed: self.config.seed,
                         topology,
                         invariant: "topology_after_recovery",
                         detail,
@@ -933,6 +1060,7 @@ mod tests {
             min_nodes: 2,
             max_nodes: 30,
             payments_per_topology: 8,
+            ..TopologyFuzzConfig::default()
         });
 
         let report = fuzzer.run();
@@ -956,6 +1084,7 @@ mod tests {
             min_nodes: 2,
             max_nodes: 20,
             payments_per_topology: 5,
+            ..TopologyFuzzConfig::default()
         };
 
         let first = TopologyFuzzer::new(config.clone()).run();
@@ -977,6 +1106,7 @@ mod tests {
                 min_nodes: num_nodes,
                 max_nodes: num_nodes,
                 payments_per_topology: 3,
+                ..TopologyFuzzConfig::default()
             });
 
             let report = fuzzer.run();
@@ -1024,6 +1154,7 @@ mod tests {
                 max_concurrent_disconnections: Some(4),
                 recover_at_end: true,
             }),
+            ..TopologyFuzzConfig::default()
         })
         .unwrap();
 
@@ -1052,6 +1183,7 @@ mod tests {
                 max_concurrent_disconnections: Some(3),
                 recover_at_end: true,
             }),
+            ..TopologyFuzzConfig::default()
         };
 
         let first = TopologyFuzzer::new(config.clone()).run();
@@ -1059,7 +1191,10 @@ mod tests {
 
         assert_eq!(first.routes_checked, second.routes_checked);
         assert_eq!(first.routes_found, second.routes_found);
-        assert_eq!(first.disconnections_simulated, second.disconnections_simulated);
+        assert_eq!(
+            first.disconnections_simulated,
+            second.disconnections_simulated
+        );
         assert_eq!(first.recoveries_simulated, second.recoveries_simulated);
         assert_eq!(first.failures, second.failures);
     }
@@ -1082,5 +1217,137 @@ mod tests {
             TopologyFuzzer::new(bad_config).try_run(),
             Err(SimulatorError::InvalidConfig(_))
         ));
+    }
+
+    #[test]
+    fn zero_and_oversized_duration_budgets_are_rejected_explicitly() {
+        let zero = TopologyFuzzConfig {
+            max_duration_ms: Some(0),
+            ..TopologyFuzzConfig::default()
+        };
+        let Err(err) = TopologyFuzzer::try_new(zero) else {
+            panic!("a zero duration budget must be rejected");
+        };
+        assert!(matches!(err, SimulatorError::InvalidConfig(_)));
+        assert!(err.to_string().contains("max_duration_ms"), "{err}");
+
+        let oversized = TopologyFuzzConfig {
+            max_duration_ms: Some(MAX_FUZZ_DURATION_MS + 1),
+            ..TopologyFuzzConfig::default()
+        };
+        assert!(matches!(
+            TopologyFuzzer::try_new(oversized),
+            Err(SimulatorError::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn duration_budget_stops_a_long_run_and_reports_the_seed() {
+        let config = TopologyFuzzConfig {
+            // Far more iterations than can finish inside the budget.
+            iterations: 10_000_000,
+            seed: 0x0BAD_F00D_1234_5678,
+            min_nodes: 2,
+            max_nodes: 12,
+            payments_per_topology: 1,
+            max_duration_ms: Some(5),
+            ..TopologyFuzzConfig::default()
+        };
+
+        let fuzzer = TopologyFuzzer::try_new(config.clone()).unwrap();
+        let report = fuzzer.run();
+
+        assert!(report.was_truncated());
+        assert_eq!(report.termination, FuzzTermination::DurationBudgetExceeded);
+        assert_eq!(report.termination.name(), "duration-budget-exceeded");
+        assert_eq!(report.seed, config.seed);
+        assert!(report.iterations < config.iterations);
+        assert_eq!(report.max_duration_ms, Some(5));
+
+        let summary = report.summarize();
+        assert!(summary.contains("seed=0x0badf00d12345678"), "{summary}");
+        assert!(summary.contains("stopped early"), "{summary}");
+    }
+
+    #[test]
+    fn a_run_without_a_budget_reports_completion() {
+        let fuzzer = TopologyFuzzer::try_new(TopologyFuzzConfig {
+            iterations: 7,
+            seed: 5,
+            min_nodes: 2,
+            max_nodes: 10,
+            payments_per_topology: 2,
+            ..TopologyFuzzConfig::default()
+        })
+        .unwrap();
+
+        let report = fuzzer.run();
+        assert_eq!(report.termination, FuzzTermination::Completed);
+        assert!(!report.was_truncated());
+        assert_eq!(report.iterations, 7);
+    }
+
+    #[test]
+    fn failures_name_the_seed_and_replay_iteration() {
+        // An invalid churn config makes every iteration fail with a `config`
+        // failure, which is the cheapest way to assert on the diagnostics.
+        let config = TopologyFuzzConfig {
+            iterations: 3,
+            seed: 0xFEED_FACE,
+            min_nodes: 2,
+            max_nodes: 6,
+            payments_per_topology: 1,
+            disconnection: Some(DisconnectionConfig {
+                min_downtime_steps: 0,
+                ..Default::default()
+            }),
+            ..TopologyFuzzConfig::default()
+        };
+
+        let report = TopologyFuzzer::new(config.clone()).run();
+        assert_eq!(report.failures.len(), 3);
+
+        for (iteration, failure) in report.failures.iter().enumerate() {
+            assert_eq!(failure.iteration, iteration);
+            assert_eq!(failure.run_seed, config.seed);
+            assert_eq!(
+                failure.seed,
+                0xFEED_FACE_u64
+                    .wrapping_add((iteration as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+            );
+
+            let hint = failure.replay_hint();
+            assert!(hint.contains(&format!("iteration={iteration}")), "{hint}");
+            assert!(hint.contains("seed=0x"), "{hint}");
+        }
+
+        let summary = report.summarize();
+        assert!(summary.contains("seed=0x00000000feedface"), "{summary}");
+        assert!(summary.contains("iteration=0"), "{summary}");
+    }
+
+    #[test]
+    fn replaying_a_reported_failure_reproduces_it() {
+        let config = TopologyFuzzConfig {
+            iterations: 5,
+            seed: 0x1234_ABCD,
+            min_nodes: 2,
+            max_nodes: 8,
+            payments_per_topology: 2,
+            disconnection: Some(DisconnectionConfig {
+                max_downtime_steps: 0,
+                ..Default::default()
+            }),
+            ..TopologyFuzzConfig::default()
+        };
+
+        let fuzzer = TopologyFuzzer::new(config);
+        let report = fuzzer.run();
+        let failure = report.failures.first().unwrap().clone();
+
+        let mut replay = FuzzReport::default();
+        fuzzer.run_iteration(failure.iteration, &mut replay);
+
+        assert_eq!(replay.failures, vec![failure]);
     }
 }

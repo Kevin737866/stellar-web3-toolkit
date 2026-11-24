@@ -4,7 +4,9 @@
 use channel_router::pathfinder::Pathfinder;
 use channel_router::{Channel, NetworkGraph, Node, NodeFeatures, RouteRequest};
 use channel_simulator::fuzz::{verify_topology, TopologyFuzzConfig, TopologyFuzzer};
-use channel_simulator::{DisconnectionConfig, SimulatedNode, Simulator, SimulatorConfig, SimulatorError};
+use channel_simulator::{
+    DisconnectionConfig, SimulatedNode, Simulator, SimulatorConfig, SimulatorError,
+};
 use std::collections::{HashMap, HashSet};
 
 #[tokio::test]
@@ -30,11 +32,17 @@ async fn end_to_end_simulation_with_disconnection_and_recovery() {
     let initial_channels = simulator.get_network().read().num_channels();
     let stats = simulator.run_simulation().await.unwrap();
 
-    assert_eq!(stats.total_payments, stats.successful_payments + stats.failed_payments);
+    assert_eq!(
+        stats.total_payments,
+        stats.successful_payments + stats.failed_payments
+    );
     assert!(stats.node_disconnections > 0);
     assert_eq!(stats.node_disconnections, stats.node_recoveries);
     assert!(simulator.disconnected_nodes().is_empty());
-    assert_eq!(simulator.get_network().read().num_channels(), initial_channels);
+    assert_eq!(
+        simulator.get_network().read().num_channels(),
+        initial_channels
+    );
 
     // Reproducibility check with the same seed
     let replay = Simulator::new(config);
@@ -139,6 +147,7 @@ fn fuzzer_workflow_with_disconnection_is_clean() {
             max_concurrent_disconnections: Some(3),
             recover_at_end: true,
         }),
+        ..TopologyFuzzConfig::default()
     })
     .unwrap();
 
