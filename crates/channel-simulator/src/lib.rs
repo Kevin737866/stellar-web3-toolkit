@@ -5,10 +5,12 @@
 
 pub mod disconnection;
 pub mod fuzz;
+pub mod metrics;
 pub mod network;
 pub mod statistics;
 
 pub use disconnection::{DisconnectionConfig, DisconnectionTracker, MAX_DOWNTIME_STEPS};
+pub use metrics::{hop_distance, PaymentSuccessMetrics, RouteLengthBucket};
 
 use channel_router::pathfinder::Pathfinder;
 use channel_router::{Channel, NetworkGraph, Node, RouteRequest};
@@ -90,6 +92,10 @@ pub struct SimulationStats {
     pub max_path_length: usize,
     /// Success rate
     pub success_rate: f64,
+    /// Payment success broken down by route length, so a network that only
+    /// fails long routes is distinguishable from one that fails everywhere.
+    #[serde(default)]
+    pub success_by_route_length: PaymentSuccessMetrics,
     /// Network utilization
     pub network_utilization: f64,
     /// Payment latency histogram (ms)
@@ -334,6 +340,7 @@ impl Simulator {
         let mut path_lengths = Vec::new();
         let mut node_disconnections = 0usize;
         let mut node_recoveries = 0usize;
+        let mut success_by_route_length = PaymentSuccessMetrics::new();
         let total_steps = payments.len();
 
         for (step, (source, dest, amount)) in payments.into_iter().enumerate() {
@@ -364,9 +371,16 @@ impl Simulator {
                 payment_metadata: None,
             };
 
-            let route_result = {
+            // The topological distance is taken alongside the route: a failed
+            // payment still has a length it was trying to reach, and bucketing
+            // it by that length keeps long-route failures in their own bucket
+            // instead of dropping them from the metric.
+            let (route_result, shortest_hops) = {
                 let network = self.network.read();
-                pathfinder.find_route_dijkstra(&network, &request)
+                (
+                    pathfinder.find_route_dijkstra(&network, &request),
+                    hop_distance(&network, &source, &dest),
+                )
             };
 
             match route_result {
@@ -376,6 +390,7 @@ impl Simulator {
                     successful += 1;
                     total_value += amount;
                     total_fees += route.total_fees;
+                    success_by_route_length.record(Some(route.hops.len()), true, amount)?;
                     path_lengths.push(route.hops.len());
 
                     debug!(
@@ -390,6 +405,7 @@ impl Simulator {
                 }
                 Err(e) => {
                     failed += 1;
+                    success_by_route_length.record(shortest_hops, false, amount)?;
                     debug!("Payment failed: {} -> {} - {:?}", source, dest, e);
                 }
             }
@@ -428,6 +444,7 @@ impl Simulator {
             avg_path_length: avg_path,
             max_path_length: max_path,
             success_rate,
+            success_by_route_length,
             network_utilization: 0.0, // Would need more complex calculation
             latency_ms: Vec::new(),
             node_disconnections,
@@ -643,6 +660,9 @@ pub enum SimulatorError {
 
     #[error("Invalid node state: {0}")]
     InvalidNodeState(String),
+
+    #[error("Invalid route length: {0}; a route must have at least one hop")]
+    InvalidRouteLength(usize),
 }
 
 #[cfg(test)]
