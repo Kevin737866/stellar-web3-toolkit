@@ -266,6 +266,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Check documentation links
+        run: python3 scripts/check-doc-links.py
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.98.1
