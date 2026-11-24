@@ -125,6 +125,64 @@ did:stellar:testnet:GD5XQZOWX3RN6BQHCYVLNQDJN6YBXNHAPK4UQGHKU2VQRA5TJ5N2J53K
 did:stellar:public:GABKJDSKLMNOPQRSTUVWXYZ1234567890ABCDEFGHIJK
 ```
 
+## DID Identifier Validation (issue #338)
+
+DID document `id` values are checked against the **configured DID method**
+before a document is created or returned by a resolver. The default method is
+`stellar`; another valid method name can be configured explicitly.
+
+```rust
+use stellar_did::{validate_did_id, DidDocument, DidError, DidMethodConfig};
+
+let config = DidMethodConfig::default(); // serves "stellar"
+assert!(validate_did_id("did:stellar:testnet:GABC", &config).is_ok());
+assert!(matches!(
+    validate_did_id("did:example:alice", &config),
+    Err(DidError::MethodMismatch { .. })
+));
+
+let document = DidDocument::try_new("did:stellar:testnet:GABC", &config)?;
+let resolved = DidDocument::from_json_str(&published_json, &config)?;
+resolved.validate_id(&config)?;
+```
+
+### Interface
+
+| API | Purpose |
+|-----|---------|
+| `DidMethodConfig::new(method)` | Configure the accepted method; errors on an invalid method name |
+| `DidMethodConfig::default()` | The `stellar` method |
+| `validate_did_id(id, config)` | Standalone DID Core + method check, returning `ValidatedDidId` |
+| `DidDocument::try_new(id, config)` | Create a document only when its id passes validation |
+| `DidDocument::validate_id(config)` | Check an existing (e.g. stored) document before returning it |
+| `DidDocument::from_json_str(json, config)` | Parse and validate a resolver/storage response |
+
+Failures are reported as `DidError::InvalidDid`, `DidError::MethodMismatch`,
+`DidError::InvalidMethodName` and `DidError::InvalidDocument`. Every error
+includes the rejected value or an actionable reason; validation never rewrites
+the identifier, and no partial document is produced on failure.
+
+### Configuration and rules
+
+A `DidMethodConfig` is the only source of the accepted method — there is no
+environment-variable fallback, so a wrong method fails at construction instead
+of silently accepting documents from another method. Validation follows the
+DID Core 1.0 ABNF: `did:<method-name>:<method-specific-id>`, where the method is
+lowercase letters and digits and the method-specific id uses letters, digits,
+`.`, `-`, `_`, `:` separators and percent-encoded characters. DID URL
+components (`#`, `?`, `/`) and empty id segments are rejected. Service endpoint
+schemes are still re-checked when a document is parsed from JSON.
+
+### Compatibility
+
+`DidDocument::new`, direct struct construction and plain `serde` deserialization
+are unchanged and remain unvalidated, so existing callers do not break; new
+callers should use `try_new` / `from_json_str` for untrusted input. The
+`stellar_did::service::DidError` re-export remains available alongside
+`stellar_did::DidError`. Resolver responses are stable: the same invalid stored
+document is rejected with the same error on every call, rather than being
+returned once and rejected later.
+
 ## Architecture
 
 ### Core Components
