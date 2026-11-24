@@ -105,6 +105,8 @@ pub struct ChannelMonitor {
     network_passphrase: String,
     /// Cached channel states
     cache: std::sync::Arc<parking_lot::RwLock<HashMap<String, ChannelUpdate>>>,
+    /// Simulated per-channel network failures, keyed by channel id.
+    injected_failures: std::sync::Arc<parking_lot::RwLock<HashMap<String, String>>>,
 }
 
 impl ChannelMonitor {
@@ -114,7 +116,23 @@ impl ChannelMonitor {
             rpc_url,
             network_passphrase,
             cache: std::sync::Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            injected_failures: std::sync::Arc::new(parking_lot::RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Inject a simulated failure for exactly one channel.
+    ///
+    /// The next [`Self::check_channel`] call for that channel returns the
+    /// supplied error; other channels are unaffected until they are injected.
+    pub fn inject_failure(&self, channel_id: &str, error: MonitorError) {
+        self.injected_failures
+            .write()
+            .insert(channel_id.to_string(), error.to_string());
+    }
+
+    /// Remove a previously injected failure so a retry can succeed.
+    pub fn clear_injected_failure(&self, channel_id: &str) -> bool {
+        self.injected_failures.write().remove(channel_id).is_some()
     }
 
     /// Check a channel for updates
@@ -127,6 +145,10 @@ impl ChannelMonitor {
         // For now, we simulate the check
 
         debug!("Checking channel: {}", channel_id);
+
+        if let Some(error) = self.injected_failures.read().get(channel_id).cloned() {
+            return Err(MonitorError::NetworkError(error));
+        }
 
         // Check cache first
         {
