@@ -10,10 +10,14 @@
 //! - HTLC timeout monitoring and refund triggering
 //! - Automated justice transaction submission
 //! - Alert notification system
+//! - Per-channel failure reporting that isolates one channel's failure from the rest
 
+pub mod failure_report;
 pub mod justice;
 pub mod monitor;
 pub mod storage;
+
+pub use failure_report::{ChannelFailureRegistry, ChannelFailureReport, MAX_FAILURE_REASON_LEN};
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -106,6 +110,17 @@ pub enum AlertType {
     UnexpectedClose { channel_id: String, reason: String },
     /// Watchtower health check failed
     HealthCheckFailed { component: String, error: String },
+    /// A single channel's monitoring scan failed (issue #374)
+    ChannelMonitorFailed {
+        channel_id: String,
+        error: String,
+        consecutive_failures: u32,
+    },
+    /// A channel that had been failing has been monitored successfully again
+    ChannelMonitorRecovered {
+        channel_id: String,
+        after_failures: u32,
+    },
 }
 
 /// Alert message
@@ -176,6 +191,44 @@ impl Alert {
         }
     }
 
+    /// Create an alert for one channel's failed monitor scan.
+    pub fn channel_monitor_failed(report: &ChannelFailureReport) -> Self {
+        let severity = if report.consecutive_failures >= 3 {
+            AlertSeverity::Critical
+        } else {
+            AlertSeverity::Warning
+        };
+        Alert {
+            id: uuid_v4(),
+            alert_type: AlertType::ChannelMonitorFailed {
+                channel_id: report.channel_id.clone(),
+                error: report.error.clone(),
+                consecutive_failures: report.consecutive_failures,
+            },
+            severity,
+            timestamp: current_timestamp(),
+            context: serde_json::json!({
+                "channel_id": report.channel_id,
+                "consecutive_failures": report.consecutive_failures,
+                "message": report.message(),
+            }),
+        }
+    }
+
+    /// Create an alert for a channel that recovered after failing.
+    pub fn channel_monitor_recovered(report: &ChannelFailureReport) -> Self {
+        Alert {
+            id: uuid_v4(),
+            alert_type: AlertType::ChannelMonitorRecovered {
+                channel_id: report.channel_id.clone(),
+                after_failures: report.consecutive_failures,
+            },
+            severity: AlertSeverity::Info,
+            timestamp: current_timestamp(),
+            context: serde_json::json!({ "channel_id": report.channel_id }),
+        }
+    }
+
     /// Get the message body for this alert
     pub fn message(&self) -> String {
         match &self.alert_type {
@@ -208,6 +261,21 @@ impl Alert {
             }
             AlertType::HealthCheckFailed { component, error } => {
                 format!("Health check failed for {component}: {error}")
+            }
+            AlertType::ChannelMonitorFailed {
+                channel_id,
+                error,
+                consecutive_failures,
+            } => {
+                format!(
+                    "Monitoring failed for channel {channel_id} ({consecutive_failures} consecutive): {error}. Retry with Watchtower::retry_channel."
+                )
+            }
+            AlertType::ChannelMonitorRecovered {
+                channel_id,
+                after_failures,
+            } => {
+                format!("Channel {channel_id} recovered after {after_failures} failed scan(s)")
             }
         }
     }
@@ -271,6 +339,8 @@ pub struct Watchtower {
     justice: justice::JusticeService,
     /// Persistent storage for subscriptions, channel state and alerts
     storage: Arc<dyn storage::StorageBackend>,
+    /// Per-channel monitoring failure reports (issue #374)
+    failures: Arc<RwLock<failure_report::ChannelFailureRegistry>>,
 }
 
 impl Watchtower {
@@ -309,6 +379,9 @@ impl Watchtower {
             monitor,
             justice,
             storage,
+            failures: Arc::new(RwLock::new(
+                failure_report::ChannelFailureRegistry::default(),
+            )),
         })
     }
 
@@ -319,11 +392,14 @@ impl Watchtower {
 
         info!("Watchtower service started");
 
-        // Start the monitoring loop
+        // Start the monitoring loop. Each channel is scanned independently:
+        // a failure is recorded for that channel only and never breaks the
+        // loop or prevents the remaining channels from being checked.
         let state = Arc::clone(&self.state);
         let config = self.config.clone();
         let monitor = self.monitor.clone();
         let justice = self.justice.clone();
+        let failures = Arc::clone(&self.failures);
 
         tokio::spawn(async move {
             loop {
@@ -336,44 +412,39 @@ impl Watchtower {
                     state.subscribed_channels.read().iter().cloned().collect();
 
                 for channel_id in channels {
-                    match monitor.check_channel(&channel_id).await {
-                        Ok(Some(update)) => {
-                            // Check for breach attempt
-                            if let Some(breach) = monitor.detect_breach(&channel_id, &update) {
-                                warn!("Breach attempt detected on channel {}", channel_id);
+                    let outcome =
+                        Self::scan_channel(&state, &monitor, &config, &justice, &channel_id).await;
 
-                                // Generate alert
-                                let alert = Alert::breach_attempt(
-                                    channel_id.clone(),
-                                    breach.old_sequence,
-                                    breach.new_sequence,
-                                );
-                                state.add_alert(alert);
-
-                                // Submit justice if enabled
-                                if config.auto_justice {
-                                    if let Err(e) = justice.submit_justice(&breach).await {
-                                        error!("Failed to submit justice: {:?}", e);
-                                    } else {
-                                        // submit_justice persists before submitting;
-                                        // bump the persisted counter on success (issue #368).
-                                        let mut stats = state.stats.write();
-                                        stats.justice_actions_persisted += 1;
-                                    }
+                    match outcome {
+                        Ok(()) => {
+                            let now = current_timestamp();
+                            if let Some(recovered) =
+                                failures.write().record_success(&channel_id, now)
+                            {
+                                let alert = Alert::channel_monitor_recovered(&recovered);
+                                state.add_alert(alert.clone());
+                                // Best effort: a storage error must never stop the
+                                // loop or roll back the in-memory recovery.
+                                if let Err(e) = state.storage().store_alert(&alert) {
+                                    error!("Failed to persist recovery alert: {:?}", e);
                                 }
                             }
-
-                            // Update stored state, mirroring it to storage so it
-                            // survives a restart and can be compacted.
-                            state.update_channel_state(&channel_id, update);
-                        }
-                        Ok(None) => {
-                            // Channel closed or not found
-                            info!("Channel {} no longer exists", channel_id);
-                            state.remove_channel(&channel_id);
                         }
                         Err(e) => {
-                            error!("Error checking channel {}: {:?}", channel_id, e);
+                            let detail = e.to_string();
+                            let now = current_timestamp();
+                            let report = failures.write().record_failure(&channel_id, &detail, now);
+                            match report {
+                                Ok(report) => {
+                                    error!("{}", report.message());
+                                    let alert = Alert::channel_monitor_failed(&report);
+                                    state.add_alert(alert.clone());
+                                    if let Err(e) = state.storage().store_alert(&alert) {
+                                        error!("Failed to persist failure alert: {:?}", e);
+                                    }
+                                }
+                                Err(e) => error!("Could not report channel failure: {:?}", e),
+                            }
                         }
                     }
                 }
@@ -398,6 +469,62 @@ impl Watchtower {
             }
         });
 
+        Ok(())
+    }
+
+    /// Scan one channel. All state changes complete before an error is returned
+    /// so a failed scan can be reported without leaving a half-applied update.
+    async fn scan_channel(
+        state: &Arc<WatchtowerState>,
+        monitor: &monitor::ChannelMonitor,
+        config: &WatchtowerConfig,
+        justice: &justice::JusticeService,
+        channel_id: &str,
+    ) -> Result<(), WatchtowerError> {
+        let update = match monitor.check_channel(channel_id).await {
+            Ok(Some(update)) => update,
+            Ok(None) => {
+                info!("Channel {} no longer exists", channel_id);
+                state.remove_channel(channel_id);
+                return Ok(());
+            }
+            Err(e) => return Err(WatchtowerError::from(e)),
+        };
+
+        let mut failure = None;
+        if let Some(breach) = monitor.detect_breach(channel_id, &update) {
+            warn!("Breach attempt detected on channel {}", channel_id);
+
+            let alert = Alert::breach_attempt(
+                channel_id.to_string(),
+                breach.old_sequence,
+                breach.new_sequence,
+            );
+            state.add_alert(alert);
+
+            if config.auto_justice {
+                match justice.submit_justice(&breach).await {
+                    Ok(_) => {
+                        // submit_justice persists before submitting;
+                        // bump the persisted counter on success (issue #368).
+                        let mut stats = state.stats.write();
+                        stats.justice_actions_persisted += 1;
+                    }
+                    Err(e) => {
+                        // Evidence validation and persistence happen inside
+                        // submit_justice; a rejected breach must not interrupt
+                        // this channel's state update or any other channel.
+                        error!("Failed to submit justice: {:?}", e);
+                        failure = Some(WatchtowerError::from(e));
+                    }
+                }
+            }
+        }
+
+        state.update_channel_state(channel_id, update);
+        if let Some(e) = failure {
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -475,9 +602,7 @@ impl Watchtower {
     /// An operator calls this after a process restart or network outage to find
     /// breach responses that were persisted but not yet submitted, then passes
     /// the results to [`Self::retry_pending_justice`] to replay them.
-    pub fn pending_justice_actions(
-        &self,
-    ) -> Result<Vec<justice::JusticeAction>, WatchtowerError> {
+    pub fn pending_justice_actions(&self) -> Result<Vec<justice::JusticeAction>, WatchtowerError> {
         self.storage
             .get_pending_justice_actions()
             .map_err(|e| WatchtowerError::StorageError(e.to_string()))
@@ -529,6 +654,106 @@ impl Watchtower {
     /// The storage backend backing this watchtower.
     pub fn storage(&self) -> &Arc<dyn storage::StorageBackend> {
         &self.storage
+    }
+
+    /// The channel monitor. Exposed so embedders and simulation tests can
+    /// inject a failure for one channel without affecting any other.
+    pub fn monitor(&self) -> &monitor::ChannelMonitor {
+        &self.monitor
+    }
+
+    /// Explicitly report a failed scan for a subscribed channel (issue #374).
+    ///
+    /// The alert is persisted before the in-memory registry is changed, so a
+    /// storage failure returns an error and leaves no partial update.
+    pub fn report_channel_failure(
+        &self,
+        channel_id: String,
+        reason: String,
+    ) -> Result<ChannelFailureReport, WatchtowerError> {
+        failure_report::ChannelFailureRegistry::validate_channel_id(&channel_id)?;
+        failure_report::ChannelFailureRegistry::validate_reason(&reason)?;
+        if !self.state.subscribed_channels.read().contains(&channel_id) {
+            return Err(WatchtowerError::InvalidChannel(format!(
+                "channel {channel_id} is not subscribed"
+            )));
+        }
+
+        let now = current_timestamp();
+        let preview = self
+            .failures
+            .read()
+            .preview_failure(&channel_id, &reason, now)?;
+        let alert = Alert::channel_monitor_failed(&preview);
+        self.storage.store_alert(&alert)?;
+        self.state.add_alert(alert);
+        self.failures
+            .write()
+            .record_failure(&channel_id, &reason, now)
+    }
+
+    /// Latest failure report for a channel, including recovered incidents.
+    pub fn channel_failure_report(&self, channel_id: &str) -> Option<ChannelFailureReport> {
+        self.failures.read().get(channel_id)
+    }
+
+    /// All failure reports, sorted by channel id.
+    pub fn channel_failure_reports(&self) -> Vec<ChannelFailureReport> {
+        self.failures.read().all()
+    }
+
+    /// Reports for channels that are still failing.
+    pub fn active_channel_failure_reports(&self) -> Vec<ChannelFailureReport> {
+        self.failures.read().active()
+    }
+
+    /// Total consecutive failures across all current incidents.
+    pub fn total_monitor_failures(&self) -> u64 {
+        self.failures.read().total_failures()
+    }
+
+    /// Forget a channel's failure report (operator recovery). Returns whether
+    /// a report existed. This never touches justice actions or subscriptions.
+    pub fn clear_channel_failure(&self, channel_id: &str) -> Result<bool, WatchtowerError> {
+        failure_report::ChannelFailureRegistry::validate_channel_id(channel_id)?;
+        Ok(self.failures.write().clear(channel_id))
+    }
+
+    /// Re-check one failing channel and mark it recovered on success.
+    ///
+    /// Returns `Some(report)` when an active failure was cleared, or `None`
+    /// when the channel had no active failure. A failed retry increments that
+    /// channel's consecutive failures and returns an actionable error; it does
+    /// not change any other channel's state or any persisted justice action.
+    pub async fn retry_channel(
+        &self,
+        channel_id: &str,
+    ) -> Result<Option<ChannelFailureReport>, WatchtowerError> {
+        failure_report::ChannelFailureRegistry::validate_channel_id(channel_id)?;
+        if !self.state.subscribed_channels.read().contains(channel_id) {
+            return Err(WatchtowerError::InvalidChannel(format!(
+                "channel {channel_id} is not subscribed"
+            )));
+        }
+
+        match self.monitor.check_channel(channel_id).await {
+            Ok(_) => Ok(self
+                .failures
+                .write()
+                .record_success(channel_id, current_timestamp())),
+            Err(e) => {
+                let reason = format!("retry failed for channel {channel_id}: {e}");
+                let now = current_timestamp();
+                let report = self
+                    .failures
+                    .write()
+                    .record_failure(channel_id, &reason, now)?;
+                let alert = Alert::channel_monitor_failed(&report);
+                self.state.add_alert(alert.clone());
+                let _ = self.storage.store_alert(&alert);
+                Err(WatchtowerError::NetworkError(report.message()))
+            }
+        }
     }
 }
 
@@ -626,6 +851,9 @@ pub enum WatchtowerError {
 
     #[error("Invalid channel: {0}")]
     InvalidChannel(String),
+
+    #[error("Invalid failure report: {0}")]
+    InvalidFailureReason(String),
 
     #[error("Justice transaction failed: {0}")]
     JusticeFailed(String),
@@ -808,5 +1036,108 @@ mod tests {
             .unwrap()
             .expect("state should be persisted");
         assert_eq!(state.last_known_sequence, 4);
+    }
+
+    fn watchtower_with_channels() -> Watchtower {
+        let watchtower = Watchtower::new(WatchtowerConfig::default()).unwrap();
+        watchtower.subscribe("alpha".to_string()).unwrap();
+        watchtower.subscribe("beta".to_string()).unwrap();
+        watchtower
+    }
+
+    #[test]
+    fn failure_reports_are_scoped_to_one_channel() {
+        let watchtower = watchtower_with_channels();
+        watchtower
+            .report_channel_failure("alpha".to_string(), "rpc timeout".to_string())
+            .unwrap();
+        watchtower
+            .report_channel_failure("alpha".to_string(), "rpc timeout".to_string())
+            .unwrap();
+
+        assert_eq!(
+            watchtower
+                .channel_failure_report("alpha")
+                .unwrap()
+                .consecutive_failures,
+            2
+        );
+        assert!(watchtower.channel_failure_report("beta").is_none());
+        assert_eq!(watchtower.active_channel_failure_reports().len(), 1);
+        assert_eq!(watchtower.total_monitor_failures(), 2);
+        assert_eq!(watchtower.channel_failure_reports().len(), 1);
+
+        let alerts = watchtower.get_alerts(10);
+        assert!(alerts.iter().all(|alert| alert.message().contains("alpha")));
+        assert!(watchtower.storage().get_alerts(10).unwrap().len() >= 2);
+    }
+
+    #[test]
+    fn invalid_failure_reports_change_no_state() {
+        let watchtower = watchtower_with_channels();
+        assert!(matches!(
+            watchtower.report_channel_failure(" ".to_string(), "boom".to_string()),
+            Err(WatchtowerError::InvalidChannel(_))
+        ));
+        assert!(matches!(
+            watchtower.report_channel_failure("alpha".to_string(), "".to_string()),
+            Err(WatchtowerError::InvalidFailureReason(_))
+        ));
+        assert!(matches!(
+            watchtower.report_channel_failure("unknown".to_string(), "boom".to_string()),
+            Err(WatchtowerError::InvalidChannel(_))
+        ));
+        assert_eq!(watchtower.total_monitor_failures(), 0);
+        assert!(watchtower.channel_failure_reports().is_empty());
+        assert!(watchtower.get_alerts(10).is_empty());
+    }
+
+    #[test]
+    fn failure_alert_escalates_and_carries_a_retry_hint() {
+        let mut registry = ChannelFailureRegistry::default();
+        let report = registry.record_failure("alpha", "rpc timeout", 10).unwrap();
+        let low = Alert::channel_monitor_failed(&report);
+        assert_eq!(low.severity, AlertSeverity::Warning);
+        assert!(low.message().contains("retry_channel"));
+
+        registry.record_failure("alpha", "rpc timeout", 20).unwrap();
+        let report = registry.record_failure("alpha", "rpc timeout", 30).unwrap();
+        let high = Alert::channel_monitor_failed(&report);
+        assert_eq!(high.severity, AlertSeverity::Critical);
+    }
+
+    #[test]
+    fn clearing_a_failure_affects_only_the_named_channel() {
+        let watchtower = watchtower_with_channels();
+        watchtower
+            .report_channel_failure("alpha".to_string(), "boom".to_string())
+            .unwrap();
+        watchtower
+            .report_channel_failure("beta".to_string(), "boom".to_string())
+            .unwrap();
+
+        assert!(watchtower.clear_channel_failure("alpha").unwrap());
+        assert!(!watchtower.clear_channel_failure("alpha").unwrap());
+        assert!(watchtower.channel_failure_report("alpha").is_none());
+        assert!(watchtower.channel_failure_report("beta").is_some());
+        assert!(matches!(
+            watchtower.clear_channel_failure(" "),
+            Err(WatchtowerError::InvalidChannel(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn injected_monitor_failure_is_isolated_to_one_channel() {
+        let watchtower = watchtower_with_channels();
+        watchtower.monitor().inject_failure(
+            "alpha",
+            monitor::MonitorError::NetworkError("boom".to_string()),
+        );
+
+        assert!(watchtower.monitor().check_channel("alpha").await.is_err());
+        assert!(watchtower.monitor().check_channel("beta").await.is_ok());
+
+        assert!(watchtower.monitor().clear_injected_failure("alpha"));
+        assert!(watchtower.monitor().check_channel("alpha").await.is_ok());
     }
 }

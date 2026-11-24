@@ -169,8 +169,7 @@ pub struct InMemoryStorage {
     alerts: parking_lot::RwLock<Vec<Alert>>,
     subscriptions: parking_lot::RwLock<Vec<String>>,
     /// Justice action records, keyed by action ID (issue #368).
-    justice_actions:
-        parking_lot::RwLock<HashMap<String, crate::justice::JusticeAction>>,
+    justice_actions: parking_lot::RwLock<HashMap<String, crate::justice::JusticeAction>>,
 }
 
 impl InMemoryStorage {
