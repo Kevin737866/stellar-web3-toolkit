@@ -88,6 +88,34 @@ pub enum ChannelStatus {
     Dispute,
 }
 
+/// Why a channel closed, and by which lifecycle path (#350).
+///
+/// Every open channel carries [`CloseReason::NotClosed`]. The reason is written
+/// once, by the operation that closes the channel, and is restored along with
+/// the rest of the state when a reorg rolls a close back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CloseReason {
+    /// The channel is still open.
+    NotClosed,
+    /// Both participants closed the channel cooperatively.
+    Cooperative,
+    /// The channel settled on a state both participants had signed.
+    SignedSettlement,
+    /// A participant force-closed the channel unilaterally.
+    Unilateral,
+}
+
+impl std::fmt::Display for CloseReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CloseReason::NotClosed => write!(f, "NotClosed"),
+            CloseReason::Cooperative => write!(f, "Cooperative"),
+            CloseReason::SignedSettlement => write!(f, "SignedSettlement"),
+            CloseReason::Unilateral => write!(f, "Unilateral"),
+        }
+    }
+}
+
 /// Local channel state for a participant
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LocalChannelState {
@@ -103,6 +131,8 @@ pub struct LocalChannelState {
     pub their_balance: i128,
     /// Channel status
     pub status: ChannelStatus,
+    /// Why the channel closed (#350); [`CloseReason::NotClosed`] while open
+    pub close_reason: CloseReason,
     /// Current sequence number
     pub sequence_number: u32,
     /// Funding transaction hash
@@ -276,6 +306,7 @@ impl ChannelManager {
             our_balance: our_initial_balance,
             their_balance: their_initial_balance,
             status: ChannelStatus::Open,
+            close_reason: CloseReason::NotClosed,
             sequence_number: 0,
             funding_tx_hash: None,
             closing_tx_hash: None,
@@ -376,20 +407,6 @@ impl ChannelManager {
         record_state(channel_id, channel, ledger_height)?;
 
         Ok(channel.state.clone())
-    }
-
-    /// Set or update the remote participant's public key for authorization verification.
-    pub fn set_remote_public_key(
-        &self,
-        channel_id: &str,
-        remote_public_key: Vec<u8>,
-    ) -> Result<(), PaymentChannelError> {
-        let mut channels = self.channels.write();
-        let channel = channels
-            .get_mut(channel_id)
-            .ok_or_else(|| PaymentChannelError::ChannelNotFound(channel_id.to_string()))?;
-        channel.state.remote_public_key = remote_public_key;
-        Ok(())
     }
 
     /// Sign the channel's current state update for exchange with the counterparty.
@@ -637,6 +654,18 @@ impl ChannelManager {
             .map(|channel| channel.history.heights())
     }
 
+    /// Why a channel closed, or [`CloseReason::NotClosed`] while it is open.
+    ///
+    /// Returns [`PaymentChannelError::ChannelNotFound`] for an unknown channel
+    /// id, so "still open" and "no such channel" are never conflated (#350).
+    pub fn close_reason(&self, channel_id: &str) -> Result<CloseReason, PaymentChannelError> {
+        self.channels
+            .read()
+            .get(channel_id)
+            .map(|channel| channel.state.close_reason)
+            .ok_or_else(|| PaymentChannelError::ChannelNotFound(channel_id.to_string()))
+    }
+
     /// Get a channel by ID
     pub fn get_channel(&self, channel_id: &str) -> Option<LocalChannelState> {
         self.channels
@@ -669,6 +698,10 @@ impl ChannelManager {
     ///
     /// A channel that is not open and not already closing cooperatively (a
     /// force close, a dispute) is refused with [`PaymentChannelError::InvalidState`].
+    ///
+    /// The first successful close records [`CloseReason::Cooperative`] (#350),
+    /// readable through [`ChannelManager::close_reason`]. A retry returns the
+    /// state the first call produced, reason included, unchanged.
     pub fn cooperative_close(
         &self,
         channel_id: &str,
@@ -719,12 +752,17 @@ impl ChannelManager {
         let ledger_height = ledger_height.unwrap_or_else(|| self.next_ledger_height());
         check_height(channel_id, &channel.history, ledger_height)?;
         channel.state.status = ChannelStatus::Closing;
+        channel.state.close_reason = CloseReason::Cooperative;
         record_state(channel_id, channel, ledger_height)?;
 
         Ok(channel.state.clone())
     }
 
     /// Initiate a unilateral close
+    ///
+    /// On success the channel moves to [`ChannelStatus::ForceClosed`] and
+    /// records [`CloseReason::Unilateral`] (#350). A rejected close leaves the
+    /// channel untouched.
     pub fn initiate_unilateral_close(
         &self,
         channel_id: &str,
@@ -737,6 +775,7 @@ impl ChannelManager {
         let ledger_height = self.next_ledger_height();
         check_height(channel_id, &state.history, ledger_height)?;
         state.state.status = ChannelStatus::ForceClosed;
+        state.state.close_reason = CloseReason::Unilateral;
         record_state(channel_id, state, ledger_height)?;
 
         Ok(state.state.clone())
@@ -789,9 +828,10 @@ impl ChannelManager {
     ///
     /// On success the balances are applied, the channel's sequence number is
     /// advanced to the signed one (gaps are allowed: a party may have missed
-    /// intermediate updates) and the channel moves to
-    /// [`ChannelStatus::Closing`], because a settled split is a terminal state
-    /// that is waiting on the on-chain confirmation.
+    /// intermediate updates), the channel moves to [`ChannelStatus::Closing`]
+    /// because a settled split is a terminal state that is waiting on the
+    /// on-chain confirmation, and [`CloseReason::SignedSettlement`] is recorded
+    /// (#350).
     pub fn settle_signed_state(
         &self,
         signed: &SignedChannelState,
@@ -858,6 +898,7 @@ impl ChannelManager {
         channel.state.their_balance = signed.balance_b;
         channel.state.sequence_number = signed.sequence_number;
         channel.state.status = ChannelStatus::Closing;
+        channel.state.close_reason = CloseReason::SignedSettlement;
 
         record_state(&signed.channel_id, channel, ledger_height)?;
 
@@ -1745,5 +1786,122 @@ mod tests {
         assert_eq!(bob_state.our_balance, 1150);
         assert_eq!(bob_state.their_balance, 850);
         assert_eq!(alice_state.sequence_number, bob_state.sequence_number);
+    }
+
+    #[tokio::test]
+    async fn an_open_channel_reports_not_closed() {
+        let (manager, channel_id) = manager_with_channel(8).await;
+
+        assert_eq!(
+            manager.close_reason(&channel_id).unwrap(),
+            CloseReason::NotClosed
+        );
+        assert_eq!(
+            manager.get_channel(&channel_id).unwrap().close_reason,
+            CloseReason::NotClosed
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_channel_has_no_close_reason() {
+        let (manager, _) = manager_with_channel(8).await;
+
+        assert!(matches!(
+            manager.close_reason("missing"),
+            Err(PaymentChannelError::ChannelNotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_cooperative_close_records_its_reason_and_keeps_it_on_retry() {
+        let (manager, channel_id) = manager_with_channel(8).await;
+
+        manager.cooperative_close(&channel_id).unwrap();
+        assert_eq!(
+            manager.close_reason(&channel_id).unwrap(),
+            CloseReason::Cooperative
+        );
+
+        manager.cooperative_close(&channel_id).unwrap();
+        assert_eq!(
+            manager.close_reason(&channel_id).unwrap(),
+            CloseReason::Cooperative,
+            "a retry must not rewrite the recorded reason"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_signed_settlement_records_its_reason() {
+        let (manager, channel_id) = manager_ready_to_settle().await;
+        let state = signed(&channel_id, 2, 1_100, 900);
+
+        manager
+            .settle_signed_state(&state, &state.digest(), 10)
+            .unwrap();
+
+        assert_eq!(
+            manager.close_reason(&channel_id).unwrap(),
+            CloseReason::SignedSettlement
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_close_does_not_record_a_reason() {
+        let (manager, channel_id) = manager_ready_to_settle().await;
+
+        // A stale settlement is refused after authentication.
+        let stale = signed(&channel_id, 0, 1_500, 500);
+        assert!(manager
+            .settle_signed_state(&stale, &stale.digest(), 10)
+            .is_err());
+        assert_eq!(
+            manager.close_reason(&channel_id).unwrap(),
+            CloseReason::NotClosed
+        );
+    }
+
+    #[tokio::test]
+    async fn a_unilateral_close_records_its_reason() {
+        let (manager, channel_id) = manager_with_channel(8).await;
+
+        manager.initiate_unilateral_close(&channel_id).unwrap();
+
+        assert_eq!(
+            manager.close_reason(&channel_id).unwrap(),
+            CloseReason::Unilateral
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_cooperative_close_keeps_the_unilateral_reason() {
+        let (manager, channel_id) = manager_with_channel(8).await;
+
+        manager.initiate_unilateral_close(&channel_id).unwrap();
+        assert!(manager.cooperative_close(&channel_id).is_err());
+
+        assert_eq!(
+            manager.close_reason(&channel_id).unwrap(),
+            CloseReason::Unilateral,
+            "a refused close must not overwrite the reason"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reorg_below_a_close_restores_the_open_reason() {
+        let (manager, channel_id) = manager_with_channel(8).await;
+
+        manager.cooperative_close_at(&channel_id, 10).unwrap();
+        assert_eq!(
+            manager.close_reason(&channel_id).unwrap(),
+            CloseReason::Cooperative
+        );
+
+        manager.handle_reorg(0);
+
+        assert_eq!(
+            manager.close_reason(&channel_id).unwrap(),
+            CloseReason::NotClosed,
+            "the rollback must restore the pre-close reason"
+        );
     }
 }
