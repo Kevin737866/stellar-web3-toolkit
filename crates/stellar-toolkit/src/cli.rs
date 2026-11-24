@@ -473,6 +473,15 @@ pub enum SessionCommand {
         #[arg(long)]
         session_public_key: String,
     },
+    /// Display active session-key scopes and expiry timestamps for an account
+    List {
+        /// Account address (G...) whose active session keys should be displayed
+        #[arg(long)]
+        account: String,
+        /// Emit machine-readable JSON instead of human-readable text
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -709,6 +718,26 @@ fn run_session(cmd: &SessionCommand) -> Result<()> {
                 "Session key with public key `{session_public_key}` revoked \
                  for account `{account}`."
             );
+            Ok(())
+        }
+        SessionCommand::List { account, json } => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let summaries = manager
+                .active_session_summaries(account, now)
+                .map_err(|e| ToolkitError::Session(e.to_string()))?;
+            if *json {
+                let rendered = serde_json::to_string_pretty(&summaries)
+                    .map_err(|e| ToolkitError::ExecutionError(e.to_string()))?;
+                println!("{rendered}");
+            } else {
+                println!(
+                    "{}",
+                    crate::session_keys::format_active_session_summaries(account, &summaries)
+                );
+            }
             Ok(())
         }
     }
