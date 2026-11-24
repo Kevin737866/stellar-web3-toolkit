@@ -1,0 +1,39 @@
+# Testnet deployment spec — stellar-toolkit deploy validate-offline
+#
+# Validate offline (no network required):
+#
+#   stellar-toolkit deploy validate-offline deploy/testnet.toml
+#   stellar-toolkit deploy validate-offline deploy/testnet.toml --json
+#
+# The `name` field must match this file's stem (`testnet`).  The validator
+# enforces that so `--spec prod.toml` cannot silently pick up testnet settings.
+
+name = "testnet"
+admin_account = "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN"
+
+[network]
+# Must be one of: dev, test, prod.
+# This links the spec to config/test.toml at submission time.
+environment = "test"
+
+[submit]
+# Base fee in stroops (integer, no decimals).
+fee = "1000"
+# Seconds the signed envelope stays valid.
+timeout_seconds = 60
+# Ledger closures to wait for confirmation.
+confirmations = 2
+# dry_run = true  →  build and validate the transaction but do not submit it.
+dry_run = false
+
+[contracts.amm_pool]
+wasm_path = "target/wasm32v1-none/release/amm_pool.wasm"
+# contract_id is optional on testnet; set it for upgrades to avoid a new deploy.
+# contract_id = "CABC..."
+# admin_account = "GABC..."  # overrides the top-level admin for this contract only
+
+[contracts.amm_factory]
+wasm_path = "target/wasm32v1-none/release/amm_factory.wasm"
+
+[contracts.amm_router]
+wasm_path = "target/wasm32v1-none/release/amm_router.wasm"

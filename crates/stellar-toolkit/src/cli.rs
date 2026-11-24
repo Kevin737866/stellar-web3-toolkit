@@ -79,6 +79,9 @@ pub enum ToolkitCommand {
     /// Session key management: revoke individual session keys (issue #334)
     #[command(subcommand)]
     Session(SessionCommand),
+    /// Offline validation of deployment configuration specs (issue #327)
+    #[command(subcommand)]
+    Deploy(DeployCommand),
     /// Print the command overview wrapped to the terminal width
     Help {
         /// Wrap width in columns (defaults to $COLUMNS, otherwise 100)
@@ -498,6 +501,33 @@ pub enum WalletCommand {
     },
 }
 
+/// Offline deployment configuration commands (issue #327).
+///
+/// These commands validate a `deploy/<spec>.toml` file without touching the
+/// network. The spec format is documented in
+/// [`crate::deploy_config::DeploymentSpec`].
+#[derive(Subcommand, Debug)]
+pub enum DeployCommand {
+    /// Validate a deployment spec offline and report all issues
+    ///
+    /// Exits non-zero when any error-severity finding is present. Warnings are
+    /// printed but do not affect the exit code.
+    ValidateOffline {
+        /// Path to the deployment spec TOML file
+        spec: PathBuf,
+        /// Directory to resolve relative `wasm_path` values from
+        /// (defaults to the workspace root)
+        #[arg(long, default_value = ".")]
+        workspace: PathBuf,
+        /// Print the report as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        /// Do not exit non-zero on warnings
+        #[arg(long, default_value_t = false)]
+        warn_only: bool,
+    },
+}
+
 /// Redacting `Debug` (issue #115).
 ///
 /// `main` logs the parsed command at info level, so a derived `Debug` here
@@ -559,6 +589,7 @@ impl ToolkitCommand {
             Self::Verify(cmd) => run_verify(cmd),
             Self::Onboarding(cmd) => run_onboarding(cmd),
             Self::Session(cmd) => run_session(cmd),
+            Self::Deploy(cmd) => run_deploy(cmd),
             Self::Help { width } => {
                 let resolved = if *width == 0 {
                     help_text::help_width()
@@ -1577,6 +1608,61 @@ fn run_verify(cmd: &VerifyCommand) -> Result<()> {
                 return Err(ToolkitError::ExecutionError(format!(
                     "{} invariant(s) violated under seed {seed}",
                     report.failed()
+                )));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Dispatch for offline deployment configuration validation (issue #327).
+fn run_deploy(cmd: &DeployCommand) -> Result<()> {
+    use crate::deploy_config::{DeploymentSpec, DeploymentValidator};
+
+    match cmd {
+        DeployCommand::ValidateOffline {
+            spec,
+            workspace,
+            json,
+            warn_only,
+        } => {
+            let spec_path = resolve_path(&cwd_root(), spec);
+            let parsed = DeploymentSpec::load(&spec_path)?;
+
+            // Filename stem must match the declared name so `--spec prod.toml`
+            // cannot accidentally pick up dev settings.
+            let stem = spec_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            let mut findings = Vec::new();
+            if stem != parsed.name() {
+                findings.push(crate::deploy_config::Finding {
+                    severity: crate::deploy_config::Severity::Error,
+                    field: "name".to_string(),
+                    message: format!(
+                        "file `{stem}.toml` declares name `{}`; they must match",
+                        parsed.name()
+                    ),
+                });
+            }
+
+            let root = normalize_workspace_root(workspace);
+            let validator = DeploymentValidator::new(&root);
+            let mut report = validator.validate(&parsed);
+            report.findings.splice(0..0, findings);
+
+            if *json {
+                println!("{}", report.to_json());
+            } else {
+                print!("{}", report.render(parsed.name()));
+            }
+
+            if !report.passed() && !*warn_only {
+                return Err(ToolkitError::ExecutionError(format!(
+                    "{} deployment config error(s) in {}",
+                    report.errors(),
+                    spec_path.display()
                 )));
             }
             Ok(())
