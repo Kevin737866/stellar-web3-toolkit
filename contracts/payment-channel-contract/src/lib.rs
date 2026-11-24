@@ -18,6 +18,23 @@ use soroban_sdk::{
 };
 use types::{ChannelState, HTLCInfo, HtlcList};
 
+/// Shortest dispute period the contract accepts for a force-close request,
+/// in seconds.
+///
+/// A period below this value leaves the non-initiating party too little time
+/// to contest a fraudulent state before the initiator can withdraw.  The
+/// value (one hour) matches the minimum enforced on `timeout` during channel
+/// initialization.
+pub const MIN_DISPUTE_PERIOD_SECS: u32 = 3_600;
+
+/// Longest dispute period the contract accepts for a force-close request,
+/// in seconds.
+///
+/// An unbounded period would let the initiator lock the channel forever and
+/// is therefore a denial-of-service vector.  The value (30 days) is generous
+/// enough for any real-world dispute while remaining practically finite.
+pub const MAX_DISPUTE_PERIOD_SECS: u32 = 30 * 24 * 3_600; // 2_592_000
+
 /// Append an address's canonical strkey encoding to `out`.
 ///
 /// `soroban-sdk` 21 exposes no accessor for an `Address`'s raw 32 bytes, so the
@@ -523,6 +540,88 @@ impl PaymentChannel {
         Ok(withdraw_time)
     }
 
+    /// Initiate a force-close with an explicit, bounded dispute period.
+    ///
+    /// This entry point is an alternative to [`PaymentChannel::initiate_unilateral_close`]
+    /// for callers that want to override the channel's configured `timeout`.
+    /// The caller supplies `dispute_period_secs`, which the contract validates
+    /// against the protocol bounds before applying it:
+    ///
+    /// * `dispute_period_secs` must be **at least** [`MIN_DISPUTE_PERIOD_SECS`]
+    ///   (one hour); shorter periods leave the counterparty too little time to
+    ///   contest a fraudulent state.  Returns
+    ///   [`PaymentChannelError::DisputePeriodTooShort`] when this is violated.
+    ///
+    /// * `dispute_period_secs` must be **at most** [`MAX_DISPUTE_PERIOD_SECS`]
+    ///   (30 days); longer periods are a denial-of-service vector that can lock
+    ///   channel funds indefinitely.  Returns
+    ///   [`PaymentChannelError::DisputePeriodTooLong`] when this is violated.
+    ///
+    /// All other invariants from `initiate_unilateral_close` still apply:
+    ///
+    /// * only a channel participant may call this;
+    /// * the channel must be open (not already closing or closed);
+    /// * there must be no outstanding HTLCs.
+    ///
+    /// On success the channel's `timeout` field is updated to `dispute_period_secs`
+    /// and the close is recorded exactly as `initiate_unilateral_close` would.
+    /// The returned `u64` is the earliest timestamp at which funds may be
+    /// withdrawn (current ledger timestamp + dispute period).
+    ///
+    /// # Compatibility
+    ///
+    /// Callers that do not need to override the dispute period should continue
+    /// using [`PaymentChannel::initiate_unilateral_close`].
+    pub fn force_close(
+        env: Env,
+        channel_id: BytesN<32>,
+        initiator: Address,
+        dispute_period_secs: u32,
+    ) -> Result<u64, PaymentChannelError> {
+        // Validate the dispute period first so that invalid input is rejected
+        // before any state is read or authorization is checked.
+        if dispute_period_secs < MIN_DISPUTE_PERIOD_SECS {
+            return Err(PaymentChannelError::DisputePeriodTooShort);
+        }
+        if dispute_period_secs > MAX_DISPUTE_PERIOD_SECS {
+            return Err(PaymentChannelError::DisputePeriodTooLong);
+        }
+
+        let mut state = state::get_channel_state(&env, &channel_id)?;
+
+        if state.is_cooperative_close {
+            return Err(PaymentChannelError::ChannelAlreadyClosed);
+        }
+        if state.close_time != 0 {
+            return Err(PaymentChannelError::ChannelAlreadyClosed);
+        }
+        if initiator != state.participant_a && initiator != state.participant_b {
+            return Err(PaymentChannelError::UnauthorizedParticipant);
+        }
+
+        initiator.require_auth();
+
+        if state::has_active_htlcs(&env, &state.htlcs) {
+            return Err(PaymentChannelError::ActiveHtlcsExist);
+        }
+
+        // Apply the caller-supplied (and validated) dispute period.
+        state.timeout = dispute_period_secs;
+        state.close_time = env.ledger().timestamp();
+        state.sequence_number += 1;
+
+        state::store_channel_state(&env, &channel_id, &state);
+
+        let withdraw_time = state.close_time + dispute_period_secs as u64;
+
+        env.events().publish(
+            ("channel_force_close_initiated", channel_id),
+            (initiator.to_val(), withdraw_time),
+        );
+
+        Ok(withdraw_time)
+    }
+
     /// Contest a unilateral close with a more recent state
     pub fn contest_close(
         env: Env,
@@ -709,5 +808,124 @@ mod tests {
         assert_eq!(state.balance_a, 1_500);
         assert_eq!(state.total_balance, 2_500);
         assert_eq!(state.sequence_number, 1);
+    }
+
+    // ── force_close / bounded dispute-period tests (#353) ─────────────────
+
+    #[test]
+    fn test_force_close_minimum_period_accepted() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, p_a, _p_b, channel_id) = setup_channel(&env);
+
+        let withdraw_time =
+            client.force_close(&channel_id, &p_a, &MIN_DISPUTE_PERIOD_SECS);
+        let state = client.get_channel_state(&channel_id);
+        assert_ne!(state.close_time, 0);
+        assert_eq!(state.timeout, MIN_DISPUTE_PERIOD_SECS);
+        assert_eq!(withdraw_time, state.close_time + MIN_DISPUTE_PERIOD_SECS as u64);
+    }
+
+    #[test]
+    fn test_force_close_maximum_period_accepted() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, p_a, _p_b, channel_id) = setup_channel(&env);
+
+        let withdraw_time =
+            client.force_close(&channel_id, &p_a, &MAX_DISPUTE_PERIOD_SECS);
+        let state = client.get_channel_state(&channel_id);
+        assert_ne!(state.close_time, 0);
+        assert_eq!(state.timeout, MAX_DISPUTE_PERIOD_SECS);
+        assert_eq!(withdraw_time, state.close_time + MAX_DISPUTE_PERIOD_SECS as u64);
+    }
+
+    #[test]
+    fn test_force_close_period_too_short_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, p_a, _p_b, channel_id) = setup_channel(&env);
+
+        let res = client.try_force_close(&channel_id, &p_a, &(MIN_DISPUTE_PERIOD_SECS - 1));
+        assert_eq!(res, Err(Ok(PaymentChannelError::DisputePeriodTooShort)));
+
+        // Channel must remain open after the rejected call.
+        let state = client.get_channel_state(&channel_id);
+        assert_eq!(state.close_time, 0);
+    }
+
+    #[test]
+    fn test_force_close_period_zero_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, p_a, _p_b, channel_id) = setup_channel(&env);
+
+        let res = client.try_force_close(&channel_id, &p_a, &0_u32);
+        assert_eq!(res, Err(Ok(PaymentChannelError::DisputePeriodTooShort)));
+    }
+
+    #[test]
+    fn test_force_close_period_too_long_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, p_a, _p_b, channel_id) = setup_channel(&env);
+
+        let res = client.try_force_close(&channel_id, &p_a, &(MAX_DISPUTE_PERIOD_SECS + 1));
+        assert_eq!(res, Err(Ok(PaymentChannelError::DisputePeriodTooLong)));
+
+        let state = client.get_channel_state(&channel_id);
+        assert_eq!(state.close_time, 0);
+    }
+
+    #[test]
+    fn test_force_close_unauthorized_participant_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _p_a, _p_b, channel_id) = setup_channel(&env);
+        let stranger = Address::generate(&env);
+
+        let res = client.try_force_close(&channel_id, &stranger, &MIN_DISPUTE_PERIOD_SECS);
+        assert_eq!(res, Err(Ok(PaymentChannelError::UnauthorizedParticipant)));
+    }
+
+    #[test]
+    fn test_force_close_already_closed_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, p_a, _p_b, channel_id) = setup_channel(&env);
+        let dummy_sig = BytesN::from_array(&env, &[0u8; 64]);
+
+        client.cooperative_close(&channel_id, &1_000, &1_000, &dummy_sig, &dummy_sig);
+
+        let res = client.try_force_close(&channel_id, &p_a, &MIN_DISPUTE_PERIOD_SECS);
+        assert_eq!(res, Err(Ok(PaymentChannelError::ChannelAlreadyClosed)));
+    }
+
+    #[test]
+    fn test_force_close_with_active_htlcs_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, p_a, _p_b, channel_id) = setup_channel(&env);
+        let hashlock = BytesN::from_array(&env, &[3u8; 32]);
+        let receiver = Address::generate(&env);
+
+        // timelock must be strictly in the future (> current ledger sequence 0)
+        client.create_htlc(&channel_id, &hashlock, &2_000, &100, &receiver);
+
+        let res = client.try_force_close(&channel_id, &p_a, &MIN_DISPUTE_PERIOD_SECS);
+        assert_eq!(res, Err(Ok(PaymentChannelError::ActiveHtlcsExist)));
+    }
+
+    #[test]
+    fn test_force_close_stores_updated_timeout_on_state() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, p_a, _p_b, channel_id) = setup_channel(&env);
+        // The channel was created with timeout=100 (see setup_channel), which
+        // is below the minimum dispute period. force_close must override it.
+        let custom_period = MIN_DISPUTE_PERIOD_SECS + 1_800;
+        client.force_close(&channel_id, &p_a, &custom_period);
+        let state = client.get_channel_state(&channel_id);
+        assert_eq!(state.timeout, custom_period);
     }
 }
