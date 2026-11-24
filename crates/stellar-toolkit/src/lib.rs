@@ -18,6 +18,7 @@ pub mod help_text;
 pub mod horizon;
 pub mod hsm;
 pub mod invariants;
+pub mod keeper;
 pub mod key_hygiene;
 pub mod merkle;
 pub mod migration_diff;
@@ -67,6 +68,10 @@ pub use horizon::{
 };
 pub use hsm::{ColdSigner, HsmError, SignRequest, StubHsm};
 pub use invariants::{run_suite, InvariantReport, Prng, SuiteReport};
+pub use keeper::{
+    BudgetedKeeper, ExecutionBudget, ExecutionReport, KeeperBudgetConfig, KeeperBudgetError,
+    KeeperOperation, KeeperStrategy,
+};
 pub use key_hygiene::{
     scan_paths, scan_text, Finding as SecretFinding, SarifLog, SarifResult, SarifRule, SarifRun,
     ScanReport, SecretKind,
