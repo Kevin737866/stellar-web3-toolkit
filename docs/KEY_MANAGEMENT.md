@@ -87,6 +87,14 @@ Derivation is fixed and documented: BIP-39 seed, SLIP-0010 hardened derivation
 at `m/44'/148'/0'`. `wallet recover` verifies the checksum before deriving, so a
 mistyped phrase is rejected rather than producing a different account.
 
+A rejected phrase now names the word position that failed (1-based, like a
+numbered backup), and never prints the word itself — the phrase is key material
+even when mistyped. Use `stellar-toolkit wallet validate` to check a phrase
+without deriving or printing a key; it accepts the phrase on stdin so it need
+not appear in shell history or `ps`. See
+[`docs/RECOVERY_PHRASE_VALIDATION.md`](RECOVERY_PHRASE_VALIDATION.md) for the
+API and compatibility details.
+
 ---
 
 ## 4. Cold-storage signing

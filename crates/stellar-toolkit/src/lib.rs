@@ -88,6 +88,9 @@ pub use timelock::{
 pub use treasury_stream::{
     StreamCancellation, StreamRelease, StreamStatus, Treasury, TreasuryStream,
 };
+pub use wallet::{
+    validate_recovery_phrase, PhraseIssue, PhraseValidation, VALID_PHRASE_WORD_COUNTS,
+};
 pub use wasm_provenance::{
     verify as verify_wasm_provenance, ArtifactProvenance, ArtifactStatus, ArtifactVerdict,
     BuildInputs, ManifestError, ProvenanceManifest, ProvenanceReport, DEFAULT_MANIFEST,
