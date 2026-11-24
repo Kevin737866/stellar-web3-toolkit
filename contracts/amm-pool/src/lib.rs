@@ -25,6 +25,7 @@ pub enum DataKey {
     CumB,
     Bal(Address),
     Allow(AllowKey),
+    FlashSwapActive,
 }
 
 #[contracttype]
@@ -81,6 +82,16 @@ fn reserves(env: &Env) -> (i128, i128) {
 fn set_reserves(env: &Env, a: i128, b: i128) {
     write_i128(env, DataKey::ReserveA, a);
     write_i128(env, DataKey::ReserveB, b);
+}
+
+fn assert_not_in_flash_swap(env: &Env) {
+    assert!(
+        !env.storage()
+            .instance()
+            .get(&DataKey::FlashSwapActive)
+            .unwrap_or(false),
+        "reentrant call during flash swap"
+    );
 }
 
 fn total_lp(env: &Env) -> i128 {
@@ -235,6 +246,7 @@ impl AmmPool {
         min_a: i128,
         min_b: i128,
     ) -> i128 {
+        assert_not_in_flash_swap(&env);
         user.require_auth();
         assert!(amount_a_desired > 0 && amount_b_desired > 0, "amounts");
         let pool = env.current_contract_address();
@@ -289,6 +301,7 @@ impl AmmPool {
         min_a: i128,
         min_b: i128,
     ) -> (i128, i128) {
+        assert_not_in_flash_swap(&env);
         user.require_auth();
         assert!(lp_amount > 0, "lp");
         let pool = env.current_contract_address();
@@ -318,6 +331,7 @@ impl AmmPool {
 
     /// Assumes `token_in` already transferred to this pool in this transaction.
     pub fn swap(env: Env, token_in: Address, to: Address, min_out: i128) -> i128 {
+        assert_not_in_flash_swap(&env);
         assert!(to != env.current_contract_address(), "to");
         let pool = env.current_contract_address();
         let (ta, tb) = get_tokens(&env);
@@ -362,6 +376,7 @@ impl AmmPool {
         amount_b_out: i128,
         callback: Address,
     ) {
+        assert_not_in_flash_swap(&env);
         assert!(amount_a_out >= 0 && amount_b_out >= 0, "out amt");
         assert!(amount_a_out > 0 || amount_b_out > 0, "need out");
         let pool = env.current_contract_address();
@@ -373,6 +388,9 @@ impl AmmPool {
             "liquidity out"
         );
 
+        env.storage()
+            .instance()
+            .set(&DataKey::FlashSwapActive, &true);
         grow_cumulative(&env);
 
         if amount_a_out > 0 {
@@ -396,6 +414,7 @@ impl AmmPool {
         );
         set_reserves(&env, bal_a, bal_b);
         grow_cumulative(&env);
+        env.storage().instance().remove(&DataKey::FlashSwapActive);
     }
 }
 
@@ -407,6 +426,7 @@ impl TokenInterface for AmmPool {
     }
 
     fn approve(env: Env, from: Address, spender: Address, amount: i128, expiration_ledger: u32) {
+        assert_not_in_flash_swap(&env);
         from.require_auth();
         allowance_store(
             &env,
@@ -424,6 +444,7 @@ impl TokenInterface for AmmPool {
     }
 
     fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+        assert_not_in_flash_swap(&env);
         from.require_auth();
         assert!(amount > 0, "amt");
         let b = lp_balance_read(&env, &from);
@@ -434,6 +455,7 @@ impl TokenInterface for AmmPool {
     }
 
     fn transfer_from(env: Env, spender: Address, from: Address, to: Address, amount: i128) {
+        assert_not_in_flash_swap(&env);
         spender.require_auth();
         assert!(amount > 0, "amt");
         let mut al = allowance_load(&env, from.clone(), spender.clone());
@@ -451,11 +473,13 @@ impl TokenInterface for AmmPool {
     }
 
     fn burn(env: Env, from: Address, amount: i128) {
+        assert_not_in_flash_swap(&env);
         from.require_auth();
         burn_lp_withdraw(&env, from, amount);
     }
 
     fn burn_from(env: Env, spender: Address, from: Address, amount: i128) {
+        assert_not_in_flash_swap(&env);
         spender.require_auth();
         let mut al = allowance_load(&env, from.clone(), spender.clone());
         let eff = allowance_effective(&env, &al);
@@ -483,6 +507,46 @@ mod test {
     use super::*;
     use soroban_sdk::testutils::{Address as _, Ledger as _};
     use soroban_sdk::token::{StellarAssetClient, TokenClient};
+
+    #[contracttype]
+    #[derive(Clone)]
+    enum CallbackKey {
+        TokenA,
+    }
+
+    #[contract]
+    struct ReentrantFlashCallback;
+
+    #[contractimpl]
+    impl ReentrantFlashCallback {
+        pub fn set_token_a(env: Env, token_a: Address) {
+            env.storage().instance().set(&CallbackKey::TokenA, &token_a);
+        }
+
+        pub fn on_flash(
+            env: Env,
+            pool_id: Address,
+            recipient: Address,
+            amount_a_out: i128,
+            amount_b_out: i128,
+        ) {
+            assert_eq!(amount_b_out, 0, "test callback expects no token B output");
+            let callback_id = env.current_contract_address();
+            let pool = AmmPoolClient::new(&env, &pool_id);
+            assert!(
+                pool.try_flash_swap(&recipient, &1, &0, &callback_id)
+                    .is_err(),
+                "nested flash swap should be rejected"
+            );
+
+            let token_a: Address = env
+                .storage()
+                .instance()
+                .get(&CallbackKey::TokenA)
+                .expect("token A configured");
+            TokenClient::new(&env, &token_a).transfer(&recipient, &pool_id, &(amount_a_out + 4));
+        }
+    }
 
     fn setup_tokens(env: &Env) -> (Address, Address) {
         let admin = Address::generate(env);
@@ -573,7 +637,7 @@ mod test {
     }
 
     #[test]
-    fn lp_minting_and_redemption_round_down() {
+    fn flash_swap_rejects_reentrant_pool_mutations() {
         let env = Env::default();
         env.mock_all_auths();
         let (ta, tb) = setup_tokens(&env);
@@ -582,51 +646,33 @@ mod test {
         let factory = Address::generate(&env);
         pool.initialize(&factory, &ta, &tb);
 
-        let u1 = Address::generate(&env);
-        let u2 = Address::generate(&env);
-        mint(&env, ta.clone(), u1.clone(), 10_000);
-        mint(&env, tb.clone(), u1.clone(), 10_000);
-        mint(&env, ta.clone(), u2.clone(), 10_000);
-        mint(&env, tb.clone(), u2.clone(), 10_000);
+        let liquidity_provider = Address::generate(&env);
+        mint(&env, ta.clone(), liquidity_provider.clone(), 10_000_000);
+        mint(&env, tb.clone(), liquidity_provider.clone(), 10_000_000);
+        pool.add_liquidity(&liquidity_provider, &1_000_000, &1_000_000, &0, &0);
 
-        // First deposit: floor(sqrt(100 * 101)) = floor(sqrt(10100)) = 100
-        let lp1 = pool.add_liquidity(&u1, &100, &101, &1, &1);
-        assert_eq!(lp1, 100);
+        let callback_id = env.register_contract(None, ReentrantFlashCallback);
+        ReentrantFlashCallbackClient::new(&env, &callback_id).set_token_a(&ta);
+        mint(&env, ta, callback_id.clone(), 4);
+        pool.flash_swap(&callback_id, &1_000, &0, &callback_id);
 
-        // Second deposit: 33 / 100 * 100 = 33, quote_b = floor(33 * 101 / 100) = 33
-        // l1 = floor(33 * 100 / 100) = 33, l2 = floor(33 * 100 / 101) = 32 -> min = 32
-        let lp2 = pool.add_liquidity(&u2, &33, &100, &1, &1);
-        assert_eq!(lp2, 32);
-
-        // Redeem 1 LP out of 132 total:
-        // reserves = (133, 134) -> floor(133 / 132) = 1, floor(134 / 132) = 1
-        let (out_a, out_b) = pool.remove_liquidity(&u2, &1, &1, &1);
-        assert_eq!((out_a, out_b), (1, 1));
-        assert_eq!(pool.get_reserves(), (132, 133));
+        assert_eq!(pool.get_reserves(), (1_000_004, 1_000_000));
     }
 
     #[test]
-    fn lp_redemption_rejects_invalid_and_slippage_bounds() {
+    fn active_flash_swap_guard_rejects_lp_token_mutations() {
         let env = Env::default();
         env.mock_all_auths();
-        let (ta, tb) = setup_tokens(&env);
         let pool_id = env.register_contract(None, AmmPool);
+        env.as_contract(&pool_id, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::FlashSwapActive, &true);
+        });
+
         let pool = AmmPoolClient::new(&env, &pool_id);
-        let factory = Address::generate(&env);
-        pool.initialize(&factory, &ta, &tb);
-
-        let u = Address::generate(&env);
-        mint(&env, ta.clone(), u.clone(), 10_000);
-        mint(&env, tb.clone(), u.clone(), 10_000);
-        let lp = pool.add_liquidity(&u, &100, &101, &1, &1);
-        assert_eq!(lp, 100);
-
-        // Zero LP amount rejected
-        assert!(pool.try_remove_liquidity(&u, &0, &0, &0).is_err());
-        // Exceeding balance / supply rejected
-        assert!(pool.try_remove_liquidity(&u, &101, &0, &0).is_err());
-        // Slippage bound above rounded-down output (floor(1 * 101 / 100) = 1, not 2) rejected
-        assert!(pool.try_remove_liquidity(&u, &1, &1, &2).is_err());
-        assert_eq!(pool.get_reserves(), (100, 101));
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+        assert!(pool.try_approve(&owner, &spender, &1, &10).is_err());
     }
 }

@@ -1491,4 +1491,62 @@ mod test {
             .try_delegate(&f.other_operator, &f.operator, &(10 * ONE))
             .is_err());
     }
+
+    #[test]
+    fn fractional_rewards_stay_as_dust_and_are_never_overpaid() {
+        let f = Fixture::new();
+        // Two base units funded over one second, split across three equal
+        // stakers: each share is two thirds of a unit, which floors to zero.
+        f.fund(2, 1);
+        assert_eq!(f.client.reward_rate(), 2);
+
+        let a = Address::generate(&f.env);
+        let b = Address::generate(&f.env);
+        let c = Address::generate(&f.env);
+        for who in [&a, &b, &c] {
+            f.mint(who, 1);
+            // Zero-commission operator so the numbers are the gross accrual.
+            f.client.delegate(who, &f.other_operator, &1);
+        }
+
+        f.advance(1);
+
+        assert_eq!(f.client.pending_rewards(&a, &f.other_operator), 0);
+        for who in [&a, &b, &c] {
+            assert_eq!(f.client.claim(who, &f.other_operator, &0), 0);
+        }
+        // The index floors the whole movement to one credited base unit; nobody
+        // can claim it, so it stays in the contract as dust.
+        assert_eq!(f.client.rewards_credited(), 1);
+        assert_eq!(f.client.rewards_paid_out(), 0);
+
+        // Every principal is still withdrawable in full.
+        for who in [&a, &b, &c] {
+            f.client.undelegate(who, &f.other_operator, &1);
+            assert_eq!(f.balance(who), 1);
+        }
+    }
+
+    #[test]
+    fn a_one_unit_stake_receives_its_exact_share_of_a_high_ratio_pool() {
+        let f = Fixture::new();
+        // 1_000 base units funded over one second over 1_000 staked units: the
+        // index moves exactly PRECISION, so a whale and a one-unit staker are
+        // both paid to the base unit.
+        f.fund(1_000, 1);
+        f.mint(&f.alice, 999);
+        f.mint(&f.bob, 1);
+        f.client.delegate(&f.alice, &f.other_operator, &999);
+        f.client.delegate(&f.bob, &f.other_operator, &1);
+
+        f.advance(1);
+        assert_eq!(f.client.pending_rewards(&f.alice, &f.other_operator), 999);
+        assert_eq!(f.client.pending_rewards(&f.bob, &f.other_operator), 1);
+
+        let whale = f.client.claim(&f.alice, &f.other_operator, &999);
+        let tiny = f.client.claim(&f.bob, &f.other_operator, &1);
+        assert_eq!((whale, tiny), (999, 1));
+        assert_eq!(f.client.rewards_paid_out(), 1_000);
+        assert!(f.client.rewards_paid_out() <= f.client.rewards_credited());
+    }
 }

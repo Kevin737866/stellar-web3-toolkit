@@ -22,6 +22,13 @@ pub enum SessionError {
     SessionExpired(String, u64),
     #[error("Session key {0} has been revoked")]
     SessionRevoked(String),
+    /// Returned when the caller supplies an `account_id` that does not match
+    /// the account that owns the session key (issue #334).
+    ///
+    /// We deliberately use the same message text as `SessionNotFound` to avoid
+    /// leaking cross-account existence information to the caller.
+    #[error("Session key {0} not found")]
+    SessionNotOwned(String),
     #[error("Contract {0} is not authorized for session {1}")]
     ContractNotAllowed(String, String),
     #[error("Method {0} on contract {1} is not authorized for session {2}")]
@@ -210,6 +217,97 @@ impl AccountAbstractionManager {
             .ok_or_else(|| SessionError::SessionNotFound(session_id.to_string()))?;
         session.is_revoked = true;
         Ok(())
+    }
+
+    /// Revokes a single session key identified by `session_id`, verifying that
+    /// it belongs to `account_id` before flipping the revocation flag (issue #334).
+    ///
+    /// This is the preferred revocation entry point: it confirms ownership so
+    /// one account cannot revoke another account's session key. The account key
+    /// itself is **never touched** — this operation only marks the specified
+    /// session key as revoked.
+    ///
+    /// # Errors
+    ///
+    /// * [`SessionError::SessionNotFound`] — no session with `session_id` exists.
+    /// * [`SessionError::SessionNotOwned`] — the session exists but its
+    ///   `account_id` does not match the supplied `account_id`. The error
+    ///   message is intentionally identical to `SessionNotFound` to prevent
+    ///   leaking cross-account existence information.
+    /// * [`SessionError::SessionRevoked`] — the session is already revoked.
+    pub fn revoke_session_authorized(
+        &mut self,
+        account_id: &str,
+        session_id: &str,
+    ) -> Result<()> {
+        let session = self
+            .sessions
+            .get_mut(session_id)
+            .ok_or_else(|| SessionError::SessionNotFound(session_id.to_string()))?;
+
+        // Ownership check: prevent cross-account revocation.
+        if session.account_id != account_id {
+            return Err(SessionError::SessionNotOwned(session_id.to_string()));
+        }
+
+        // Reject double-revocation so the caller gets an explicit signal.
+        if session.is_revoked {
+            return Err(SessionError::SessionRevoked(session_id.to_string()));
+        }
+
+        session.is_revoked = true;
+        Ok(())
+    }
+
+    /// Revokes the session key whose **public key** matches `session_public_key`,
+    /// within the given `account_id` (issue #334).
+    ///
+    /// A session may be identified by its ephemeral public key when the caller
+    /// knows the key but not the internal session ID (e.g. from a hardware
+    /// wallet flow or an on-chain event). Like [`revoke_session_authorized`],
+    /// this only revokes the matching session and does not rotate the account
+    /// key.
+    ///
+    /// # Errors
+    ///
+    /// * [`SessionError::SessionNotFound`] — no session with the given
+    ///   `session_public_key` and `account_id` exists. The same error is
+    ///   returned when a matching public key exists under a *different*
+    ///   account, to avoid leaking cross-account existence information.
+    /// * [`SessionError::SessionRevoked`] — the session is already revoked.
+    ///
+    /// [`revoke_session_authorized`]: Self::revoke_session_authorized
+    pub fn revoke_session_by_public_key(
+        &mut self,
+        account_id: &str,
+        session_public_key: &str,
+    ) -> Result<()> {
+        // Scan for a session that matches BOTH the public key AND the account.
+        // We do not expose a session that belongs to a different account, even
+        // if its public key matches — the error is SessionNotFound in both
+        // cases.
+        let session = self
+            .sessions
+            .values_mut()
+            .find(|s| s.session_public_key == session_public_key && s.account_id == account_id)
+            .ok_or_else(|| SessionError::SessionNotFound(session_public_key.to_string()))?;
+
+        if session.is_revoked {
+            return Err(SessionError::SessionRevoked(session.session_id.clone()));
+        }
+
+        session.is_revoked = true;
+        Ok(())
+    }
+
+    /// List all session key IDs registered for `account_id`, regardless of
+    /// revocation or expiry status.
+    #[must_use]
+    pub fn list_sessions(&self, account_id: &str) -> Vec<&SessionKey> {
+        self.sessions
+            .values()
+            .filter(|s| s.account_id == account_id)
+            .collect()
     }
 
     /// Validates an intended contract call against session key policies.
@@ -961,5 +1059,190 @@ mod tests {
         assert!(decoded.is_vetoed());
         assert_eq!(decoded.vetoes["v1"].reason, "compelled");
         assert_eq!(decoded.vetoes["v1"].cast_at, 12345);
+    }
+
+    // ── revoke_session_authorized (issue #334) ────────────────────────────────
+
+    fn session_for(
+        session_id: &str,
+        account_id: &str,
+        public_key: &str,
+        expires_at: u64,
+    ) -> SessionKey {
+        SessionKey::new(
+            session_id,
+            account_id,
+            public_key,
+            SessionPolicy {
+                expires_at,
+                ..SessionPolicy::default()
+            },
+        )
+    }
+
+    #[test]
+    fn revoke_authorized_succeeds_for_correct_owner() {
+        let mut mgr = AccountAbstractionManager::new();
+        mgr.register_session(session_for("s1", "acct_A", "pubkey_A1", 9999));
+
+        assert!(mgr.revoke_session_authorized("acct_A", "s1").is_ok());
+
+        // The key is now rejected by validate_and_record_call.
+        let res = mgr.validate_and_record_call("s1", "contract", "fn", 0, 500);
+        assert!(
+            matches!(res, Err(SessionError::SessionRevoked(_))),
+            "revoked key must be rejected: {res:?}"
+        );
+    }
+
+    #[test]
+    fn revoke_authorized_fails_for_unknown_session_id() {
+        let mut mgr = AccountAbstractionManager::new();
+        let err = mgr
+            .revoke_session_authorized("acct_A", "no-such-session")
+            .unwrap_err();
+        assert!(matches!(err, SessionError::SessionNotFound(_)));
+    }
+
+    #[test]
+    fn revoke_authorized_fails_when_account_does_not_own_session() {
+        let mut mgr = AccountAbstractionManager::new();
+        mgr.register_session(session_for("s1", "acct_A", "pubkey_A1", 9999));
+
+        let err = mgr
+            .revoke_session_authorized("acct_B", "s1")
+            .unwrap_err();
+        // Returns SessionNotOwned (same display as SessionNotFound — no
+        // cross-account existence leak).
+        assert!(
+            matches!(err, SessionError::SessionNotOwned(_)),
+            "wrong account must be rejected: {err:?}"
+        );
+
+        // The session must remain valid after the failed revocation.
+        let session = mgr.get_session("s1").unwrap();
+        assert!(!session.is_revoked, "session must not be revoked after failed attempt");
+    }
+
+    #[test]
+    fn revoke_authorized_fails_when_session_is_already_revoked() {
+        let mut mgr = AccountAbstractionManager::new();
+        mgr.register_session(session_for("s1", "acct_A", "pubkey_A1", 9999));
+
+        mgr.revoke_session_authorized("acct_A", "s1").unwrap();
+        let err = mgr
+            .revoke_session_authorized("acct_A", "s1")
+            .unwrap_err();
+        assert!(
+            matches!(err, SessionError::SessionRevoked(_)),
+            "double-revoke must be rejected: {err:?}"
+        );
+    }
+
+    #[test]
+    fn revoke_authorized_does_not_affect_other_sessions_on_same_account() {
+        let mut mgr = AccountAbstractionManager::new();
+        mgr.register_session(session_for("s1", "acct_A", "pubkey_A1", 9999));
+        mgr.register_session(session_for("s2", "acct_A", "pubkey_A2", 9999));
+
+        mgr.revoke_session_authorized("acct_A", "s1").unwrap();
+
+        // s2 must still be active.
+        let s2 = mgr.get_session("s2").unwrap();
+        assert!(!s2.is_revoked, "s2 must remain active after revoking s1");
+    }
+
+    #[test]
+    fn revoke_authorized_does_not_rotate_or_modify_account_key() {
+        // wallet.rs has no account-key rotation and session_keys.rs has no
+        // reference to wallet.rs — confirm that after revocation the account_id
+        // stored on the remaining session key is unchanged.
+        let mut mgr = AccountAbstractionManager::new();
+        mgr.register_session(session_for("s1", "acct_A", "pubkey_A1", 9999));
+        mgr.register_session(session_for("s2", "acct_A", "pubkey_A2", 9999));
+
+        mgr.revoke_session_authorized("acct_A", "s1").unwrap();
+
+        // The account_id on s2 is still what was registered.
+        assert_eq!(
+            mgr.get_session("s2").unwrap().account_id,
+            "acct_A",
+            "account_id must be unchanged after session revocation"
+        );
+    }
+
+    // ── revoke_session_by_public_key (issue #334) ─────────────────────────────
+
+    #[test]
+    fn revoke_by_public_key_succeeds_for_correct_owner() {
+        let mut mgr = AccountAbstractionManager::new();
+        mgr.register_session(session_for("s1", "acct_A", "pubkey_A1", 9999));
+
+        assert!(mgr
+            .revoke_session_by_public_key("acct_A", "pubkey_A1")
+            .is_ok());
+
+        assert!(mgr.get_session("s1").unwrap().is_revoked);
+    }
+
+    #[test]
+    fn revoke_by_public_key_fails_for_unknown_key() {
+        let mut mgr = AccountAbstractionManager::new();
+        let err = mgr
+            .revoke_session_by_public_key("acct_A", "nonexistent_pubkey")
+            .unwrap_err();
+        assert!(matches!(err, SessionError::SessionNotFound(_)));
+    }
+
+    #[test]
+    fn revoke_by_public_key_does_not_reveal_cross_account_existence() {
+        // A key registered under acct_B must not be revocable by acct_A, and
+        // the error must be SessionNotFound (not SessionNotOwned) to avoid
+        // leaking that the key exists under a different account.
+        let mut mgr = AccountAbstractionManager::new();
+        mgr.register_session(session_for("s1", "acct_B", "shared_pubkey", 9999));
+
+        let err = mgr
+            .revoke_session_by_public_key("acct_A", "shared_pubkey")
+            .unwrap_err();
+        assert!(
+            matches!(err, SessionError::SessionNotFound(_)),
+            "cross-account key must return SessionNotFound, got: {err:?}"
+        );
+
+        // The key on acct_B must be untouched.
+        assert!(!mgr.get_session("s1").unwrap().is_revoked);
+    }
+
+    #[test]
+    fn revoke_by_public_key_fails_when_already_revoked() {
+        let mut mgr = AccountAbstractionManager::new();
+        mgr.register_session(session_for("s1", "acct_A", "pubkey_A1", 9999));
+
+        mgr.revoke_session_by_public_key("acct_A", "pubkey_A1")
+            .unwrap();
+        let err = mgr
+            .revoke_session_by_public_key("acct_A", "pubkey_A1")
+            .unwrap_err();
+        assert!(matches!(err, SessionError::SessionRevoked(_)));
+    }
+
+    // ── list_sessions ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn list_sessions_returns_only_sessions_for_the_given_account() {
+        let mut mgr = AccountAbstractionManager::new();
+        mgr.register_session(session_for("s1", "acct_A", "pk1", 9999));
+        mgr.register_session(session_for("s2", "acct_A", "pk2", 9999));
+        mgr.register_session(session_for("s3", "acct_B", "pk3", 9999));
+
+        let sessions_a = mgr.list_sessions("acct_A");
+        assert_eq!(sessions_a.len(), 2);
+
+        let sessions_b = mgr.list_sessions("acct_B");
+        assert_eq!(sessions_b.len(), 1);
+
+        let sessions_c = mgr.list_sessions("acct_C");
+        assert!(sessions_c.is_empty());
     }
 }

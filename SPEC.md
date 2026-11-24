@@ -205,7 +205,14 @@ Each state update is committed with:
 - Sequence number (incrementing)
 - Digital signatures from both parties
 
-### 5.3 Revocable State
+### 5.3 Participant Authorization & Verification
+
+All channel state transitions enforce strict participant authorization:
+- **On-chain (`PaymentChannel::update_state`)**: Requires explicit authorization from both participants (`participant_a.require_auth()` and `participant_b.require_auth()`). Closed channels reject subsequent state updates.
+- **Off-chain (`ChannelManager::apply_signed_state_update`)**: Verifies counterparty cryptographic signatures over a canonical SHA-256 state update digest (`compute_state_digest`) before mutating balances or sequence numbers. Failed verifications leave local channel state completely unmutated.
+- **Backwards Compatibility**: Existing `execute_payment` and `execute_payment_at` methods remain available for internal/local operations while new authorized workflows enforce mutual signatures.
+
+### 5.4 Revocable State
 
 Previous states become revocable after update:
 ```

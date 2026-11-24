@@ -1345,4 +1345,45 @@ mod test {
             assert!(names.contains(&expected), "missing {expected:?}");
         }
     }
+
+    #[test]
+    fn a_one_unit_position_receives_its_exact_share() {
+        let f = Fixture::new();
+        f.client.add_pool(&1, &f.lp_a, &1);
+        // 1_000 base units funded over one second over 1_000 staked units: the
+        // accumulator moves by exactly PRECISION, so the 999:1 split resolves
+        // to whole base units on both sides.
+        f.fund(1_000 * ONE, 1);
+        f.deposit(&f.alice, 1, &f.lp_a, 999 * ONE);
+        f.deposit(&f.bob, 1, &f.lp_a, ONE);
+
+        f.advance(1);
+        assert_eq!(f.client.pending_rewards(&f.alice, &1), 999 * ONE);
+        assert_eq!(f.client.pending_rewards(&f.bob, &1), ONE);
+
+        let whale = f.client.harvest(&f.alice, &1, &0);
+        let tiny = f.client.harvest(&f.bob, &1, &0);
+        assert_eq!((whale, tiny), (999 * ONE, ONE));
+        assert_eq!(f.client.rewards_paid_out(), 1_000 * ONE);
+        assert!(f.client.rewards_paid_out() <= f.client.rewards_credited());
+    }
+
+    #[test]
+    fn rewards_below_one_base_unit_stay_as_dust() {
+        let f = Fixture::new();
+        f.client.add_pool(&1, &f.lp_a, &1);
+        // One base unit of rewards across 1_000_000_001 staked units: every
+        // position floors to zero and no credit is recorded.
+        f.fund(1, 1);
+        f.deposit(&f.alice, 1, &f.lp_a, 1_000_000_000);
+        f.deposit(&f.bob, 1, &f.lp_a, 1);
+
+        f.advance(1);
+        assert_eq!(f.client.pending_rewards(&f.alice, &1), 0);
+        assert_eq!(f.client.pending_rewards(&f.bob, &1), 0);
+        assert_eq!(f.client.harvest(&f.alice, &1, &0), 0);
+        assert_eq!(f.client.harvest(&f.bob, &1, &0), 0);
+        assert_eq!(f.client.rewards_credited(), 0);
+        assert_eq!(f.client.rewards_paid_out(), 0);
+    }
 }

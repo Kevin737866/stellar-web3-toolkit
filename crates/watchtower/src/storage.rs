@@ -124,6 +124,42 @@ pub trait StorageBackend: Send + Sync {
     fn compact_with_defaults(&self) -> Result<CompactionReport, StorageError> {
         self.compact(&CompactionPolicy::default())
     }
+
+    // ── Justice action persistence (issue #368) ───────────────────────────────
+
+    /// Persist a justice action record.
+    ///
+    /// Called **before** the justice transaction is submitted so that the
+    /// breach evidence is never silently lost on a failed submission.
+    fn store_justice_action(
+        &self,
+        action: &crate::justice::JusticeAction,
+    ) -> Result<(), StorageError>;
+
+    /// Retrieve a justice action by its ID.
+    fn get_justice_action(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::justice::JusticeAction>, StorageError>;
+
+    /// Retrieve all justice actions whose status is `Pending`.
+    ///
+    /// Used by the operator recovery path: after a restart, any `Pending`
+    /// action can be retried via [`crate::justice::JusticeService::retry_pending_actions`].
+    fn get_pending_justice_actions(
+        &self,
+    ) -> Result<Vec<crate::justice::JusticeAction>, StorageError>;
+
+    /// Update the status and optional transaction hash of a persisted action.
+    ///
+    /// A no-op when the `id` is not found (the in-process record is the
+    /// authoritative source; storage is best-effort for durability).
+    fn update_justice_action_status(
+        &self,
+        id: &str,
+        status: crate::justice::ActionStatus,
+        tx_hash: Option<&str>,
+    ) -> Result<(), StorageError>;
 }
 
 /// In-memory storage backend
@@ -132,6 +168,9 @@ pub struct InMemoryStorage {
     channel_updates: parking_lot::RwLock<HashMap<String, ChannelUpdate>>,
     alerts: parking_lot::RwLock<Vec<Alert>>,
     subscriptions: parking_lot::RwLock<Vec<String>>,
+    /// Justice action records, keyed by action ID (issue #368).
+    justice_actions:
+        parking_lot::RwLock<HashMap<String, crate::justice::JusticeAction>>,
 }
 
 impl InMemoryStorage {
@@ -142,6 +181,7 @@ impl InMemoryStorage {
             channel_updates: parking_lot::RwLock::new(HashMap::new()),
             alerts: parking_lot::RwLock::new(Vec::new()),
             subscriptions: parking_lot::RwLock::new(Vec::new()),
+            justice_actions: parking_lot::RwLock::new(HashMap::new()),
         }
     }
 }
@@ -314,6 +354,51 @@ impl StorageBackend for InMemoryStorage {
 
         Ok(report)
     }
+
+    fn store_justice_action(
+        &self,
+        action: &crate::justice::JusticeAction,
+    ) -> Result<(), StorageError> {
+        let mut actions = self.justice_actions.write();
+        actions.insert(action.id.clone(), action.clone());
+        Ok(())
+    }
+
+    fn get_justice_action(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::justice::JusticeAction>, StorageError> {
+        let actions = self.justice_actions.read();
+        Ok(actions.get(id).cloned())
+    }
+
+    fn get_pending_justice_actions(
+        &self,
+    ) -> Result<Vec<crate::justice::JusticeAction>, StorageError> {
+        let actions = self.justice_actions.read();
+        Ok(actions
+            .values()
+            .filter(|a| a.status == crate::justice::ActionStatus::Pending)
+            .cloned()
+            .collect())
+    }
+
+    fn update_justice_action_status(
+        &self,
+        id: &str,
+        status: crate::justice::ActionStatus,
+        tx_hash: Option<&str>,
+    ) -> Result<(), StorageError> {
+        let mut actions = self.justice_actions.write();
+        if let Some(action) = actions.get_mut(id) {
+            action.status = status;
+            if let Some(hash) = tx_hash {
+                action.tx_hash = Some(hash.to_string());
+            }
+            action.updated_at = current_timestamp();
+        }
+        Ok(())
+    }
 }
 
 /// SQLite storage backend (placeholder implementation)
@@ -405,6 +490,46 @@ impl StorageBackend for SqliteStorage {
             policy.max_alerts, policy.alert_retention_secs, policy.update_retention_secs
         );
         Ok(CompactionReport::default())
+    }
+
+    fn store_justice_action(
+        &self,
+        action: &crate::justice::JusticeAction,
+    ) -> Result<(), StorageError> {
+        // In production: INSERT OR REPLACE INTO justice_actions VALUES (?, ?, ?)
+        info!("SQLite: storing justice action {}", action.id);
+        Ok(())
+    }
+
+    fn get_justice_action(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::justice::JusticeAction>, StorageError> {
+        // In production: SELECT * FROM justice_actions WHERE id = ?
+        info!("SQLite: getting justice action {}", id);
+        Ok(None)
+    }
+
+    fn get_pending_justice_actions(
+        &self,
+    ) -> Result<Vec<crate::justice::JusticeAction>, StorageError> {
+        // In production: SELECT * FROM justice_actions WHERE status = 'pending'
+        info!("SQLite: getting pending justice actions");
+        Ok(Vec::new())
+    }
+
+    fn update_justice_action_status(
+        &self,
+        id: &str,
+        status: crate::justice::ActionStatus,
+        tx_hash: Option<&str>,
+    ) -> Result<(), StorageError> {
+        // In production: UPDATE justice_actions SET status = ?, tx_hash = ? WHERE id = ?
+        info!(
+            "SQLite: updating justice action {} to {:?} (tx: {:?})",
+            id, status, tx_hash
+        );
+        Ok(())
     }
 }
 

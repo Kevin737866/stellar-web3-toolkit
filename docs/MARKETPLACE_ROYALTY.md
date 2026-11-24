@@ -21,9 +21,12 @@ points (1 bps = 0.01%).
 1. **`create_listing`** — the seller authorizes an escrow transfer of the asset
    into the marketplace. The listing is stored with its price, payment token,
    and metadata.
+1a. **`create_listing_with_expiry`** — as above, but the order carries an expiry
+   ledger timestamp. The seller may still cancel it after it expires.
 2. **`buy`** — the buyer authorizes payment. The marketplace fee (in bps) goes to
    the configured recipient, the remainder goes to the seller, and the escrowed
-   asset is released to the buyer.
+   asset is released to the buyer. Orders expire at `expires_at`: purchases are
+   rejected once the current ledger timestamp reaches that value.
 3. **`cancel_listing`** — the seller reclaims the escrowed asset from an active
    listing.
 4. **`update_price`** — the seller adjusts the asking price of an active listing.
@@ -44,6 +47,19 @@ let listing_id = market.create_listing(
     &payment_token,  // SEP-41 token used to settle
 );
 
+// Or list with an expiry ledger timestamp (in seconds). The listing can only
+// be bought while ledger.timestamp() < expires_at; expired listings can still
+// be cancelled by the seller.
+let listing_id = market.create_listing_with_expiry(
+    &seller,
+    &asset,
+    &1_u128,
+    &1_i128,
+    &1_000_i128,
+    &payment_token,
+    &2_000_u64, // expires_at
+);
+
 // Buyer settles. Returns the seller proceeds after fees (975).
 let proceeds = market.buy(&buyer, &listing_id);
 
@@ -55,8 +71,8 @@ market.set_fee_bps(&500_u32);
 market.set_fee_recipient(&new_recipient);
 ```
 
-Read helpers: `get_listing(listing_id)`, `listing_count()`, `get_fee_bps()`,
-`get_fee_recipient()`.
+Read helpers: `get_listing(listing_id)`, `get_listing_expiry(listing_id)`,
+`listing_count()`, `get_fee_bps()`, `get_fee_recipient()`.
 
 ### Notes
 
@@ -67,6 +83,12 @@ Read helpers: `get_listing(listing_id)`, `listing_count()`, `get_fee_bps()`,
   anything larger.
 - A seller cannot buy their own listing, and inactive listings cannot be
   purchased or re-cancelled.
+- Expiry is opt-in and stored separately from the listing record, so existing
+  listings and callers of `create_listing` are unaffected; they never expire.
+  `create_listing_with_expiry` rejects an expiry that is not in the future, and
+  `buy` checks expiry before any token transfer, leaving the escrow and the
+  listing state untouched when it rejects. Expiry values are ledger timestamps
+  (seconds), not ledger sequence numbers.
 
 ## Royalty Splitter (Issue #147)
 
