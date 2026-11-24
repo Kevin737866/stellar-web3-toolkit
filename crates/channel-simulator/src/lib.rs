@@ -4,11 +4,14 @@
 //! Supports network generation, payment simulation, and routing algorithm testing.
 
 pub mod disconnection;
+pub mod failure_summary;
 pub mod fuzz;
 pub mod network;
 pub mod statistics;
 
 pub use disconnection::{DisconnectionConfig, DisconnectionTracker, MAX_DOWNTIME_STEPS};
+pub use failure_summary::{FailedPayment, FailureCategory, FailureSummary, MAX_FAILURE_SAMPLES};
+use std::collections::BTreeMap;
 
 use channel_router::pathfinder::Pathfinder;
 use channel_router::{Channel, NetworkGraph, Node, RouteRequest};
@@ -100,6 +103,12 @@ pub struct SimulationStats {
     /// Total node recoveries observed during simulation
     #[serde(default)]
     pub node_recoveries: usize,
+    /// Failed payments per [`FailureCategory`] key (#386).
+    ///
+    /// `default` so a stats value serialised before the breakdown existed still
+    /// deserialises; such a record simply reports no breakdown.
+    #[serde(default)]
+    pub failures_by_category: BTreeMap<String, usize>,
 }
 
 /// Payment result for simulation
@@ -135,6 +144,8 @@ pub struct Simulator {
     stats: Arc<RwLock<SimulationStats>>,
     /// Tracks temporarily disconnected nodes and suspended channels
     disconnection_tracker: Arc<RwLock<DisconnectionTracker>>,
+    /// Why the last run's payments failed, aggregated by category (#386)
+    failure_summary: Arc<RwLock<FailureSummary>>,
     /// Random number generator
     rng: parking_lot::Mutex<rand::rngs::StdRng>,
 }
@@ -157,6 +168,7 @@ impl Simulator {
             nodes: Arc::new(RwLock::new(HashMap::new())),
             stats: Arc::new(RwLock::new(SimulationStats::default())),
             disconnection_tracker: Arc::new(RwLock::new(DisconnectionTracker::new())),
+            failure_summary: Arc::new(RwLock::new(FailureSummary::new())),
             rng: parking_lot::Mutex::new(rng),
         }
     }
@@ -334,6 +346,7 @@ impl Simulator {
         let mut path_lengths = Vec::new();
         let mut node_disconnections = 0usize;
         let mut node_recoveries = 0usize;
+        let mut failure_summary = FailureSummary::new();
         let total_steps = payments.len();
 
         for (step, (source, dest, amount)) in payments.into_iter().enumerate() {
@@ -390,6 +403,15 @@ impl Simulator {
                 }
                 Err(e) => {
                     failed += 1;
+                    // Keep the router's message verbatim alongside the coarse
+                    // category, so a reported sample explains itself (#386).
+                    failure_summary.record(FailedPayment {
+                        source: source.clone(),
+                        destination: dest.clone(),
+                        amount,
+                        category: FailureCategory::from_routing_error(&e),
+                        reason: e.to_string(),
+                    });
                     debug!("Payment failed: {} -> {} - {:?}", source, dest, e);
                 }
             }
@@ -432,9 +454,11 @@ impl Simulator {
             latency_ms: Vec::new(),
             node_disconnections,
             node_recoveries,
+            failures_by_category: failure_summary.by_category.clone(),
         };
 
         *self.stats.write() = stats.clone();
+        *self.failure_summary.write() = failure_summary;
 
         info!(
             "Simulation complete: {} successful, {} failed, {:.2}% success rate",
@@ -467,6 +491,14 @@ impl Simulator {
     /// Get simulation statistics
     pub fn get_stats(&self) -> SimulationStats {
         self.stats.read().clone()
+    }
+
+    /// Why the last simulation's payments failed, aggregated by category (#386).
+    ///
+    /// Empty before the first run, and after a run in which every payment
+    /// succeeded. Counts cover the last run only; a new run replaces them.
+    pub fn failure_summary(&self) -> FailureSummary {
+        self.failure_summary.read().clone()
     }
 
     /// Temporarily disconnect a node and suspend its active channels.
