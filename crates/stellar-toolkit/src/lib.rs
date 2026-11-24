@@ -60,7 +60,7 @@ pub use env_config::{
 };
 pub use error::{Result, ToolkitError};
 pub use example_gallery::{ContractExample, ExampleGalleryRegistry};
-pub use gas_simulator::{FeeBump, FeeEstimate, FeeSchedule, GasSimulator, TransactionProfile};
+pub use gas_simulator::{FeeBump, FeeBreakdown, FeeBreakdownPercents, FeeEstimate, FeeEstimateReport, FeeSchedule, GasSimulator, TransactionProfile};
 pub use help_text::{help_width, render_command_help, wrap, HelpEntry};
 pub use horizon::{
     page_path, paginate, Cursor, HorizonPage, HorizonPaginationError, DEFAULT_LIMIT, MAX_LIMIT,
