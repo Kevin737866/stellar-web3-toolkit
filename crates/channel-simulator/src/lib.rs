@@ -3,11 +3,18 @@
 //! A simulator for testing Stellar payment channel networks with 100+ nodes.
 //! Supports network generation, payment simulation, and routing algorithm testing.
 
+pub mod baseline;
 pub mod disconnection;
 pub mod fuzz;
 pub mod network;
 pub mod statistics;
 
+pub use baseline::{
+    baseline_network, baseline_nodes, baseline_simulated_nodes, validate_baseline_specs,
+    BaselineChannelSpec, BaselineFailureCase, BaselineNodeSpec, BaselineRouteCase,
+    BASELINE_AMOUNT, BASELINE_CHANNELS, BASELINE_NETWORK_NAME, BASELINE_NODES, BASELINE_ROUTES,
+    BASELINE_UNROUTABLE,
+};
 pub use disconnection::{DisconnectionConfig, DisconnectionTracker, MAX_DOWNTIME_STEPS};
 
 use channel_router::pathfinder::Pathfinder;
