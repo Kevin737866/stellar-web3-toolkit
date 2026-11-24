@@ -45,7 +45,7 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use thiserror::Error;
 
 // ── Errors ───────────────────────────────────────────────────────────────────
@@ -81,6 +81,26 @@ pub enum DidError {
     /// The service type is empty or blank.
     #[error("service type must not be empty")]
     EmptyServiceType,
+
+    /// The DID string does not conform to W3C DID Core syntax.
+    #[error("invalid DID `{input}`: {reason}")]
+    InvalidDid { input: String, reason: String },
+
+    /// The resolved document's `id` does not match the requested DID.
+    #[error("resolved DID document id `{actual}` does not match requested DID `{expected}`")]
+    DidMismatch { expected: String, actual: String },
+
+    /// The DID document JSON could not be parsed or is not a JSON object.
+    #[error("invalid DID document JSON: {reason}")]
+    InvalidDocumentJson { reason: String },
+
+    /// Attempted to store a reserved top-level field in `additional_properties`.
+    #[error("property `{0}` is a reserved DID document field and cannot be set as an additional property")]
+    ReservedProperty(String),
+
+    /// Attempted to set an additional property with an empty or blank key.
+    #[error("additional property key must not be empty")]
+    EmptyPropertyKey,
 }
 
 // ── Scheme allowlist ─────────────────────────────────────────────────────────
@@ -96,6 +116,71 @@ const ALLOWED_SCHEMES: &[&str] = &["https", "http", "did"];
 #[inline]
 fn is_scheme_allowed(scheme: &str) -> bool {
     ALLOWED_SCHEMES.contains(&scheme)
+}
+
+/// Validates a raw endpoint URI string against the scheme allowlist.
+fn validate_endpoint_uri(raw: &str) -> Result<(), DidError> {
+    let parsed = url::Url::parse(raw).map_err(|e| DidError::InvalidUri {
+        input: raw.to_string(),
+        reason: e.to_string(),
+    })?;
+
+    let scheme = parsed.scheme();
+    if !is_scheme_allowed(scheme) {
+        return Err(DidError::InvalidScheme {
+            scheme: scheme.to_string(),
+            uri: raw.to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+/// Validates a DID string against W3C DID Core `did:<method>:<id>` syntax.
+pub(crate) fn validate_did(did: &str) -> Result<(), DidError> {
+    if did.is_empty() || did.chars().any(char::is_whitespace) {
+        return Err(DidError::InvalidDid {
+            input: did.to_string(),
+            reason: "DID must be non-empty and contain no whitespace".to_string(),
+        });
+    }
+
+    let Some(rest) = did.strip_prefix("did:") else {
+        return Err(DidError::InvalidDid {
+            input: did.to_string(),
+            reason: "DID must start with `did:`".to_string(),
+        });
+    };
+
+    let Some((method, method_id)) = rest.split_once(':') else {
+        return Err(DidError::InvalidDid {
+            input: did.to_string(),
+            reason: "DID must contain a method and method-specific identifier".to_string(),
+        });
+    };
+
+    if method.is_empty()
+        || !method
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    {
+        return Err(DidError::InvalidDid {
+            input: did.to_string(),
+            reason: format!("invalid DID method `{method}`"),
+        });
+    }
+
+    if method_id.is_empty()
+        || method_id.ends_with(':')
+        || method_id.chars().any(char::is_control)
+    {
+        return Err(DidError::InvalidDid {
+            input: did.to_string(),
+            reason: "DID method-specific identifier must be non-empty and well-formed".to_string(),
+        });
+    }
+
+    Ok(())
 }
 
 // ── ServiceEndpoint ───────────────────────────────────────────────────────────
@@ -121,24 +206,11 @@ impl ServiceEndpoint {
     /// the allowlist (`https`, `http`, `did`).
     pub fn uri(input: impl Into<String>) -> Result<Self, DidError> {
         let raw = input.into();
-
         // Use the `url` crate for normalization and scheme extraction.
         // `did:` URIs are parsed by the url crate with scheme "did", which is
         // exactly what we need for the allowlist check.
-        let parsed = url::Url::parse(&raw).map_err(|e| DidError::InvalidUri {
-            input: raw.clone(),
-            reason: e.to_string(),
-        })?;
-
-        let scheme = parsed.scheme();
-        if !is_scheme_allowed(scheme) {
-            return Err(DidError::InvalidScheme {
-                scheme: scheme.to_string(),
-                uri: raw,
-            });
-        }
-
-        Ok(ServiceEndpoint(raw))
+        validate_endpoint_uri(&raw)?;
+        Ok(Self(raw))
     }
 
     /// The underlying URI string.
@@ -206,29 +278,148 @@ impl Service {
 
 // ── DidDocument ───────────────────────────────────────────────────────────────
 
-/// A minimal DID document that holds the service array.
+/// Top-level fields owned directly by [`DidDocument`] that must not be
+/// duplicated in `additional_properties`.
+const RESERVED_DOCUMENT_FIELDS: &[&str] = &["id", "service"];
+
+/// A DID document that holds the subject identifier, service array, and any
+/// unknown/extension properties.
 ///
 /// The service array is the publication surface for which scheme validation
 /// matters: `add_service` re-validates on every insertion as defense-in-depth,
 /// and it enforces uniqueness of service IDs so that a repeated ID cannot be
 /// used to shadow a legitimate entry.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// Any unknown top-level JSON properties (such as `@context`, `alsoKnownAs`,
+/// `controller`, `verificationMethod`, `authentication`, or custom extension
+/// fields) are preserved in `additional_properties` across deserialization and
+/// re-serialization. Because `additional_properties` uses a [`BTreeMap`],
+/// serialized output has deterministic key ordering.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DidDocument {
     /// DID subject identifier.
     pub id: String,
     /// Service endpoints registered in this document.
     #[serde(default)]
     pub service: Vec<Service>,
+    /// Unknown or extension DID document properties preserved during
+    /// resolution and serialization.
+    #[serde(flatten)]
+    pub additional_properties: BTreeMap<String, serde_json::Value>,
 }
 
 impl DidDocument {
     /// Create an empty DID document for the given subject `id`.
     #[must_use]
     pub fn new(id: impl Into<String>) -> Self {
-        DidDocument {
+        Self {
             id: id.into(),
             service: Vec::new(),
+            additional_properties: BTreeMap::new(),
         }
+    }
+
+    /// Deserialize a DID document from JSON, validating DID Core invariants
+    /// and service endpoint schemes while preserving unknown top-level
+    /// properties.
+    ///
+    /// # Errors
+    ///
+    /// * [`DidError::InvalidDocumentJson`] — the input is not valid JSON or is
+    ///   not a JSON object.
+    /// * [`DidError::InvalidDid`] — the document `id` does not conform to DID
+    ///   Core syntax.
+    /// * [`DidError::InvalidScheme`] / [`DidError::InvalidUri`] /
+    ///   [`DidError::DuplicateServiceId`] / [`DidError::EmptyServiceId`] /
+    ///   [`DidError::EmptyServiceType`] — a service entry is invalid.
+    pub fn from_json(json: &str) -> Result<Self, DidError> {
+        let value: serde_json::Value =
+            serde_json::from_str(json).map_err(|e| DidError::InvalidDocumentJson {
+                reason: e.to_string(),
+            })?;
+        if !value.is_object() {
+            return Err(DidError::InvalidDocumentJson {
+                reason: "DID document must be a JSON object".to_string(),
+            });
+        }
+        let doc: Self =
+            serde_json::from_value(value).map_err(|e| DidError::InvalidDocumentJson {
+                reason: e.to_string(),
+            })?;
+        doc.validate()?;
+        Ok(doc)
+    }
+
+    /// Validate the document's DID Core invariants, service entries, and
+    /// additional properties without mutating state.
+    pub fn validate(&self) -> Result<(), DidError> {
+        validate_did(&self.id)?;
+
+        for key in self.additional_properties.keys() {
+            if key.trim().is_empty() {
+                return Err(DidError::EmptyPropertyKey);
+            }
+            if RESERVED_DOCUMENT_FIELDS.contains(&key.as_str()) {
+                return Err(DidError::ReservedProperty(key.clone()));
+            }
+        }
+
+        let mut seen_ids = HashSet::with_capacity(self.service.len());
+        for svc in &self.service {
+            if svc.id.trim().is_empty() {
+                return Err(DidError::EmptyServiceId);
+            }
+            if svc.service_type.trim().is_empty() {
+                return Err(DidError::EmptyServiceType);
+            }
+            validate_endpoint_uri(svc.service_endpoint.as_str())?;
+            if !seen_ids.insert(svc.id.as_str()) {
+                return Err(DidError::DuplicateServiceId(svc.id.clone()));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate and serialize the DID document to a deterministic JSON string.
+    pub fn to_json(&self) -> Result<String, DidError> {
+        self.validate()?;
+        serde_json::to_string(self).map_err(|e| DidError::InvalidDocumentJson {
+            reason: e.to_string(),
+        })
+    }
+
+    /// Set an additional (extension) top-level property on the document.
+    ///
+    /// # Errors
+    ///
+    /// * [`DidError::EmptyPropertyKey`] — `key` is empty or whitespace-only.
+    /// * [`DidError::ReservedProperty`] — `key` is `"id"` or `"service"`.
+    pub fn set_property(
+        &mut self,
+        key: impl Into<String>,
+        value: serde_json::Value,
+    ) -> Result<(), DidError> {
+        let key = key.into();
+        if key.trim().is_empty() {
+            return Err(DidError::EmptyPropertyKey);
+        }
+        if RESERVED_DOCUMENT_FIELDS.contains(&key.as_str()) {
+            return Err(DidError::ReservedProperty(key));
+        }
+        self.additional_properties.insert(key, value);
+        Ok(())
+    }
+
+    /// Look up an additional top-level property by key.
+    pub fn get_property(&self, key: &str) -> Option<&serde_json::Value> {
+        self.additional_properties.get(key)
+    }
+
+    /// Remove an additional top-level property by key, returning its value if
+    /// present.
+    pub fn remove_property(&mut self, key: &str) -> Option<serde_json::Value> {
+        self.additional_properties.remove(key)
     }
 
     /// Add a service to the document, validating the endpoint scheme.
@@ -247,19 +438,7 @@ impl DidDocument {
         // Re-validate the scheme as defense-in-depth.  A ServiceEndpoint
         // constructed through the public API is already valid, but a document
         // deserialized from untrusted JSON could carry any string.
-        let parsed = url::Url::parse(service.service_endpoint.as_str()).map_err(|e| {
-            DidError::InvalidUri {
-                input: service.service_endpoint.as_str().to_string(),
-                reason: e.to_string(),
-            }
-        })?;
-        let scheme = parsed.scheme();
-        if !is_scheme_allowed(scheme) {
-            return Err(DidError::InvalidScheme {
-                scheme: scheme.to_string(),
-                uri: service.service_endpoint.as_str().to_string(),
-            });
-        }
+        validate_endpoint_uri(service.service_endpoint.as_str())?;
 
         // Reject duplicate IDs: a second entry with the same ID cannot shadow
         // the first without the caller explicitly removing the original.
@@ -571,5 +750,90 @@ mod tests {
 
         // The document was never modified.
         assert!(document.service.is_empty());
+    }
+
+    // ── Unknown property preservation & validation ────────────────────────────
+
+    #[test]
+    fn from_json_preserves_unknown_properties_and_round_trips() {
+        let json = r#"{
+            "@context": ["https://www.w3.org/ns/did/v1"],
+            "id": "did:stellar:testnet:GABC",
+            "alsoKnownAs": ["https://example.org"],
+            "customMeta": { "tier": 1, "active": true },
+            "service": []
+        }"#;
+
+        let doc = DidDocument::from_json(json).unwrap();
+        assert_eq!(doc.id, "did:stellar:testnet:GABC");
+        assert_eq!(
+            doc.get_property("@context"),
+            Some(&serde_json::json!(["https://www.w3.org/ns/did/v1"]))
+        );
+        assert_eq!(
+            doc.get_property("customMeta"),
+            Some(&serde_json::json!({ "tier": 1, "active": true }))
+        );
+
+        let serialized = doc.to_json().unwrap();
+        let reparsed = DidDocument::from_json(&serialized).unwrap();
+        assert_eq!(doc, reparsed);
+    }
+
+    #[test]
+    fn set_and_remove_property_manage_additional_properties() {
+        let mut doc = DidDocument::new("did:stellar:testnet:GABC");
+        doc.set_property("controller", serde_json::json!("did:stellar:testnet:GCTRL"))
+            .unwrap();
+        assert_eq!(
+            doc.get_property("controller"),
+            Some(&serde_json::json!("did:stellar:testnet:GCTRL"))
+        );
+
+        let removed = doc.remove_property("controller");
+        assert_eq!(
+            removed,
+            Some(serde_json::json!("did:stellar:testnet:GCTRL"))
+        );
+        assert!(doc.get_property("controller").is_none());
+    }
+
+    #[test]
+    fn set_property_rejects_reserved_and_blank_keys() {
+        let mut doc = DidDocument::new("did:stellar:testnet:GABC");
+
+        assert!(matches!(
+            doc.set_property("id", serde_json::json!("did:stellar:testnet:OTHER")),
+            Err(DidError::ReservedProperty(ref k)) if k == "id"
+        ));
+        assert!(matches!(
+            doc.set_property("service", serde_json::json!([])),
+            Err(DidError::ReservedProperty(ref k)) if k == "service"
+        ));
+        assert!(matches!(
+            doc.set_property("   ", serde_json::json!(1)),
+            Err(DidError::EmptyPropertyKey)
+        ));
+        assert!(doc.additional_properties.is_empty());
+    }
+
+    #[test]
+    fn from_json_rejects_invalid_did_and_malformed_json() {
+        assert!(matches!(
+            DidDocument::from_json("not json"),
+            Err(DidError::InvalidDocumentJson { .. })
+        ));
+        assert!(matches!(
+            DidDocument::from_json(r#"{"id": ""}"#),
+            Err(DidError::InvalidDid { .. })
+        ));
+        assert!(matches!(
+            DidDocument::from_json(r#"{"id": "did:INVALID:123"}"#),
+            Err(DidError::InvalidDid { .. })
+        ));
+        assert!(matches!(
+            DidDocument::from_json(r#"{"id": "did:stellar:"}"#),
+            Err(DidError::InvalidDid { .. })
+        ));
     }
 }
