@@ -3,7 +3,9 @@
 //! Advanced pathfinding algorithms for payment channel routing.
 
 use crate::fee_cap::FeeCap;
-use crate::{NetworkGraph, Route, RouteHop, RouteRequest, RoutingError, MAX_ROUTE_HOPS};
+use crate::{
+    build_exclusion_set, NetworkGraph, Route, RouteHop, RouteRequest, RoutingError, MAX_ROUTE_HOPS,
+};
 use fxhash::FxHashMap;
 use priority_queue::PriorityQueue;
 use std::cmp::Reverse;
@@ -67,6 +69,8 @@ impl Pathfinder {
         graph: &NetworkGraph,
         request: &RouteRequest,
     ) -> Result<Route, RoutingError> {
+        let excluded = build_exclusion_set(&request.excluded_unavailable)?;
+
         let mut dist: FxHashMap<String, (i128, Vec<RouteHop>)> = FxHashMap::default();
         let mut pq: PriorityQueue<String, Reverse<i128>> = PriorityQueue::new();
 
@@ -94,6 +98,11 @@ impl Pathfinder {
             if let Some(neighbors) = graph.adjacency.get(&node) {
                 for (neighbor, channel_id) in neighbors {
                     if let Some(channel) = graph.channels.get(channel_id) {
+                        // Skip temporarily unavailable channels.
+                        if excluded.contains(channel_id.as_str()) {
+                            continue;
+                        }
+
                         if self.fee_cap.check_channel(channel).is_err() {
                             continue;
                         }
@@ -153,6 +162,8 @@ impl Pathfinder {
         graph: &NetworkGraph,
         request: &RouteRequest,
     ) -> Result<Route, RoutingError> {
+        let excluded = build_exclusion_set(&request.excluded_unavailable)?;
+
         let mut open_set: PriorityQueue<String, Reverse<i128>> = PriorityQueue::new();
         let mut g_score: FxHashMap<String, i128> = FxHashMap::default();
         let mut f_score: FxHashMap<String, i128> = FxHashMap::default();
@@ -185,6 +196,11 @@ impl Pathfinder {
                     let Some(channel) = graph.channels.get(channel_id) else {
                         continue;
                     };
+
+                    // Skip temporarily unavailable channels.
+                    if excluded.contains(channel_id.as_str()) {
+                        continue;
+                    }
 
                     if self.fee_cap.check_channel(channel).is_err() {
                         continue;
@@ -235,6 +251,8 @@ impl Pathfinder {
         graph: &NetworkGraph,
         request: &RouteRequest,
     ) -> Result<Route, RoutingError> {
+        let excluded = build_exclusion_set(&request.excluded_unavailable)?;
+
         let mut queue: VecDeque<(String, Vec<RouteHop>)> = VecDeque::new();
         let mut visited: HashSet<String> = HashSet::new();
 
@@ -259,6 +277,11 @@ impl Pathfinder {
                     }
 
                     if let Some(channel) = graph.channels.get(channel_id) {
+                        // Skip temporarily unavailable channels.
+                        if excluded.contains(channel_id.as_str()) {
+                            continue;
+                        }
+
                         if self.fee_cap.check_channel(channel).is_err() {
                             continue;
                         }
@@ -319,6 +342,8 @@ impl Pathfinder {
     ) -> Result<Route, RoutingError> {
         use rand::seq::SliceRandom;
 
+        let excluded = build_exclusion_set(&request.excluded_unavailable)?;
+
         let mut visited: HashSet<String> = HashSet::new();
         let mut path: Vec<RouteHop> = Vec::new();
         let mut current = request.source.clone();
@@ -333,11 +358,15 @@ impl Pathfinder {
                 .map(|n| n.iter().collect::<Vec<_>>())
                 .unwrap_or_default();
 
-            // Filter out visited nodes and nodes without capacity
+            // Filter out visited nodes, excluded channels, and nodes without capacity
             let valid_neighbors: Vec<_> = neighbors
                 .into_iter()
                 .filter(|(node_id, channel_id)| {
                     if visited.contains(*node_id) {
+                        return false;
+                    }
+                    // Skip temporarily unavailable channels.
+                    if excluded.contains(channel_id.as_str()) {
                         return false;
                     }
                     if let Some(channel) = graph.channels.get(*channel_id) {
@@ -585,6 +614,7 @@ mod tests {
             max_hops: None,
             find_any: false,
             payment_metadata: None,
+            excluded_unavailable: vec![],
         }
     }
 
@@ -647,5 +677,132 @@ mod tests {
         assert!(Pathfinder::new()
             .find_route_dijkstra(&graph, &request())
             .is_ok());
+    }
+
+    // ── Temporarily-unavailable channel exclusion (Pathfinder) ───────────────
+
+    fn request_exclude(channel_id: &str) -> RouteRequest {
+        use crate::{UnavailabilityReason, UnavailableChannel};
+        RouteRequest {
+            excluded_unavailable: vec![UnavailableChannel::until(
+                channel_id.to_string(),
+                UnavailabilityReason::ForwardingFailure,
+                None,
+            )],
+            ..request()
+        }
+    }
+
+    /// All four search algorithms respect the `excluded_unavailable` list.
+    #[test]
+    fn all_algorithms_skip_excluded_unavailable_channels() {
+        // ch2 is the only way to reach carol; excluding it must block all
+        // algorithms.
+        let graph = graph_with(&[
+            ("ch1", "alice", "bob", 1_000),
+            ("ch2", "bob", "carol", 1_000),
+        ]);
+        let req = request_exclude("ch2");
+        let pathfinder = Pathfinder::new();
+
+        assert!(pathfinder.find_route_dijkstra(&graph, &req).is_err());
+        assert!(pathfinder.find_route_astar(&graph, &req).is_err());
+        assert!(pathfinder.find_route_bfs(&graph, &req).is_err());
+        assert!(pathfinder.find_random_route(&graph, &req).is_err());
+    }
+
+    /// When the excluded channel has a valid alternative, all algorithms find
+    /// the alternative.
+    #[test]
+    fn all_algorithms_find_alternative_when_one_channel_excluded() {
+        // Build a four-node graph so the alternative is two hops from alice.
+        let mut graph = NetworkGraph::new();
+        for id in ["alice", "bob", "carol", "dave"] {
+            graph.add_node(Node {
+                id: id.to_string(),
+                public_key: vec![1],
+                alias: None,
+                online: true,
+                last_seen: 0,
+                features: NodeFeatures::default(),
+            });
+        }
+        // Direct path alice->bob->carol
+        for (id, a, b) in [("ch1", "alice", "bob"), ("ch2", "bob", "carol")] {
+            graph.add_channel(Channel {
+                id: id.to_string(),
+                node_a: a.to_string(),
+                node_b: b.to_string(),
+                capacity_a_to_b: 5_000_000,
+                capacity_b_to_a: 5_000_000,
+                base_fee: 1,
+                fee_rate: 1_000,
+                cltv_delta: 40,
+                min_htlc_size: 1,
+                max_htlc_size: 5_000_000,
+                htlcs_in_flight: 0,
+                enabled: true,
+                age_seconds: 0,
+            });
+        }
+        // Alternative path alice->dave->carol
+        for (id, a, b) in [("ch3", "alice", "dave"), ("ch4", "dave", "carol")] {
+            graph.add_channel(Channel {
+                id: id.to_string(),
+                node_a: a.to_string(),
+                node_b: b.to_string(),
+                capacity_a_to_b: 5_000_000,
+                capacity_b_to_a: 5_000_000,
+                base_fee: 1,
+                fee_rate: 1_000,
+                cltv_delta: 40,
+                min_htlc_size: 1,
+                max_htlc_size: 5_000_000,
+                htlcs_in_flight: 0,
+                enabled: true,
+                age_seconds: 0,
+            });
+        }
+
+        let req = request_exclude("ch2"); // block direct path
+        let pathfinder = Pathfinder::new();
+
+        for route in [
+            pathfinder.find_route_dijkstra(&graph, &req).unwrap(),
+            pathfinder.find_route_astar(&graph, &req).unwrap(),
+            pathfinder.find_route_bfs(&graph, &req).unwrap(),
+        ] {
+            assert!(
+                route.hops.iter().all(|h| h.channel_id != "ch2"),
+                "route must not use excluded channel"
+            );
+        }
+    }
+
+    /// An invalid exclusion entry (empty channel ID) causes all algorithms to
+    /// return an error immediately.
+    #[test]
+    fn invalid_exclusion_aborts_all_algorithms() {
+        use crate::{UnavailabilityReason, UnavailableChannel};
+        let graph = graph_with(&[("ch1", "alice", "bob", 1_000)]);
+        let req = RouteRequest {
+            source: "alice".to_string(),
+            destination: "bob".to_string(),
+            amount: 1_000,
+            max_fee_budget: None,
+            max_hops: None,
+            find_any: false,
+            payment_metadata: None,
+            excluded_unavailable: vec![UnavailableChannel::until(
+                String::new(), // invalid
+                UnavailabilityReason::Other,
+                None,
+            )],
+        };
+        let pathfinder = Pathfinder::new();
+        assert!(pathfinder.find_route_dijkstra(&graph, &req).is_err());
+        assert!(pathfinder.find_route_astar(&graph, &req).is_err());
+        assert!(pathfinder.find_route_bfs(&graph, &req).is_err());
+        assert!(pathfinder.find_random_route(&graph, &req).is_err());
     }
 }

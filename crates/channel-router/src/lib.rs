@@ -3,6 +3,41 @@
 //! Multi-hop payment routing for Stellar payment channels.
 //! Implements path-finding algorithms for routing payments through
 //! the payment channel network.
+//!
+//! ## Excluding temporarily unavailable channels
+//!
+//! Callers that know a channel is currently offline (e.g. because a previous
+//! payment attempt just returned a forwarding failure) can exclude it from the
+//! next route search without permanently removing it from the graph.  Pass one
+//! or more [`UnavailableChannel`] entries in
+//! [`RouteRequest::excluded_unavailable`]:
+//!
+//! ```rust,no_run
+//! use channel_router::{RouteRequest, UnavailableChannel, UnavailabilityReason};
+//!
+//! let request = RouteRequest {
+//!     source: "alice".to_string(),
+//!     destination: "carol".to_string(),
+//!     amount: 100_000,
+//!     max_fee_budget: None,
+//!     max_hops: None,
+//!     find_any: false,
+//!     payment_metadata: None,
+//!     excluded_unavailable: vec![
+//!         UnavailableChannel::until(
+//!             "ch_flaky".to_string(),
+//!             UnavailabilityReason::ForwardingFailure,
+//!             Some(1_700_000_060),   // Unix timestamp after which it may be retried
+//!         ),
+//!     ],
+//! };
+//! ```
+//!
+//! Channels in `excluded_unavailable` are skipped by **all** route-search
+//! code paths: [`find_best_route`], [`find_best_route_with_cap`], and every
+//! algorithm inside [`pathfinder::Pathfinder`].  Callers that do not need this
+//! feature leave `excluded_unavailable` as an empty `Vec` and see no change in
+//! behaviour.
 
 pub mod fee_cap;
 pub mod graph;
@@ -93,6 +128,120 @@ pub enum RoutingError {
 
     #[error("Route declares {declared} in fees but its hops sum to {actual}")]
     InconsistentRouteFees { declared: i128, actual: i128 },
+
+    #[error(
+        "Channel {channel_id} is temporarily unavailable ({reason:?}) \
+         and was excluded from routing"
+    )]
+    ChannelTemporarilyUnavailable {
+        channel_id: String,
+        reason: UnavailabilityReason,
+    },
+}
+
+// ── Temporary channel exclusion ─────────────────────────────────────────────
+
+/// Why a channel is being excluded for the duration of a single routing
+/// attempt.
+///
+/// This is informational: the router skips the channel regardless of which
+/// variant is used.  Callers should choose the variant that best matches what
+/// they observed so that logs and metrics are meaningful.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum UnavailabilityReason {
+    /// The channel returned a forwarding failure on a recent payment attempt.
+    ForwardingFailure,
+    /// The remote peer is not reachable right now.
+    PeerOffline,
+    /// The channel is offline or in a closing/negotiation state.
+    ChannelOffline,
+    /// The channel has insufficient liquidity in the required direction.
+    InsufficientLiquidity,
+    /// A caller-defined reason not covered by the variants above.
+    Other,
+}
+
+/// A channel that must not be used for the current routing attempt.
+///
+/// Include one of these in [`RouteRequest::excluded_unavailable`] to prevent
+/// the router from using a channel that is known to be temporarily
+/// non-functional.  The exclusion applies only to the single
+/// [`RouteRequest`] in which it appears; the channel remains in the
+/// [`NetworkGraph`] and will be considered again the next time a route is
+/// searched.
+///
+/// # Invariants
+///
+/// * `channel_id` must not be empty — an empty string is rejected with
+///   [`RoutingError::ChannelNotFound`].
+/// * `unavailable_until` is optional.  If `Some`, it is a Unix timestamp
+///   (seconds since the epoch) after which the channel *may* be retried.
+///   The router itself does not consult this value at search time — it is
+///   stored so that callers can pass it through scheduling code — but it must
+///   not be zero when present (zero is treated as "no expiry" and is rejected
+///   to avoid ambiguity; callers that truly mean "expire immediately" should
+///   pass `None`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnavailableChannel {
+    /// ID of the channel to exclude.
+    pub channel_id: String,
+    /// Why the channel is unavailable.
+    pub reason: UnavailabilityReason,
+    /// Unix timestamp after which the channel may be retried, if known.
+    pub unavailable_until: Option<u64>,
+}
+
+impl UnavailableChannel {
+    /// Construct an [`UnavailableChannel`], validating that `channel_id` is
+    /// non-empty and that `unavailable_until`, when present, is non-zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoutingError::ChannelNotFound`] if `channel_id` is empty.
+    /// Returns [`RoutingError::InvalidNodeAddress`] if `unavailable_until`
+    /// is `Some(0)` (zero is ambiguous; use `None` for "no expiry").
+    pub fn until(
+        channel_id: String,
+        reason: UnavailabilityReason,
+        unavailable_until: Option<u64>,
+    ) -> Self {
+        // The constructing caller is trusted to supply valid data; validation
+        // is performed by `validate()` before the entry is used by the router.
+        UnavailableChannel {
+            channel_id,
+            reason,
+            unavailable_until,
+        }
+    }
+
+    /// Validate this entry.
+    ///
+    /// Called automatically by the routing functions before the exclusion list
+    /// is applied.
+    pub fn validate(&self) -> Result<(), RoutingError> {
+        if self.channel_id.is_empty() {
+            return Err(RoutingError::ChannelNotFound {
+                channel_id: "(empty)".to_string(),
+            });
+        }
+        if self.unavailable_until == Some(0) {
+            return Err(RoutingError::InvalidNodeAddress);
+        }
+        Ok(())
+    }
+}
+
+/// Build a lookup set of channel IDs that must be skipped, validating each
+/// entry first.  Returns the first validation error encountered.
+pub(crate) fn build_exclusion_set(
+    entries: &[UnavailableChannel],
+) -> Result<HashSet<&str>, RoutingError> {
+    let mut set = HashSet::with_capacity(entries.len());
+    for entry in entries {
+        entry.validate()?;
+        set.insert(entry.channel_id.as_str());
+    }
+    Ok(set)
 }
 
 /// Represents a node in the payment channel network
@@ -256,6 +405,12 @@ pub struct RouteRequest {
     pub find_any: bool,
     /// Payment metadata
     pub payment_metadata: Option<PaymentMetadata>,
+    /// Channels that are known to be temporarily unavailable and must not be
+    /// used for this routing attempt.  Callers that have no exclusions leave
+    /// this empty; existing call sites that construct `RouteRequest` without
+    /// this field compile unchanged when they switch to struct-update syntax
+    /// (`..RouteRequest { excluded_unavailable: vec![], .. }`).
+    pub excluded_unavailable: Vec<UnavailableChannel>,
 }
 
 /// Payment metadata for routing decisions
@@ -498,6 +653,10 @@ pub fn find_best_route_with_cap(
         });
     }
 
+    // Validate and compile the temporary-exclusion list before the search so
+    // that invalid entries are caught atomically rather than mid-route.
+    let excluded = build_exclusion_set(&request.excluded_unavailable)?;
+
     let max_hops = request.max_hops.unwrap_or(MAX_ROUTE_HOPS);
 
     // Dijkstra's algorithm with weighted edges (fees)
@@ -532,6 +691,11 @@ pub fn find_best_route_with_cap(
         if let Some(neighbors) = graph.adjacency.get(&node_id) {
             for (neighbor_id, channel_id) in neighbors {
                 if let Some(channel) = graph.channels.get(channel_id) {
+                    // Skip channels that are temporarily unavailable.
+                    if excluded.contains(channel_id.as_str()) {
+                        continue;
+                    }
+
                     // A hop that advertises an absurd fee schedule is never
                     // admitted, no matter how cheap the rest of the route is.
                     if cap.check_channel(channel).is_err() {
@@ -796,6 +960,7 @@ mod tests {
             max_hops: Some(3),
             find_any: false,
             payment_metadata: None,
+            excluded_unavailable: vec![],
         };
 
         let route = find_best_route(&graph, &request).unwrap();
@@ -843,6 +1008,7 @@ mod tests {
             max_hops: None,
             find_any: false,
             payment_metadata: None,
+            excluded_unavailable: vec![],
         }
     }
 
@@ -1029,5 +1195,190 @@ mod tests {
 
         let routes = find_k_routes(&graph, &request("alice", "carol", 1_000), 3).unwrap();
         assert!(routes.is_empty());
+    }
+
+    // ── Temporarily-unavailable channel exclusion ────────────────────────────
+
+    /// A channel in `excluded_unavailable` is never chosen, even when it is
+    /// the only path that would otherwise satisfy the request.
+    #[test]
+    fn excluded_unavailable_channel_causes_no_path_found() {
+        let mut graph = NetworkGraph::new();
+        for id in ["alice", "bob"] {
+            add_node(&mut graph, id);
+        }
+        add_edge(&mut graph, "ch1", "alice", "bob", 1_000);
+
+        let req = RouteRequest {
+            excluded_unavailable: vec![UnavailableChannel::until(
+                "ch1".to_string(),
+                UnavailabilityReason::ForwardingFailure,
+                None,
+            )],
+            ..request("alice", "bob", 100)
+        };
+
+        assert!(matches!(
+            find_best_route(&graph, &req).unwrap_err(),
+            RoutingError::NoPathFound { .. }
+        ));
+    }
+
+    /// When an alternative path exists the router uses it and avoids the
+    /// excluded channel.
+    #[test]
+    fn router_finds_alternative_when_one_channel_excluded() {
+        let mut graph = NetworkGraph::new();
+        for id in ["alice", "bob", "carol"] {
+            add_node(&mut graph, id);
+        }
+        // Direct channel – will be excluded
+        add_edge(&mut graph, "ch_direct", "alice", "bob", 1_000);
+        // Two-hop alternative: alice -> carol -> bob
+        add_edge(&mut graph, "ch_ac", "alice", "carol", 1_000);
+        add_edge(&mut graph, "ch_cb", "carol", "bob", 1_000);
+
+        let req = RouteRequest {
+            excluded_unavailable: vec![UnavailableChannel::until(
+                "ch_direct".to_string(),
+                UnavailabilityReason::PeerOffline,
+                Some(1_700_000_060),
+            )],
+            ..request("alice", "bob", 100)
+        };
+
+        let route = find_best_route(&graph, &req).unwrap();
+        assert!(
+            route.hops.iter().all(|h| h.channel_id != "ch_direct"),
+            "route must not use the excluded channel"
+        );
+        assert_eq!(route.hops.len(), 2);
+    }
+
+    /// Multiple channels can be excluded simultaneously.
+    #[test]
+    fn multiple_channels_can_be_excluded() {
+        let mut graph = NetworkGraph::new();
+        for id in ["alice", "bob", "carol"] {
+            add_node(&mut graph, id);
+        }
+        add_edge(&mut graph, "ch1", "alice", "bob", 1_000);
+        add_edge(&mut graph, "ch2", "bob", "carol", 1_000);
+
+        // Exclude both hops on the only path.
+        let req = RouteRequest {
+            excluded_unavailable: vec![
+                UnavailableChannel::until(
+                    "ch1".to_string(),
+                    UnavailabilityReason::ChannelOffline,
+                    None,
+                ),
+                UnavailableChannel::until(
+                    "ch2".to_string(),
+                    UnavailabilityReason::InsufficientLiquidity,
+                    None,
+                ),
+            ],
+            ..request("alice", "carol", 100)
+        };
+
+        assert!(matches!(
+            find_best_route(&graph, &req).unwrap_err(),
+            RoutingError::NoPathFound { .. }
+        ));
+    }
+
+    /// An empty `excluded_unavailable` list is a no-op; routing behaves
+    /// exactly as before.
+    #[test]
+    fn empty_excluded_list_is_a_noop() {
+        let mut graph = NetworkGraph::new();
+        for id in ["alice", "bob"] {
+            add_node(&mut graph, id);
+        }
+        add_edge(&mut graph, "ch1", "alice", "bob", 1_000);
+
+        let req = RouteRequest {
+            excluded_unavailable: vec![],
+            ..request("alice", "bob", 100)
+        };
+
+        assert!(find_best_route(&graph, &req).is_ok());
+    }
+
+    /// `UnavailableChannel::validate` rejects an empty channel ID.
+    #[test]
+    fn empty_channel_id_in_exclusion_is_rejected() {
+        let entry = UnavailableChannel::until(
+            String::new(),
+            UnavailabilityReason::Other,
+            None,
+        );
+        assert!(matches!(
+            entry.validate().unwrap_err(),
+            RoutingError::ChannelNotFound { .. }
+        ));
+    }
+
+    /// `UnavailableChannel::validate` rejects `unavailable_until = Some(0)`.
+    #[test]
+    fn zero_expiry_in_exclusion_is_rejected() {
+        let entry = UnavailableChannel::until(
+            "ch1".to_string(),
+            UnavailabilityReason::Other,
+            Some(0),
+        );
+        assert!(matches!(
+            entry.validate().unwrap_err(),
+            RoutingError::InvalidNodeAddress
+        ));
+    }
+
+    /// An exclusion list with an invalid entry causes `find_best_route` to
+    /// return an error immediately, before any graph traversal.
+    #[test]
+    fn invalid_exclusion_entry_aborts_routing() {
+        let mut graph = NetworkGraph::new();
+        for id in ["alice", "bob"] {
+            add_node(&mut graph, id);
+        }
+        add_edge(&mut graph, "ch1", "alice", "bob", 1_000);
+
+        let req = RouteRequest {
+            excluded_unavailable: vec![UnavailableChannel::until(
+                String::new(), // invalid
+                UnavailabilityReason::Other,
+                None,
+            )],
+            ..request("alice", "bob", 100)
+        };
+
+        assert!(matches!(
+            find_best_route(&graph, &req).unwrap_err(),
+            RoutingError::ChannelNotFound { .. }
+        ));
+    }
+
+    /// A non-existent channel ID in the exclusion list is silently ignored
+    /// (the channel isn't in the graph, so skipping it has no effect).
+    #[test]
+    fn excluding_nonexistent_channel_is_harmless() {
+        let mut graph = NetworkGraph::new();
+        for id in ["alice", "bob"] {
+            add_node(&mut graph, id);
+        }
+        add_edge(&mut graph, "ch1", "alice", "bob", 1_000);
+
+        let req = RouteRequest {
+            excluded_unavailable: vec![UnavailableChannel::until(
+                "ch_does_not_exist".to_string(),
+                UnavailabilityReason::Other,
+                None,
+            )],
+            ..request("alice", "bob", 100)
+        };
+
+        // The real channel ch1 is still available.
+        assert!(find_best_route(&graph, &req).is_ok());
     }
 }

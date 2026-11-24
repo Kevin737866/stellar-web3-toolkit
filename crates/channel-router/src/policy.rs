@@ -2,7 +2,10 @@
 //!
 //! Routing policies and constraints for the payment channel router.
 
-use crate::{Channel, NetworkGraph, Route, RouteHop, RouteRequest, RoutingError, MAX_ROUTE_HOPS};
+use crate::{
+    Channel, NetworkGraph, Route, RouteHop, RouteRequest, RoutingError, UnavailableChannel,
+    MAX_ROUTE_HOPS,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -19,7 +22,7 @@ pub struct RoutingPolicy {
     pub max_fee_rate: u32,
     /// Excluded node IDs
     pub excluded_nodes: HashSet<String>,
-    /// Excluded channel IDs
+    /// Excluded channel IDs (permanent – these channels are never used)
     pub excluded_channels: HashSet<String>,
     /// Preferred nodes (favor these in routing)
     pub preferred_nodes: HashSet<String>,
@@ -33,6 +36,13 @@ pub struct RoutingPolicy {
     pub min_amount: i128,
     /// Maximum amount
     pub max_amount: i128,
+    /// Channels that are temporarily unavailable for the next routing attempt.
+    ///
+    /// These are merged into [`RouteRequest::excluded_unavailable`] by
+    /// [`RoutingPolicy::apply_to_request`].  Unlike `excluded_channels`
+    /// (which are permanently skipped), entries here can carry an expiry
+    /// timestamp so scheduling code knows when to clear them.
+    pub temporarily_unavailable: Vec<UnavailableChannel>,
 }
 
 impl Default for RoutingPolicy {
@@ -50,6 +60,7 @@ impl Default for RoutingPolicy {
             prefer_low_cltv: true,
             min_amount: 1,
             max_amount: i128::MAX / 2,
+            temporarily_unavailable: Vec::new(),
         }
     }
 }
@@ -193,6 +204,14 @@ impl RoutingPolicy {
             let max_fee = (request.amount as f64 * self.max_fee_bps as f64 / 10000.0) as i128;
             request.max_fee_budget = Some(max_fee);
         }
+
+        // Merge temporarily-unavailable channels from the policy into the
+        // request.  Caller-supplied entries take precedence and are kept at
+        // the front; policy entries are appended so deduplication is not
+        // required (the router holds a `HashSet` internally anyway).
+        request
+            .excluded_unavailable
+            .extend(self.temporarily_unavailable.iter().cloned());
 
         request
     }
