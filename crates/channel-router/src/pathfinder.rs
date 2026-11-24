@@ -648,4 +648,159 @@ mod tests {
             .find_route_dijkstra(&graph, &request())
             .is_ok());
     }
+
+    // ── Disconnected network components (issue #366) ─────────────────────────
+
+    fn two_component_graph() -> NetworkGraph {
+        // Component 1: alice <-> bob <-> carol
+        // Component 2: dave <-> erin
+        // Component 3: frank (isolated node with no channels)
+        let mut graph = NetworkGraph::new();
+        for id in ["alice", "bob", "carol", "dave", "erin", "frank"] {
+            graph.add_node(Node {
+                id: id.to_string(),
+                public_key: vec![1],
+                alias: None,
+                online: true,
+                last_seen: 0,
+                features: NodeFeatures::default(),
+            });
+        }
+
+        for (id, a, b) in [
+            ("ch1", "alice", "bob"),
+            ("ch2", "bob", "carol"),
+            ("ch3", "dave", "erin"),
+        ] {
+            graph.add_channel(Channel {
+                id: id.to_string(),
+                node_a: a.to_string(),
+                node_b: b.to_string(),
+                capacity_a_to_b: 5_000_000,
+                capacity_b_to_a: 5_000_000,
+                base_fee: 1,
+                fee_rate: 1_000,
+                cltv_delta: 40,
+                min_htlc_size: 1,
+                max_htlc_size: 5_000_000,
+                htlcs_in_flight: 0,
+                enabled: true,
+                age_seconds: 0,
+            });
+        }
+
+        graph
+    }
+
+    fn req(source: &str, destination: &str) -> RouteRequest {
+        RouteRequest {
+            source: source.to_string(),
+            destination: destination.to_string(),
+            amount: 100_000,
+            max_fee_budget: None,
+            max_hops: None,
+            find_any: false,
+            payment_metadata: None,
+        }
+    }
+
+    #[test]
+    fn intra_component_routes_succeed_in_disconnected_graph() {
+        let graph = two_component_graph();
+        let pf = Pathfinder::new();
+
+        for (src, dst) in [("alice", "carol"), ("dave", "erin")] {
+            let r = req(src, dst);
+            assert!(pf.find_route_dijkstra(&graph, &r).is_ok());
+            assert!(pf.find_route_astar(&graph, &r).is_ok());
+            assert!(pf.find_route_bfs(&graph, &r).is_ok());
+            assert!(pf.find_cheapest_route(&graph, &r).is_ok());
+            assert!(pf.find_fastest_route(&graph, &r).is_ok());
+            assert!(pf.find_random_route(&graph, &r).is_ok());
+        }
+    }
+
+    #[test]
+    fn cross_component_route_search_returns_no_path_found() {
+        let graph = two_component_graph();
+        let pf = Pathfinder::new();
+        let r = req("alice", "erin");
+
+        for result in [
+            pf.find_route_dijkstra(&graph, &r),
+            pf.find_route_astar(&graph, &r),
+            pf.find_route_bfs(&graph, &r),
+            pf.find_cheapest_route(&graph, &r),
+            pf.find_fastest_route(&graph, &r),
+            pf.find_random_route(&graph, &r),
+        ] {
+            assert!(matches!(
+                result,
+                Err(RoutingError::NoPathFound {
+                    ref origin,
+                    ref destination,
+                }) if origin == "alice" && destination == "erin"
+            ));
+        }
+    }
+
+    #[test]
+    fn isolated_node_component_cannot_send_or_receive() {
+        let graph = two_component_graph();
+        let pf = Pathfinder::new();
+
+        for (src, dst) in [("frank", "alice"), ("alice", "frank")] {
+            let r = req(src, dst);
+            assert!(matches!(
+                pf.find_route_dijkstra(&graph, &r),
+                Err(RoutingError::NoPathFound { .. })
+            ));
+            assert!(matches!(
+                pf.find_route_astar(&graph, &r),
+                Err(RoutingError::NoPathFound { .. })
+            ));
+            assert!(matches!(
+                pf.find_route_bfs(&graph, &r),
+                Err(RoutingError::NoPathFound { .. })
+            ));
+            assert!(matches!(
+                pf.find_random_route(&graph, &r),
+                Err(RoutingError::NoPathFound { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn removing_bridge_channel_disconnects_route_search() {
+        let mut graph = two_component_graph();
+        graph.add_channel(Channel {
+            id: "bridge".to_string(),
+            node_a: "carol".to_string(),
+            node_b: "dave".to_string(),
+            capacity_a_to_b: 5_000_000,
+            capacity_b_to_a: 5_000_000,
+            base_fee: 1,
+            fee_rate: 1_000,
+            cltv_delta: 40,
+            min_htlc_size: 1,
+            max_htlc_size: 5_000_000,
+            htlcs_in_flight: 0,
+            enabled: true,
+            age_seconds: 0,
+        });
+
+        let pf = Pathfinder::new();
+        let r = req("alice", "erin");
+        assert!(pf.find_route_dijkstra(&graph, &r).is_ok());
+
+        graph.remove_channel("bridge");
+        assert!(matches!(
+            pf.find_route_dijkstra(&graph, &r),
+            Err(RoutingError::NoPathFound { .. })
+        ));
+        assert!(matches!(
+            pf.find_route_bfs(&graph, &r),
+            Err(RoutingError::NoPathFound { .. })
+        ));
+    }
 }
