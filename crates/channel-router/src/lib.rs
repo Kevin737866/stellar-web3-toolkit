@@ -3,13 +3,22 @@
 //! Multi-hop payment routing for Stellar payment channels.
 //! Implements path-finding algorithms for routing payments through
 //! the payment channel network.
+//!
+//! Policy rejections can be explained with [`find_best_route_with_policy`] and
+//! [`evaluate_route_policy`], which report the candidate route and the exact
+//! rule it broke (issue #365).
 
 pub mod fee_cap;
 pub mod graph;
 pub mod pathfinder;
 pub mod policy;
+pub mod policy_report;
 
 pub use fee_cap::FeeCap;
+pub use policy_report::{
+    CandidateRouteFailure, CandidateRouteSummary, PolicyFailureReason, RouteEvaluationReport,
+    RoutePolicyError,
+};
 
 use fxhash::FxHashMap;
 use priority_queue::PriorityQueue;
@@ -660,6 +669,60 @@ pub fn find_best_route_with_cap(
     cap.check_route(request.amount, &route)?;
 
     Ok(route)
+}
+
+/// Explain why candidate routes failed policy checks.
+///
+/// The returned report lists every simple candidate examined and the exact
+/// rule that rejected it. A report with `accepted > 0` means a route exists;
+/// it does not change any graph or request state.
+pub fn evaluate_route_policy(
+    graph: &NetworkGraph,
+    request: &RouteRequest,
+    policy: &policy::RoutingPolicy,
+) -> Result<RouteEvaluationReport, RoutePolicyError> {
+    Ok(policy_report::evaluate(graph, request, policy)?.report)
+}
+
+/// Find the best route under an explicit routing policy, reporting why every
+/// rejected candidate failed (issue #365).
+///
+/// Selection is deterministic: candidates are sorted by total fee, hop count
+/// and then channel ids, so equal-cost routes never depend on hash iteration.
+/// Existing [`find_best_route`] callers are unaffected.
+pub fn find_best_route_with_policy(
+    graph: &NetworkGraph,
+    request: &RouteRequest,
+    policy: &policy::RoutingPolicy,
+) -> Result<Route, RoutePolicyError> {
+    let evaluation = policy_report::evaluate(graph, request, policy)?;
+    let best = match evaluation.best() {
+        Some(best) => best,
+        None if evaluation.report.failures.is_empty() => {
+            return Err(RoutePolicyError::NoCandidates {
+                origin: request.source.clone(),
+                destination: request.destination.clone(),
+            })
+        }
+        None => return Err(RoutePolicyError::Rejected(evaluation.report.clone())),
+    };
+
+    let num_hops = best.hops.len();
+    Ok(Route {
+        hops: best.hops.clone(),
+        total_fees: best.summary.total_fees,
+        total_amount: request.amount,
+        success_probability: 0.95,
+        metadata: RouteMetadata {
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            num_nodes: num_hops,
+            estimated_time_ms: 100 * num_hops as u64,
+            is_direct: num_hops == 1,
+        },
+    })
 }
 
 /// Find multiple routes using k-shortest paths
