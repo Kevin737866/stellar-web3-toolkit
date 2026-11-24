@@ -3,7 +3,10 @@
 //! Advanced pathfinding algorithms for payment channel routing.
 
 use crate::fee_cap::FeeCap;
-use crate::{NetworkGraph, Route, RouteHop, RouteRequest, RoutingError, MAX_ROUTE_HOPS};
+use crate::{
+    compute_hop_timeouts, NetworkGraph, PaymentMetadata, Route, RouteHop, RouteRequest,
+    RoutingError, MAX_ROUTE_HOPS,
+};
 use fxhash::FxHashMap;
 use priority_queue::PriorityQueue;
 use std::cmp::Reverse;
@@ -77,7 +80,11 @@ impl Pathfinder {
             let (final_cost, path) = dist.get(&node).unwrap().clone();
 
             if node == request.destination {
-                return self.build_route(path, request.amount);
+                return self.build_route_with_metadata(
+                    path,
+                    request.amount,
+                    request.payment_metadata.as_ref(),
+                );
             }
 
             if cost > final_cost {
@@ -175,6 +182,7 @@ impl Pathfinder {
                     &request.source,
                     &request.destination,
                     request.amount,
+                    request.payment_metadata.as_ref(),
                 );
             }
 
@@ -243,7 +251,11 @@ impl Pathfinder {
 
         while let Some((current, path)) = queue.pop_front() {
             if current == request.destination {
-                return self.build_route(path, request.amount);
+                return self.build_route_with_metadata(
+                    path,
+                    request.amount,
+                    request.payment_metadata.as_ref(),
+                );
             }
 
             if path.len() >= self.max_hops {
@@ -386,7 +398,7 @@ impl Pathfinder {
             });
         }
 
-        self.build_route(path, request.amount)
+        self.build_route_with_metadata(path, request.amount, request.payment_metadata.as_ref())
     }
 
     fn calculate_fee(&self, channel: &crate::Channel, amount: i128) -> i128 {
@@ -443,6 +455,15 @@ impl Pathfinder {
     }
 
     fn build_route(&self, path: Vec<RouteHop>, amount: i128) -> Result<Route, RoutingError> {
+        self.build_route_with_metadata(path, amount, None)
+    }
+
+    fn build_route_with_metadata(
+        &self,
+        mut path: Vec<RouteHop>,
+        amount: i128,
+        payment_metadata: Option<&PaymentMetadata>,
+    ) -> Result<Route, RoutingError> {
         if path.is_empty() {
             return Err(RoutingError::NoPathFound {
                 origin: "unknown".to_string(),
@@ -462,6 +483,14 @@ impl Pathfinder {
 
         self.enforce_fee_cap(amount, &path)?;
 
+        let (final_cltv_delta, max_cltv_budget) = match payment_metadata {
+            Some(meta) => (meta.required_cltv_delta.unwrap_or(0), meta.payment_expiry),
+            None => (0, None),
+        };
+        let (total_cltv_delta, hop_timeouts) =
+            compute_hop_timeouts(&mut path, final_cltv_delta, max_cltv_budget)?;
+        let num_hops = path.len();
+
         Ok(Route {
             hops: path,
             total_fees,
@@ -472,9 +501,11 @@ impl Pathfinder {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_secs(),
-                num_nodes: 0, // Will be set correctly
+                num_nodes: num_hops,
                 estimated_time_ms: 100,
-                is_direct: false,
+                is_direct: num_hops == 1,
+                total_cltv_delta,
+                hop_timeouts,
             },
         })
     }
@@ -485,14 +516,13 @@ impl Pathfinder {
         source: &str,
         destination: &str,
         amount: i128,
+        payment_metadata: Option<&PaymentMetadata>,
     ) -> Result<Route, RoutingError> {
         let mut path = Vec::new();
         let mut current = destination.to_string();
-        let mut total_fees = 0i128;
 
         while let Some((prev, hop)) = came_from.get(&current) {
             path.push(hop.clone());
-            total_fees += hop.fee;
 
             if prev == source {
                 break;
@@ -509,23 +539,7 @@ impl Pathfinder {
             });
         }
 
-        self.enforce_fee_cap(amount, &path)?;
-
-        Ok(Route {
-            hops: path,
-            total_fees,
-            total_amount: amount,
-            success_probability: 0.9,
-            metadata: crate::RouteMetadata {
-                created_at: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-                num_nodes: 0,
-                estimated_time_ms: 100,
-                is_direct: false,
-            },
-        })
+        self.build_route_with_metadata(path, amount, payment_metadata)
     }
 }
 
