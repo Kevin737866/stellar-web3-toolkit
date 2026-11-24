@@ -201,6 +201,16 @@ jobs:
             echo "Live deploy would run: stellar contract deploy --wasm dist/<contract>.wasm --network ${{ inputs.environment }} --source <deployer>"
             echo "Guarded by GitHub Environment approval (prod requires manual approval)."
           fi
+      - name: Rollback smoke test
+        # A rollback redeploys the previous release's wasm, so the artifact set
+        # must still match its recorded checksums. Fail the job if any wasm is
+        # missing or differs from dist/wasm-checksums.txt (paths are rebased
+        # onto dist/ because the manifest records build-tree paths).
+        run: |
+          test -s dist/wasm-checksums.txt
+          while read -r hash file; do
+            echo "${hash}  dist/$(basename "${file#\*}")"
+          done < dist/wasm-checksums.txt | sha256sum -c -
       - name: Append deployment audit log
         run: |
           mkdir -p logs
