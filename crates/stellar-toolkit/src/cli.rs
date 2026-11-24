@@ -484,6 +484,13 @@ pub enum WalletCommand {
         /// The BIP-39 recovery phrase (quote it for shell safety)
         phrase: String,
     },
+    /// Check a recovery phrase for errors without deriving or printing keys
+    Validate {
+        /// The BIP-39 recovery phrase (quote it for shell safety).
+        /// Omit to read one line from stdin, keeping it out of shell history and `ps`.
+        #[arg(value_name = "PHRASE")]
+        phrase: Option<String>,
+    },
     /// Fund a Stellar account on testnet using the Friendbot faucet
     Fund {
         /// The account id (G...) to fund
@@ -510,6 +517,7 @@ impl std::fmt::Debug for WalletCommand {
         match self {
             Self::Generate => f.write_str("Generate"),
             Self::Recover { .. } => f.write_str("Recover { phrase: \"<redacted>\" }"),
+            Self::Validate { .. } => f.write_str("Validate { phrase: \"<redacted>\" }"),
             Self::Fund { account } => f.debug_struct("Fund").field("account", account).finish(),
             Self::Sign { message, .. } => f
                 .debug_struct("Sign")
@@ -644,6 +652,31 @@ fn run_wallet(wallet: &WalletCommand) -> Result<()> {
         WalletCommand::Recover { phrase } => {
             let w = wallet::recover_wallet(phrase)?;
             print_wallet(&w);
+            Ok(())
+        }
+        WalletCommand::Validate { phrase } => {
+            let phrase = match phrase {
+                Some(phrase) => phrase.clone(),
+                None => {
+                    let mut line = String::new();
+                    std::io::stdin().read_line(&mut line).map_err(|e| {
+                        ToolkitError::Wallet(format!(
+                            "could not read recovery phrase from stdin: {e}"
+                        ))
+                    })?;
+                    line
+                }
+            };
+            let validation = wallet::validate_recovery_phrase(&phrase);
+            if let Some(message) = validation.error_message() {
+                return Err(ToolkitError::Wallet(format!(
+                    "invalid recovery phrase: {message}"
+                )));
+            }
+            println!(
+                "Recovery phrase is valid ({} words).",
+                validation.word_count
+            );
             Ok(())
         }
         WalletCommand::Fund { account } => wallet::fund_account(account),
