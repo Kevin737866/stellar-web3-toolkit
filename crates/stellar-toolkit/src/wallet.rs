@@ -88,7 +88,8 @@ pub fn recover_wallet(phrase: &str) -> Result<GeneratedWallet> {
 /// hardened-only derivation at the given path.
 fn slip10_derive(seed: &[u8], path: &[u32]) -> [u8; 32] {
     // Master key: I = HMAC-SHA512(key="ed25519 seed", data=seed).
-    let mut mac = HmacSha512::new_from_slice(b"ed25519 seed").expect("hmac accepts fixed key");
+    let mut mac =
+        <HmacSha512 as Mac>::new_from_slice(b"ed25519 seed").expect("hmac accepts fixed key");
     mac.update(seed);
     let i = mac.finalize().into_bytes();
 
@@ -102,7 +103,8 @@ fn slip10_derive(seed: &[u8], path: &[u32]) -> [u8; 32] {
         data.extend_from_slice(&private);
         data.extend_from_slice(&index.wrapping_add(0x8000_0000).to_be_bytes());
 
-        let mut mac = HmacSha512::new_from_slice(&chain_code).expect("hmac accepts fixed key");
+        let mut mac =
+            <HmacSha512 as Mac>::new_from_slice(&chain_code).expect("hmac accepts fixed key");
         mac.update(&data);
         let i = mac.finalize().into_bytes();
 
