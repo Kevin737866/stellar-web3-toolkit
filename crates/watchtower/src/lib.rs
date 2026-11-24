@@ -10,6 +10,7 @@
 //! - HTLC timeout monitoring and refund triggering
 //! - Automated justice transaction submission
 //! - Alert notification system
+//! - Health checks for the storage backends that hold breach evidence
 
 pub mod justice;
 pub mod monitor;
@@ -49,6 +50,17 @@ pub struct WatchtowerConfig {
     /// pass, leaving [`Watchtower::compact_storage`] as the only entry point.
     #[serde(default = "default_compaction_interval_secs")]
     pub compaction_interval_secs: u64,
+    /// How often the monitor loop probes storage health, in seconds. Zero
+    /// (the default) disables automatic probes, so existing deployments keep
+    /// their current behaviour; call [`Watchtower::check_storage_health`]
+    /// explicitly whenever an on-demand check is needed.
+    #[serde(default)]
+    pub storage_health_check_interval_secs: u64,
+    /// Options applied to every storage health probe, whether automatic or
+    /// on-demand. Invalid options are rejected at construction time rather
+    /// than silently replaced with defaults.
+    #[serde(default)]
+    pub storage_health_check: storage::StorageHealthCheckOptions,
 }
 
 /// Default automatic compaction interval: hourly.
@@ -70,6 +82,8 @@ impl Default for WatchtowerConfig {
             alert_webhook_url: None,
             compaction: storage::CompactionPolicy::default(),
             compaction_interval_secs: default_compaction_interval_secs(),
+            storage_health_check_interval_secs: 0,
+            storage_health_check: storage::StorageHealthCheckOptions::default(),
         }
     }
 }
@@ -176,6 +190,24 @@ impl Alert {
         }
     }
 
+    /// Create an alert for a failed or degraded health check.
+    ///
+    /// `error` should be the report summary from
+    /// [`storage::StorageHealthReport::summary`], including the backend name
+    /// and the reason it is not healthy.
+    pub fn health_check_failed(component: impl Into<String>, error: impl Into<String>) -> Self {
+        Alert {
+            id: uuid_v4(),
+            alert_type: AlertType::HealthCheckFailed {
+                component: component.into(),
+                error: error.into(),
+            },
+            severity: AlertSeverity::Critical,
+            timestamp: current_timestamp(),
+            context: serde_json::json!({}),
+        }
+    }
+
     /// Get the message body for this alert
     pub fn message(&self) -> String {
         match &self.alert_type {
@@ -227,6 +259,10 @@ pub struct WatchtowerState {
     pub stats: RwLock<WatchtowerStats>,
     /// Unix timestamp of the last storage compaction
     pub last_compaction_ts: RwLock<u64>,
+    /// Most recent storage health report, when a probe has run.
+    pub last_storage_health: RwLock<Option<storage::StorageHealthReport>>,
+    /// Unix timestamp of the last storage health probe (0 = never).
+    pub last_storage_health_check_ts: RwLock<u64>,
     /// Storage backend, shared with the owning [`Watchtower`]
     storage: Arc<dyn storage::StorageBackend>,
 }
@@ -281,6 +317,24 @@ impl Watchtower {
             None => Arc::new(storage::InMemoryStorage::new()),
         };
 
+        Self::with_storage(config, storage)
+    }
+
+    /// Create a watchtower backed by a caller-supplied storage backend.
+    ///
+    /// This is the injection point for embedders that implement
+    /// [`storage::StorageBackend`] themselves and for tests that need to
+    /// simulate a failing backend. Invalid health-check options are rejected
+    /// here rather than being silently replaced with defaults.
+    pub fn with_storage(
+        config: WatchtowerConfig,
+        storage: Arc<dyn storage::StorageBackend>,
+    ) -> Result<Self, WatchtowerError> {
+        config
+            .storage_health_check
+            .validate()
+            .map_err(|e| WatchtowerError::InvalidConfiguration(e.to_string()))?;
+
         let monitor = monitor::ChannelMonitor::new(
             config.stellar_rpc_url.clone(),
             config.network_passphrase.clone(),
@@ -300,6 +354,8 @@ impl Watchtower {
             is_running: RwLock::new(false),
             stats: RwLock::new(WatchtowerStats::default()),
             last_compaction_ts: RwLock::new(current_timestamp()),
+            last_storage_health: RwLock::new(None),
+            last_storage_health_check_ts: RwLock::new(0),
             storage: Arc::clone(&storage),
         });
 
@@ -393,6 +449,12 @@ impl Watchtower {
                     stats.records_compacted += report.total_removed() as u64;
                 }
 
+                // A watchtower that cannot read or persist its state cannot
+                // safely respond to a breach. Scheduled probes are opt-in so
+                // deployments that do not configure them keep their existing
+                // behaviour.
+                let _ = state.check_storage_health_if_due(&config);
+
                 tokio::time::sleep(tokio::time::Duration::from_secs(config.scan_interval_secs))
                     .await;
             }
@@ -470,14 +532,51 @@ impl Watchtower {
         Ok(report)
     }
 
+    /// Probe the configured storage backend with the configured options.
+    ///
+    /// The report is cached in [`WatchtowerState::last_storage_health`] and a
+    /// [`AlertType::HealthCheckFailed`] alert is recorded for a degraded or
+    /// unhealthy backend. Invalid options are rejected before any probe runs.
+    pub fn check_storage_health(&self) -> Result<storage::StorageHealthReport, WatchtowerError> {
+        self.check_storage_health_with(&self.config.storage_health_check)
+    }
+
+    /// Probe storage with explicit options, overriding the configured ones.
+    pub fn check_storage_health_with(
+        &self,
+        options: &storage::StorageHealthCheckOptions,
+    ) -> Result<storage::StorageHealthReport, WatchtowerError> {
+        options
+            .validate()
+            .map_err(|e| WatchtowerError::InvalidConfiguration(e.to_string()))?;
+
+        let report = self.storage.check_health_with(options)?;
+        *self.state.last_storage_health.write() = Some(report.clone());
+        *self.state.last_storage_health_check_ts.write() = current_timestamp();
+
+        if !report.is_healthy() {
+            let alert = Alert::health_check_failed("storage", report.summary());
+            self.state.add_alert(alert.clone());
+            // Best effort: a backend that is already unhealthy may reject the
+            // write. The in-memory alert remains available to the operator.
+            let _ = self.storage.store_alert(&alert);
+            warn!("{}", alert.message());
+        }
+
+        Ok(report)
+    }
+
+    /// The most recent storage health report, if a probe has run.
+    pub fn last_storage_health(&self) -> Option<storage::StorageHealthReport> {
+        self.state.last_storage_health.read().clone()
+    }
+
     /// Retrieve all justice actions that are still `Pending` from storage.
     ///
     /// An operator calls this after a process restart or network outage to find
     /// breach responses that were persisted but not yet submitted, then passes
     /// the results to [`Self::retry_pending_justice`] to replay them.
-    pub fn pending_justice_actions(
-        &self,
-    ) -> Result<Vec<justice::JusticeAction>, WatchtowerError> {
+    pub fn pending_justice_actions(&self) -> Result<Vec<justice::JusticeAction>, WatchtowerError> {
         self.storage
             .get_pending_justice_actions()
             .map_err(|e| WatchtowerError::StorageError(e.to_string()))
@@ -591,6 +690,50 @@ impl WatchtowerState {
         }
     }
 
+    /// Run a scheduled storage health probe when its interval has elapsed.
+    ///
+    /// Returns the report when a probe ran. The timestamp is stamped before
+    /// probing so a failing backend cannot make every scan retry the same
+    /// expensive check.
+    pub fn check_storage_health_if_due(
+        &self,
+        config: &WatchtowerConfig,
+    ) -> Option<storage::StorageHealthReport> {
+        if config.storage_health_check_interval_secs == 0
+            || config.storage_health_check.validate().is_err()
+        {
+            return None;
+        }
+
+        let now = current_timestamp();
+        let last = *self.last_storage_health_check_ts.read();
+        if now.saturating_sub(last) < config.storage_health_check_interval_secs {
+            return None;
+        }
+        *self.last_storage_health_check_ts.write() = now;
+
+        match self.storage.check_health_with(&config.storage_health_check) {
+            Ok(report) => {
+                *self.last_storage_health.write() = Some(report.clone());
+                if !report.is_healthy() {
+                    let alert = Alert::health_check_failed("storage", report.summary());
+                    self.add_alert(alert.clone());
+                    let _ = self.storage.store_alert(&alert);
+                    warn!("{}", alert.message());
+                }
+                Some(report)
+            }
+            Err(e) => {
+                let alert = Alert::health_check_failed(
+                    "storage",
+                    format!("storage health probe failed: {e}"),
+                );
+                self.add_alert(alert);
+                None
+            }
+        }
+    }
+
     /// The storage backend shared by this state and its watchtower.
     pub fn storage(&self) -> &Arc<dyn storage::StorageBackend> {
         &self.storage
@@ -623,6 +766,9 @@ pub enum WatchtowerError {
 
     #[error("Storage error: {0}")]
     StorageError(String),
+
+    #[error("Invalid configuration: {0}")]
+    InvalidConfiguration(String),
 
     #[error("Invalid channel: {0}")]
     InvalidChannel(String),
@@ -775,6 +921,90 @@ mod tests {
         assert!(watchtower
             .state()
             .compact_if_due(watchtower.config())
+            .is_none());
+    }
+
+    #[test]
+    fn storage_health_checks_are_opt_in_by_default() {
+        let config = WatchtowerConfig::default();
+        assert_eq!(config.storage_health_check_interval_secs, 0);
+        assert_eq!(config.storage_health_check.max_latency_ms, 1_000);
+        assert!(!config.storage_health_check.probe_writes);
+    }
+
+    #[test]
+    fn invalid_health_options_are_rejected_at_construction() {
+        let config = WatchtowerConfig {
+            storage_health_check: storage::StorageHealthCheckOptions {
+                max_latency_ms: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let error = match Watchtower::new(config) {
+            Ok(_) => panic!("invalid health-check options must be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, WatchtowerError::InvalidConfiguration(_)));
+        assert!(error.to_string().contains("max_latency_ms"));
+    }
+
+    #[test]
+    fn on_demand_health_check_caches_the_report_without_alerting_when_healthy() {
+        let watchtower = Watchtower::new(WatchtowerConfig::default()).unwrap();
+        let report = watchtower.check_storage_health().unwrap();
+
+        assert_eq!(report.state, storage::StorageHealthState::Healthy);
+        assert!(watchtower.last_storage_health().unwrap().is_healthy());
+        assert!(*watchtower.state().last_storage_health_check_ts.read() > 0);
+        assert!(watchtower.get_alerts(10).is_empty());
+    }
+
+    #[test]
+    fn invalid_explicit_health_options_do_not_mutate_state() {
+        let watchtower = Watchtower::new(WatchtowerConfig::default()).unwrap();
+        let error = watchtower
+            .check_storage_health_with(&storage::StorageHealthCheckOptions {
+                max_latency_ms: 0,
+                ..Default::default()
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, WatchtowerError::InvalidConfiguration(_)));
+        assert!(watchtower.last_storage_health().is_none());
+        assert!(watchtower.get_alerts(10).is_empty());
+    }
+
+    #[test]
+    fn scheduled_health_probe_runs_only_when_enabled_and_due() {
+        let config = WatchtowerConfig {
+            storage_health_check_interval_secs: 1,
+            ..Default::default()
+        };
+        let watchtower = Watchtower::new(config).unwrap();
+
+        // The first probe is due immediately (last check timestamp is 0).
+        assert!(watchtower
+            .state()
+            .check_storage_health_if_due(watchtower.config())
+            .is_some());
+        // It stamped the timestamp, so a second call is not due yet.
+        *watchtower.state().last_storage_health_check_ts.write() = current_timestamp();
+        assert!(watchtower
+            .state()
+            .check_storage_health_if_due(watchtower.config())
+            .is_none());
+
+        *watchtower.state().last_storage_health_check_ts.write() = 0;
+        assert!(watchtower
+            .state()
+            .check_storage_health_if_due(watchtower.config())
+            .is_some());
+
+        let disabled = Watchtower::new(WatchtowerConfig::default()).unwrap();
+        assert!(disabled
+            .state()
+            .check_storage_health_if_due(disabled.config())
             .is_none());
     }
 
