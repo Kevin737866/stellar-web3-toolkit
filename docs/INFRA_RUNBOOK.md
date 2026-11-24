@@ -51,6 +51,7 @@ cargo build --workspace --exclude stellar-toolkit --target wasm32v1-none --relea
 
 - **Base:** `rust:1.98-bookworm` with `wasm32v1-none`, `binaryen`, `wabt`, `soroban-cli 21.5.0`, `wasm-pack`.
 - **Determinism:** `SOURCE_DATE_EPOCH=0`, `RUSTFLAGS="-C target-feature=-crt-static"`, clean incremental caches, pinned `Cargo.lock`.
+- **BuildKit:** `scripts/reproducible-build.sh --docker` and `scripts/verify-bytecode.sh --docker` run `docker build` with `DOCKER_BUILDKIT=1`, so independent stages build in parallel and layer caching is the BuildKit one on every Docker version.
 - **Quickstart:**
 
 ```bash
