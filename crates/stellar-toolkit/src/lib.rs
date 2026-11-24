@@ -7,6 +7,7 @@ pub mod api_reference_gen;
 pub mod audit_allowlist;
 pub mod bridge_oracle;
 pub mod cli;
+pub mod completions;
 pub mod compliance;
 pub mod conviction;
 pub mod env_config;
@@ -46,6 +47,10 @@ pub use bridge_oracle::{
     OracleConfirmation, OracleQuorumError, OracleSet, QuorumReport, QuorumVerdict, MAX_ORACLES,
 };
 pub use cli::{App, ToolkitCommand};
+pub use completions::{
+    generate_completion, generate_completion_for_command, top_level_commands, validate_bin_name,
+    write_completion, CompletionError, Shell, TopLevelCommandSpec,
+};
 pub use compliance::{
     ComplianceCategory, ComplianceChecklist, ComplianceItem, VerificationHarness,
     VerificationHarnessReport, VerificationStep,
