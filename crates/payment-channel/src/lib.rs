@@ -71,6 +71,17 @@ pub enum PaymentChannelError {
         recorded: u32,
         presented: u32,
     },
+
+    /// A payment or state update would drop a participant's balance below the
+    /// channel's configured reserve requirement (#356).
+    #[error(
+        "Channel reserve not met for channel {channel_id}: balance {remaining} is below required reserve {reserve}"
+    )]
+    ReserveNotMet {
+        channel_id: String,
+        remaining: i128,
+        reserve: i128,
+    },
 }
 
 /// Channel status
@@ -113,6 +124,12 @@ pub struct LocalChannelState {
     pub timeout: u32,
     /// Fee percentage for routing
     pub fee_percentage: u32,
+    /// Minimum balance each participant must maintain during off-chain payments (#356).
+    ///
+    /// Defaults to `0` for channels created via [`ChannelManager::create_channel`]
+    /// to preserve backward compatibility with callers that do not configure a reserve.
+    #[serde(default)]
+    pub channel_reserve: i128,
     /// Pending HTLCs
     pub pending_htlcs: Vec<HtlcState>,
     /// Local secret for signing
@@ -254,7 +271,11 @@ impl ChannelManager {
         }
     }
 
-    /// Create a new payment channel
+    /// Create a new payment channel with a default `channel_reserve` of `0`.
+    ///
+    /// Preserves existing behavior for callers that do not configure a reserve.
+    /// Use [`ChannelManager::create_channel_with_reserve`] to enforce a non-zero
+    /// minimum balance per participant during off-chain payments.
     #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // public API; funding will need an RPC round trip
     pub async fn create_channel(
         &self,
@@ -265,8 +286,65 @@ impl ChannelManager {
         timeout: u32,
         fee_percentage: u32,
     ) -> Result<LocalChannelState, PaymentChannelError> {
+        self.create_channel_with_reserve(
+            our_address,
+            their_address,
+            our_initial_balance,
+            their_initial_balance,
+            timeout,
+            fee_percentage,
+            0,
+        )
+        .await
+    }
+
+    /// Create a new payment channel with an explicit per-participant reserve requirement (#356).
+    ///
+    /// Both `our_initial_balance` and `their_initial_balance` must be non-negative and at
+    /// least `channel_reserve`, and `channel_reserve` must be non-negative.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::unused_async,
+        clippy::unused_async_trait_impl
+    )]
+    pub async fn create_channel_with_reserve(
+        &self,
+        our_address: String,
+        their_address: String,
+        our_initial_balance: i128,
+        their_initial_balance: i128,
+        timeout: u32,
+        fee_percentage: u32,
+        channel_reserve: i128,
+    ) -> Result<LocalChannelState, PaymentChannelError> {
+        if our_initial_balance < 0 || their_initial_balance < 0 {
+            return Err(PaymentChannelError::InvalidState(
+                "Initial balances cannot be negative".to_string(),
+            ));
+        }
+        if channel_reserve < 0 {
+            return Err(PaymentChannelError::InvalidState(
+                "Channel reserve cannot be negative".to_string(),
+            ));
+        }
+
         // Generate channel ID
         let channel_id = Self::generate_channel_id(&our_address, &their_address);
+
+        if our_initial_balance < channel_reserve {
+            return Err(PaymentChannelError::ReserveNotMet {
+                channel_id,
+                remaining: our_initial_balance,
+                reserve: channel_reserve,
+            });
+        }
+        if their_initial_balance < channel_reserve {
+            return Err(PaymentChannelError::ReserveNotMet {
+                channel_id,
+                remaining: their_initial_balance,
+                reserve: channel_reserve,
+            });
+        }
 
         // Create local state
         let state = LocalChannelState {
@@ -281,6 +359,7 @@ impl ChannelManager {
             closing_tx_hash: None,
             timeout,
             fee_percentage,
+            channel_reserve,
             pending_htlcs: Vec::new(),
             local_secret: self.signer.public_key(),
             remote_public_key: Vec::new(), // Will be set during handshake
@@ -303,6 +382,51 @@ impl ChannelManager {
         );
 
         Ok(state)
+    }
+
+    /// Configure or update the minimum per-participant reserve on an open channel (#356).
+    ///
+    /// Rejects negative reserves, closed channels, or reserves exceeding either
+    /// participant's current balance without mutating channel state.
+    pub fn set_channel_reserve(
+        &self,
+        channel_id: &str,
+        channel_reserve: i128,
+    ) -> Result<(), PaymentChannelError> {
+        if channel_reserve < 0 {
+            return Err(PaymentChannelError::InvalidState(
+                "Channel reserve cannot be negative".to_string(),
+            ));
+        }
+
+        let mut channels = self.channels.write();
+        let channel = channels
+            .get_mut(channel_id)
+            .ok_or_else(|| PaymentChannelError::ChannelNotFound(channel_id.to_string()))?;
+
+        if channel.state.status != ChannelStatus::Open {
+            return Err(PaymentChannelError::ChannelClosed(
+                channel.state.status.to_string(),
+            ));
+        }
+
+        if channel.state.our_balance < channel_reserve {
+            return Err(PaymentChannelError::ReserveNotMet {
+                channel_id: channel_id.to_string(),
+                remaining: channel.state.our_balance,
+                reserve: channel_reserve,
+            });
+        }
+        if channel.state.their_balance < channel_reserve {
+            return Err(PaymentChannelError::ReserveNotMet {
+                channel_id: channel_id.to_string(),
+                remaining: channel.state.their_balance,
+                reserve: channel_reserve,
+            });
+        }
+
+        channel.state.channel_reserve = channel_reserve;
+        Ok(())
     }
 
     /// Execute an off-chain payment at the next inferred ledger height.
@@ -347,30 +471,11 @@ impl ChannelManager {
         // must leave the channel exactly as it was.
         check_height(channel_id, &channel.history, ledger_height)?;
 
-        // Update balances
-        match direction {
-            PaymentDirection::ToThem => {
-                if channel.state.our_balance < amount {
-                    return Err(PaymentChannelError::InsufficientBalance {
-                        have: channel.state.our_balance,
-                        need: amount,
-                    });
-                }
-                channel.state.our_balance -= amount;
-                channel.state.their_balance += amount;
-            }
-            PaymentDirection::ToUs => {
-                if channel.state.their_balance < amount {
-                    return Err(PaymentChannelError::InsufficientBalance {
-                        have: channel.state.their_balance,
-                        need: amount,
-                    });
-                }
-                channel.state.their_balance -= amount;
-                channel.state.our_balance += amount;
-            }
-        }
+        let (new_our, new_their) =
+            compute_post_payment_balances(channel_id, &channel.state, amount, direction)?;
 
+        channel.state.our_balance = new_our;
+        channel.state.their_balance = new_their;
         channel.state.sequence_number += 1;
 
         record_state(channel_id, channel, ledger_height)?;
@@ -477,13 +582,34 @@ impl ChannelManager {
             ));
         }
 
-        let expected_total = channel.state.our_balance + channel.state.their_balance;
-        if new_our_balance + new_their_balance != expected_total {
+        let expected_total = channel
+            .state
+            .our_balance
+            .checked_add(channel.state.their_balance)
+            .ok_or_else(|| PaymentChannelError::InvalidState("Channel balance overflow".to_string()))?;
+        let new_total = new_our_balance
+            .checked_add(new_their_balance)
+            .ok_or_else(|| PaymentChannelError::InvalidState("Proposed balance overflow".to_string()))?;
+        if new_total != expected_total {
             return Err(PaymentChannelError::InvalidState(format!(
                 "Total balance mismatch: expected {}, got {}",
-                expected_total,
-                new_our_balance + new_their_balance
+                expected_total, new_total
             )));
+        }
+
+        if new_our_balance < channel.state.channel_reserve {
+            return Err(PaymentChannelError::ReserveNotMet {
+                channel_id: channel_id.to_string(),
+                remaining: new_our_balance,
+                reserve: channel.state.channel_reserve,
+            });
+        }
+        if new_their_balance < channel.state.channel_reserve {
+            return Err(PaymentChannelError::ReserveNotMet {
+                channel_id: channel_id.to_string(),
+                remaining: new_their_balance,
+                reserve: channel.state.channel_reserve,
+            });
         }
 
         check_height(channel_id, &channel.history, ledger_height)?;
@@ -541,32 +667,13 @@ impl ChannelManager {
                 .get(channel_id)
                 .ok_or_else(|| PaymentChannelError::ChannelNotFound(channel_id.to_string()))?;
 
-            match direction {
-                PaymentDirection::ToThem => {
-                    if channel.state.our_balance < amount {
-                        return Err(PaymentChannelError::InsufficientBalance {
-                            have: channel.state.our_balance,
-                            need: amount,
-                        });
-                    }
-                    (
-                        channel.state.our_balance - amount,
-                        channel.state.their_balance + amount,
-                    )
-                }
-                PaymentDirection::ToUs => {
-                    if channel.state.their_balance < amount {
-                        return Err(PaymentChannelError::InsufficientBalance {
-                            have: channel.state.their_balance,
-                            need: amount,
-                        });
-                    }
-                    (
-                        channel.state.our_balance + amount,
-                        channel.state.their_balance - amount,
-                    )
-                }
+            if channel.state.status != ChannelStatus::Open {
+                return Err(PaymentChannelError::ChannelClosed(
+                    channel.state.status.to_string(),
+                ));
             }
+
+            compute_post_payment_balances(channel_id, &channel.state, amount, direction)?
         };
 
         self.apply_signed_state_update(
@@ -944,6 +1051,51 @@ pub fn compute_state_digest(
     let mut digest = [0u8; 32];
     digest.copy_from_slice(&res);
     digest
+}
+
+/// Compute post-payment balances after validating positive amount, sufficient
+/// funds, and the channel's reserve requirement.
+fn compute_post_payment_balances(
+    channel_id: &str,
+    state: &LocalChannelState,
+    amount: i128,
+    direction: PaymentDirection,
+) -> Result<(i128, i128), PaymentChannelError> {
+    if amount <= 0 {
+        return Err(PaymentChannelError::InvalidState(
+            "Payment amount must be positive".to_string(),
+        ));
+    }
+
+    let (sender_balance, receiver_balance) = match direction {
+        PaymentDirection::ToThem => (state.our_balance, state.their_balance),
+        PaymentDirection::ToUs => (state.their_balance, state.our_balance),
+    };
+
+    if sender_balance < amount {
+        return Err(PaymentChannelError::InsufficientBalance {
+            have: sender_balance,
+            need: amount,
+        });
+    }
+
+    let new_sender = sender_balance - amount;
+    if new_sender < state.channel_reserve {
+        return Err(PaymentChannelError::ReserveNotMet {
+            channel_id: channel_id.to_string(),
+            remaining: new_sender,
+            reserve: state.channel_reserve,
+        });
+    }
+
+    let new_receiver = receiver_balance
+        .checked_add(amount)
+        .ok_or_else(|| PaymentChannelError::InvalidState("Balance overflow".to_string()))?;
+
+    match direction {
+        PaymentDirection::ToThem => Ok((new_sender, new_receiver)),
+        PaymentDirection::ToUs => Ok((new_receiver, new_sender)),
+    }
 }
 
 /// Reject an update that claims a height the channel has already passed.
@@ -1745,5 +1897,274 @@ mod tests {
         assert_eq!(bob_state.our_balance, 1150);
         assert_eq!(bob_state.their_balance, 850);
         assert_eq!(alice_state.sequence_number, bob_state.sequence_number);
+    }
+
+    #[tokio::test]
+    async fn create_channel_with_reserve_validates_bounds() {
+        let manager = ChannelManager::with_history_depth(Box::new(TestSigner), 8);
+
+        // Exact boundary: initial balances equal to reserve succeed.
+        let exact = manager
+            .create_channel_with_reserve(
+                "alice".to_string(),
+                "bob".to_string(),
+                200,
+                200,
+                100,
+                0,
+                200,
+            )
+            .await
+            .unwrap();
+        assert_eq!(exact.channel_reserve, 200);
+
+        // Negative reserve is rejected explicitly.
+        let neg_err = manager
+            .create_channel_with_reserve(
+                "alice".to_string(),
+                "carol".to_string(),
+                500,
+                500,
+                100,
+                0,
+                -1,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(neg_err, PaymentChannelError::InvalidState(_)));
+
+        // Initial balance below reserve is rejected with ReserveNotMet.
+        let low_err = manager
+            .create_channel_with_reserve(
+                "alice".to_string(),
+                "dave".to_string(),
+                199,
+                500,
+                100,
+                0,
+                200,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            low_err,
+            PaymentChannelError::ReserveNotMet {
+                remaining: 199,
+                reserve: 200,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn execute_payment_enforces_reserve_at_boundary_without_partial_update() {
+        let manager = ChannelManager::with_history_depth(Box::new(TestSigner), 8);
+        let state = manager
+            .create_channel_with_reserve(
+                "alice".to_string(),
+                "bob".to_string(),
+                1_000,
+                1_000,
+                100,
+                0,
+                200,
+            )
+            .await
+            .unwrap();
+
+        // Normal payment leaving balance above reserve succeeds.
+        let after_first = manager
+            .execute_payment_at(&state.channel_id, 500, PaymentDirection::ToThem, 1)
+            .unwrap();
+        assert_eq!(after_first.our_balance, 500);
+        assert_eq!(after_first.their_balance, 1_500);
+
+        // Boundary payment leaving balance exactly equal to reserve (200) succeeds.
+        let after_boundary = manager
+            .execute_payment_at(&state.channel_id, 300, PaymentDirection::ToThem, 2)
+            .unwrap();
+        assert_eq!(after_boundary.our_balance, 200);
+        assert_eq!(after_boundary.their_balance, 1_800);
+        assert_eq!(after_boundary.sequence_number, 2);
+
+        // Payment of 1 would drop balance to 199 < 200 and must fail cleanly.
+        let err = manager
+            .execute_payment_at(&state.channel_id, 1, PaymentDirection::ToThem, 3)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            PaymentChannelError::ReserveNotMet {
+                channel_id: state.channel_id.clone(),
+                remaining: 199,
+                reserve: 200,
+            }
+        );
+
+        // State and reorg history must be untouched by the failed payment.
+        let untouched = manager.get_channel(&state.channel_id).unwrap();
+        assert_eq!(untouched, after_boundary);
+        assert_eq!(
+            manager.recorded_heights(&state.channel_id).unwrap(),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_signed_state_update_rejects_reserve_breach_without_mutation() {
+        let manager =
+            ChannelManager::with_history_depth(Box::new(StrictTestSigner::new(vec![1; 32])), 8);
+        let remote_signer = StrictTestSigner::new(vec![2; 32]);
+        let state = manager
+            .create_channel_with_reserve(
+                "alice".to_string(),
+                "bob".to_string(),
+                1_000,
+                1_000,
+                100,
+                0,
+                200,
+            )
+            .await
+            .unwrap();
+        manager
+            .set_remote_public_key(&state.channel_id, remote_signer.public_key())
+            .unwrap();
+
+        let digest = compute_state_digest(&state.channel_id, 1, "alice", 150, "bob", 1_850, 5);
+        let sig = remote_signer.sign(&digest).unwrap();
+
+        let err = manager
+            .apply_signed_state_update(&state.channel_id, 150, 1_850, &sig, 5)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            PaymentChannelError::ReserveNotMet {
+                channel_id: state.channel_id.clone(),
+                remaining: 150,
+                reserve: 200,
+            }
+        );
+
+        let untouched = manager.get_channel(&state.channel_id).unwrap();
+        assert_eq!(untouched.our_balance, 1_000);
+        assert_eq!(untouched.their_balance, 1_000);
+        assert_eq!(untouched.sequence_number, 0);
+        assert_eq!(manager.recorded_heights(&state.channel_id).unwrap(), vec![0]);
+    }
+
+    #[tokio::test]
+    async fn set_channel_reserve_validates_state_and_balances() {
+        let manager = ChannelManager::with_history_depth(Box::new(TestSigner), 8);
+        let state = manager
+            .create_channel("alice".to_string(), "bob".to_string(), 1_000, 300, 100, 0)
+            .await
+            .unwrap();
+
+        // Setting reserve above their_balance (300) fails without mutating.
+        let err = manager.set_channel_reserve(&state.channel_id, 301).unwrap_err();
+        assert!(matches!(
+            err,
+            PaymentChannelError::ReserveNotMet {
+                remaining: 300,
+                reserve: 301,
+                ..
+            }
+        ));
+        assert_eq!(manager.get_channel(&state.channel_id).unwrap().channel_reserve, 0);
+
+        // Setting reserve equal to min balance succeeds.
+        manager.set_channel_reserve(&state.channel_id, 300).unwrap();
+        assert_eq!(
+            manager.get_channel(&state.channel_id).unwrap().channel_reserve,
+            300
+        );
+
+        // Closed channels refuse reserve changes.
+        manager.cooperative_close(&state.channel_id).unwrap();
+        let closed_err = manager.set_channel_reserve(&state.channel_id, 100).unwrap_err();
+        assert!(matches!(closed_err, PaymentChannelError::ChannelClosed(_)));
+    }
+
+    #[tokio::test]
+    async fn integration_reserve_enforced_across_payment_and_settlement_workflow() {
+        let alice_signer = StrictTestSigner::new(vec![10; 32]);
+        let bob_signer = StrictTestSigner::new(vec![20; 32]);
+
+        let alice_manager =
+            ChannelManager::with_history_depth(Box::new(StrictTestSigner::new(vec![10; 32])), 8);
+        let bob_manager =
+            ChannelManager::with_history_depth(Box::new(StrictTestSigner::new(vec![20; 32])), 8);
+
+        let ch_alice = alice_manager
+            .create_channel_with_reserve(
+                "alice".to_string(),
+                "bob".to_string(),
+                1_000,
+                1_000,
+                100,
+                0,
+                200,
+            )
+            .await
+            .unwrap();
+        let ch_bob = bob_manager
+            .create_channel_with_reserve(
+                "bob".to_string(),
+                "alice".to_string(),
+                1_000,
+                1_000,
+                100,
+                0,
+                200,
+            )
+            .await
+            .unwrap();
+        let ch_id = ch_alice.channel_id.clone();
+        assert_eq!(ch_id, ch_bob.channel_id);
+
+        alice_manager
+            .set_remote_public_key(&ch_id, bob_signer.public_key())
+            .unwrap();
+        bob_manager
+            .set_remote_public_key(&ch_id, alice_signer.public_key())
+            .unwrap();
+
+        // Step 1: Alice pays 800 to Bob (leaves Alice at exact reserve 200).
+        let bob_sig = bob_manager.sign_proposed_state(&ch_id, 1, 1_800, 200, 1).unwrap();
+        let alice_state = alice_manager
+            .execute_authorized_payment_at(&ch_id, 800, PaymentDirection::ToThem, &bob_sig, 1)
+            .unwrap();
+        assert_eq!(alice_state.our_balance, 200);
+
+        let alice_sig = alice_manager.sign_state_update(&ch_id, 1).unwrap();
+        let bob_state = bob_manager
+            .apply_signed_state_update(&ch_id, 1_800, 200, &alice_sig, 1)
+            .unwrap();
+        assert_eq!(bob_state.their_balance, 200);
+
+        // Step 2: Further payment from Alice to Bob (100) would breach Alice's reserve.
+        let bad_sig = bob_manager.sign_proposed_state(&ch_id, 2, 1_900, 100, 2).unwrap();
+        let err = alice_manager
+            .execute_authorized_payment_at(&ch_id, 100, PaymentDirection::ToThem, &bad_sig, 2)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            PaymentChannelError::ReserveNotMet {
+                channel_id: ch_id.clone(),
+                remaining: 100,
+                reserve: 200,
+            }
+        );
+        assert_eq!(alice_manager.get_channel(&ch_id).unwrap().sequence_number, 1);
+
+        // Step 3: Final settlement can still close the channel at any valid split (including below reserve).
+        let final_split = signed(&ch_id, 2, 0, 2_000);
+        let settle_sig = bob_signer.sign(&final_split.digest()).unwrap();
+        let settled = alice_manager
+            .settle_signed_state(&final_split, &settle_sig, 3)
+            .unwrap();
+        assert_eq!(settled.our_balance, 0);
+        assert_eq!(settled.their_balance, 2_000);
+        assert_eq!(settled.status, ChannelStatus::Closing);
     }
 }
