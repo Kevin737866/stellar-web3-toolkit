@@ -76,8 +76,8 @@ pub use oracle_resilience::{assess_quorum_liveness, LivenessError, QuorumLivenes
 pub use p2p_qr_payment::{P2PQRPaymentFlow, PaymentStatus, QRPaymentRequest};
 pub use scaffolder::{LintFinding, LintReport, LintSeverity, ScaffoldOptions, Scaffolder};
 pub use session_keys::{
-    AccountAbstractionManager, Guardian, RecoveryRequest, RecoveryVeto, SessionError, SessionKey,
-    SessionPolicy, VetoGuardian,
+    AccountAbstractionManager, ExpiryScope, Guardian, RecoveryRequest, RecoveryVeto,
+    ScopedExpiry, SessionError, SessionKey, SessionPolicy, VetoGuardian,
 };
 pub use signal_sync::{Signal, SignalSnapshot, SyncError, SyncReport, SNAPSHOT_VERSION};
 pub use state_inspector::{Durability, StateEntry, StateInspector, StatePage, StateQuery};
