@@ -42,6 +42,15 @@ pub enum AtomicSwapError {
     #[error("Asset not supported: {asset}")]
     UnsupportedAsset { asset: String },
 
+    /// An asset identifier is not a well-formed Stellar asset (#388).
+    ///
+    /// An offer is signed off-chain and settled on-chain, so a malformed code or
+    /// issuer cannot be caught by the chain at signing time: it would be
+    /// discovered only after a counterparty had committed. The offer path
+    /// therefore rejects it up front, naming the asset and the defect.
+    #[error("Invalid asset identifier `{asset}`: {reason}")]
+    InvalidAssetIdentifier { asset: String, reason: String },
+
     #[error("Network error: {0}")]
     NetworkError(#[from] reqwest::Error),
 
@@ -53,6 +62,18 @@ pub enum AtomicSwapError {
 
     #[error("Invalid timeout: {timeout_hours} hours")]
     InvalidTimeout { timeout_hours: u32 },
+
+    /// An offer's expiry ledger does not leave a usable window (#388).
+    ///
+    /// An offer that expires at or before the ledger it was created at can
+    /// never be accepted, so it is refused instead of being advertised.
+    #[error(
+        "Invalid offer expiry: expires_at_ledger {expires_at_ledger} must be later than created_at_ledger {created_at_ledger}"
+    )]
+    InvalidOfferExpiry {
+        created_at_ledger: u32,
+        expires_at_ledger: u32,
+    },
 
     #[error("Invalid amount: {amount}")]
     InvalidAmount { amount: i128 },
