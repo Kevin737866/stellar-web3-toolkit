@@ -74,7 +74,9 @@ pub use key_hygiene::{
 pub use one_click_airdrop::{AirdropClaimRequest, ClaimStatus, OneClickAirdropClaimer};
 pub use oracle_resilience::{assess_quorum_liveness, LivenessError, QuorumLiveness};
 pub use p2p_qr_payment::{P2PQRPaymentFlow, PaymentStatus, QRPaymentRequest};
-pub use scaffolder::{LintFinding, LintReport, LintSeverity, ScaffoldOptions, Scaffolder};
+pub use scaffolder::{
+    validate_template_name, LintFinding, LintReport, LintSeverity, ScaffoldOptions, Scaffolder,
+};
 pub use session_keys::{
     AccountAbstractionManager, Guardian, RecoveryRequest, RecoveryVeto, SessionError, SessionKey,
     SessionPolicy, VetoGuardian,

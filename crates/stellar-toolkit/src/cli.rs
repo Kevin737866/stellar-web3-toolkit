@@ -1126,7 +1126,7 @@ fn run_migration(cmd: &MigrationCommand) -> Result<()> {
 }
 
 fn run_scaffold(cmd: &ScaffoldCommand) -> Result<()> {
-    use crate::scaffolder::{lint_directory, ScaffoldOptions, Scaffolder};
+    use crate::scaffolder::{lint_directory, validate_template_name, ScaffoldOptions, Scaffolder};
     match cmd {
         ScaffoldCommand::New {
             name,
@@ -1137,6 +1137,7 @@ fn run_scaffold(cmd: &ScaffoldCommand) -> Result<()> {
             dry_run,
             force,
         } => {
+            validate_template_name(name)?;
             let mut options = ScaffoldOptions::new(name.clone()).with_tests(!no_tests);
             if let Some(description) = description {
                 options = options.with_description(description.clone());
