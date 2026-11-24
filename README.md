@@ -129,7 +129,10 @@ toolkit contracts:
   and account id (`G…`). Keep the phrase somewhere safe; it is shown only once.
 - **Recovery** – `wallet recover "<phrase>"` re-derives the same keypair from an
   existing phrase. The phrase checksum is validated first, so a mistyped phrase
-  is rejected before any key is derived.
+  is rejected before any key is derived, with the offending word position named.
+- **Phrase validation** – `wallet validate "<phrase>"` checks a phrase offline
+  without deriving or printing a key; invalid words are reported by 1-based
+  position. See [Recovery Phrase Validation](docs/RECOVERY_PHRASE_VALIDATION.md).
 - **Key derivation** – keys are derived with BIP-39 plus SLIP-0010 hardened
   Ed25519 derivation at `m/44'/148'/0'`, the standard Stellar path.
 - **Gas funding** – `wallet fund <G…>` tops up a testnet account through the

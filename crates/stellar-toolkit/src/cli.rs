@@ -484,6 +484,11 @@ pub enum WalletCommand {
         /// The BIP-39 recovery phrase (quote it for shell safety)
         phrase: String,
     },
+    /// Check a recovery phrase without deriving or printing any key material
+    Validate {
+        /// The BIP-39 recovery phrase (quote it for shell safety)
+        phrase: String,
+    },
     /// Fund a Stellar account on testnet using the Friendbot faucet
     Fund {
         /// The account id (G...) to fund
@@ -510,6 +515,7 @@ impl std::fmt::Debug for WalletCommand {
         match self {
             Self::Generate => f.write_str("Generate"),
             Self::Recover { .. } => f.write_str("Recover { phrase: \"<redacted>\" }"),
+            Self::Validate { .. } => f.write_str("Validate { phrase: \"<redacted>\" }"),
             Self::Fund { account } => f.debug_struct("Fund").field("account", account).finish(),
             Self::Sign { message, .. } => f
                 .debug_struct("Sign")
@@ -644,6 +650,15 @@ fn run_wallet(wallet: &WalletCommand) -> Result<()> {
         WalletCommand::Recover { phrase } => {
             let w = wallet::recover_wallet(phrase)?;
             print_wallet(&w);
+            Ok(())
+        }
+        WalletCommand::Validate { phrase } => {
+            wallet::validate_recovery_phrase(phrase)
+                .map_err(|e| ToolkitError::Wallet(e.to_string()))?;
+            println!(
+                "Recovery phrase is valid ({} words).",
+                phrase.split_whitespace().count()
+            );
             Ok(())
         }
         WalletCommand::Fund { account } => wallet::fund_account(account),

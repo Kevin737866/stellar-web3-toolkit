@@ -6,20 +6,240 @@
 //! The wallet module lets end users interact with toolkit contracts: they can
 //! generate a recovery phrase, derive a Stellar account/secret key, fund the
 //! account on testnet, and sign (build) transactions.
+//!
+//! Recovery phrases can also be checked *without* deriving any key material via
+//! [`validate_recovery_phrase`]. Every finding carries a 1-based word position
+//! when one word can be blamed, and no error message ever echoes a word from
+//! the phrase (issue #330).
 
 use crate::error::{Result, ToolkitError};
-use aes_gcm::KeyInit;
-use zeroize::Zeroize;
 use crate::theme::{Style, Theme};
+use aes_gcm::KeyInit;
 use ed25519_dalek::{Signature, Signer, SigningKey};
 use hmac::{Hmac, Mac};
 use sha2::Sha512;
-use std::fmt::Write as _;
+use std::fmt::{self, Write as _};
+use zeroize::Zeroize;
 
 type HmacSha512 = Hmac<Sha512>;
 
 /// Default hardened derivation path for Stellar: `m/44'/148'/0'`.
 const STELLAR_PATH: [u32; 3] = [44, 148, 0];
+
+/// Word counts a BIP-39 recovery phrase may contain (issue #330).
+pub const RECOVERY_PHRASE_WORD_COUNTS: [usize; 5] = [12, 15, 18, 21, 24];
+
+/// Why a recovery phrase was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryPhraseIssueKind {
+    /// The phrase contained no words.
+    EmptyPhrase,
+    /// The word count is not one BIP-39 accepts.
+    InvalidWordCount,
+    /// A word is not in the English BIP-39 wordlist.
+    UnknownWord,
+    /// All words are known but the checksum carried by the final word is wrong.
+    ChecksumMismatch,
+}
+
+/// One actionable finding from phrase validation.
+///
+/// `position` is 1-based. `message` is safe to log: it never contains words
+/// from the phrase, only positions and guidance.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RecoveryPhraseIssue {
+    pub kind: RecoveryPhraseIssueKind,
+    /// Word position, when a specific word can be blamed; `None` when the
+    /// problem concerns the phrase as a whole (empty, wrong length).
+    pub position: Option<usize>,
+    /// Human-readable guidance that never echoes phrase material.
+    pub message: String,
+}
+
+/// All findings for a rejected recovery phrase (issue #330).
+///
+/// The type derives `Debug` and is safe to print: it holds positions and
+/// guidance only, never phrase words or derived key material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryPhraseError {
+    pub issues: Vec<RecoveryPhraseIssue>,
+}
+
+impl RecoveryPhraseError {
+    /// The findings, in phrase order.
+    #[must_use]
+    pub fn issues(&self) -> &[RecoveryPhraseIssue] {
+        &self.issues
+    }
+
+    fn new(issues: Vec<RecoveryPhraseIssue>) -> Self {
+        Self { issues }
+    }
+}
+
+impl fmt::Display for RecoveryPhraseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("invalid recovery phrase")?;
+        for issue in &self.issues {
+            write!(f, ": {}", issue.message)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for RecoveryPhraseError {}
+
+/// Validate an English BIP-39 recovery phrase without deriving or storing any
+/// key material (issue #330).
+///
+/// Returns `Ok(())` only when the phrase would be accepted by
+/// [`recover_wallet`]. Otherwise the error lists every actionable problem:
+///
+/// * an empty phrase;
+/// * a word count other than 12, 15, 18, 21 or 24;
+/// * each word that is not in the English wordlist, with its 1-based position;
+/// * a checksum mismatch. When a single nearby wordlist word would repair the
+///   checksum, that word's position is reported as the likely typo; otherwise
+///   the final word is reported because it carries the checksum bits.
+///
+/// No word from the input is copied into the error, and validation has no side
+/// effects, so a rejected phrase leaves no partial state behind.
+pub fn validate_recovery_phrase(phrase: &str) -> std::result::Result<(), RecoveryPhraseError> {
+    let words: Vec<&str> = phrase.split_whitespace().collect();
+
+    if words.is_empty() {
+        return Err(RecoveryPhraseError::new(vec![RecoveryPhraseIssue {
+            kind: RecoveryPhraseIssueKind::EmptyPhrase,
+            position: None,
+            message: "phrase is empty; enter the words from your backup separated by spaces"
+                .to_string(),
+        }]));
+    }
+
+    if !RECOVERY_PHRASE_WORD_COUNTS.contains(&words.len()) {
+        return Err(RecoveryPhraseError::new(vec![RecoveryPhraseIssue {
+            kind: RecoveryPhraseIssueKind::InvalidWordCount,
+            position: None,
+            message: format!("expected 12, 15, 18, 21 or 24 words, found {}", words.len()),
+        }]));
+    }
+
+    let unknown: Vec<usize> = words
+        .iter()
+        .enumerate()
+        .filter_map(|(index, word)| {
+            (bip39::Language::English.find_word(word).is_none()).then_some(index + 1)
+        })
+        .collect();
+    if !unknown.is_empty() {
+        return Err(RecoveryPhraseError::new(
+            unknown
+                .into_iter()
+                .map(|position| RecoveryPhraseIssue {
+                    kind: RecoveryPhraseIssueKind::UnknownWord,
+                    position: Some(position),
+                    message: format!(
+                        "word {position} is not in the BIP-39 English wordlist; \
+                         compare it with your backup"
+                    ),
+                })
+                .collect(),
+        ));
+    }
+
+    // Word count and every word are valid; the only remaining reason for a
+    // parse failure is the checksum encoded in the final word.
+    if bip39::Mnemonic::parse_in_normalized(bip39::Language::English, phrase).is_ok() {
+        return Ok(());
+    }
+
+    let suspects = checksum_typo_positions(&words);
+    let issue = match suspects.as_slice() {
+        [position] => RecoveryPhraseIssue {
+            kind: RecoveryPhraseIssueKind::ChecksumMismatch,
+            position: Some(*position),
+            message: format!(
+                "word {position} fails the BIP-39 checksum; it looks like a typo, \
+                 compare that word with your backup"
+            ),
+        },
+        [] => {
+            let last = words.len();
+            RecoveryPhraseIssue {
+                kind: RecoveryPhraseIssueKind::ChecksumMismatch,
+                position: Some(last),
+                message: format!(
+                    "word {last} carries the BIP-39 checksum and does not match the \
+                     preceding words; verify the whole phrase against your backup"
+                ),
+            }
+        }
+        positions => {
+            let listed = positions
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            RecoveryPhraseIssue {
+                kind: RecoveryPhraseIssueKind::ChecksumMismatch,
+                position: None,
+                message: format!(
+                    "checksum mismatch; a single mistyped word at position(s) {listed} \
+                     would explain it"
+                ),
+            }
+        }
+    };
+    Err(RecoveryPhraseError::new(vec![issue]))
+}
+
+/// Find positions where replacing one word with a *nearby* wordlist word would
+/// make the checksum valid. A wordlist contains many replacements that satisfy
+/// a short checksum at any position, so only small edits (a typo) are useful
+/// evidence; otherwise the search would blame almost every word.
+fn checksum_typo_positions(words: &[&str]) -> Vec<usize> {
+    let wordlist = bip39::Language::English.word_list();
+    let mut positions = Vec::new();
+    for (index, word) in words.iter().enumerate() {
+        for candidate in wordlist {
+            let candidate = *candidate;
+            if candidate == *word || !within_edit_distance(candidate, word, 2) {
+                continue;
+            }
+            let mut trial = words.to_vec();
+            trial[index] = candidate;
+            if bip39::Mnemonic::parse_in_normalized(bip39::Language::English, &trial.join(" "))
+                .is_ok()
+            {
+                positions.push(index + 1);
+                break;
+            }
+        }
+    }
+    positions
+}
+
+/// Levenshtein distance between two ASCII words, capped at `max`.
+fn within_edit_distance(a: &str, b: &str, max: usize) -> bool {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    if a.len().abs_diff(b.len()) > max {
+        return false;
+    }
+    let mut previous: Vec<usize> = (0..=b.len()).collect();
+    let mut current = vec![0; b.len() + 1];
+    for (i, &a_byte) in a.iter().enumerate() {
+        current[0] = i + 1;
+        for (j, &b_byte) in b.iter().enumerate() {
+            current[j + 1] = (previous[j + 1] + 1)
+                .min(current[j] + 1)
+                .min(previous[j] + usize::from(a_byte != b_byte));
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[b.len()] <= max
+}
 
 /// A freshly generated recovery phrase and the keypair it derives to.
 pub struct GeneratedWallet {
@@ -71,6 +291,9 @@ pub fn generate_wallet() -> Result<GeneratedWallet> {
 /// Recover a Stellar keypair from an existing recovery phrase. Verifies the
 /// mnemonic checksum before deriving, so a typo'd phrase is rejected early.
 pub fn recover_wallet(phrase: &str) -> Result<GeneratedWallet> {
+    // Fail before deriving: actionable positions come from the dedicated
+    // validator, while the parse below stays as a defense-in-depth check.
+    validate_recovery_phrase(phrase).map_err(|e| ToolkitError::Wallet(e.to_string()))?;
     let mnemonic = bip39::Mnemonic::parse_in_normalized(bip39::Language::English, phrase)
         .map_err(|e| ToolkitError::Wallet(format!("invalid recovery phrase: {e}")))?;
     let seed = mnemonic.to_seed("");
@@ -184,7 +407,6 @@ pub fn format_wallet_summary(wallet: &GeneratedWallet, theme: &Theme) -> String 
     out
 }
 
-
 /// Minimum passphrase length for an exported keystore.
 pub const KEYSTORE_MIN_PASSPHRASE_LENGTH: usize = 12;
 const KEYSTORE_VERSION: u32 = 1;
@@ -238,7 +460,9 @@ pub fn export_keystore(wallet: &GeneratedWallet, passphrase: &str) -> Result<Str
     let private = decode_secret(&wallet.secret)?;
     let account = encode_account(SigningKey::from_bytes(&private).verifying_key().as_bytes());
     if wallet.account != account {
-        return Err(ToolkitError::Wallet("wallet account does not match its secret key".into()));
+        return Err(ToolkitError::Wallet(
+            "wallet account does not match its secret key".into(),
+        ));
     }
     let mut payload = serde_json::to_vec(&KeystorePayload {
         secret: wallet.secret.clone(),
@@ -330,12 +554,15 @@ pub fn import_keystore(document: &str, passphrase: &str) -> Result<ImportedKeyst
     })?;
     let payload_result = serde_json::from_slice::<KeystorePayload>(&plaintext);
     plaintext.zeroize();
-    let payload: KeystorePayload = payload_result
-        .map_err(|_| ToolkitError::Wallet("decrypted keystore payload has an invalid schema".into()))?;
+    let payload: KeystorePayload = payload_result.map_err(|_| {
+        ToolkitError::Wallet("decrypted keystore payload has an invalid schema".into())
+    })?;
     let private = decode_secret(&payload.secret)?;
     let expected = encode_account(SigningKey::from_bytes(&private).verifying_key().as_bytes());
     if payload.account != expected {
-        return Err(ToolkitError::Wallet("keystore account does not match its secret key".into()));
+        return Err(ToolkitError::Wallet(
+            "keystore account does not match its secret key".into(),
+        ));
     }
     Ok(ImportedKeystore {
         secret: payload.secret,
@@ -367,7 +594,6 @@ fn derive_keystore_key(passphrase: &str, salt: &[u8]) -> Result<[u8; 32]> {
         .map_err(|_| ToolkitError::Wallet("keystore key derivation failed".into()))?;
     Ok(key)
 }
-
 
 /// Fund an account on the Stellar testnet using the Friendbot faucet.
 pub fn fund_account(account: &str) -> Result<()> {
@@ -577,5 +803,130 @@ mod tests {
         // The secret is highlighted, never dimmed or recoloured as a value.
         assert!(out.contains("\x1b[1;35m"));
         assert!(out.contains(&format!("\n{}\n", wallet.secret)));
+    }
+
+    // ── Validation (issue #330) ──────────────────────────────────────────────
+    //
+    // Phrases are assembled from words instead of written as literals so this
+    // file never contains a checksum-valid phrase that `security secrets`
+    // would have to excuse.
+
+    fn canonical_24_word_phrase() -> String {
+        let mut words = vec!["abandon"; 23];
+        words.push("art");
+        words.join(" ")
+    }
+
+    fn canonical_12_word_phrase() -> String {
+        let mut words = vec!["abandon"; 11];
+        words.push("about");
+        words.join(" ")
+    }
+
+    #[test]
+    fn validation_accepts_valid_phrases_at_both_word_count_boundaries() {
+        let phrases = [canonical_12_word_phrase(), canonical_24_word_phrase()];
+        for phrase in &phrases {
+            validate_recovery_phrase(phrase).expect("canonical phrase must validate");
+        }
+        assert_eq!(phrases[0].split_whitespace().count(), 12);
+        assert_eq!(phrases[1].split_whitespace().count(), 24);
+    }
+
+    #[test]
+    fn validation_rejects_empty_and_whitespace_only_phrases() {
+        for phrase in ["", " \t\n "] {
+            let err = validate_recovery_phrase(phrase).unwrap_err();
+            assert_eq!(err.issues.len(), 1);
+            assert_eq!(err.issues[0].kind, RecoveryPhraseIssueKind::EmptyPhrase);
+            assert_eq!(err.issues[0].position, None);
+            assert!(err.to_string().contains("empty"));
+        }
+    }
+
+    #[test]
+    fn validation_reports_the_actual_word_count() {
+        for count in [1usize, 11, 13, 23, 25] {
+            let phrase = vec!["abandon"; count].join(" ");
+            let err = validate_recovery_phrase(&phrase).unwrap_err();
+            assert_eq!(
+                err.issues[0].kind,
+                RecoveryPhraseIssueKind::InvalidWordCount
+            );
+            assert_eq!(err.issues[0].position, None);
+            assert!(
+                err.to_string().contains(&format!("found {count}")),
+                "error must name the offending count: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validation_reports_every_unknown_word_position_without_echoing_words() {
+        let mut words = vec!["abandon"; 23];
+        words[6] = "notaword";
+        words[19] = "xxxxx";
+        words.push("art");
+        let phrase = words.join(" ");
+
+        let err = validate_recovery_phrase(&phrase).unwrap_err();
+        let positions: Vec<Option<usize>> = err.issues.iter().map(|i| i.position).collect();
+        assert_eq!(positions, vec![Some(7), Some(20)]);
+        assert!(err
+            .issues
+            .iter()
+            .all(|i| i.kind == RecoveryPhraseIssueKind::UnknownWord));
+        // The phrase is a secret: no word may appear in the error.
+        let rendered = err.to_string();
+        assert!(!rendered.contains("notaword"));
+        assert!(!rendered.contains("xxxxx"));
+        assert!(!format!("{err:?}").contains("notaword"));
+    }
+
+    #[test]
+    fn validation_flags_checksum_mismatch_on_a_known_word() {
+        let mut words = vec!["abandon"; 23];
+        words.push("zoo"); // known word, wrong checksum
+        let phrase = words.join(" ");
+
+        let err = validate_recovery_phrase(&phrase).unwrap_err();
+        assert_eq!(err.issues.len(), 1);
+        assert_eq!(
+            err.issues[0].kind,
+            RecoveryPhraseIssueKind::ChecksumMismatch
+        );
+        assert!(err.issues[0].position.is_some());
+        assert!(err.to_string().contains("checksum"));
+    }
+
+    #[test]
+    fn validation_points_at_the_word_a_nearby_wordlist_word_would_fix() {
+        // `act` is one edit from `art`, the final word of the canonical
+        // 24-word vector. Replacing it with `art` repairs the checksum, so the
+        // validator must blame word 24 rather than guessing the whole phrase.
+        let mut words = vec!["abandon"; 23];
+        words.push("act");
+        let phrase = words.join(" ");
+
+        assert!(validate_recovery_phrase(&phrase).is_err());
+        let err = validate_recovery_phrase(&phrase).unwrap_err();
+        assert_eq!(
+            err.issues[0].kind,
+            RecoveryPhraseIssueKind::ChecksumMismatch
+        );
+        assert_eq!(err.issues[0].position, Some(24));
+        assert!(err.to_string().contains("word 24"));
+    }
+
+    #[test]
+    fn recovery_reports_the_offending_word_position() {
+        let mut words = vec!["abandon"; 24];
+        words[2] = "notaword";
+        let phrase = words.join(" ");
+
+        let err = recover_wallet(&phrase).unwrap_err().to_string();
+        assert!(err.contains("invalid recovery phrase"), "{err}");
+        assert!(err.contains("word 3"), "error must be actionable: {err}");
+        assert!(!err.contains("notaword"), "error echoed phrase material");
     }
 }
