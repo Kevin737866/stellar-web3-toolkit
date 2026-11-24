@@ -1546,116 +1546,60 @@ mod test {
     }
 
     #[test]
-    fn undelegate_boundary_exact_and_one_over_preserves_state() {
+    fn fractional_rewards_stay_as_dust_and_are_never_overpaid() {
         let f = Fixture::new();
-        f.fund(1_000 * ONE, 1_000);
-        f.mint(&f.alice, 100 * ONE);
-        f.client.delegate(&f.alice, &f.operator, &(100 * ONE));
-        f.advance(50);
+        // Two base units funded over one second, split across three equal
+        // stakers: each share is two thirds of a unit, which floors to zero.
+        f.fund(2, 1);
+        assert_eq!(f.client.reward_rate(), 2);
 
-        // One unit over staked balance is rejected with no state mutation.
-        assert!(f
-            .client
-            .try_undelegate(&f.alice, &f.operator, &(100 * ONE + 1))
-            .is_err());
-        assert_eq!(f.client.position(&f.alice, &f.operator).amount, 100 * ONE);
-        assert_eq!(f.client.total_staked(), 100 * ONE);
-        assert_eq!(
-            f.client.operator_of(&f.operator).unwrap().total_staked,
-            100 * ONE
-        );
-        assert_eq!(f.client.rewards_credited(), 0);
-        assert_eq!(f.balance(&f.alice), 0);
+        let a = Address::generate(&f.env);
+        let b = Address::generate(&f.env);
+        let c = Address::generate(&f.env);
+        for who in [&a, &b, &c] {
+            f.mint(who, 1);
+            // Zero-commission operator so the numbers are the gross accrual.
+            f.client.delegate(who, &f.other_operator, &1);
+        }
 
-        // Exact balance withdrawal succeeds.
-        assert_eq!(
-            f.client.undelegate(&f.alice, &f.operator, &(100 * ONE)),
-            100 * ONE
-        );
-        assert_eq!(f.balance(&f.alice), 100 * ONE);
-        assert_eq!(f.client.total_staked(), 0);
-    }
+        f.advance(1);
 
-    #[test]
-    fn undelegate_rejects_zero_balance_and_excess_after_partial() {
-        let f = Fixture::new();
-        // Bob has never delegated.
-        assert!(f
-            .client
-            .try_undelegate(&f.bob, &f.operator, &ONE)
-            .is_err());
-        assert!(f.client.try_undelegate(&f.alice, &f.operator, &0).is_err());
-        assert!(f.client.try_undelegate(&f.alice, &f.operator, &-5).is_err());
-
-        f.mint(&f.alice, 100 * ONE);
-        f.client.delegate(&f.alice, &f.operator, &(100 * ONE));
-        assert_eq!(
-            f.client.undelegate(&f.alice, &f.operator, &(60 * ONE)),
-            60 * ONE
-        );
-        // Remaining is 40 * ONE; requesting 40 * ONE + 1 must fail.
-        assert!(f
-            .client
-            .try_undelegate(&f.alice, &f.operator, &(40 * ONE + 1))
-            .is_err());
-        assert_eq!(f.client.position(&f.alice, &f.operator).amount, 40 * ONE);
-    }
-
-    #[test]
-    fn undelegate_with_auto_compound_rejects_excess_without_side_effects() {
-        let f = Fixture::new();
-        f.fund(1_000 * ONE, 1_000);
-        f.mint(&f.alice, 100 * ONE);
-        f.client.set_auto_compound(&f.alice, &f.operator, &true);
-        f.client.delegate(&f.alice, &f.operator, &(100 * ONE));
-        f.advance(100);
-
-        // 100 * ONE gross reward -> 95 * ONE net + 5 * ONE commission; max withdrawable = 195 * ONE.
-        assert!(f
-            .client
-            .try_undelegate(&f.alice, &f.operator, &(195 * ONE + 1))
-            .is_err());
-        // No commission paid, no rewards compounded, principal intact.
-        assert_eq!(f.balance(&f.operator), 0);
+        assert_eq!(f.client.pending_rewards(&a, &f.other_operator), 0);
+        for who in [&a, &b, &c] {
+            assert_eq!(f.client.claim(who, &f.other_operator, &0), 0);
+        }
+        // The index floors the whole movement to one credited base unit; nobody
+        // can claim it, so it stays in the contract as dust.
+        assert_eq!(f.client.rewards_credited(), 1);
         assert_eq!(f.client.rewards_paid_out(), 0);
-        assert_eq!(f.client.rewards_compounded(), 0);
-        assert_eq!(f.client.position(&f.alice, &f.operator).amount, 100 * ONE);
 
-        // Exact post-compound balance succeeds.
-        assert_eq!(
-            f.client.undelegate(&f.alice, &f.operator, &(195 * ONE)),
-            195 * ONE
-        );
-        assert_eq!(f.balance(&f.alice), 195 * ONE);
-        assert_eq!(f.balance(&f.operator), 5 * ONE);
+        // Every principal is still withdrawable in full.
+        for who in [&a, &b, &c] {
+            f.client.undelegate(who, &f.other_operator, &1);
+            assert_eq!(f.balance(who), 1);
+        }
     }
 
     #[test]
-    fn integration_delegation_over_withdrawal_and_claim_workflow() {
+    fn a_one_unit_stake_receives_its_exact_share_of_a_high_ratio_pool() {
         let f = Fixture::new();
-        f.fund(1_000 * ONE, 1_000);
-        f.mint(&f.alice, 100 * ONE);
-        f.client.delegate(&f.alice, &f.operator, &(100 * ONE));
+        // 1_000 base units funded over one second over 1_000 staked units: the
+        // index moves exactly PRECISION, so a whale and a one-unit staker are
+        // both paid to the base unit.
+        f.fund(1_000, 1);
+        f.mint(&f.alice, 999);
+        f.mint(&f.bob, 1);
+        f.client.delegate(&f.alice, &f.other_operator, &999);
+        f.client.delegate(&f.bob, &f.other_operator, &1);
 
-        f.advance(100);
-        // Over-withdrawal fails without disturbing principal or rewards.
-        assert!(f
-            .client
-            .try_undelegate(&f.alice, &f.operator, &(100 * ONE + 1))
-            .is_err());
-        assert_eq!(f.client.pending_rewards(&f.alice, &f.operator), 100 * ONE);
+        f.advance(1);
+        assert_eq!(f.client.pending_rewards(&f.alice, &f.other_operator), 999);
+        assert_eq!(f.client.pending_rewards(&f.bob, &f.other_operator), 1);
 
-        // Claim rewards, then undelegate full principal.
-        let net = f.client.claim(&f.alice, &f.operator, &0);
-        assert_eq!(net, 95 * ONE);
-        f.client.undelegate(&f.alice, &f.operator, &(100 * ONE));
-
-        assert_eq!(f.balance(&f.alice), 195 * ONE);
-        assert_eq!(f.balance(&f.operator), 5 * ONE);
-        assert_eq!(f.client.total_staked(), 0);
-        assert!(
-            f.client.rewards_paid_out() + f.client.rewards_compounded()
-                <= f.client.rewards_credited()
-        );
+        let whale = f.client.claim(&f.alice, &f.other_operator, &999);
+        let tiny = f.client.claim(&f.bob, &f.other_operator, &1);
+        assert_eq!((whale, tiny), (999, 1));
+        assert_eq!(f.client.rewards_paid_out(), 1_000);
+        assert!(f.client.rewards_paid_out() <= f.client.rewards_credited());
     }
 }

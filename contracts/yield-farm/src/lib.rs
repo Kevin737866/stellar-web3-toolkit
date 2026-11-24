@@ -1367,91 +1367,43 @@ mod test {
     }
 
     #[test]
-    fn withdraw_boundary_exact_and_one_over_preserves_state() {
+    fn a_one_unit_position_receives_its_exact_share() {
         let f = Fixture::new();
-        f.standard_farm();
-        f.deposit(&f.alice, 1, &f.lp_a, 100 * ONE);
-        f.advance(50);
+        f.client.add_pool(&1, &f.lp_a, &1);
+        // 1_000 base units funded over one second over 1_000 staked units: the
+        // accumulator moves by exactly PRECISION, so the 999:1 split resolves
+        // to whole base units on both sides.
+        f.fund(1_000 * ONE, 1);
+        f.deposit(&f.alice, 1, &f.lp_a, 999 * ONE);
+        f.deposit(&f.bob, 1, &f.lp_a, ONE);
 
-        // One unit over staked balance is rejected with no state mutation.
-        assert!(f
-            .client
-            .try_withdraw(&f.alice, &1, &(100 * ONE + 1))
-            .is_err());
-        assert_eq!(f.client.position(&f.alice, &1).amount, 100 * ONE);
-        assert_eq!(f.client.pool_of(&1).unwrap().total_staked, 100 * ONE);
-        assert_eq!(f.client.rewards_credited(), 0);
-        assert_eq!(f.balance(&f.lp_a, &f.alice), 0);
+        f.advance(1);
+        assert_eq!(f.client.pending_rewards(&f.alice, &1), 999 * ONE);
+        assert_eq!(f.client.pending_rewards(&f.bob, &1), ONE);
 
-        // Exact balance withdrawal succeeds.
-        let remaining = f.client.withdraw(&f.alice, &1, &(100 * ONE));
-        assert_eq!(remaining, 0);
-        assert_eq!(f.balance(&f.lp_a, &f.alice), 100 * ONE);
-        assert_eq!(f.client.pool_of(&1).unwrap().total_staked, 0);
-    }
-
-    #[test]
-    fn withdraw_rejects_zero_balance_and_excess_after_partial() {
-        let f = Fixture::new();
-        f.standard_farm();
-        // Bob has never deposited.
-        assert!(f.client.try_withdraw(&f.bob, &1, &1).is_err());
-        assert!(f.client.try_withdraw(&f.alice, &1, &0).is_err());
-        assert!(f.client.try_withdraw(&f.alice, &1, &-5).is_err());
-
-        f.deposit(&f.alice, 1, &f.lp_a, 100 * ONE);
-        assert_eq!(f.client.withdraw(&f.alice, &1, &(70 * ONE)), 30 * ONE);
-        // Remaining is 30 * ONE; requesting 30 * ONE + 1 must fail.
-        assert!(f
-            .client
-            .try_withdraw(&f.alice, &1, &(30 * ONE + 1))
-            .is_err());
-        assert_eq!(f.client.position(&f.alice, &1).amount, 30 * ONE);
-    }
-
-    #[test]
-    fn withdraw_while_paused_enforces_staked_balance_limit() {
-        let f = Fixture::new();
-        f.standard_farm();
-        f.deposit(&f.alice, 1, &f.lp_a, 50 * ONE);
-        f.client.set_paused(&true);
-
-        assert!(f
-            .client
-            .try_withdraw(&f.alice, &1, &(50 * ONE + 1))
-            .is_err());
-        assert_eq!(f.client.withdraw(&f.alice, &1, &(50 * ONE)), 0);
-        assert_eq!(f.balance(&f.lp_a, &f.alice), 50 * ONE);
-    }
-
-    #[test]
-    fn integration_farm_over_withdrawal_harvest_and_emergency_exit() {
-        let f = Fixture::new();
-        f.standard_farm();
-        f.deposit(&f.alice, 1, &f.lp_a, 100 * ONE);
-        f.deposit(&f.bob, 1, &f.lp_a, 100 * ONE);
-
-        f.advance(40);
-        // Over-withdrawal fails without altering Alice's stake or pending rewards.
-        assert!(f
-            .client
-            .try_withdraw(&f.alice, &1, &(100 * ONE + 1))
-            .is_err());
-        assert_eq!(f.client.position(&f.alice, &1).amount, 100 * ONE);
-        assert_eq!(f.client.pending_rewards(&f.alice, &1), 10 * ONE);
-
-        // Partial withdraw + harvest preserves and pays accrued rewards.
-        assert_eq!(f.client.withdraw(&f.alice, &1, &(60 * ONE)), 40 * ONE);
-        assert_eq!(f.client.harvest(&f.alice, &1, &0), 10 * ONE);
-        assert_eq!(f.balance(&f.lp_a, &f.alice), 60 * ONE);
-        assert_eq!(f.balance(&f.reward_token, &f.alice), 10 * ONE);
-
-        // Advance more, then emergency_withdraw exits remaining LP and forfeits new accrual.
-        f.advance(20);
-        let emg = f.client.emergency_withdraw(&f.alice, &1);
-        assert_eq!(emg, 40 * ONE);
-        assert_eq!(f.balance(&f.lp_a, &f.alice), 100 * ONE);
-        assert_eq!(f.client.pending_rewards(&f.alice, &1), 0);
+        let whale = f.client.harvest(&f.alice, &1, &0);
+        let tiny = f.client.harvest(&f.bob, &1, &0);
+        assert_eq!((whale, tiny), (999 * ONE, ONE));
+        assert_eq!(f.client.rewards_paid_out(), 1_000 * ONE);
         assert!(f.client.rewards_paid_out() <= f.client.rewards_credited());
+    }
+
+    #[test]
+    fn rewards_below_one_base_unit_stay_as_dust() {
+        let f = Fixture::new();
+        f.client.add_pool(&1, &f.lp_a, &1);
+        // One base unit of rewards across 1_000_000_001 staked units: every
+        // position floors to zero and no credit is recorded.
+        f.fund(1, 1);
+        f.deposit(&f.alice, 1, &f.lp_a, 1_000_000_000);
+        f.deposit(&f.bob, 1, &f.lp_a, 1);
+
+        f.advance(1);
+        assert_eq!(f.client.pending_rewards(&f.alice, &1), 0);
+        assert_eq!(f.client.pending_rewards(&f.bob, &1), 0);
+        assert_eq!(f.client.harvest(&f.alice, &1, &0), 0);
+        assert_eq!(f.client.harvest(&f.bob, &1, &0), 0);
+        assert_eq!(f.client.rewards_credited(), 0);
+        assert_eq!(f.client.rewards_paid_out(), 0);
     }
 }

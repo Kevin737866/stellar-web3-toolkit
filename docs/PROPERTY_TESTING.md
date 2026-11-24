@@ -46,6 +46,7 @@ configuration — that these tests do not use.
 | `Config` | Iteration count and seed, read from `PROPERTY_CASES` / `PROPERTY_SEED`. |
 | `Candidate` | A `shrink` method implemented for the numeric types, `bool`, tuples and `Vec`. |
 | `check` / `check_default` | Runners that shrink the first failure to a local minimum and panic with it. |
+| `Scenario` | Named `given` / `when` / `then` steps for readable, ordered contract workflows. |
 | `expect` | Small helper for a boolean assertion with a reason. |
 
 A failing property reports the seed, the case index, the reason, the minimal
@@ -113,6 +114,36 @@ fn my_invariant_always_holds() {
 Keep the generator's output type shrinkable — plain numbers, tuples, and `Vec`
 already are. If a new type is needed, implement `Candidate` for it and prefer
 shrinking toward the simplest failing case.
+
+## Scenario tests
+
+Use `Scenario<C>` when a contract test is easier to explain as a workflow than
+as generated inputs. Each step receives the same mutable fixture, and the first
+failure reports the scenario, phase, step, and reason:
+
+```rust
+use contract_proptests::Scenario;
+
+let scenario = Scenario::new("deposit then withdraw")
+    .given("the account starts funded", |balance: &mut i128| {
+        *balance = 10;
+        Ok(())
+    })
+    .when("the account withdraws", |balance: &mut i128| {
+        *balance -= 4;
+        Ok(())
+    })
+    .then("the remaining balance is correct", |balance: &mut i128| {
+        if *balance == 6 { Ok(()) } else { Err("expected six units".into()) }
+    });
+
+scenario.run(&mut 0).unwrap();
+```
+
+The AMM scenario in `crates/contract-proptests/tests/amm_pool_scenarios.rs`
+shows the DSL against a real Soroban test environment. Scenario tests are part
+of `cargo test -p contract-proptests`, which the existing `proptest` CI job runs
+with both its pinned and alternate seeds.
 
 ## Coverage
 
