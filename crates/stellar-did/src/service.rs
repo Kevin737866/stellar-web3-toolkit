@@ -81,6 +81,22 @@ pub enum DidError {
     /// The service type is empty or blank.
     #[error("service type must not be empty")]
     EmptyServiceType,
+
+    /// The DID string is empty or does not conform to DID Core syntax.
+    #[error("invalid DID `{did}`: {reason}")]
+    InvalidDid { did: String, reason: String },
+
+    /// No document or history exists for the requested DID.
+    #[error("DID `{0}` was not found")]
+    DidNotFound(String),
+
+    /// The requested pagination limit is zero or exceeds the maximum allowed.
+    #[error("invalid pagination limit {limit}: must be between 1 and {max}")]
+    InvalidPaginationLimit { limit: usize, max: usize },
+
+    /// The pagination cursor is malformed or out of bounds.
+    #[error("invalid pagination cursor `{cursor}`: {reason}")]
+    InvalidCursor { cursor: String, reason: String },
 }
 
 // ── Scheme allowlist ─────────────────────────────────────────────────────────

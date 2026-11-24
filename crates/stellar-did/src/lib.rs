@@ -4,8 +4,13 @@
 //! creation, service endpoint management, and resolution compliant with the
 //! [W3C DID Core specification](https://www.w3.org/TR/did-core/).
 
+pub mod resolver;
 pub mod service;
 
+pub use resolver::{
+    DidHistoryEntry, DidResolver, PaginatedHistoryResponse, PaginationParams, DEFAULT_PAGE_LIMIT,
+    MAX_PAGE_LIMIT,
+};
 pub use service::{DidDocument, DidError, Service, ServiceEndpoint};
 
 pub fn version() -> &'static str {
