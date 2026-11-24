@@ -3,6 +3,18 @@
 //! Multi-hop payment routing for Stellar payment channels.
 //! Implements path-finding algorithms for routing payments through
 //! the payment channel network.
+//!
+//! ## Deterministic Tie-Breaking
+//!
+//! Equal-cost routes are broken deterministically via [`TieBreaker`]
+//! (defaulting to [`TieBreaker::Canonical`]: fewer hops, lower total CLTV
+//! delta for timeout safety, and lexicographically smallest
+//! `(channel_id, node_id)` hop sequence). Existing callers of
+//! [`find_best_route`] and [`find_best_route_with_cap`] automatically receive
+//! deterministic, insertion-order-independent results; callers needing a
+//! specific tie-breaking order can use [`find_best_route_with_tie_breaker`],
+//! [`pathfinder::Pathfinder::with_tie_breaker`], or
+//! [`policy::RoutingPolicy::with_tie_breaker`].
 
 pub mod fee_cap;
 pub mod graph;
@@ -10,6 +22,7 @@ pub mod pathfinder;
 pub mod policy;
 
 pub use fee_cap::FeeCap;
+pub use policy::TieBreaker;
 
 use fxhash::FxHashMap;
 use priority_queue::PriorityQueue;
@@ -473,17 +486,44 @@ pub fn find_best_route(
 
 /// Find the best route using Dijkstra's algorithm with fees, rejecting any
 /// channel or route that breaks `cap`.
+///
+/// Equal-cost routes are broken deterministically using [`TieBreaker::Canonical`].
+/// Use [`find_best_route_with_tie_breaker`] to select a different tie-breaker.
 pub fn find_best_route_with_cap(
     graph: &NetworkGraph,
     request: &RouteRequest,
     cap: &FeeCap,
 ) -> Result<Route, RoutingError> {
-    // Validate inputs
+    find_best_route_with_tie_breaker(graph, request, cap, TieBreaker::Canonical)
+}
+
+/// Find the best route using Dijkstra's algorithm with fees, enforcing `cap`
+/// and breaking equal-cost ties deterministically according to `tie_breaker`.
+pub fn find_best_route_with_tie_breaker(
+    graph: &NetworkGraph,
+    request: &RouteRequest,
+    cap: &FeeCap,
+    tie_breaker: TieBreaker,
+) -> Result<Route, RoutingError> {
+    // Validate inputs explicitly
     if request.amount <= 0 {
         return Err(RoutingError::BelowDustLimit {
             amount: request.amount,
             dust_limit: 1,
         });
+    }
+
+    if request.amount > MAX_ROUTE_AMOUNT {
+        return Err(RoutingError::AmountExceedsMaximum {
+            amount: request.amount,
+            max_amount: MAX_ROUTE_AMOUNT,
+        });
+    }
+
+    if let Some(budget) = request.max_fee_budget {
+        if budget < 0 {
+            return Err(RoutingError::FeeExceedsBudget { fee: 0, budget });
+        }
     }
 
     if !graph.has_node(&request.source) {
@@ -500,83 +540,105 @@ pub fn find_best_route_with_cap(
 
     let max_hops = request.max_hops.unwrap_or(MAX_ROUTE_HOPS);
 
-    // Dijkstra's algorithm with weighted edges (fees)
-    let mut dist: FxHashMap<String, i128> = FxHashMap::default();
+    // Dijkstra's algorithm with weighted edges (fees) and deterministic tie-breaking
+    let mut best_keys: FxHashMap<String, policy::SearchKey> = FxHashMap::default();
     let mut prev: FxHashMap<String, (String, String, i128, i128)> = FxHashMap::default(); // node -> (prev_node, channel_id, amount, fee)
                                                                                           // The amount that actually arrives at each node. A hop's fee is charged on
                                                                                           // the amount forwarded through it, which is the payment plus every fee
                                                                                           // already paid upstream, so this has to be tracked per node rather than
                                                                                           // derived from the accumulated fee.
     let mut amount_at: FxHashMap<String, i128> = FxHashMap::default();
-    let mut pq: PriorityQueue<String, Reverse<i128>> = PriorityQueue::new();
+    let mut pq: PriorityQueue<String, Reverse<policy::SearchKey>> = PriorityQueue::new();
 
-    dist.insert(request.source.clone(), 0);
+    let root_key = policy::SearchKey::root(0, tie_breaker);
+    best_keys.insert(request.source.clone(), root_key.clone());
     amount_at.insert(request.source.clone(), request.amount);
-    pq.push(request.source.clone(), Reverse(0));
+    pq.push(request.source.clone(), Reverse(root_key));
 
-    while let Some((node_id, Reverse(dist_cost))) = pq.pop() {
+    while let Some((node_id, Reverse(current_key))) = pq.pop() {
         // Found destination
         if node_id == request.destination {
             break;
         }
 
         // Skip if we've found a better path
-        if dist_cost > *dist.get(&node_id).unwrap_or(&i128::MAX) {
-            continue;
+        if let Some(best) = best_keys.get(&node_id) {
+            if &current_key > best {
+                continue;
+            }
         }
 
         // Amount arriving at this node, which is what the next hop charges on.
         let current_amount = *amount_at.get(&node_id).unwrap_or(&request.amount);
+        let dist_cost = current_key.primary_cost;
 
-        // Check all neighbors
-        if let Some(neighbors) = graph.adjacency.get(&node_id) {
-            for (neighbor_id, channel_id) in neighbors {
-                if let Some(channel) = graph.channels.get(channel_id) {
-                    // A hop that advertises an absurd fee schedule is never
-                    // admitted, no matter how cheap the rest of the route is.
-                    if cap.check_channel(channel).is_err() {
-                        continue;
-                    }
+        // Check all neighbors in deterministic sorted order
+        for (neighbor_id, channel_id) in policy::sorted_neighbors(graph, &node_id) {
+            if let Some(channel) = graph.channels.get(channel_id) {
+                // A hop that advertises an absurd fee schedule is never
+                // admitted, no matter how cheap the rest of the route is.
+                if cap.check_channel(channel).is_err() {
+                    continue;
+                }
 
-                    // Determine direction and available capacity.
-                    //
-                    // `neighbor_id` is where we are heading, so the capacity we
-                    // need is the one leaving `node_id`: when the neighbour is
-                    // `node_a`, we are `node_b` and travel along `b_to_a`.
-                    // Reading the opposite direction lets a payment be routed
-                    // through a hop that has no room for it.
-                    let (available_capacity, _direction) = if &channel.node_a == neighbor_id {
-                        (channel.capacity_b_to_a, Direction::BToA)
-                    } else {
-                        (channel.capacity_a_to_b, Direction::AToB)
-                    };
+                // Determine direction and available capacity.
+                //
+                // `neighbor_id` is where we are heading, so the capacity we
+                // need is the one leaving `node_id`: when the neighbour is
+                // `node_a`, we are `node_b` and travel along `b_to_a`.
+                // Reading the opposite direction lets a payment be routed
+                // through a hop that has no room for it.
+                let (available_capacity, _direction) = if &channel.node_a == neighbor_id {
+                    (channel.capacity_b_to_a, Direction::BToA)
+                } else {
+                    (channel.capacity_a_to_b, Direction::AToB)
+                };
 
-                    // Skip if channel doesn't have enough capacity
-                    let amount_at_next_hop = current_amount;
-                    if available_capacity < amount_at_next_hop {
-                        continue;
-                    }
+                // Skip if channel doesn't have enough capacity
+                let amount_at_next_hop = current_amount;
+                if available_capacity < amount_at_next_hop {
+                    continue;
+                }
 
-                    // Calculate fee for this hop
-                    let fee = calculate_channel_fee(
-                        amount_at_next_hop,
-                        channel.base_fee,
-                        channel.fee_rate,
-                        channel.cltv_delta,
+                // Reject negative base fees to prevent negative-weight cycles
+                if channel.base_fee < 0 {
+                    continue;
+                }
+
+                // Calculate fee for this hop
+                let fee = calculate_channel_fee(
+                    amount_at_next_hop,
+                    channel.base_fee,
+                    channel.fee_rate,
+                    channel.cltv_delta,
+                );
+                if fee < 0 {
+                    continue;
+                }
+
+                let Some(next_dist) = dist_cost.checked_add(fee) else {
+                    continue;
+                };
+                let Some(next_amount) = current_amount.checked_add(fee) else {
+                    continue;
+                };
+
+                let next_key =
+                    current_key.extend(next_dist, channel_id, neighbor_id, channel.cltv_delta);
+
+                let is_better = match best_keys.get(neighbor_id) {
+                    None => true,
+                    Some(existing) => &next_key < existing,
+                };
+
+                if is_better {
+                    best_keys.insert(neighbor_id.clone(), next_key.clone());
+                    amount_at.insert(neighbor_id.clone(), next_amount);
+                    prev.insert(
+                        neighbor_id.clone(),
+                        (node_id.clone(), channel_id.clone(), current_amount, fee),
                     );
-
-                    let next_dist = dist_cost + fee;
-
-                    // Check if this is a better path
-                    if next_dist < *dist.get(neighbor_id).unwrap_or(&i128::MAX) {
-                        dist.insert(neighbor_id.clone(), next_dist);
-                        amount_at.insert(neighbor_id.clone(), current_amount + fee);
-                        prev.insert(
-                            neighbor_id.clone(),
-                            (node_id.clone(), channel_id.clone(), current_amount, fee),
-                        );
-                        pq.push(neighbor_id.clone(), Reverse(next_dist));
-                    }
+                    pq.push(neighbor_id.clone(), Reverse(next_key));
                 }
             }
         }
@@ -1029,5 +1091,84 @@ mod tests {
 
         let routes = find_k_routes(&graph, &request("alice", "carol", 1_000), 3).unwrap();
         assert!(routes.is_empty());
+    }
+
+    #[test]
+    fn equal_cost_routes_break_ties_deterministically_across_insertion_orders() {
+        let build_diamond = |reverse_edges: bool| {
+            let mut graph = NetworkGraph::new();
+            for id in ["alice", "bob", "dave", "carol"] {
+                add_node(&mut graph, id);
+            }
+            let mut edges = vec![
+                ("ch_a1", "alice", "bob", 1_000u32, 40u32),
+                ("ch_a2", "bob", "carol", 1_000, 40),
+                ("ch_b1", "alice", "dave", 1_000, 20),
+                ("ch_b2", "dave", "carol", 1_000, 20),
+            ];
+            if reverse_edges {
+                edges.reverse();
+            }
+            for (id, a, b, rate, cltv) in edges {
+                graph.add_channel(Channel {
+                    id: id.to_string(),
+                    node_a: a.to_string(),
+                    node_b: b.to_string(),
+                    capacity_a_to_b: 5_000_000,
+                    capacity_b_to_a: 5_000_000,
+                    base_fee: 1,
+                    fee_rate: rate,
+                    cltv_delta: cltv,
+                    min_htlc_size: 1,
+                    max_htlc_size: 5_000_000,
+                    htlcs_in_flight: 0,
+                    enabled: true,
+                    age_seconds: 3600,
+                });
+            }
+            graph
+        };
+
+        // For amount = 100, time_lock_fee = (40*10)/1440 = 0 and (20*10)/1440 = 0,
+        // so both 2-hop paths have identical fee, but alice -> dave -> carol
+        // has lower total CLTV (40 vs 80).
+        let req = request("alice", "carol", 100);
+        let r1 = find_best_route(&build_diamond(false), &req).unwrap();
+        let r2 = find_best_route(&build_diamond(true), &req).unwrap();
+        assert_eq!(r1.hops, r2.hops);
+        assert_eq!(r1.hops[0].node_id, "dave");
+
+        // With Lexicographical tie-breaker, ch_a1 < ch_b1 wins despite higher CLTV.
+        let r_lex = find_best_route_with_tie_breaker(
+            &build_diamond(true),
+            &req,
+            &FeeCap::protocol(),
+            TieBreaker::Lexicographical,
+        )
+        .unwrap();
+        assert_eq!(r_lex.hops[0].channel_id, "ch_a1");
+    }
+
+    #[test]
+    fn route_search_rejects_invalid_amount_and_negative_budget() {
+        let mut graph = NetworkGraph::new();
+        add_node(&mut graph, "alice");
+        add_node(&mut graph, "bob");
+
+        assert!(matches!(
+            find_best_route(&graph, &request("alice", "bob", 0)).unwrap_err(),
+            RoutingError::BelowDustLimit { amount: 0, .. }
+        ));
+        assert!(matches!(
+            find_best_route(&graph, &request("alice", "bob", MAX_ROUTE_AMOUNT + 1)).unwrap_err(),
+            RoutingError::AmountExceedsMaximum { .. }
+        ));
+
+        let mut neg_budget = request("alice", "bob", 100);
+        neg_budget.max_fee_budget = Some(-1);
+        assert!(matches!(
+            find_best_route(&graph, &neg_budget).unwrap_err(),
+            RoutingError::FeeExceedsBudget { budget: -1, .. }
+        ));
     }
 }
