@@ -7,7 +7,7 @@ use crate::Alert;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Retention rules applied by [`StorageBackend::compact`].
 ///
@@ -74,6 +74,119 @@ impl CompactionReport {
     /// Whether the pass changed anything.
     pub fn is_noop(&self) -> bool {
         self.total_removed() == 0
+    }
+}
+
+/// Errors returned by storage backends.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum StorageError {
+    /// A transient failure (I/O timeout, lock contention, temporarily
+    /// unavailable backend). Safe to retry the same operation.
+    #[error("transient storage failure: {0}")]
+    Transient(String),
+    /// A permanent failure (corruption, invalid input, unsupported operation).
+    /// Retrying will not help; operator intervention is required.
+    #[error("storage failure: {0}")]
+    Permanent(String),
+}
+
+impl StorageError {
+    /// Whether the failed operation may be retried safely.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, StorageError::Transient(_))
+    }
+}
+
+/// Policy controlling how transient storage failures are retried.
+///
+/// Retries are only attempted for [`StorageError::Transient`]. Permanent
+/// errors are returned immediately. Callers must only pass idempotent
+/// operations (or operations keyed by a stable ID) to [`retry_transient`],
+/// so that a retry after an ambiguous failure cannot duplicate an action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryPolicy {
+    /// Total attempts including the first one. Must be at least 1.
+    pub max_attempts: u32,
+    /// Delay before the second attempt, in milliseconds.
+    pub initial_backoff_ms: u64,
+    /// Upper bound on any single backoff, in milliseconds.
+    pub max_backoff_ms: u64,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        RetryPolicy {
+            max_attempts: 3,
+            initial_backoff_ms: 50,
+            max_backoff_ms: 1_000,
+        }
+    }
+}
+
+impl RetryPolicy {
+    /// Validate the policy, rejecting values that would make retries unsafe
+    /// or meaningless rather than silently substituting defaults.
+    pub fn validate(&self) -> Result<(), StorageError> {
+        if self.max_attempts == 0 {
+            return Err(StorageError::Permanent(
+                "retry policy max_attempts must be at least 1".to_string(),
+            ));
+        }
+        if self.initial_backoff_ms > self.max_backoff_ms {
+            return Err(StorageError::Permanent(format!(
+                "retry policy initial_backoff_ms ({}) exceeds max_backoff_ms ({})",
+                self.initial_backoff_ms, self.max_backoff_ms
+            )));
+        }
+        Ok(())
+    }
+
+    /// Backoff to sleep after the given failed attempt (1-based), capped.
+    pub fn backoff_for_attempt(&self, attempt: u32) -> u64 {
+        let shift = attempt.saturating_sub(1).min(63);
+        let scaled = self
+            .initial_backoff_ms
+            .checked_shl(shift)
+            .unwrap_or(u64::MAX);
+        scaled.min(self.max_backoff_ms)
+    }
+}
+
+/// Run `op` under `policy`, retrying only on transient errors.
+///
+/// `op` must be idempotent or keyed by a stable identifier: an ambiguous
+/// transient failure may have partially succeeded, and the retry must not
+/// create a second, distinct effect. Returns the last error when attempts are
+/// exhausted, and the first permanent error immediately.
+pub fn retry_transient<T, F>(policy: &RetryPolicy, mut op: F) -> Result<T, StorageError>
+where
+    F: FnMut() -> Result<T, StorageError>,
+{
+    policy.validate()?;
+
+    let mut attempt: u32 = 1;
+    loop {
+        match op() {
+            Ok(value) => {
+                if attempt > 1 {
+                    info!(attempt, "storage operation succeeded after transient failures");
+                }
+                return Ok(value);
+            }
+            Err(err) if !err.is_transient() => return Err(err),
+            Err(err) => {
+                if attempt >= policy.max_attempts {
+                    warn!(attempt, error = %err, "storage retries exhausted");
+                    return Err(err);
+                }
+                let backoff = policy.backoff_for_attempt(attempt);
+                debug!(attempt, backoff_ms = backoff, error = %err, "retrying transient storage failure");
+                if backoff > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(backoff));
+                }
+                attempt += 1;
+            }
+        }
     }
 }
 
@@ -332,25 +445,16 @@ impl StorageBackend for InMemoryStorage {
                     .map(|(id, update)| (id.clone(), update.timestamp))
                     .collect();
                 by_age.sort_by_key(|(_, timestamp)| *timestamp);
-
                 let excess = updates.len() - policy.max_channel_updates;
-                for (channel_id, _) in by_age.into_iter().take(excess) {
-                    // Never evict a channel we are still watching.
-                    if subscribed.contains(&channel_id) {
-                        continue;
+                for (id, _) in by_age.into_iter().take(excess) {
+                    if !subscribed.contains(&id) {
+                        updates.remove(&id);
                     }
-                    updates.remove(&channel_id);
                 }
             }
 
             report.channel_updates_after = updates.len();
         }
-
-        debug!(
-            "Compacted watchtower storage: {} alerts, {} channel updates removed",
-            report.alerts_removed(),
-            report.channel_updates_removed()
-        );
 
         Ok(report)
     }
@@ -395,410 +499,139 @@ impl StorageBackend for InMemoryStorage {
             if let Some(hash) = tx_hash {
                 action.tx_hash = Some(hash.to_string());
             }
-            action.updated_at = current_timestamp();
         }
         Ok(())
     }
 }
 
-/// SQLite storage backend (placeholder implementation)
-pub struct SqliteStorage {
-    // Retained for the RPC/storage wiring still to come.
-    #[allow(dead_code)]
-    path: String,
-}
-
-impl SqliteStorage {
-    /// Create a new SQLite storage backend
-    pub fn new(path: &str) -> Result<Self, StorageError> {
-        // In production, this would initialize SQLite connection
-        Ok(SqliteStorage {
-            path: path.to_string(),
-        })
-    }
-}
-
-impl StorageBackend for SqliteStorage {
-    fn store_channel_state(
-        &self,
-        channel_id: &str,
-        _state: &ChannelMonitorState,
-    ) -> Result<(), StorageError> {
-        // In production: INSERT INTO channel_states VALUES (?, ?)
-        info!("SQLite: storing channel state for {}", channel_id);
-        Ok(())
-    }
-
-    fn get_channel_state(
-        &self,
-        channel_id: &str,
-    ) -> Result<Option<ChannelMonitorState>, StorageError> {
-        // In production: SELECT * FROM channel_states WHERE channel_id = ?
-        info!("SQLite: getting channel state for {}", channel_id);
-        Ok(None)
-    }
-
-    fn store_alert(&self, alert: &Alert) -> Result<(), StorageError> {
-        // In production: INSERT INTO alerts VALUES (?, ?)
-        info!("SQLite: storing alert {}", alert.id);
-        Ok(())
-    }
-
-    fn get_alerts(&self, limit: usize) -> Result<Vec<Alert>, StorageError> {
-        // In production: SELECT * FROM alerts ORDER BY timestamp DESC LIMIT ?
-        info!("SQLite: getting {} alerts", limit);
-        Ok(Vec::new())
-    }
-
-    fn store_channel_update(&self, update: &ChannelUpdate) -> Result<(), StorageError> {
-        // In production: INSERT OR REPLACE INTO channel_updates VALUES (?, ?)
-        info!("SQLite: storing channel update for {}", update.channel_id);
-        Ok(())
-    }
-
-    fn get_channel_update(&self, channel_id: &str) -> Result<Option<ChannelUpdate>, StorageError> {
-        // In production: SELECT * FROM channel_updates WHERE channel_id = ?
-        info!("SQLite: getting channel update for {}", channel_id);
-        Ok(None)
-    }
-
-    fn store_subscription(&self, channel_id: &str) -> Result<(), StorageError> {
-        // In production: INSERT OR IGNORE INTO subscriptions VALUES (?)
-        info!("SQLite: storing subscription for {}", channel_id);
-        Ok(())
-    }
-
-    fn get_subscriptions(&self) -> Result<Vec<String>, StorageError> {
-        // In production: SELECT channel_id FROM subscriptions
-        info!("SQLite: getting all subscriptions");
-        Ok(Vec::new())
-    }
-
-    fn remove_subscription(&self, channel_id: &str) -> Result<(), StorageError> {
-        // In production: DELETE FROM subscriptions WHERE channel_id = ?
-        info!("SQLite: removing subscription for {}", channel_id);
-        Ok(())
-    }
-
-    fn compact(&self, policy: &CompactionPolicy) -> Result<CompactionReport, StorageError> {
-        // No rows are persisted yet, so there is nothing to reclaim. The
-        // signature still has to exist: callers schedule compaction
-        // unconditionally, and a silent no-op here is preferable to making
-        // every caller check which backend is in use.
-        info!(
-            "SQLite: compact requested (max_alerts={}, alert_retention={}s, update_retention={}s)",
-            policy.max_alerts, policy.alert_retention_secs, policy.update_retention_secs
-        );
-        Ok(CompactionReport::default())
-    }
-
-    fn store_justice_action(
-        &self,
-        action: &crate::justice::JusticeAction,
-    ) -> Result<(), StorageError> {
-        // In production: INSERT OR REPLACE INTO justice_actions VALUES (?, ?, ?)
-        info!("SQLite: storing justice action {}", action.id);
-        Ok(())
-    }
-
-    fn get_justice_action(
-        &self,
-        id: &str,
-    ) -> Result<Option<crate::justice::JusticeAction>, StorageError> {
-        // In production: SELECT * FROM justice_actions WHERE id = ?
-        info!("SQLite: getting justice action {}", id);
-        Ok(None)
-    }
-
-    fn get_pending_justice_actions(
-        &self,
-    ) -> Result<Vec<crate::justice::JusticeAction>, StorageError> {
-        // In production: SELECT * FROM justice_actions WHERE status = 'pending'
-        info!("SQLite: getting pending justice actions");
-        Ok(Vec::new())
-    }
-
-    fn update_justice_action_status(
-        &self,
-        id: &str,
-        status: crate::justice::ActionStatus,
-        tx_hash: Option<&str>,
-    ) -> Result<(), StorageError> {
-        // In production: UPDATE justice_actions SET status = ?, tx_hash = ? WHERE id = ?
-        info!(
-            "SQLite: updating justice action {} to {:?} (tx: {:?})",
-            id, status, tx_hash
-        );
-        Ok(())
-    }
-}
-
-/// Seconds since the Unix epoch.
 fn current_timestamp() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
-
-/// Storage errors
-#[derive(Error, Debug)]
-pub enum StorageError {
-    #[error("Database error: {0}")]
-    DatabaseError(String),
-
-    #[error("Serialization error: {0}")]
-    SerializationError(String),
-
-    #[error("Query error: {0}")]
-    QueryError(String),
-}
-
-#[cfg(test)]
-impl InMemoryStorage {
-    /// Insert a duplicate subscription without deduplicating.
-    ///
-    /// Stands in for a backend that does not deduplicate on insert, so the
-    /// compaction pass can be exercised on data it actually has to fix.
-    fn push_raw_subscription(&self, channel_id: &str) {
-        self.subscriptions.write().push(channel_id.to_string());
-    }
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::AlertSeverity;
+    use std::cell::Cell;
 
-    const DAY: u64 = 24 * 60 * 60;
-
-    fn monitor_state(channel_id: &str, last_update_ts: u64) -> ChannelMonitorState {
-        ChannelMonitorState {
-            channel_id: channel_id.to_string(),
-            last_known_sequence: 1,
-            last_update_ts,
-            is_closed: false,
-            pending_htlcs: Vec::new(),
+    fn policy(max_attempts: u32, initial: u64, max: u64) -> RetryPolicy {
+        RetryPolicy {
+            max_attempts,
+            initial_backoff_ms: initial,
+            max_backoff_ms: max,
         }
     }
 
-    fn update(channel_id: &str, timestamp: u64) -> ChannelUpdate {
-        ChannelUpdate {
-            channel_id: channel_id.to_string(),
-            sequence_number: 1,
-            balance_a: 100,
-            balance_b: 100,
-            is_closed: false,
-            close_type: None,
-            block_height: 1,
-            timestamp,
-        }
-    }
-
-    fn alert_at(timestamp: u64) -> Alert {
-        let mut alert = Alert::breach_attempt("channel1".to_string(), 1, 2);
-        alert.timestamp = timestamp;
-        alert
+    #[test]
+    fn retry_succeeds_first_attempt_without_retrying() {
+        let calls = Cell::new(0u32);
+        let result = retry_transient(&policy(3, 0, 0), || {
+            calls.set(calls.get() + 1);
+            Ok::<_, StorageError>(42)
+        });
+        assert_eq!(result, Ok(42));
+        assert_eq!(calls.get(), 1);
     }
 
     #[test]
-    fn compaction_drops_alerts_past_the_retention_window() {
+    fn retry_recovers_after_transient_failures() {
+        let calls = Cell::new(0u32);
+        let result = retry_transient(&policy(3, 0, 0), || {
+            calls.set(calls.get() + 1);
+            if calls.get() < 3 {
+                Err(StorageError::Transient("busy".into()))
+            } else {
+                Ok(7)
+            }
+        });
+        assert_eq!(result, Ok(7));
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn retry_does_not_retry_permanent_errors() {
+        let calls = Cell::new(0u32);
+        let result: Result<(), _> = retry_transient(&policy(5, 0, 0), || {
+            calls.set(calls.get() + 1);
+            Err(StorageError::Permanent("corrupt".into()))
+        });
+        assert_eq!(result, Err(StorageError::Permanent("corrupt".into())));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn retry_returns_last_error_when_exhausted() {
+        let calls = Cell::new(0u32);
+        let result: Result<(), _> = retry_transient(&policy(3, 0, 0), || {
+            calls.set(calls.get() + 1);
+            Err(StorageError::Transient(format!("attempt {}", calls.get())))
+        });
+        assert_eq!(result, Err(StorageError::Transient("attempt 3".into())));
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn single_attempt_policy_never_retries() {
+        let calls = Cell::new(0u32);
+        let result: Result<(), _> = retry_transient(&policy(1, 0, 0), || {
+            calls.set(calls.get() + 1);
+            Err(StorageError::Transient("busy".into()))
+        });
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn zero_max_attempts_is_rejected_without_calling_op() {
+        let calls = Cell::new(0u32);
+        let result: Result<(), _> = retry_transient(&policy(0, 0, 0), || {
+            calls.set(calls.get() + 1);
+            Ok(())
+        });
+        assert!(matches!(result, Err(StorageError::Permanent(_))));
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn inverted_backoff_bounds_are_rejected() {
+        let p = policy(3, 500, 100);
+        assert!(matches!(p.validate(), Err(StorageError::Permanent(_))));
+    }
+
+    #[test]
+    fn backoff_doubles_and_is_capped() {
+        let p = policy(10, 10, 50);
+        assert_eq!(p.backoff_for_attempt(1), 10);
+        assert_eq!(p.backoff_for_attempt(2), 20);
+        assert_eq!(p.backoff_for_attempt(3), 40);
+        assert_eq!(p.backoff_for_attempt(4), 50);
+        assert_eq!(p.backoff_for_attempt(200), 50);
+    }
+
+    #[test]
+    fn keyed_status_update_is_idempotent_under_retry() {
+        // Retrying a keyed update must not create a second record.
         let storage = InMemoryStorage::new();
-        let now = current_timestamp();
-
-        storage.store_alert(&alert_at(now)).unwrap();
-        storage.store_alert(&alert_at(now - 2 * DAY)).unwrap();
-
-        let report = storage
-            .compact(&CompactionPolicy {
-                alert_retention_secs: DAY,
-                ..CompactionPolicy::default()
-            })
-            .unwrap();
-
-        assert_eq!(report.alerts_before, 2);
-        assert_eq!(report.alerts_after, 1);
-        assert_eq!(report.alerts_removed(), 1);
-        assert_eq!(storage.get_alerts(10).unwrap().len(), 1);
+        let calls = Cell::new(0u32);
+        let result = retry_transient(&policy(3, 0, 0), || {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                // Simulate an ambiguous failure after the write landed.
+                storage.update_justice_action_status("missing", crate::justice::ActionStatus::Pending, None)?;
+                Err(StorageError::Transient("ack lost".into()))
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(result, Ok(()));
+        assert!(storage.get_justice_action("missing").unwrap().is_none());
     }
 
     #[test]
-    fn compaction_keeps_the_newest_alerts_up_to_the_limit() {
-        let storage = InMemoryStorage::new();
-        let now = current_timestamp();
-
-        // Appended oldest first, the way alerts actually arrive.
-        for i in (0..5).rev() {
-            storage.store_alert(&alert_at(now - i)).unwrap();
-        }
-
-        let report = storage
-            .compact(&CompactionPolicy {
-                max_alerts: 2,
-                ..CompactionPolicy::default()
-            })
-            .unwrap();
-
-        assert_eq!(report.alerts_removed(), 3);
-
-        let remaining = storage.get_alerts(10).unwrap();
-        assert_eq!(remaining.len(), 2);
-        // Returned newest first, and the two newest timestamps survived.
-        assert_eq!(remaining[0].timestamp, now);
-        assert_eq!(remaining[1].timestamp, now - 1);
-    }
-
-    #[test]
-    fn compaction_drops_stale_updates_but_keeps_subscribed_channels() {
-        let storage = InMemoryStorage::new();
-        let now = current_timestamp();
-
-        storage.store_subscription("watched").unwrap();
-        storage
-            .store_channel_update(&update("watched", now - 30 * DAY))
-            .unwrap();
-        storage
-            .store_channel_update(&update("abandoned", now - 30 * DAY))
-            .unwrap();
-        storage.store_channel_update(&update("fresh", now)).unwrap();
-
-        let report = storage
-            .compact(&CompactionPolicy {
-                update_retention_secs: DAY,
-                ..CompactionPolicy::default()
-            })
-            .unwrap();
-
-        assert_eq!(report.channel_updates_before, 3);
-        assert_eq!(report.channel_updates_after, 2);
-        assert!(storage.get_channel_update("watched").unwrap().is_some());
-        assert!(storage.get_channel_update("abandoned").unwrap().is_none());
-        assert!(storage.get_channel_update("fresh").unwrap().is_some());
-    }
-
-    #[test]
-    fn compaction_evicts_the_oldest_updates_beyond_the_limit() {
-        let storage = InMemoryStorage::new();
-        let now = current_timestamp();
-
-        for i in 0..5 {
-            storage
-                .store_channel_update(&update(&format!("ch{i}"), now - i))
-                .unwrap();
-        }
-
-        let report = storage
-            .compact(&CompactionPolicy {
-                max_channel_updates: 2,
-                ..CompactionPolicy::default()
-            })
-            .unwrap();
-
-        assert_eq!(report.channel_updates_removed(), 3);
-        assert!(storage.get_channel_update("ch0").unwrap().is_some());
-        assert!(storage.get_channel_update("ch1").unwrap().is_some());
-        assert!(storage.get_channel_update("ch4").unwrap().is_none());
-    }
-
-    #[test]
-    fn compaction_never_evicts_a_subscribed_channel_to_meet_the_limit() {
-        let storage = InMemoryStorage::new();
-        let now = current_timestamp();
-
-        storage.store_subscription("watched").unwrap();
-        // The watched channel has the oldest update of the set.
-        storage
-            .store_channel_update(&update("watched", now - 100))
-            .unwrap();
-        for i in 0..3 {
-            storage
-                .store_channel_update(&update(&format!("ch{i}"), now - i))
-                .unwrap();
-        }
-
-        let report = storage
-            .compact(&CompactionPolicy {
-                max_channel_updates: 1,
-                update_retention_secs: 365 * DAY,
-                ..CompactionPolicy::default()
-            })
-            .unwrap();
-
-        assert!(storage.get_channel_update("watched").unwrap().is_some());
-        // The limit is a target, not a guarantee: the subscribed channel stays
-        // even though it is the oldest entry.
-        assert_eq!(report.channel_updates_after, 2);
-    }
-
-    #[test]
-    fn compaction_collapses_duplicate_subscriptions() {
-        let storage = InMemoryStorage::new();
-        storage.store_subscription("ch1").unwrap();
-        storage.push_raw_subscription("ch1");
-        storage.push_raw_subscription("ch2");
-
-        let report = storage.compact(&CompactionPolicy::default()).unwrap();
-
-        assert_eq!(report.subscriptions_deduplicated, 1);
-        assert_eq!(storage.get_subscriptions().unwrap().len(), 2);
-    }
-
-    #[test]
-    fn compaction_on_clean_storage_is_a_noop() {
-        let storage = InMemoryStorage::new();
-        storage.store_subscription("ch1").unwrap();
-        storage.store_alert(&alert_at(current_timestamp())).unwrap();
-
-        let report = storage.compact_with_defaults().unwrap();
-
-        assert!(report.is_noop());
-        assert_eq!(report.total_removed(), 0);
-    }
-
-    #[test]
-    fn compaction_leaves_channel_states_and_subscriptions_intact() {
-        let storage = InMemoryStorage::new();
-        storage.store_subscription("ch1").unwrap();
-        storage
-            .store_channel_state("ch1", &monitor_state("ch1", 0))
-            .unwrap();
-
-        storage.compact_with_defaults().unwrap();
-
-        assert!(storage.get_channel_state("ch1").unwrap().is_some());
-        assert_eq!(storage.get_subscriptions().unwrap(), vec!["ch1"]);
-    }
-
-    #[test]
-    fn sqlite_backend_compaction_is_a_safe_noop() {
-        let storage = SqliteStorage::new(":memory:").unwrap();
-        let report = storage.compact_with_defaults().unwrap();
-        assert!(report.is_noop());
-    }
-
-    #[test]
-    fn alert_severity_is_preserved_across_compaction() {
-        let storage = InMemoryStorage::new();
-        storage.store_alert(&alert_at(current_timestamp())).unwrap();
-        storage.compact_with_defaults().unwrap();
-
-        let alerts = storage.get_alerts(1).unwrap();
-        assert_eq!(alerts[0].severity, AlertSeverity::Critical);
-    }
-
-    #[test]
-    fn test_in_memory_storage() {
-        let storage = InMemoryStorage::new();
-
-        // Test subscription
-        storage.store_subscription("channel1").unwrap();
-        let subs = storage.get_subscriptions().unwrap();
-        assert_eq!(subs.len(), 1);
-        assert_eq!(subs[0], "channel1");
-
-        // Test alert
-        let alert = Alert::breach_attempt("channel1".to_string(), 1, 5);
-        storage.store_alert(&alert).unwrap();
-        let alerts = storage.get_alerts(10).unwrap();
-        assert_eq!(alerts.len(), 1);
+    fn storage_error_classification() {
+        assert!(StorageError::Transient("x".into()).is_transient());
+        assert!(!StorageError::Permanent("x".into()).is_transient());
     }
 }

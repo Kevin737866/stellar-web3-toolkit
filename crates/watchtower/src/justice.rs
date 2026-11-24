@@ -1,5 +1,3 @@
-//! # Justice Service Module
-//!
 //! Handles submission of justice transactions when breach attempts are detected.
 //!
 //! ## Persist-first ordering (issue #368)
