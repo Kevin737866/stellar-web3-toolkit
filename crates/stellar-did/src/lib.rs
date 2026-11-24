@@ -4,8 +4,10 @@
 //! creation, service endpoint management, and resolution compliant with the
 //! [W3C DID Core specification](https://www.w3.org/TR/did-core/).
 
+pub mod key_rotation;
 pub mod service;
 
+pub use key_rotation::{KeyRotationRecord, VerificationMethod};
 pub use service::{DidDocument, DidError, Service, ServiceEndpoint};
 
 pub fn version() -> &'static str {

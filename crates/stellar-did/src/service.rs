@@ -44,6 +44,7 @@
 //! ));
 //! ```
 
+use crate::key_rotation::{KeyRotationRecord, VerificationMethod};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
@@ -81,6 +82,28 @@ pub enum DidError {
     /// The service type is empty or blank.
     #[error("service type must not be empty")]
     EmptyServiceType,
+
+    /// A verification method has missing or malformed fields.
+    #[error("invalid verification method: {0}")]
+    InvalidKey(String),
+
+    /// A verification method with this ID already exists in the DID document.
+    #[error("verification method `{0}` is already registered in this DID document")]
+    DuplicateKeyId(String),
+
+    /// The referenced verification method ID was not found in the DID document.
+    #[error("verification method `{0}` was not found in this DID document")]
+    KeyNotFound(String),
+
+    /// The requested key rotation violates rotation invariants.
+    #[error("invalid key rotation: {0}")]
+    InvalidKeyRotation(String),
+
+    /// The rotation timestamp precedes an earlier recorded rotation.
+    #[error(
+        "rotation timestamp {attempted} precedes previous rotation timestamp {previous}"
+    )]
+    InvalidRotationTimestamp { attempted: u64, previous: u64 },
 }
 
 // ── Scheme allowlist ─────────────────────────────────────────────────────────
@@ -219,6 +242,12 @@ pub struct DidDocument {
     /// Service endpoints registered in this document.
     #[serde(default)]
     pub service: Vec<Service>,
+    /// Active verification methods (public keys) for this DID subject.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verification_method: Vec<VerificationMethod>,
+    /// Ordered history of key rotations performed on this document.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_rotation_history: Vec<KeyRotationRecord>,
 }
 
 impl DidDocument {
@@ -228,6 +257,8 @@ impl DidDocument {
         DidDocument {
             id: id.into(),
             service: Vec::new(),
+            verification_method: Vec::new(),
+            key_rotation_history: Vec::new(),
         }
     }
 
@@ -282,6 +313,105 @@ impl DidDocument {
     #[must_use]
     pub fn get_service(&self, id: &str) -> Option<&Service> {
         self.service.iter().find(|s| s.id == id)
+    }
+
+    /// Register a new active [`VerificationMethod`] on this document.
+    ///
+    /// # Errors
+    ///
+    /// - [`DidError::InvalidKey`] if any field of `method` is invalid.
+    /// - [`DidError::DuplicateKeyId`] if a key with `method.id` is already active.
+    pub fn add_verification_method(&mut self, method: VerificationMethod) -> Result<(), DidError> {
+        method.validate()?;
+        if self.verification_method.iter().any(|k| k.id == method.id) {
+            return Err(DidError::DuplicateKeyId(method.id));
+        }
+        self.verification_method.push(method);
+        Ok(())
+    }
+
+    /// Atomically rotate an active verification method to `new_key` and append
+    /// a [`KeyRotationRecord`] to `key_rotation_history`.
+    ///
+    /// On any validation failure, neither `verification_method` nor
+    /// `key_rotation_history` is modified.
+    ///
+    /// # Errors
+    ///
+    /// - [`DidError::InvalidKey`] if `previous_key_id` is blank or `new_key` is invalid.
+    /// - [`DidError::KeyNotFound`] if `previous_key_id` is not an active key.
+    /// - [`DidError::DuplicateKeyId`] if `new_key.id` is already active or
+    ///   equals `previous_key_id`.
+    /// - [`DidError::InvalidKeyRotation`] if `new_key` has the same public key
+    ///   material as the key being retired.
+    /// - [`DidError::InvalidRotationTimestamp`] if `rotated_at` is earlier than
+    ///   the most recent rotation timestamp.
+    pub fn rotate_key(
+        &mut self,
+        previous_key_id: &str,
+        new_key: VerificationMethod,
+        rotated_at: u64,
+        reason: Option<String>,
+    ) -> Result<&KeyRotationRecord, DidError> {
+        if previous_key_id.trim().is_empty() {
+            return Err(DidError::InvalidKey(
+                "previous_key_id must not be empty".to_string(),
+            ));
+        }
+        new_key.validate()?;
+
+        let prev_idx = self
+            .verification_method
+            .iter()
+            .position(|k| k.id == previous_key_id)
+            .ok_or_else(|| DidError::KeyNotFound(previous_key_id.to_string()))?;
+
+        if new_key.id == previous_key_id
+            || self.verification_method.iter().any(|k| k.id == new_key.id)
+        {
+            return Err(DidError::DuplicateKeyId(new_key.id));
+        }
+
+        if self.verification_method[prev_idx].public_key_multibase == new_key.public_key_multibase {
+            return Err(DidError::InvalidKeyRotation(
+                "new key material must differ from the retired key".to_string(),
+            ));
+        }
+
+        if let Some(last) = self.key_rotation_history.last() {
+            if rotated_at < last.rotated_at {
+                return Err(DidError::InvalidRotationTimestamp {
+                    attempted: rotated_at,
+                    previous: last.rotated_at,
+                });
+            }
+        }
+
+        let new_key_id = new_key.id.clone();
+        self.verification_method[prev_idx] = new_key;
+
+        let sequence = self.key_rotation_history.len() as u64 + 1;
+        self.key_rotation_history.push(KeyRotationRecord {
+            sequence,
+            previous_key_id: previous_key_id.to_string(),
+            new_key_id,
+            rotated_at,
+            reason,
+        });
+
+        Ok(self.key_rotation_history.last().expect("just pushed"))
+    }
+
+    /// Return the currently active verification methods.
+    #[must_use]
+    pub fn active_keys(&self) -> &[VerificationMethod] {
+        &self.verification_method
+    }
+
+    /// Return the ordered key-rotation history for this document.
+    #[must_use]
+    pub fn key_rotation_history(&self) -> &[KeyRotationRecord] {
+        &self.key_rotation_history
     }
 }
 
@@ -571,5 +701,176 @@ mod tests {
 
         // The document was never modified.
         assert!(document.service.is_empty());
+    }
+
+    // ── Key-rotation history (issue #345) ────────────────────────────────────
+
+    fn make_key(id: &str, multibase: &str) -> VerificationMethod {
+        VerificationMethod::new(
+            id,
+            "Ed25519VerificationKey2020",
+            "did:stellar:testnet:GABC",
+            multibase,
+        )
+        .expect("valid test key")
+    }
+
+    #[test]
+    fn rotate_key_replaces_active_key_and_records_history() {
+        let mut doc = DidDocument::new("did:stellar:testnet:GABC");
+        doc.add_verification_method(make_key("did:stellar:testnet:GABC#key-1", "z6MkInitial"))
+            .unwrap();
+
+        let record = doc
+            .rotate_key(
+                "did:stellar:testnet:GABC#key-1",
+                make_key("did:stellar:testnet:GABC#key-2", "z6MkRotated"),
+                1_700_000_100,
+                Some("scheduled rotation".to_string()),
+            )
+            .unwrap();
+
+        assert_eq!(record.sequence, 1);
+        assert_eq!(record.previous_key_id, "did:stellar:testnet:GABC#key-1");
+        assert_eq!(record.new_key_id, "did:stellar:testnet:GABC#key-2");
+        assert_eq!(record.rotated_at, 1_700_000_100);
+        assert_eq!(record.reason.as_deref(), Some("scheduled rotation"));
+
+        assert_eq!(doc.active_keys().len(), 1);
+        assert_eq!(doc.active_keys()[0].id, "did:stellar:testnet:GABC#key-2");
+        assert_eq!(doc.key_rotation_history().len(), 1);
+    }
+
+    #[test]
+    fn rotate_key_allows_equal_timestamp_boundary_and_rejects_backwards() {
+        let mut doc = DidDocument::new("did:stellar:testnet:GABC");
+        doc.add_verification_method(make_key("did:stellar:testnet:GABC#key-1", "z6MkOne"))
+            .unwrap();
+        doc.rotate_key(
+            "did:stellar:testnet:GABC#key-1",
+            make_key("did:stellar:testnet:GABC#key-2", "z6MkTwo"),
+            1_700_000_100,
+            None,
+        )
+        .unwrap();
+
+        // Equal timestamp is permitted (boundary).
+        doc.rotate_key(
+            "did:stellar:testnet:GABC#key-2",
+            make_key("did:stellar:testnet:GABC#key-3", "z6MkThree"),
+            1_700_000_100,
+            None,
+        )
+        .unwrap();
+
+        // Earlier timestamp must be rejected without mutating state.
+        let err = doc
+            .rotate_key(
+                "did:stellar:testnet:GABC#key-3",
+                make_key("did:stellar:testnet:GABC#key-4", "z6MkFour"),
+                1_700_000_099,
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            DidError::InvalidRotationTimestamp {
+                attempted: 1_700_000_099,
+                previous: 1_700_000_100
+            }
+        ));
+        assert_eq!(doc.active_keys()[0].id, "did:stellar:testnet:GABC#key-3");
+        assert_eq!(doc.key_rotation_history().len(), 2);
+    }
+
+    #[test]
+    fn rotate_key_failure_cases_leave_document_unchanged() {
+        let mut doc = DidDocument::new("did:stellar:testnet:GABC");
+        doc.add_verification_method(make_key("did:stellar:testnet:GABC#key-1", "z6MkOne"))
+            .unwrap();
+
+        // Unknown previous key.
+        let err_missing = doc
+            .rotate_key(
+                "did:stellar:testnet:GABC#unknown",
+                make_key("did:stellar:testnet:GABC#key-2", "z6MkTwo"),
+                100,
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(err_missing, DidError::KeyNotFound(_)));
+
+        // Reusing same key ID.
+        let err_dup = doc
+            .rotate_key(
+                "did:stellar:testnet:GABC#key-1",
+                make_key("did:stellar:testnet:GABC#key-1", "z6MkTwo"),
+                100,
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(err_dup, DidError::DuplicateKeyId(_)));
+
+        // Reusing same public key material.
+        let err_same_material = doc
+            .rotate_key(
+                "did:stellar:testnet:GABC#key-1",
+                make_key("did:stellar:testnet:GABC#key-2", "z6MkOne"),
+                100,
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(err_same_material, DidError::InvalidKeyRotation(_)));
+
+        // Malformed verification method.
+        let err_bad = VerificationMethod::new("", "Ed25519VerificationKey2020", "did:stellar:x", "z6Mk");
+        assert!(matches!(err_bad, Err(DidError::InvalidKey(_))));
+
+        assert_eq!(doc.active_keys().len(), 1);
+        assert_eq!(doc.active_keys()[0].id, "did:stellar:testnet:GABC#key-1");
+        assert!(doc.key_rotation_history().is_empty());
+    }
+
+    #[test]
+    fn legacy_did_document_json_without_rotation_fields_deserializes() {
+        let legacy_json = r#"{"id":"did:stellar:testnet:GABC","service":[]}"#;
+        let doc: DidDocument = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(doc.id, "did:stellar:testnet:GABC");
+        assert!(doc.active_keys().is_empty());
+        assert!(doc.key_rotation_history().is_empty());
+    }
+
+    #[test]
+    fn full_key_rotation_workflow_persists_through_json_roundtrip() {
+        let mut doc = DidDocument::new("did:stellar:testnet:GABC");
+        doc.add_verification_method(make_key("did:stellar:testnet:GABC#key-1", "z6MkOne"))
+            .unwrap();
+        doc.rotate_key(
+            "did:stellar:testnet:GABC#key-1",
+            make_key("did:stellar:testnet:GABC#key-2", "z6MkTwo"),
+            1_700_000_010,
+            Some("compromise precaution".to_string()),
+        )
+        .unwrap();
+        doc.rotate_key(
+            "did:stellar:testnet:GABC#key-2",
+            make_key("did:stellar:testnet:GABC#key-3", "z6MkThree"),
+            1_700_000_020,
+            None,
+        )
+        .unwrap();
+
+        let json = serde_json::to_string(&doc).unwrap();
+        let restored: DidDocument = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.active_keys().len(), 1);
+        assert_eq!(restored.active_keys()[0].id, "did:stellar:testnet:GABC#key-3");
+        assert_eq!(restored.key_rotation_history().len(), 2);
+        assert_eq!(restored.key_rotation_history()[0].sequence, 1);
+        assert_eq!(restored.key_rotation_history()[1].sequence, 2);
+        assert_eq!(
+            restored.key_rotation_history()[1].previous_key_id,
+            "did:stellar:testnet:GABC#key-2"
+        );
     }
 }
