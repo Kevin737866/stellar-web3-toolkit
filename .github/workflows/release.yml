@@ -104,6 +104,8 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
       - name: Download artifacts
@@ -111,6 +113,12 @@ jobs:
         with:
           name: release-wasm-${{ needs.build.outputs.version }}
           path: dist
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/*.wasm
+            dist/wasm-checksums.txt
       - name: Generate release notes
         run: |
           cat > release-notes.md <<'EOF'
@@ -130,6 +138,10 @@ jobs:
           # Docker reproducibility check
           ./scripts/verify-bytecode.sh --docker
           ./scripts/reproducible-build.sh --docker
+          ```
+
+          # Supply-chain attestation (build provenance) for a downloaded file
+          gh attestation verify <file> --repo ${{ github.repository }}
           ```
 
           ### Environments

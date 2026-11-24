@@ -90,7 +90,7 @@ CI's `wasm` job mirrors `scripts/reproducible-build.sh` exactly, so a green CI m
 ### Jobs
 
 1. **build** — reproducible WASM build, runs both `cargo build …` and `scripts/reproducible-build.sh`, packages `dist/`.
-2. **release** — only on tags, publishes Release + checksums + notes (how to verify).
+2. **release** — only on tags, attests build provenance for `dist/*.wasm` and `wasm-checksums.txt` (`actions/attest-build-provenance`), then publishes Release + checksums + notes (how to verify). Check a downloaded file with `gh attestation verify <file> --repo Kevin737866/stellar-web3-toolkit`.
 3. **deploy-testnet** — `environment: test` (or `dev`/`prod`), `workflow_dispatch` only; dry-run by default; loads `config/<env>.toml`, prints checksums, appends `logs/deployment-audit.log`.
 4. **deploy-prod-gate** — `environment: prod` with GitHub Environment protection (manual approval required).
 
