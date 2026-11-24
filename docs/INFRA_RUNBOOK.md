@@ -184,7 +184,7 @@ cargo test -p stellar-toolkit monitoring_dashboard
 
 ---
 
-## 5. CLI Tooling (Issues #240, #242, #243, #244)
+## 5. CLI Tooling (Issues #240, #242, #243, #244, #313)
 
 **Files:** `crates/stellar-toolkit/src/help_text.rs` · `scaffolder.rs` · `gas_simulator.rs` · `state_inspector.rs` · `cli.rs`
 
@@ -231,7 +231,7 @@ in stroops and XLM, the single fee bump required by the protocol rule
 `outer_fee = ceil(inner_fee * base_fee / fee_at_signing)`, and an escalating
 fee-bump ladder that stops at `--max-bumps` or the `max_fee_stroops` cap.
 
-### Contract state inspection (Issue #244)
+### Contract state inspection (Issues #244, #313)
 
 ```bash
 # First page of the built-in sample export
@@ -242,12 +242,45 @@ cargo run -p stellar-toolkit -- inspect state --contract CDEMO7POOLCONTRACTID --
 cargo run -p stellar-toolkit -- inspect state --page-size 2 --cursor 2
 cargo run -p stellar-toolkit -- inspect state --all-pages --include-temporary
 cargo run -p stellar-toolkit -- inspect state --input state-export.json --json
+
+# Opaque page cursors: pass the token from one page to fetch the next
+cargo run -p stellar-toolkit -- inspect state --page-size 2 --json
+cargo run -p stellar-toolkit -- inspect state --page-size 2 --json \
+  --page-cursor 's1.0100000000000000020000000200ffffffffffffffffffffffffffffffffee700d34'
 ```
 
 Entries are ordered by (durability, key, contract), temporary entries are hidden
-unless `--include-temporary` is passed, `--page-size` is clamped to `1..=200`, and
-each page prints the cursor for the next one (or `end of results`). `--input`
-reads a JSON array of state entries instead of the built-in sample.
+unless `--include-temporary` is passed, and `--page-size` is clamped to `1..=200`.
+Each page prints the legacy numeric `next cursor` (or `end of results`) plus an
+opaque `next page token`, which is also emitted as `next_page_token` in JSON. The
+token encodes the offset, page size and filter (`--contract`, `--key-prefix`,
+`--include-temporary`) with a checksum, and is consumed by `--page-cursor`.
+`--input` reads a JSON array of state entries instead of the built-in sample.
+
+**Compatibility and errors**
+
+- `--cursor <offset>` and the `next_cursor` JSON field are unchanged; callers
+  that never pass `--page-cursor` keep the existing output format. The new token
+  is an additive field/line, and is omitted from the last page's JSON.
+- A token must be reused with the same filter and page size that issued it, and
+  its offset must still be inside the result set. Malformed, tampered,
+  version-mismatched, scope-mismatched and stale tokens are rejected with an
+  explicit error before any page is printed; they never silently restart the
+  walk at a different entry.
+- `--page-cursor` cannot be combined with `--cursor` or `--all-pages` (use one
+  pagination mode at a time).
+- The library exposes `PageCursor::issue`/`PageCursor::parse`,
+  `StateInspector::validate_page_token` and `StateInspector::page_from_token`
+  from `stellar_toolkit::state_inspector` (also re-exported at the crate root).
+  Change `PAGE_CURSOR_VERSION` only with a new payload layout: older tokens are
+  then explicitly rejected as unsupported.
+
+Run the focused checks with:
+
+```bash
+cargo test -p stellar-toolkit state_inspector
+cargo test -p stellar-toolkit --test state_cursor_workflow
+```
 
 ### Tests
 
