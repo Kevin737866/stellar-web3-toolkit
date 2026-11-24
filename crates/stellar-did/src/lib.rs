@@ -5,8 +5,10 @@
 //! [W3C DID Core specification](https://www.w3.org/TR/did-core/).
 
 pub mod service;
+pub mod verification;
 
 pub use service::{DidDocument, DidError, Service, ServiceEndpoint};
+pub use verification::VerificationMethod;
 
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
