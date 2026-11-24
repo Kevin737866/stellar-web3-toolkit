@@ -24,6 +24,99 @@ pub const MAX_ROUTE_HOPS: usize = 20;
 /// Maximum amount we'll attempt to route (to prevent overflow)
 pub const MAX_ROUTE_AMOUNT: i128 = i128::MAX / 2;
 
+/// Minimum value accepted for `RouteSearchConfig::max_hop_count`.
+///
+/// A hop count of zero would mean "no path is acceptable", which is never a
+/// useful configuration.  Setting this to 1 allows direct (single-hop) routes
+/// while rejecting configurations that can never produce a result.
+pub const MIN_HOP_COUNT: usize = 1;
+
+/// Configuration for a route search, including an optional bounded hop limit.
+///
+/// `RouteSearchConfig` complements [`RouteRequest`] with search-time policy
+/// that is validated before the pathfinder runs.  The main addition over
+/// using `RouteRequest::max_hops` directly is that an invalid hop count is
+/// rejected with an actionable error rather than silently clamped or ignored.
+///
+/// # Compatibility
+///
+/// Callers that do not need a custom hop limit should continue calling
+/// [`find_best_route`] or [`find_best_route_with_cap`], which are unchanged.
+/// `RouteSearchConfig` is only required when you want explicit validation of
+/// the hop-count bound.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let config = RouteSearchConfig::new(request)
+///     .with_max_hop_count(5)?;
+/// let route = find_best_route_with_config(&graph, &config, &FeeCap::protocol())?;
+/// ```
+#[derive(Debug, Clone)]
+pub struct RouteSearchConfig {
+    /// The underlying route request.
+    pub request: RouteRequest,
+    /// Maximum number of hops the search may traverse.
+    ///
+    /// When `Some`, it must satisfy `MIN_HOP_COUNT <= n <= MAX_ROUTE_HOPS`;
+    /// the constructor enforces this.  When `None`, `MAX_ROUTE_HOPS` is used.
+    pub max_hop_count: Option<usize>,
+}
+
+impl RouteSearchConfig {
+    /// Wrap `request` in a `RouteSearchConfig` with no hop-count override.
+    pub fn new(request: RouteRequest) -> Self {
+        RouteSearchConfig {
+            request,
+            max_hop_count: None,
+        }
+    }
+
+    /// Set an explicit maximum hop count, validating the bounds.
+    ///
+    /// Returns [`RoutingError::MaxHopCountTooLow`] when `count < MIN_HOP_COUNT`
+    /// and [`RoutingError::MaxHopCountTooHigh`] when `count > MAX_ROUTE_HOPS`.
+    pub fn with_max_hop_count(mut self, count: usize) -> Result<Self, RoutingError> {
+        validate_max_hop_count(count)?;
+        self.max_hop_count = Some(count);
+        Ok(self)
+    }
+
+    /// The effective hop limit: the explicit override, or the value from the
+    /// inner `RouteRequest`, or the protocol maximum.
+    pub fn effective_max_hops(&self) -> usize {
+        self.max_hop_count
+            .or(self.request.max_hops)
+            .unwrap_or(MAX_ROUTE_HOPS)
+    }
+}
+
+/// Validate that `count` is a legal hop-count value.
+///
+/// Returns:
+/// - [`RoutingError::MaxHopCountTooLow`] when `count < MIN_HOP_COUNT`
+/// - [`RoutingError::MaxHopCountTooHigh`] when `count > MAX_ROUTE_HOPS`
+/// - `Ok(())` otherwise
+///
+/// This function is the single enforcement point for hop-count bounds.  Both
+/// [`RouteSearchConfig::with_max_hop_count`] and callers that set
+/// `RouteRequest::max_hops` manually can call it to get the same error types.
+pub fn validate_max_hop_count(count: usize) -> Result<(), RoutingError> {
+    if count < MIN_HOP_COUNT {
+        return Err(RoutingError::MaxHopCountTooLow {
+            count,
+            min: MIN_HOP_COUNT,
+        });
+    }
+    if count > MAX_ROUTE_HOPS {
+        return Err(RoutingError::MaxHopCountTooHigh {
+            count,
+            max: MAX_ROUTE_HOPS,
+        });
+    }
+    Ok(())
+}
+
 /// Errors that can occur during routing
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum RoutingError {
@@ -93,6 +186,16 @@ pub enum RoutingError {
 
     #[error("Route declares {declared} in fees but its hops sum to {actual}")]
     InconsistentRouteFees { declared: i128, actual: i128 },
+
+    #[error(
+        "max_hop_count {count} is below the minimum of {min}"
+    )]
+    MaxHopCountTooLow { count: usize, min: usize },
+
+    #[error(
+        "max_hop_count {count} exceeds the protocol maximum of {max}"
+    )]
+    MaxHopCountTooHigh { count: usize, max: usize },
 }
 
 /// Represents a node in the payment channel network
@@ -662,6 +765,45 @@ pub fn find_best_route_with_cap(
     Ok(route)
 }
 
+/// Find the best route using a [`RouteSearchConfig`] that carries a validated,
+/// bounded hop-count limit.
+///
+/// The hop count in `config` is validated once here before the search begins:
+///
+/// * `0` and any value above [`MAX_ROUTE_HOPS`] are rejected with actionable
+///   errors ([`RoutingError::MaxHopCountTooLow`] and
+///   [`RoutingError::MaxHopCountTooHigh`] respectively) rather than being
+///   silently clamped.
+/// * When the config carries no explicit hop limit the value from the inner
+///   [`RouteRequest`] is used, falling back to [`MAX_ROUTE_HOPS`].
+///
+/// All other invariants from [`find_best_route_with_cap`] apply unchanged:
+/// fee caps, liquidity checks, and node existence.
+///
+/// # Errors
+///
+/// Returns [`RoutingError::MaxHopCountTooLow`] when
+/// `config.effective_max_hops() < MIN_HOP_COUNT` and
+/// [`RoutingError::MaxHopCountTooHigh`] when
+/// `config.effective_max_hops() > MAX_ROUTE_HOPS`, in addition to the
+/// errors from [`find_best_route_with_cap`].
+pub fn find_best_route_with_config(
+    graph: &NetworkGraph,
+    config: &RouteSearchConfig,
+    cap: &FeeCap,
+) -> Result<Route, RoutingError> {
+    // Validate the hop count before touching the graph.
+    let max_hops = config.effective_max_hops();
+    validate_max_hop_count(max_hops)?;
+
+    // Build a patched request that carries the validated hop limit so that
+    // `find_best_route_with_cap` sees it through the normal `max_hops` path.
+    let mut patched = config.request.clone();
+    patched.max_hops = Some(max_hops);
+
+    find_best_route_with_cap(graph, &patched, cap)
+}
+
 /// Find multiple routes using k-shortest paths
 pub fn find_k_routes(
     graph: &NetworkGraph,
@@ -1029,5 +1171,181 @@ mod tests {
 
         let routes = find_k_routes(&graph, &request("alice", "carol", 1_000), 3).unwrap();
         assert!(routes.is_empty());
+    }
+
+    // ── RouteSearchConfig / max_hop_count tests (#364) ────────────────────────
+
+    #[test]
+    fn route_search_config_default_hop_limit_is_protocol_maximum() {
+        let req = request("alice", "carol", 100);
+        let config = RouteSearchConfig::new(req);
+        assert_eq!(config.effective_max_hops(), MAX_ROUTE_HOPS);
+    }
+
+    #[test]
+    fn route_search_config_explicit_hop_limit_overrides_default() {
+        let req = request("alice", "carol", 100);
+        let config = RouteSearchConfig::new(req).with_max_hop_count(3).unwrap();
+        assert_eq!(config.effective_max_hops(), 3);
+    }
+
+    #[test]
+    fn route_search_config_explicit_limit_overrides_request_max_hops() {
+        let mut req = request("alice", "carol", 100);
+        req.max_hops = Some(10);
+        let config = RouteSearchConfig::new(req).with_max_hop_count(5).unwrap();
+        // The RouteSearchConfig override wins.
+        assert_eq!(config.effective_max_hops(), 5);
+    }
+
+    #[test]
+    fn route_search_config_falls_back_to_request_max_hops_when_no_explicit_limit() {
+        let mut req = request("alice", "carol", 100);
+        req.max_hops = Some(7);
+        let config = RouteSearchConfig::new(req);
+        assert_eq!(config.effective_max_hops(), 7);
+    }
+
+    #[test]
+    fn zero_hop_count_is_rejected_with_max_hop_count_too_low() {
+        let req = request("alice", "carol", 100);
+        let err = RouteSearchConfig::new(req)
+            .with_max_hop_count(0)
+            .unwrap_err();
+        assert!(
+            matches!(err, RoutingError::MaxHopCountTooLow { count: 0, min: MIN_HOP_COUNT }),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn hop_count_above_maximum_is_rejected_with_max_hop_count_too_high() {
+        let req = request("alice", "carol", 100);
+        let err = RouteSearchConfig::new(req)
+            .with_max_hop_count(MAX_ROUTE_HOPS + 1)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RoutingError::MaxHopCountTooHigh {
+                    count,
+                    max: MAX_ROUTE_HOPS,
+                } if count == MAX_ROUTE_HOPS + 1
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn maximum_hop_count_itself_is_accepted() {
+        let req = request("alice", "carol", 100);
+        assert!(RouteSearchConfig::new(req)
+            .with_max_hop_count(MAX_ROUTE_HOPS)
+            .is_ok());
+    }
+
+    #[test]
+    fn minimum_hop_count_one_is_accepted() {
+        let req = request("alice", "carol", 100);
+        assert!(RouteSearchConfig::new(req)
+            .with_max_hop_count(MIN_HOP_COUNT)
+            .is_ok());
+    }
+
+    #[test]
+    fn find_best_route_with_config_routes_within_hop_limit() {
+        // alice -> bob -> carol: 2 hops; a limit of 2 must succeed.
+        let mut graph = NetworkGraph::new();
+        for id in ["alice", "bob", "carol"] {
+            add_node(&mut graph, id);
+        }
+        add_edge(&mut graph, "ch1", "alice", "bob", 1_000);
+        add_edge(&mut graph, "ch2", "bob", "carol", 1_000);
+
+        let config = RouteSearchConfig::new(request("alice", "carol", 100))
+            .with_max_hop_count(2)
+            .unwrap();
+        let route = find_best_route_with_config(&graph, &config, &FeeCap::protocol()).unwrap();
+        assert_eq!(route.hops.len(), 2);
+    }
+
+    #[test]
+    fn find_best_route_with_config_hop_limit_one_finds_direct_route() {
+        let mut graph = NetworkGraph::new();
+        for id in ["alice", "bob"] {
+            add_node(&mut graph, id);
+        }
+        add_edge(&mut graph, "ch1", "alice", "bob", 1_000);
+
+        let config = RouteSearchConfig::new(request("alice", "bob", 100))
+            .with_max_hop_count(1)
+            .unwrap();
+        let route = find_best_route_with_config(&graph, &config, &FeeCap::protocol()).unwrap();
+        assert_eq!(route.hops.len(), 1);
+    }
+
+    #[test]
+    fn find_best_route_with_config_hop_limit_too_low_produces_no_path() {
+        // alice -> bob -> carol: 2 hops; a limit of 1 must fail to find the route.
+        let mut graph = NetworkGraph::new();
+        for id in ["alice", "bob", "carol"] {
+            add_node(&mut graph, id);
+        }
+        add_edge(&mut graph, "ch1", "alice", "bob", 1_000);
+        add_edge(&mut graph, "ch2", "bob", "carol", 1_000);
+
+        let config = RouteSearchConfig::new(request("alice", "carol", 100))
+            .with_max_hop_count(1)
+            .unwrap();
+        let err =
+            find_best_route_with_config(&graph, &config, &FeeCap::protocol()).unwrap_err();
+        assert!(
+            matches!(err, RoutingError::NoPathFound { .. }),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn find_best_route_with_config_invalid_zero_hop_count_rejected_before_graph_access() {
+        // validate_max_hop_count is called before we touch the graph, so even
+        // an empty graph (no source node) gives MaxHopCountTooLow, not NodeNotFound.
+        let graph = NetworkGraph::new();
+        let req = RouteRequest {
+            source: "nowhere".to_string(),
+            destination: "nowhere-else".to_string(),
+            amount: 100,
+            max_fee_budget: None,
+            max_hops: Some(0), // bypass with_max_hop_count
+            find_any: false,
+            payment_metadata: None,
+        };
+        let config = RouteSearchConfig {
+            request: req,
+            max_hop_count: Some(0),
+        };
+        let err =
+            find_best_route_with_config(&graph, &config, &FeeCap::protocol()).unwrap_err();
+        assert!(
+            matches!(err, RoutingError::MaxHopCountTooLow { count: 0, .. }),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_max_hop_count_accepts_boundary_values() {
+        assert!(validate_max_hop_count(MIN_HOP_COUNT).is_ok());
+        assert!(validate_max_hop_count(MAX_ROUTE_HOPS).is_ok());
+    }
+
+    #[test]
+    fn validate_max_hop_count_rejects_out_of_bounds() {
+        assert!(matches!(
+            validate_max_hop_count(0),
+            Err(RoutingError::MaxHopCountTooLow { .. })
+        ));
+        assert!(matches!(
+            validate_max_hop_count(MAX_ROUTE_HOPS + 1),
+            Err(RoutingError::MaxHopCountTooHigh { .. })
+        ));
     }
 }
