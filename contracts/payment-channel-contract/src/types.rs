@@ -4,6 +4,8 @@
 
 use soroban_sdk::{contracttype, Address, Bytes, BytesN, Env, Map, Val, Vec};
 
+use crate::error::PaymentChannelError;
+
 /// Represents a payment channel between two participants
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -100,6 +102,83 @@ impl ChannelState {
         }
         self.sequence_number += 1;
         Ok(())
+    }
+}
+
+/// How a partially funded channel's recovery ended (#357).
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FundingResolution {
+    /// Waiting for the pending side to fund or for the deadline to pass.
+    Pending,
+    /// The pending side supplied the outstanding funds.
+    Completed,
+    /// The funded side closed the channel after the deadline.
+    Aborted,
+}
+
+/// Recoverable state of a channel whose funding transaction did not complete.
+///
+/// The channel state itself is unchanged while recovery is pending; this record
+/// is stored separately so existing entrypoints keep their behaviour and only
+/// callers that opt into recovery see the new restrictions.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FundingRecovery {
+    /// Channel being recovered.
+    pub channel_id: BytesN<32>,
+    /// Participant whose funding is confirmed on chain.
+    pub funded_participant: Address,
+    /// Participant who still owes funding.
+    pub pending_participant: Address,
+    /// Amount still expected from the pending participant.
+    pub outstanding: i128,
+    /// Ledger sequence at which recovery was opened.
+    pub opened_at_ledger: u32,
+    /// Last ledger sequence at which completion is accepted.
+    pub deadline_ledger: u32,
+    /// Current resolution.
+    pub resolution: FundingResolution,
+}
+
+impl FundingRecovery {
+    /// Build and validate a new recovery record.
+    ///
+    /// # Errors
+    ///
+    /// [`PaymentChannelError::InvalidFundingAmount`] for a non-positive
+    /// outstanding amount, and [`PaymentChannelError::InvalidTimeout`] when
+    /// the deadline would overflow a `u32` ledger sequence.
+    pub fn new(
+        env: &Env,
+        channel_id: BytesN<32>,
+        funded_participant: Address,
+        pending_participant: Address,
+        outstanding: i128,
+        timeout: u32,
+    ) -> Result<Self, PaymentChannelError> {
+        if outstanding <= 0 {
+            return Err(PaymentChannelError::InvalidFundingAmount);
+        }
+        let opened_at_ledger = env.ledger().sequence();
+        let deadline_ledger = opened_at_ledger
+            .checked_add(timeout)
+            .ok_or(PaymentChannelError::InvalidTimeout)?;
+
+        Ok(Self {
+            channel_id,
+            funded_participant,
+            pending_participant,
+            outstanding,
+            opened_at_ledger,
+            deadline_ledger,
+            resolution: FundingResolution::Pending,
+        })
+    }
+
+    /// Whether `ledger_sequence` is past the completion deadline.
+    pub fn is_expired(&self, ledger_sequence: u32) -> bool {
+        ledger_sequence > self.deadline_ledger
     }
 }
 
@@ -338,4 +417,51 @@ impl ChannelStats {
 pub struct HtlcList {
     /// Every HTLC recorded on the channel, claimed or not.
     pub entries: Vec<HTLCInfo>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    fn recovery(env: &Env, outstanding: i128) -> Result<FundingRecovery, PaymentChannelError> {
+        FundingRecovery::new(
+            env,
+            BytesN::from_array(env, &[1u8; 32]),
+            Address::generate(env),
+            Address::generate(env),
+            outstanding,
+            100,
+        )
+    }
+
+    #[test]
+    fn new_starts_pending_with_the_channel_timeout_as_deadline() {
+        let env = Env::default();
+        let record = recovery(&env, 500).expect("valid recovery");
+        assert_eq!(record.outstanding, 500);
+        assert_eq!(record.deadline_ledger, record.opened_at_ledger + 100);
+        assert_eq!(record.resolution, FundingResolution::Pending);
+    }
+
+    #[test]
+    fn non_positive_outstanding_is_rejected() {
+        let env = Env::default();
+        for amount in [0, -1] {
+            assert_eq!(
+                recovery(&env, amount).unwrap_err(),
+                PaymentChannelError::InvalidFundingAmount
+            );
+        }
+    }
+
+    #[test]
+    fn expiry_boundary_is_exact() {
+        let env = Env::default();
+        let record = recovery(&env, 1).unwrap();
+        let deadline = record.deadline_ledger;
+        assert!(!record.is_expired(deadline));
+        assert!(record.is_expired(deadline + 1));
+        assert!(!record.is_expired(deadline.saturating_sub(1)));
+    }
 }

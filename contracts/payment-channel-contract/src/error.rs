@@ -73,6 +73,20 @@ pub enum PaymentChannelError {
     AmountExceedsMaximum = 29,
     /// Presented state is not newer than the channel's recorded sequence (#352)
     StaleState = 30,
+    /// A recovery is pending; the channel cannot be used until it resolves (#357)
+    ChannelAwaitingFunding = 31,
+    /// A recovery is already pending for this channel (#357)
+    FundingRecoveryExists = 32,
+    /// No recovery record exists for this channel (#357)
+    FundingRecoveryNotFound = 33,
+    /// Completion was attempted after the recovery deadline (#357)
+    FundingRecoveryExpired = 34,
+    /// Abort was attempted before the recovery deadline (#357)
+    FundingDeadlineNotReached = 35,
+    /// The supplied amount is not the outstanding funding amount (#357)
+    FundingAmountMismatch = 36,
+    /// The outstanding funding amount is not positive (#357)
+    InvalidFundingAmount = 37,
 }
 
 impl TryFrom<u32> for PaymentChannelError {
@@ -110,6 +124,13 @@ impl TryFrom<u32> for PaymentChannelError {
             28 => Ok(PaymentChannelError::PathTooLong),
             29 => Ok(PaymentChannelError::AmountExceedsMaximum),
             30 => Ok(PaymentChannelError::StaleState),
+            31 => Ok(PaymentChannelError::ChannelAwaitingFunding),
+            32 => Ok(PaymentChannelError::FundingRecoveryExists),
+            33 => Ok(PaymentChannelError::FundingRecoveryNotFound),
+            34 => Ok(PaymentChannelError::FundingRecoveryExpired),
+            35 => Ok(PaymentChannelError::FundingDeadlineNotReached),
+            36 => Ok(PaymentChannelError::FundingAmountMismatch),
+            37 => Ok(PaymentChannelError::InvalidFundingAmount),
             _ => Err(Error::from_contract_error(value)),
         }
     }
@@ -149,6 +170,23 @@ impl PaymentChannelError {
             PaymentChannelError::PathTooLong => "Payment path too long",
             PaymentChannelError::AmountExceedsMaximum => "Amount exceeds maximum allowed",
             PaymentChannelError::StaleState => "State is older than the recorded sequence",
+            PaymentChannelError::ChannelAwaitingFunding => "Channel is awaiting funding recovery",
+            PaymentChannelError::FundingRecoveryExists => {
+                "A funding recovery is already pending for this channel"
+            }
+            PaymentChannelError::FundingRecoveryNotFound => {
+                "No funding recovery exists for this channel"
+            }
+            PaymentChannelError::FundingRecoveryExpired => "Funding recovery deadline has passed",
+            PaymentChannelError::FundingDeadlineNotReached => {
+                "Funding recovery deadline has not been reached"
+            }
+            PaymentChannelError::FundingAmountMismatch => {
+                "Supplied amount does not match the outstanding funding"
+            }
+            PaymentChannelError::InvalidFundingAmount => {
+                "Outstanding funding amount must be positive"
+            }
         }
     }
 }
