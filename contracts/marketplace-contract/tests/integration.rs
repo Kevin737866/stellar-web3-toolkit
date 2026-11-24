@@ -11,6 +11,7 @@
 use marketplace_contract::{ListingStatus, MarketplaceContract, MarketplaceContractClient};
 use royalty_splitter::{Receiver, RoyaltySplitter, RoyaltySplitterClient};
 use soroban_sdk::testutils::Address as _;
+use soroban_sdk::testutils::Ledger as _;
 use soroban_sdk::token::{StellarAssetClient, TokenClient};
 use soroban_sdk::{Address, Env, Vec};
 
@@ -93,4 +94,61 @@ fn secondary_sale_settles_marketplace_fee_and_royalties() {
     assert_eq!(balance(&env, &payment, &platform), 45);
     // Buyer spent 1,000 on the sale and 70 on royalties.
     assert_eq!(balance(&env, &payment, &buyer), 930);
+}
+
+#[test]
+fn expired_listing_rejects_sale_and_returns_escrow() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000);
+
+    let admin = Address::generate(&env);
+    let seller = Address::generate(&env);
+    let buyer = Address::generate(&env);
+    let asset = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let payment = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+
+    let market_id = env.register_contract(None, MarketplaceContract);
+    let market = MarketplaceContractClient::new(&env, &market_id);
+    market.initialize(&admin, &250, &admin);
+
+    mint(&env, &asset, &seller, 1);
+    mint(&env, &payment, &buyer, 1_000);
+
+    // The order is valid until ledger timestamp 2,000.
+    let listing_id = market.create_listing_with_expiry(
+        &seller,
+        &asset,
+        &1_u128,
+        &1_i128,
+        &1_000_i128,
+        &payment,
+        &2_000,
+    );
+    assert_eq!(balance(&env, &asset, &market_id), 1);
+    assert_eq!(market.get_listing_expiry(&listing_id), Some(2_000));
+
+    // Once the expiry has passed the order cannot settle.
+    env.ledger().set_timestamp(2_000);
+    assert!(market.try_buy(&buyer, &listing_id).is_err());
+    assert_eq!(balance(&env, &payment, &buyer), 1_000);
+    assert_eq!(balance(&env, &payment, &seller), 0);
+    assert_eq!(balance(&env, &asset, &buyer), 0);
+    assert_eq!(
+        market.get_listing(&listing_id).status,
+        ListingStatus::Active
+    );
+
+    // The seller reclaims the escrow from the expired listing.
+    market.cancel_listing(&seller, &listing_id);
+    assert_eq!(balance(&env, &asset, &seller), 1);
+    assert_eq!(balance(&env, &asset, &market_id), 0);
+    assert_eq!(
+        market.get_listing(&listing_id).status,
+        ListingStatus::Cancelled
+    );
 }

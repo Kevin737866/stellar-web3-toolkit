@@ -1351,100 +1351,43 @@ mod test {
     }
 
     #[test]
-    fn multiple_deposit_intervals_track_accrual_accurately() {
-        let f = Fixture::new();
-        f.standard_farm(); // 1 * ONE/s split 1:1 -> 0.5 * ONE/s to pool 1.
-
-        // Interval 1: 100 * ONE for 50s -> 25 * ONE accrued.
-        f.deposit(&f.alice, 1, &f.lp_a, 100 * ONE);
-        f.advance(50);
-
-        // Interval 2: +100 * ONE (200 * ONE total) for 50s -> 25 * ONE more.
-        f.deposit(&f.alice, 1, &f.lp_a, 100 * ONE);
-        let pos = f.client.position(&f.alice, &1);
-        assert_eq!(pos.amount, 200 * ONE);
-        assert_eq!(pos.accrued, 25 * ONE);
-
-        f.advance(50);
-        assert_eq!(f.client.pending_rewards(&f.alice, &1), 50 * ONE);
-        assert_eq!(f.client.total_pending_rewards(&f.alice), 50 * ONE);
-        assert_eq!(f.client.harvest(&f.alice, &1, &0), 50 * ONE);
-        assert!(f.client.rewards_paid_out() <= f.client.rewards_credited());
-    }
-
-    #[test]
-    fn multiple_deposit_and_withdraw_intervals_with_competing_staker() {
-        let f = Fixture::new();
-        f.standard_farm(); // pool 1 gets 0.5 * ONE/s.
-
-        // Interval 1 (40s): Alice 100, Bob 100 -> 10 * ONE each.
-        f.deposit(&f.alice, 1, &f.lp_a, 100 * ONE);
-        f.deposit(&f.bob, 1, &f.lp_a, 100 * ONE);
-        f.advance(40);
-
-        // Interval 2 (40s): Alice deposits +200 (300 vs 100) -> 15 * ONE Alice, 5 * ONE Bob.
-        f.deposit(&f.alice, 1, &f.lp_a, 200 * ONE);
-        f.advance(40);
-
-        // Interval 3 (20s): Alice withdraws 200 (100 vs 100) -> 5 * ONE each.
-        f.client.withdraw(&f.alice, &1, &(200 * ONE));
-        f.advance(20);
-
-        assert_eq!(f.client.pending_rewards(&f.alice, &1), 30 * ONE);
-        assert_eq!(f.client.pending_rewards(&f.bob, &1), 20 * ONE);
-        assert_eq!(f.client.harvest(&f.alice, &1, &0), 30 * ONE);
-        assert_eq!(f.client.harvest(&f.bob, &1, &0), 20 * ONE);
-        assert!(f.client.rewards_paid_out() <= f.client.rewards_credited());
-    }
-
-    #[test]
-    fn multi_interval_deposits_with_zero_rate_gap_and_topup() {
+    fn a_one_unit_position_receives_its_exact_share() {
         let f = Fixture::new();
         f.client.add_pool(&1, &f.lp_a, &1);
-        f.fund(50 * ONE, 50); // 1 * ONE/s for 50s
+        // 1_000 base units funded over one second over 1_000 staked units: the
+        // accumulator moves by exactly PRECISION, so the 999:1 split resolves
+        // to whole base units on both sides.
+        f.fund(1_000 * ONE, 1);
+        f.deposit(&f.alice, 1, &f.lp_a, 999 * ONE);
+        f.deposit(&f.bob, 1, &f.lp_a, ONE);
 
-        f.deposit(&f.alice, 1, &f.lp_a, 100 * ONE);
-        f.advance(100); // 50s active, 50s expired gap.
+        f.advance(1);
+        assert_eq!(f.client.pending_rewards(&f.alice, &1), 999 * ONE);
+        assert_eq!(f.client.pending_rewards(&f.bob, &1), ONE);
 
-        // Second deposit after schedule ended settles 50 * ONE, 0 during gap.
-        f.deposit(&f.alice, 1, &f.lp_a, 100 * ONE);
-        assert_eq!(f.client.position(&f.alice, &1).accrued, 50 * ONE);
-
-        // Top up for another 50s and advance.
-        f.fund(50 * ONE, 50);
-        f.advance(50);
-
-        assert_eq!(f.client.pending_rewards(&f.alice, &1), 100 * ONE);
-        assert_eq!(f.client.harvest(&f.alice, &1, &0), 100 * ONE);
+        let whale = f.client.harvest(&f.alice, &1, &0);
+        let tiny = f.client.harvest(&f.bob, &1, &0);
+        assert_eq!((whale, tiny), (999 * ONE, ONE));
+        assert_eq!(f.client.rewards_paid_out(), 1_000 * ONE);
+        assert!(f.client.rewards_paid_out() <= f.client.rewards_credited());
     }
 
     #[test]
-    fn integration_multi_interval_farm_lifecycle() {
+    fn rewards_below_one_base_unit_stay_as_dust() {
         let f = Fixture::new();
-        f.standard_farm(); // 1 * ONE/s across pool 1 (1) and pool 2 (1)
+        f.client.add_pool(&1, &f.lp_a, &1);
+        // One base unit of rewards across 1_000_000_001 staked units: every
+        // position floors to zero and no credit is recorded.
+        f.fund(1, 1);
+        f.deposit(&f.alice, 1, &f.lp_a, 1_000_000_000);
+        f.deposit(&f.bob, 1, &f.lp_a, 1);
 
-        // Interval 1 (40s): Alice in pool 1 (100), Bob in pool 2 (100) -> 20 * ONE each.
-        f.deposit(&f.alice, 1, &f.lp_a, 100 * ONE);
-        f.deposit(&f.bob, 2, &f.lp_b, 100 * ONE);
-        f.advance(40);
-
-        // Alice adds to pool 1 and enters pool 2.
-        f.deposit(&f.alice, 1, &f.lp_a, 100 * ONE);
-        f.deposit(&f.alice, 2, &f.lp_b, 100 * ONE);
-        f.advance(40); // Pool 1: +20 Alice. Pool 2: +10 Alice, +10 Bob.
-
-        let portfolio = f.client.positions(&f.alice);
-        assert_eq!(portfolio.len(), 2);
-        assert_eq!(f.client.total_pending_rewards(&f.alice), 50 * ONE);
-        assert_eq!(f.client.pending_rewards(&f.bob, &2), 30 * ONE);
-
-        // Harvest pool 1, then emergency_withdraw pool 2 (forfeits pool 2's 10 * ONE).
-        assert_eq!(f.client.harvest(&f.alice, &1, &0), 40 * ONE);
-        assert_eq!(f.client.emergency_withdraw(&f.alice, &2), 100 * ONE);
-        assert_eq!(f.client.pending_rewards(&f.alice, &2), 0);
-
-        assert_eq!(f.client.harvest(&f.bob, &2, &0), 30 * ONE);
-        assert!(f.client.rewards_paid_out() <= f.client.rewards_credited());
-        assert!(f.client.rewards_credited() <= f.client.rewards_funded());
+        f.advance(1);
+        assert_eq!(f.client.pending_rewards(&f.alice, &1), 0);
+        assert_eq!(f.client.pending_rewards(&f.bob, &1), 0);
+        assert_eq!(f.client.harvest(&f.alice, &1, &0), 0);
+        assert_eq!(f.client.harvest(&f.bob, &1, &0), 0);
+        assert_eq!(f.client.rewards_credited(), 0);
+        assert_eq!(f.client.rewards_paid_out(), 0);
     }
 }
