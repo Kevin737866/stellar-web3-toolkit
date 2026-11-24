@@ -38,7 +38,7 @@ in shape: an NFT is a fungible token with one unit per instance.
 
 | Function | Notes |
 | --- | --- |
-| `mint(to, token_id, quantity, asset_name, uri)` | Admin only. A `token_id` cannot be minted twice until it is fully burned. |
+| `mint(to, token_id, quantity, asset_name, uri)` | Admin only. A `token_id` cannot be minted twice until it is fully burned. Names must be 1–128 UTF-8 bytes; metadata and base URIs may be empty (for base-URI fallback) but are limited to 2,048 bytes. |
 | `balance(holder, token_id)` | Units held. |
 | `owner_of(token_id)` | `Some(holder)` exactly when one address holds every unit. |
 | `is_nft(token_id)` | `base_supply == 1`. |
@@ -99,13 +99,15 @@ not have to fit in a single instance entry.
 - Transfers and burns are holder-authorised; `transfer_from` and `burn_from`
   are spender-authorised and draw down the SEP-41 allowance.
 - `mint` is admin-only and refuses to exceed `max_supply` when one is set.
+- Asset names are required and bounded to 128 UTF-8 bytes. Explicit metadata
+  URIs and collection base URIs are bounded to 2,048 bytes before storage.
 - Freezing blocks transfers but not burns, so a freeze cannot strand an NFT.
 - A fully burned base token deletes its supply, metadata and holder entries, so
   a burned `token_id` cannot be resurrected with stale state.
 
 ## Tests
 
-`cargo test -p nft-sft-contract` — 16 tests covering initialisation, NFT
+`cargo test -p nft-sft-contract` — 17 tests covering initialisation, NFT
 ownership handover, SFT division and re-consolidation, burn-driven ownership
 restoration, allowance gating and expiry, freezing, the collection cap, id
 reuse, and event emission.

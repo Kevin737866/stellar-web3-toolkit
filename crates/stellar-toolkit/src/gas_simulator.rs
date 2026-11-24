@@ -310,6 +310,19 @@ mod tests {
     }
 
     #[test]
+    fn hostile_resource_profiles_saturate_instead_of_wrapping() {
+        let estimate = testnet().estimate(&TransactionProfile {
+            operations: u32::MAX,
+            instructions: u32::MAX,
+            ledger_reads: u32::MAX,
+            ledger_writes: u32::MAX,
+            bid_ledgers: u32::MAX,
+        });
+        assert_eq!(estimate.total_stroops, u32::MAX);
+        assert_eq!(estimate.breakdown.resource_fee, u32::MAX);
+    }
+
+    #[test]
     fn test_fee_bump_scales_with_base_fee() {
         let simulator = testnet();
         let bump = simulator.fee_bump(1_000, 500, 200).unwrap();
@@ -369,6 +382,31 @@ mod tests {
             .map(|b| b.outer_fee_stroops)
             .collect();
         assert_eq!(fees, vec![1_500, 2_000]);
+    }
+
+    #[test]
+    fn bump_ladders_remain_bounded_for_extreme_fee_inputs() {
+        for max_fee in [1, 100, 10_000, u32::MAX] {
+            for start_fee in [0, 1, 100, u32::MAX] {
+                for bump_percent in [0, 1, 50, u32::MAX] {
+                    for max_bumps in [0, 1, 3, 32] {
+                        let mut schedule = FeeSchedule::testnet_default();
+                        schedule.max_fee_stroops = max_fee;
+                        schedule.bump_percent = bump_percent;
+                        schedule.max_bumps = max_bumps;
+                        let ladder = GasSimulator::new(schedule).bump_ladder(start_fee);
+                        let mut previous = start_fee.max(schedule.base_fee_stroops);
+
+                        assert!(ladder.len() <= max_bumps as usize);
+                        for bump in ladder {
+                            assert!(bump.outer_fee_stroops <= max_fee);
+                            assert!(bump.outer_fee_stroops > previous);
+                            previous = bump.outer_fee_stroops;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

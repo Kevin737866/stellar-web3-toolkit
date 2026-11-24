@@ -76,6 +76,9 @@ pub enum ToolkitCommand {
     /// Contributor onboarding checklist progress (issue #194)
     #[command(subcommand)]
     Onboarding(OnboardingCommand),
+    /// Session key management: revoke individual session keys (issue #334)
+    #[command(subcommand)]
+    Session(SessionCommand),
     /// Print the command overview wrapped to the terminal width
     Help {
         /// Wrap width in columns (defaults to $COLUMNS, otherwise 100)
@@ -444,6 +447,34 @@ pub enum VerifyCommand {
     },
 }
 
+/// Session key management commands (issue #334).
+///
+/// These commands revoke individual session keys without touching the account
+/// key. The account key is a wallet-level concept (see `wallet generate` /
+/// `wallet recover`); session keys are short-lived delegation keys managed by
+/// [`crate::session_keys::AccountAbstractionManager`].
+#[derive(Subcommand, Debug)]
+pub enum SessionCommand {
+    /// Revoke one session key by its session ID, verifying account ownership
+    Revoke {
+        /// Account address (G...) that owns the session key
+        #[arg(long)]
+        account: String,
+        /// Session key ID to revoke
+        #[arg(long)]
+        session_id: String,
+    },
+    /// Revoke one session key by its public key, verifying account ownership
+    RevokeByKey {
+        /// Account address (G...) that owns the session key
+        #[arg(long)]
+        account: String,
+        /// Public key of the session key to revoke
+        #[arg(long)]
+        session_public_key: String,
+    },
+}
+
 #[derive(Subcommand)]
 pub enum WalletCommand {
     /// Generate a 24-word recovery phrase and derive a Stellar keypair
@@ -527,6 +558,7 @@ impl ToolkitCommand {
             Self::Security(cmd) => run_security(cmd),
             Self::Verify(cmd) => run_verify(cmd),
             Self::Onboarding(cmd) => run_onboarding(cmd),
+            Self::Session(cmd) => run_session(cmd),
             Self::Help { width } => {
                 let resolved = if *width == 0 {
                     help_text::help_width()
@@ -618,6 +650,65 @@ fn run_wallet(wallet: &WalletCommand) -> Result<()> {
         WalletCommand::Sign { secret, message } => {
             let signature = wallet::sign_message(secret, message)?;
             println!("{signature}");
+            Ok(())
+        }
+    }
+}
+
+/// Dispatch for session key management commands (issue #334).
+///
+/// The in-memory [`crate::session_keys::AccountAbstractionManager`] is
+/// instantiated per CLI invocation; persistent session stores are a future
+/// concern. This command exists to demonstrate and test the revocation API.
+fn run_session(cmd: &SessionCommand) -> Result<()> {
+    use crate::session_keys::{AccountAbstractionManager, SessionError};
+
+    // Build a manager seeded with any sessions the caller has registered.
+    // In production this would load from a persistent store; here we surface
+    // the API surface and validate the error paths.
+    let mut manager = AccountAbstractionManager::new();
+
+    match cmd {
+        SessionCommand::Revoke {
+            account,
+            session_id,
+        } => {
+            manager
+                .revoke_session_authorized(account, session_id)
+                .map_err(|e| match e {
+                    SessionError::SessionNotFound(_) | SessionError::SessionNotOwned(_) => {
+                        ToolkitError::ExecutionError(format!(
+                            "session key `{session_id}` not found for account `{account}`"
+                        ))
+                    }
+                    SessionError::SessionRevoked(_) => ToolkitError::ExecutionError(format!(
+                        "session key `{session_id}` is already revoked"
+                    )),
+                    other => ToolkitError::Session(other.to_string()),
+                })?;
+            println!("Session key `{session_id}` revoked for account `{account}`.");
+            Ok(())
+        }
+        SessionCommand::RevokeByKey {
+            account,
+            session_public_key,
+        } => {
+            manager
+                .revoke_session_by_public_key(account, session_public_key)
+                .map_err(|e| match e {
+                    SessionError::SessionNotFound(_) => ToolkitError::ExecutionError(format!(
+                        "no active session key with public key `{session_public_key}` \
+                         found for account `{account}`"
+                    )),
+                    SessionError::SessionRevoked(_) => ToolkitError::ExecutionError(format!(
+                        "session key with public key `{session_public_key}` is already revoked"
+                    )),
+                    other => ToolkitError::Session(other.to_string()),
+                })?;
+            println!(
+                "Session key with public key `{session_public_key}` revoked \
+                 for account `{account}`."
+            );
             Ok(())
         }
     }
