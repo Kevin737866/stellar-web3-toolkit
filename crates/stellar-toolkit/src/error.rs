@@ -34,6 +34,8 @@ pub enum ToolkitError {
     Horizon(String),
     #[error("horizon pagination error: {0}")]
     HorizonPagination(#[from] crate::horizon::HorizonPaginationError),
+    #[error("soroban rpc error: {0}")]
+    SorobanRpc(#[from] crate::soroban_rpc::PollError),
 }
 
 pub type Result<T> = std::result::Result<T, ToolkitError>;

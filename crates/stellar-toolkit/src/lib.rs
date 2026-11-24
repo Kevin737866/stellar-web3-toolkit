@@ -29,6 +29,7 @@ pub mod p2p_qr_payment;
 pub mod scaffolder;
 pub mod session_keys;
 pub mod signal_sync;
+pub mod soroban_rpc;
 pub mod state_inspector;
 pub mod theme;
 pub mod timelock;
@@ -80,6 +81,11 @@ pub use session_keys::{
     SessionPolicy, VetoGuardian,
 };
 pub use signal_sync::{Signal, SignalSnapshot, SyncError, SyncReport, SNAPSHOT_VERSION};
+pub use soroban_rpc::{
+    poll_transaction, poll_transaction_with_sleep, validate_rpc_url, validate_tx_hash,
+    HttpSorobanRpcClient, PollConfig, PollError, PollOutcome, SorobanRpcTransport,
+    TerminalTransactionResult, TransactionReceipt, TransactionStatusResponse,
+};
 pub use state_inspector::{Durability, StateEntry, StateInspector, StatePage, StateQuery};
 pub use timelock::{
     authorize_governance_action, DelayKind, GovernanceAction, GovernanceRole,
