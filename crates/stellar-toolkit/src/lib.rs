@@ -4,6 +4,7 @@
 
 pub mod anomaly;
 pub mod api_reference_gen;
+pub mod atomic_output;
 pub mod audit_allowlist;
 pub mod bridge_oracle;
 pub mod cli;
@@ -42,6 +43,9 @@ pub use anomaly::{
     MetricVerdict, Series,
 };
 pub use api_reference_gen::{ApiFunctionDoc, ApiReferenceGenerator};
+pub use atomic_output::{
+    atomic_write_bytes, atomic_write_str, AtomicOutputError, StagedDeploymentOutput, StagedFile,
+};
 pub use bridge_oracle::{
     OracleConfirmation, OracleQuorumError, OracleSet, QuorumReport, QuorumVerdict, MAX_ORACLES,
 };

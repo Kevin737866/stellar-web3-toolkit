@@ -34,6 +34,8 @@ pub enum ToolkitError {
     Horizon(String),
     #[error("horizon pagination error: {0}")]
     HorizonPagination(#[from] crate::horizon::HorizonPaginationError),
+    #[error("atomic output error: {0}")]
+    AtomicOutput(#[from] crate::atomic_output::AtomicOutputError),
 }
 
 pub type Result<T> = std::result::Result<T, ToolkitError>;
