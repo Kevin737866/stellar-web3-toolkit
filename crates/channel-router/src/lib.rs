@@ -93,6 +93,13 @@ pub enum RoutingError {
 
     #[error("Route declares {declared} in fees but its hops sum to {actual}")]
     InconsistentRouteFees { declared: i128, actual: i128 },
+
+    #[error("Channel {channel_id} does not connect {from} to {to}")]
+    InvalidRouteDirection {
+        channel_id: String,
+        from: String,
+        to: String,
+    },
 }
 
 /// Represents a node in the payment channel network
@@ -155,6 +162,36 @@ pub struct Channel {
     pub enabled: bool,
     /// Channel age in seconds
     pub age_seconds: u64,
+}
+
+impl Channel {
+    /// Determine the [`Direction`] of travel from `from` to `to` across this channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoutingError::InvalidRouteDirection`] if `from` and `to` do
+    /// not match the channel's two endpoints.
+    pub fn direction_for_hop(&self, from: &str, to: &str) -> Result<Direction, RoutingError> {
+        if self.node_a == from && self.node_b == to {
+            Ok(Direction::AToB)
+        } else if self.node_b == from && self.node_a == to {
+            Ok(Direction::BToA)
+        } else {
+            Err(RoutingError::InvalidRouteDirection {
+                channel_id: self.id.clone(),
+                from: from.to_string(),
+                to: to.to_string(),
+            })
+        }
+    }
+
+    /// Return the available balance in `direction`.
+    pub fn available_capacity(&self, direction: Direction) -> i128 {
+        match direction {
+            Direction::AToB => self.capacity_a_to_b,
+            Direction::BToA => self.capacity_b_to_a,
+        }
+    }
 }
 
 /// Direction for capacity checks
@@ -658,8 +695,67 @@ pub fn find_best_route_with_cap(
 
     // Individually acceptable hops can still add up past the payment budget.
     cap.check_route(request.amount, &route)?;
+    validate_route_direction_and_balance(graph, &request.source, &route)?;
 
     Ok(route)
+}
+
+/// Validate that every hop in `route` traverses a channel in a valid direction
+/// from `source` and has sufficient directional balance in `graph`.
+///
+/// # Errors
+///
+/// - [`RoutingError::NodeNotFound`] if `source` is not in `graph`.
+/// - [`RoutingError::NoPathFound`] if `route.hops` is empty.
+/// - [`RoutingError::ChannelNotFound`] if any hop references an unknown channel.
+/// - [`RoutingError::InvalidRouteDirection`] if a hop's `(from, to)` pair does
+///   not match the channel's endpoints.
+/// - [`RoutingError::BelowDustLimit`] if any hop amount is `<= 0`.
+/// - [`RoutingError::InsufficientCapacity`] if the channel's available balance
+///   in the hop's direction of travel is less than `hop.amount`.
+pub fn validate_route_direction_and_balance(
+    graph: &NetworkGraph,
+    source: &str,
+    route: &Route,
+) -> Result<(), RoutingError> {
+    if !graph.has_node(source) {
+        return Err(RoutingError::NodeNotFound {
+            node: source.to_string(),
+        });
+    }
+    if route.hops.is_empty() {
+        return Err(RoutingError::NoPathFound {
+            origin: source.to_string(),
+            destination: source.to_string(),
+        });
+    }
+
+    let mut current_node = source;
+    for hop in &route.hops {
+        if hop.amount <= 0 {
+            return Err(RoutingError::BelowDustLimit {
+                amount: hop.amount,
+                dust_limit: 1,
+            });
+        }
+        let channel = graph
+            .get_channel(&hop.channel_id)
+            .ok_or_else(|| RoutingError::ChannelNotFound {
+                channel_id: hop.channel_id.clone(),
+            })?;
+        let direction = channel.direction_for_hop(current_node, &hop.node_id)?;
+        let available = channel.available_capacity(direction);
+        if available < hop.amount {
+            return Err(RoutingError::InsufficientCapacity {
+                needed: hop.amount,
+                available,
+                channel_id: hop.channel_id.clone(),
+            });
+        }
+        current_node = &hop.node_id;
+    }
+
+    Ok(())
 }
 
 /// Find multiple routes using k-shortest paths
@@ -1029,5 +1125,163 @@ mod tests {
 
         let routes = find_k_routes(&graph, &request("alice", "carol", 1_000), 3).unwrap();
         assert!(routes.is_empty());
+    }
+
+    #[test]
+    fn validate_route_direction_accepts_exact_balance_and_rejects_reverse_shortfall() {
+        let mut graph = NetworkGraph::new();
+        for id in ["alice", "bob", "carol"] {
+            add_node(&mut graph, id);
+        }
+        graph.add_channel(Channel {
+            id: "ch1".to_string(),
+            node_a: "alice".to_string(),
+            node_b: "bob".to_string(),
+            capacity_a_to_b: 1_000,
+            capacity_b_to_a: 200,
+            base_fee: 1,
+            fee_rate: 1_000,
+            cltv_delta: 40,
+            min_htlc_size: 1,
+            max_htlc_size: 1_000,
+            htlcs_in_flight: 0,
+            enabled: true,
+            age_seconds: 3600,
+        });
+        graph.add_channel(Channel {
+            id: "ch2".to_string(),
+            node_a: "carol".to_string(),
+            node_b: "bob".to_string(),
+            capacity_a_to_b: 50,
+            capacity_b_to_a: 1_000,
+            base_fee: 1,
+            fee_rate: 1_000,
+            cltv_delta: 40,
+            min_htlc_size: 1,
+            max_htlc_size: 1_000,
+            htlcs_in_flight: 0,
+            enabled: true,
+            age_seconds: 3600,
+        });
+
+        // Exact boundary balance: alice -> bob (AToB = 1_000), bob -> carol (BToA = 1_000).
+        let valid_route = Route {
+            hops: vec![
+                RouteHop::new("ch1".to_string(), "bob".to_string(), 1_000, 2, 40),
+                RouteHop::new("ch2".to_string(), "carol".to_string(), 1_000, 2, 40),
+            ],
+            total_fees: 4,
+            total_amount: 1_000,
+            success_probability: 0.95,
+            metadata: RouteMetadata::default(),
+        };
+        assert!(validate_route_direction_and_balance(&graph, "alice", &valid_route).is_ok());
+
+        // Reverse direction carol -> bob -> alice exceeds bob->alice balance (200).
+        let reverse_route = Route {
+            hops: vec![
+                RouteHop::new("ch2".to_string(), "bob".to_string(), 50, 1, 40),
+                RouteHop::new("ch1".to_string(), "alice".to_string(), 500, 1, 40),
+            ],
+            total_fees: 2,
+            total_amount: 500,
+            success_probability: 0.95,
+            metadata: RouteMetadata::default(),
+        };
+        let err = validate_route_direction_and_balance(&graph, "carol", &reverse_route).unwrap_err();
+        assert!(matches!(
+            err,
+            RoutingError::InsufficientCapacity {
+                needed: 500,
+                available: 200,
+                ref channel_id
+            } if channel_id == "ch1"
+        ));
+    }
+
+    #[test]
+    fn validate_route_direction_rejects_mismatched_endpoints_and_unknown_channel() {
+        let mut graph = NetworkGraph::new();
+        for id in ["alice", "bob", "carol"] {
+            add_node(&mut graph, id);
+        }
+        add_edge(&mut graph, "ch1", "alice", "bob", 1_000);
+
+        // ch1 connects alice <-> bob, not alice <-> carol.
+        let bad_dir = Route {
+            hops: vec![RouteHop::new(
+                "ch1".to_string(),
+                "carol".to_string(),
+                100,
+                1,
+                40,
+            )],
+            total_fees: 1,
+            total_amount: 100,
+            success_probability: 0.95,
+            metadata: RouteMetadata::default(),
+        };
+        let err = validate_route_direction_and_balance(&graph, "alice", &bad_dir).unwrap_err();
+        assert!(matches!(err, RoutingError::InvalidRouteDirection { .. }));
+
+        // Unknown channel is rejected.
+        let missing_ch = Route {
+            hops: vec![RouteHop::new(
+                "ch999".to_string(),
+                "bob".to_string(),
+                100,
+                1,
+                40,
+            )],
+            total_fees: 1,
+            total_amount: 100,
+            success_probability: 0.95,
+            metadata: RouteMetadata::default(),
+        };
+        let err_ch = validate_route_direction_and_balance(&graph, "alice", &missing_ch).unwrap_err();
+        assert!(matches!(err_ch, RoutingError::ChannelNotFound { .. }));
+    }
+
+    #[test]
+    fn graph_view_records_directional_edge_orientation_and_route_workflow() {
+        let mut graph = NetworkGraph::new();
+        for id in ["alice", "bob"] {
+            add_node(&mut graph, id);
+        }
+        graph.add_channel(Channel {
+            id: "ch1".to_string(),
+            node_a: "alice".to_string(),
+            node_b: "bob".to_string(),
+            capacity_a_to_b: 5_000,
+            capacity_b_to_a: 100,
+            base_fee: 1,
+            fee_rate: 1_000,
+            cltv_delta: 40,
+            min_htlc_size: 1,
+            max_htlc_size: 5_000,
+            htlcs_in_flight: 0,
+            enabled: true,
+            age_seconds: 3600,
+        });
+
+        let view = graph::GraphView::new(&graph);
+        assert_eq!(view.get_edges("alice")[0].direction, Direction::AToB);
+        assert_eq!(view.get_edges("bob")[0].direction, Direction::BToA);
+
+        // End-to-end: find_best_route succeeds in funded direction and passes validation.
+        let route = find_best_route(&graph, &request("alice", "bob", 1_000)).unwrap();
+        assert!(validate_route_direction_and_balance(&graph, "alice", &route).is_ok());
+
+        // After draining A->B capacity below the route amount, validation rejects it.
+        graph.update_capacity("ch1", Direction::AToB, 500);
+        let err = validate_route_direction_and_balance(&graph, "alice", &route).unwrap_err();
+        assert!(matches!(
+            err,
+            RoutingError::InsufficientCapacity {
+                needed: 1_000,
+                available: 500,
+                ..
+            }
+        ));
     }
 }
