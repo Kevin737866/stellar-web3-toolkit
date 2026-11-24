@@ -251,6 +251,9 @@ pub enum InspectCommand {
         #[arg(long, default_value_t = 0)]
         cursor: usize,
         /// JSON state export to read instead of the built-in sample
+        ///
+        /// Accepts a bare array of entries as well as a document written by
+        /// `--output`.
         #[arg(long)]
         input: Option<PathBuf>,
         /// Print every page instead of a single one
@@ -259,6 +262,13 @@ pub enum InspectCommand {
         /// Print the page as JSON
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// Write every entry matching the filters to a single JSON document
+        ///
+        /// Unlike `--json`, which prints one page, this exports the complete
+        /// result (entries, filters and schema version) to a file that `--input`
+        /// can read back (issue #312).
+        #[arg(long)]
+        output: Option<PathBuf>,
     },
 }
 
@@ -1293,6 +1303,7 @@ fn run_inspect(cmd: &InspectCommand) -> Result<()> {
             input,
             all_pages,
             json,
+            output,
         } => {
             let inspector = match input {
                 Some(input) => {
@@ -1325,6 +1336,20 @@ fn run_inspect(cmd: &InspectCommand) -> Result<()> {
                 inspector.total(&query),
                 inspector.len()
             );
+
+            // An export is the whole filtered result in one document, so it is
+            // written before (and instead of) any page rendering (#312).
+            if let Some(output) = output {
+                let path = resolve_path(&cwd_root(), output);
+                let export = inspector.write_export(&query, &path)?;
+                println!(
+                    "exported {} entr{} to {}",
+                    export.total,
+                    if export.total == 1 { "y" } else { "ies" },
+                    path.display()
+                );
+                return Ok(());
+            }
 
             if *all_pages {
                 for (index, page) in inspector.pages(&query).iter().enumerate() {

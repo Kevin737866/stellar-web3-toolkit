@@ -54,8 +54,10 @@ stellar-toolkit scaffold lint --dir contracts/amm-pool
 # Estimate Soroban fees and plan fee bumps
 stellar-toolkit gas estimate --instructions 250000 --bump-percent 100
 
-# Inspect contract state page by page
+# Inspect contract state page by page, or export the whole result as JSON
 stellar-toolkit inspect state --contract <C...> --page-size 20
+stellar-toolkit inspect state --contract <C...> --output target/state.json
+stellar-toolkit inspect state --input target/state.json --json
 
 # Validate the dev/test/prod deploy configs against their contract
 stellar-toolkit env validate

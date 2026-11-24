@@ -80,7 +80,10 @@ pub use session_keys::{
     SessionPolicy, VetoGuardian,
 };
 pub use signal_sync::{Signal, SignalSnapshot, SyncError, SyncReport, SNAPSHOT_VERSION};
-pub use state_inspector::{Durability, StateEntry, StateInspector, StatePage, StateQuery};
+pub use state_inspector::{
+    Durability, StateEntry, StateExport, StateInspector, StatePage, StateQuery,
+    STATE_EXPORT_SCHEMA_VERSION,
+};
 pub use timelock::{
     authorize_governance_action, DelayKind, GovernanceAction, GovernanceRole,
     ProposalQuorumProgress, TimelockError, TimelockPolicy, MAX_PAUSE_DELAY, MIN_PAUSE_DELAY,

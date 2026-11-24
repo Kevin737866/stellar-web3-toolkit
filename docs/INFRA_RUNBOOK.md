@@ -247,7 +247,25 @@ cargo run -p stellar-toolkit -- inspect state --input state-export.json --json
 Entries are ordered by (durability, key, contract), temporary entries are hidden
 unless `--include-temporary` is passed, `--page-size` is clamped to `1..=200`, and
 each page prints the cursor for the next one (or `end of results`). `--input`
-reads a JSON array of state entries instead of the built-in sample.
+reads a JSON state export instead of the built-in sample.
+
+#### Exporting results (Issue #312)
+
+```bash
+# Every entry matching the filters, in one self-describing document
+cargo run -p stellar-toolkit -- inspect state --contract CDEMO7POOLCONTRACTID \
+  --output target/state/pool.json
+
+# The exported document can be read back (and re-filtered) later
+cargo run -p stellar-toolkit -- inspect state --input target/state/pool.json --json
+```
+
+`--output` writes the complete filtered result — not one page — to
+`{ "schema_version": 1, "contract_id", "key_prefix", "include_temporary",
+"total", "entries" }` and creates missing parent directories. `--json` still
+prints a single page to stdout, and the two flags are independent: `--page-size`
+and `--cursor` never truncate an export. `--input` accepts both the export
+document and a bare array of `StateEntry` values, so older exports keep working.
 
 ### Tests
 
