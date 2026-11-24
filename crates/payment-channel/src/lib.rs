@@ -4,9 +4,11 @@
 //! This library provides a Rust API for creating, managing, and closing
 //! payment channels, as well as executing off-chain payments.
 
+pub mod funding;
 pub mod reorg;
 pub mod signed;
 
+use funding::{FundingRecovery, FundingResolution, FundingSide};
 use parking_lot::RwLock;
 use reorg::{ReorgError, ReorgLog};
 use serde::{Deserialize, Serialize};
@@ -71,6 +73,55 @@ pub enum PaymentChannelError {
         recorded: u32,
         presented: u32,
     },
+
+    /// An operation was attempted on a channel whose funding did not complete.
+    #[error(
+        "Channel {channel_id} is awaiting funding; complete or abort the recovery before using it"
+    )]
+    ChannelAwaitingFunding { channel_id: String },
+
+    /// A second recovery was opened while one is still pending.
+    #[error("Channel {channel_id} already has a pending funding recovery")]
+    FundingRecoveryExists { channel_id: String },
+
+    /// A recovery action was requested for a channel with no pending recovery.
+    #[error("Channel {channel_id} has no pending funding recovery")]
+    NoFundingRecovery { channel_id: String },
+
+    /// The supplied amount does not match the outstanding funding.
+    #[error(
+        "Funding recovery for {channel_id} expects {expected}, got {provided}; no funds were moved"
+    )]
+    FundingAmountMismatch {
+        channel_id: String,
+        expected: i128,
+        provided: i128,
+    },
+
+    /// Completion was attempted after the recovery deadline.
+    #[error("Funding recovery for {channel_id} expired at ledger {deadline}; observed {observed}")]
+    FundingRecoveryExpired {
+        channel_id: String,
+        deadline: u32,
+        observed: u32,
+    },
+
+    /// Abort was attempted before the recovery deadline.
+    #[error(
+        "Funding recovery for {channel_id} cannot be aborted until ledger {deadline}; observed {observed}"
+    )]
+    FundingDeadlineNotReached {
+        channel_id: String,
+        deadline: u32,
+        observed: u32,
+    },
+
+    /// The recovery action was not signed by the participant who must authorise it.
+    #[error("Funding recovery for {channel_id} is not signed by the {side} participant")]
+    FundingUnauthorized {
+        channel_id: String,
+        side: FundingSide,
+    },
 }
 
 /// Channel status
@@ -86,6 +137,9 @@ pub enum ChannelStatus {
     ForceClosed,
     /// Channel is in dispute
     Dispute,
+    /// One side's funding transaction did not complete; the channel is
+    /// recoverable but must not be used until recovery resolves (#357).
+    AwaitingFunding,
 }
 
 /// Local channel state for a participant
@@ -218,6 +272,9 @@ pub struct ChannelManager {
     ledger_height: AtomicU32,
     /// How many past heights to retain per channel.
     history_depth: u32,
+    /// Funding recoveries, keyed by channel ID. Only channels in
+    /// `AwaitingFunding` have an entry here.
+    recoveries: RwLock<HashMap<String, FundingRecovery>>,
 }
 
 /// Signature signer trait
@@ -251,6 +308,7 @@ impl ChannelManager {
             signer,
             ledger_height: AtomicU32::new(0),
             history_depth,
+            recoveries: RwLock::new(HashMap::new()),
         }
     }
 
@@ -337,6 +395,7 @@ impl ChannelManager {
             .ok_or_else(|| PaymentChannelError::ChannelNotFound(channel_id.to_string()))?;
 
         // Check if channel is open
+        ensure_funding_ready(channel_id, channel.state.status)?;
         if channel.state.status != ChannelStatus::Open {
             return Err(PaymentChannelError::ChannelClosed(
                 channel.state.status.to_string(),
@@ -376,20 +435,6 @@ impl ChannelManager {
         record_state(channel_id, channel, ledger_height)?;
 
         Ok(channel.state.clone())
-    }
-
-    /// Set or update the remote participant's public key for authorization verification.
-    pub fn set_remote_public_key(
-        &self,
-        channel_id: &str,
-        remote_public_key: Vec<u8>,
-    ) -> Result<(), PaymentChannelError> {
-        let mut channels = self.channels.write();
-        let channel = channels
-            .get_mut(channel_id)
-            .ok_or_else(|| PaymentChannelError::ChannelNotFound(channel_id.to_string()))?;
-        channel.state.remote_public_key = remote_public_key;
-        Ok(())
     }
 
     /// Sign the channel's current state update for exchange with the counterparty.
@@ -465,6 +510,7 @@ impl ChannelManager {
             .get_mut(channel_id)
             .ok_or_else(|| PaymentChannelError::ChannelNotFound(channel_id.to_string()))?;
 
+        ensure_funding_ready(channel_id, channel.state.status)?;
         if channel.state.status != ChannelStatus::Open {
             return Err(PaymentChannelError::ChannelClosed(
                 channel.state.status.to_string(),
@@ -505,11 +551,9 @@ impl ChannelManager {
             ledger_height,
         );
 
-        let valid = self.signer.verify(
-            &digest,
-            remote_signature,
-            &channel.state.remote_public_key,
-        )?;
+        let valid =
+            self.signer
+                .verify(&digest, remote_signature, &channel.state.remote_public_key)?;
 
         if !valid {
             return Err(PaymentChannelError::SignatureError(
@@ -621,6 +665,16 @@ impl ChannelManager {
             }
         }
 
+        // A recovery opened above the fork did not happen on the canonical
+        // chain, and one whose channel rolled back to a different state is no
+        // longer applicable. Drop both so a stale recovery cannot be replayed.
+        self.recoveries.write().retain(|channel_id, recovery| {
+            recovery.opened_at <= fork_height
+                && channels
+                    .get(channel_id)
+                    .is_some_and(|channel| channel.state.status == ChannelStatus::AwaitingFunding)
+        });
+
         // `HashMap` iteration order is unspecified; sort the report so callers
         // can diff two reorg events without spurious changes.
         report.rolled_back.sort();
@@ -635,6 +689,299 @@ impl ChannelManager {
             .read()
             .get(channel_id)
             .map(|channel| channel.history.heights())
+    }
+
+    /// The funding recovery for `channel_id`, if one has been opened.
+    #[must_use]
+    pub fn get_funding_recovery(&self, channel_id: &str) -> Option<FundingRecovery> {
+        self.recoveries.read().get(channel_id).cloned()
+    }
+
+    /// Mark an open channel as partially funded and open a recovery window.
+    ///
+    /// `funded_side` is the side whose funding transaction is confirmed on
+    /// chain; `outstanding` is what the other side still owes. The window runs
+    /// until `ledger_height + channel.timeout`. While it is open the channel
+    /// is [`ChannelStatus::AwaitingFunding`] and every payment or settlement
+    /// is refused with [`PaymentChannelError::ChannelAwaitingFunding`].
+    ///
+    /// The state transition and its snapshot are committed together, so a
+    /// rejected open leaves the channel `Open` and records no recovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the channel does not exist or is not open, when
+    /// it has pending HTLCs, when a recovery is already pending, when the
+    /// funded side has no confirmed balance, or when the ledger height is not
+    /// newer than the last recorded height.
+    pub fn open_funding_recovery(
+        &self,
+        channel_id: &str,
+        funded_side: FundingSide,
+        outstanding: i128,
+        ledger_height: u32,
+    ) -> Result<FundingRecovery, PaymentChannelError> {
+        let mut channels = self.channels.write();
+        let channel = channels
+            .get_mut(channel_id)
+            .ok_or_else(|| PaymentChannelError::ChannelNotFound(channel_id.to_string()))?;
+
+        if self
+            .recoveries
+            .read()
+            .get(channel_id)
+            .is_some_and(|recovery| recovery.resolution == FundingResolution::Pending)
+        {
+            return Err(PaymentChannelError::FundingRecoveryExists {
+                channel_id: channel_id.to_string(),
+            });
+        }
+        if channel.state.status != ChannelStatus::Open {
+            return Err(PaymentChannelError::InvalidState(format!(
+                "cannot open funding recovery in state {}",
+                channel.state.status
+            )));
+        }
+        if !channel.state.pending_htlcs.is_empty() {
+            return Err(PaymentChannelError::InvalidState(format!(
+                "channel {channel_id} has pending HTLCs; resolve them before recovery"
+            )));
+        }
+
+        let funded_balance = match funded_side {
+            FundingSide::Local => channel.state.our_balance,
+            FundingSide::Remote => channel.state.their_balance,
+        };
+        if funded_balance <= 0 {
+            return Err(PaymentChannelError::InvalidState(format!(
+                "the {funded_side} side has no confirmed funds to recover"
+            )));
+        }
+
+        check_height(channel_id, &channel.history, ledger_height)?;
+        let recovery = FundingRecovery::new(
+            channel_id,
+            funded_side,
+            outstanding,
+            ledger_height,
+            channel.state.timeout,
+        )?;
+
+        let mut updated = channel.state.clone();
+        updated.status = ChannelStatus::AwaitingFunding;
+        commit_state(channel_id, channel, updated, ledger_height)?;
+
+        self.recoveries
+            .write()
+            .insert(channel_id.to_string(), recovery.clone());
+        Ok(recovery)
+    }
+
+    /// Complete a pending recovery by supplying exactly the outstanding funds.
+    ///
+    /// The pending participant must sign [`FundingRecovery::digest`]. A retry
+    /// with the same amount after success returns the recovered state without
+    /// changing it; a completion after the deadline is refused.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when there is no pending recovery, the amount differs
+    /// from the outstanding amount, the deadline has passed, the signature is
+    /// not from the pending participant, or the ledger height is stale.
+    pub fn complete_funding_recovery(
+        &self,
+        channel_id: &str,
+        amount: i128,
+        signature: &[u8],
+        ledger_height: u32,
+    ) -> Result<LocalChannelState, PaymentChannelError> {
+        let recovery = self.require_recovery(channel_id)?;
+        match recovery.resolution {
+            FundingResolution::Completed => {
+                return if recovery.outstanding == amount {
+                    self.get_channel(channel_id)
+                        .ok_or_else(|| PaymentChannelError::ChannelNotFound(channel_id.to_string()))
+                } else {
+                    Err(PaymentChannelError::FundingAmountMismatch {
+                        channel_id: channel_id.to_string(),
+                        expected: recovery.outstanding,
+                        provided: amount,
+                    })
+                };
+            }
+            FundingResolution::Aborted => {
+                return Err(PaymentChannelError::InvalidState(format!(
+                    "funding recovery for {channel_id} was aborted; open a new recovery"
+                )));
+            }
+            FundingResolution::Pending => {}
+        }
+
+        if recovery.outstanding != amount {
+            return Err(PaymentChannelError::FundingAmountMismatch {
+                channel_id: channel_id.to_string(),
+                expected: recovery.outstanding,
+                provided: amount,
+            });
+        }
+        if recovery.is_expired(ledger_height) {
+            return Err(PaymentChannelError::FundingRecoveryExpired {
+                channel_id: channel_id.to_string(),
+                deadline: recovery.deadline,
+                observed: ledger_height,
+            });
+        }
+
+        let pending_side = recovery.pending_side();
+        let key = self.authorization_key(channel_id, pending_side)?;
+        if !self.signer.verify(&recovery.digest(), signature, &key)? {
+            return Err(PaymentChannelError::FundingUnauthorized {
+                channel_id: channel_id.to_string(),
+                side: pending_side,
+            });
+        }
+
+        let mut channels = self.channels.write();
+        let channel = channels
+            .get_mut(channel_id)
+            .ok_or_else(|| PaymentChannelError::ChannelNotFound(channel_id.to_string()))?;
+        if channel.state.status != ChannelStatus::AwaitingFunding {
+            return Err(PaymentChannelError::InvalidState(format!(
+                "channel {channel_id} is not awaiting funding"
+            )));
+        }
+        check_height(channel_id, &channel.history, ledger_height)?;
+
+        let mut updated = channel.state.clone();
+        let balance = match pending_side {
+            FundingSide::Local => &mut updated.our_balance,
+            FundingSide::Remote => &mut updated.their_balance,
+        };
+        *balance = balance
+            .checked_add(amount)
+            .ok_or_else(|| PaymentChannelError::InvalidState("funded balance overflow".into()))?;
+        updated.status = ChannelStatus::Open;
+        updated.sequence_number += 1;
+        commit_state(channel_id, channel, updated, ledger_height)?;
+
+        let mut resolved = recovery;
+        resolved.resolution = FundingResolution::Completed;
+        self.recoveries
+            .write()
+            .insert(channel_id.to_string(), resolved);
+
+        Ok(channels
+            .get(channel_id)
+            .expect("channel was just written")
+            .state
+            .clone())
+    }
+
+    /// Abort a pending recovery after its deadline, releasing the funded side.
+    ///
+    /// The funded participant must sign [`FundingRecovery::digest`]. Aborting
+    /// before the deadline is refused so the other side keeps the full window
+    /// to complete funding. A retry after success is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when there is no pending recovery, the deadline has
+    /// not passed, the signature is not from the funded participant, or the
+    /// ledger height is stale.
+    pub fn abort_funding_recovery(
+        &self,
+        channel_id: &str,
+        signature: &[u8],
+        ledger_height: u32,
+    ) -> Result<LocalChannelState, PaymentChannelError> {
+        let recovery = self.require_recovery(channel_id)?;
+        match recovery.resolution {
+            FundingResolution::Aborted => {
+                return self
+                    .get_channel(channel_id)
+                    .ok_or_else(|| PaymentChannelError::ChannelNotFound(channel_id.to_string()));
+            }
+            FundingResolution::Completed => {
+                return Err(PaymentChannelError::InvalidState(format!(
+                    "funding recovery for {channel_id} already completed"
+                )));
+            }
+            FundingResolution::Pending => {}
+        }
+
+        if !recovery.is_expired(ledger_height) {
+            return Err(PaymentChannelError::FundingDeadlineNotReached {
+                channel_id: channel_id.to_string(),
+                deadline: recovery.deadline,
+                observed: ledger_height,
+            });
+        }
+
+        let key = self.authorization_key(channel_id, recovery.funded_side)?;
+        if !self.signer.verify(&recovery.digest(), signature, &key)? {
+            return Err(PaymentChannelError::FundingUnauthorized {
+                channel_id: channel_id.to_string(),
+                side: recovery.funded_side,
+            });
+        }
+
+        let mut channels = self.channels.write();
+        let channel = channels
+            .get_mut(channel_id)
+            .ok_or_else(|| PaymentChannelError::ChannelNotFound(channel_id.to_string()))?;
+        if channel.state.status != ChannelStatus::AwaitingFunding {
+            return Err(PaymentChannelError::InvalidState(format!(
+                "channel {channel_id} is not awaiting funding"
+            )));
+        }
+        check_height(channel_id, &channel.history, ledger_height)?;
+
+        let mut updated = channel.state.clone();
+        updated.status = ChannelStatus::ForceClosed;
+        updated.sequence_number += 1;
+        commit_state(channel_id, channel, updated, ledger_height)?;
+
+        let mut resolved = recovery;
+        resolved.resolution = FundingResolution::Aborted;
+        self.recoveries
+            .write()
+            .insert(channel_id.to_string(), resolved);
+
+        Ok(channels
+            .get(channel_id)
+            .expect("channel was just written")
+            .state
+            .clone())
+    }
+
+    fn require_recovery(&self, channel_id: &str) -> Result<FundingRecovery, PaymentChannelError> {
+        self.get_funding_recovery(channel_id).ok_or_else(|| {
+            PaymentChannelError::NoFundingRecovery {
+                channel_id: channel_id.to_string(),
+            }
+        })
+    }
+
+    fn authorization_key(
+        &self,
+        channel_id: &str,
+        side: FundingSide,
+    ) -> Result<Vec<u8>, PaymentChannelError> {
+        match side {
+            FundingSide::Local => Ok(self.signer.public_key()),
+            FundingSide::Remote => {
+                let channels = self.channels.read();
+                let channel = channels
+                    .get(channel_id)
+                    .ok_or_else(|| PaymentChannelError::ChannelNotFound(channel_id.to_string()))?;
+                if channel.state.remote_public_key.is_empty() {
+                    return Err(PaymentChannelError::InvalidState(format!(
+                        "channel {channel_id} has no registered counterparty key; call set_remote_public_key first"
+                    )));
+                }
+                Ok(channel.state.remote_public_key.clone())
+            }
+        }
     }
 
     /// Get a channel by ID
@@ -707,6 +1054,11 @@ impl ChannelManager {
                 return Ok(channel.state.clone());
             }
             ChannelStatus::Open => {}
+            ChannelStatus::AwaitingFunding => {
+                return Err(PaymentChannelError::ChannelAwaitingFunding {
+                    channel_id: channel_id.to_string(),
+                });
+            }
             other => {
                 return Err(PaymentChannelError::InvalidState(format!(
                     "Cannot close channel in state {other}"
@@ -803,6 +1155,7 @@ impl ChannelManager {
             .get_mut(&signed.channel_id)
             .ok_or_else(|| PaymentChannelError::ChannelNotFound(signed.channel_id.clone()))?;
 
+        ensure_funding_ready(&signed.channel_id, channel.state.status)?;
         if channel.state.status != ChannelStatus::Open {
             return Err(PaymentChannelError::ChannelClosed(
                 channel.state.status.to_string(),
@@ -875,6 +1228,7 @@ impl ChannelManager {
             .get_mut(channel_id)
             .ok_or_else(|| PaymentChannelError::ChannelNotFound(channel_id.to_string()))?;
 
+        ensure_funding_ready(channel_id, state.state.status)?;
         if state.state.status != ChannelStatus::Open {
             return Err(PaymentChannelError::InvalidState(
                 "Channel not open".to_string(),
@@ -927,19 +1281,19 @@ pub fn compute_state_digest(
     let mut hasher = Sha256::new();
     hasher.update(b"STELLAR_PAYMENT_CHANNEL_STATE_UPDATE:");
     hasher.update(channel_id.as_bytes());
-    hasher.update(&sequence_number.to_be_bytes());
+    hasher.update(sequence_number.to_be_bytes());
     if our_address <= their_address {
         hasher.update(our_address.as_bytes());
-        hasher.update(&our_balance.to_be_bytes());
+        hasher.update(our_balance.to_be_bytes());
         hasher.update(their_address.as_bytes());
-        hasher.update(&their_balance.to_be_bytes());
+        hasher.update(their_balance.to_be_bytes());
     } else {
         hasher.update(their_address.as_bytes());
-        hasher.update(&their_balance.to_be_bytes());
+        hasher.update(their_balance.to_be_bytes());
         hasher.update(our_address.as_bytes());
-        hasher.update(&our_balance.to_be_bytes());
+        hasher.update(our_balance.to_be_bytes());
     }
-    hasher.update(&ledger_height.to_be_bytes());
+    hasher.update(ledger_height.to_be_bytes());
     let res = hasher.finalize();
     let mut digest = [0u8; 32];
     digest.copy_from_slice(&res);
@@ -992,6 +1346,38 @@ fn record_state(
     Ok(())
 }
 
+/// Commit a replacement state and its snapshot as one operation.
+///
+/// If the snapshot cannot be recorded the previous state is restored, so a
+/// failed recovery transition never leaves an unanchored state behind.
+fn commit_state(
+    channel_id: &str,
+    channel: &mut TrackedChannel,
+    updated: LocalChannelState,
+    ledger_height: u32,
+) -> Result<(), PaymentChannelError> {
+    let previous = channel.state.clone();
+    channel.state = updated;
+    if let Err(err) = record_state(channel_id, channel, ledger_height) {
+        channel.state = previous;
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Refuse channel use while its funding recovery is unresolved.
+fn ensure_funding_ready(
+    channel_id: &str,
+    status: ChannelStatus,
+) -> Result<(), PaymentChannelError> {
+    if status == ChannelStatus::AwaitingFunding {
+        return Err(PaymentChannelError::ChannelAwaitingFunding {
+            channel_id: channel_id.to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Payment direction
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaymentDirection {
@@ -1010,6 +1396,7 @@ impl std::fmt::Display for ChannelStatus {
             ChannelStatus::Closed => write!(f, "Closed"),
             ChannelStatus::ForceClosed => write!(f, "ForceClosed"),
             ChannelStatus::Dispute => write!(f, "Dispute"),
+            ChannelStatus::AwaitingFunding => write!(f, "AwaitingFunding"),
         }
     }
 }
@@ -1593,14 +1980,17 @@ mod tests {
 
     #[tokio::test]
     async fn apply_signed_state_update_accepts_valid_signature() {
-        let manager = ChannelManager::with_history_depth(Box::new(StrictTestSigner::new(vec![1; 32])), 8);
+        let manager =
+            ChannelManager::with_history_depth(Box::new(StrictTestSigner::new(vec![1; 32])), 8);
         let remote_signer = StrictTestSigner::new(vec![2; 32]);
         let state = manager
             .create_channel("alice".to_string(), "bob".to_string(), 1_000, 1_000, 100, 0)
             .await
             .unwrap();
 
-        manager.set_remote_public_key(&state.channel_id, remote_signer.public_key()).unwrap();
+        manager
+            .set_remote_public_key(&state.channel_id, remote_signer.public_key())
+            .unwrap();
 
         // Remote party (Bob) signs an update: Alice 800, Bob 1200 at sequence 1, height 5
         let digest = compute_state_digest(&state.channel_id, 1, "alice", 800, "bob", 1200, 5);
@@ -1613,19 +2003,25 @@ mod tests {
         assert_eq!(updated.our_balance, 800);
         assert_eq!(updated.their_balance, 1200);
         assert_eq!(updated.sequence_number, 1);
-        assert_eq!(manager.recorded_heights(&state.channel_id).unwrap(), vec![0, 5]);
+        assert_eq!(
+            manager.recorded_heights(&state.channel_id).unwrap(),
+            vec![0, 5]
+        );
     }
 
     #[tokio::test]
     async fn apply_signed_state_update_rejects_corrupted_signature_without_mutation() {
-        let manager = ChannelManager::with_history_depth(Box::new(StrictTestSigner::new(vec![1; 32])), 8);
+        let manager =
+            ChannelManager::with_history_depth(Box::new(StrictTestSigner::new(vec![1; 32])), 8);
         let remote_signer = StrictTestSigner::new(vec![2; 32]);
         let state = manager
             .create_channel("alice".to_string(), "bob".to_string(), 1_000, 1_000, 100, 0)
             .await
             .unwrap();
 
-        manager.set_remote_public_key(&state.channel_id, remote_signer.public_key()).unwrap();
+        manager
+            .set_remote_public_key(&state.channel_id, remote_signer.public_key())
+            .unwrap();
 
         // Sign with wrong/foreign key
         let wrong_signer = StrictTestSigner::new(vec![99; 32]);
@@ -1643,19 +2039,25 @@ mod tests {
         assert_eq!(untouched.our_balance, 1_000);
         assert_eq!(untouched.their_balance, 1_000);
         assert_eq!(untouched.sequence_number, 0);
-        assert_eq!(manager.recorded_heights(&state.channel_id).unwrap(), vec![0]);
+        assert_eq!(
+            manager.recorded_heights(&state.channel_id).unwrap(),
+            vec![0]
+        );
     }
 
     #[tokio::test]
     async fn apply_signed_state_update_rejects_balance_mismatch() {
-        let manager = ChannelManager::with_history_depth(Box::new(StrictTestSigner::new(vec![1; 32])), 8);
+        let manager =
+            ChannelManager::with_history_depth(Box::new(StrictTestSigner::new(vec![1; 32])), 8);
         let remote_signer = StrictTestSigner::new(vec![2; 32]);
         let state = manager
             .create_channel("alice".to_string(), "bob".to_string(), 1_000, 1_000, 100, 0)
             .await
             .unwrap();
 
-        manager.set_remote_public_key(&state.channel_id, remote_signer.public_key()).unwrap();
+        manager
+            .set_remote_public_key(&state.channel_id, remote_signer.public_key())
+            .unwrap();
 
         let digest = compute_state_digest(&state.channel_id, 1, "alice", 1_500, "bob", 1_500, 5);
         let sig = remote_signer.sign(&digest).unwrap();
@@ -1669,21 +2071,30 @@ mod tests {
 
     #[tokio::test]
     async fn execute_authorized_payment_verifies_signature() {
-        let manager = ChannelManager::with_history_depth(Box::new(StrictTestSigner::new(vec![1; 32])), 8);
+        let manager =
+            ChannelManager::with_history_depth(Box::new(StrictTestSigner::new(vec![1; 32])), 8);
         let remote_signer = StrictTestSigner::new(vec![2; 32]);
         let state = manager
             .create_channel("alice".to_string(), "bob".to_string(), 1_000, 1_000, 100, 0)
             .await
             .unwrap();
 
-        manager.set_remote_public_key(&state.channel_id, remote_signer.public_key()).unwrap();
+        manager
+            .set_remote_public_key(&state.channel_id, remote_signer.public_key())
+            .unwrap();
 
         // Payment of 200 to them produces our 800, their 1200
         let digest = compute_state_digest(&state.channel_id, 1, "alice", 800, "bob", 1200, 10);
         let valid_sig = remote_signer.sign(&digest).unwrap();
 
         let updated = manager
-            .execute_authorized_payment_at(&state.channel_id, 200, PaymentDirection::ToThem, &valid_sig, 10)
+            .execute_authorized_payment_at(
+                &state.channel_id,
+                200,
+                PaymentDirection::ToThem,
+                &valid_sig,
+                10,
+            )
             .unwrap();
 
         assert_eq!(updated.our_balance, 800);
@@ -1696,14 +2107,10 @@ mod tests {
         let alice_signer = StrictTestSigner::new(vec![10; 32]);
         let bob_signer = StrictTestSigner::new(vec![20; 32]);
 
-        let alice_manager = ChannelManager::with_history_depth(
-            Box::new(StrictTestSigner::new(vec![10; 32])),
-            8,
-        );
-        let bob_manager = ChannelManager::with_history_depth(
-            Box::new(StrictTestSigner::new(vec![20; 32])),
-            8,
-        );
+        let alice_manager =
+            ChannelManager::with_history_depth(Box::new(StrictTestSigner::new(vec![10; 32])), 8);
+        let bob_manager =
+            ChannelManager::with_history_depth(Box::new(StrictTestSigner::new(vec![20; 32])), 8);
 
         let ch_alice = alice_manager
             .create_channel("alice".to_string(), "bob".to_string(), 1_000, 1_000, 100, 0)
@@ -1717,8 +2124,12 @@ mod tests {
         assert_eq!(ch_alice.channel_id, ch_bob.channel_id);
         let ch_id = ch_alice.channel_id.clone();
 
-        alice_manager.set_remote_public_key(&ch_id, bob_signer.public_key()).unwrap();
-        bob_manager.set_remote_public_key(&ch_id, alice_signer.public_key()).unwrap();
+        alice_manager
+            .set_remote_public_key(&ch_id, bob_signer.public_key())
+            .unwrap();
+        bob_manager
+            .set_remote_public_key(&ch_id, alice_signer.public_key())
+            .unwrap();
 
         // Alice pays 150 to Bob at height 1.
         // Proposed new balances: Alice 850, Bob 1150.
@@ -1745,5 +2156,248 @@ mod tests {
         assert_eq!(bob_state.our_balance, 1150);
         assert_eq!(bob_state.their_balance, 850);
         assert_eq!(alice_state.sequence_number, bob_state.sequence_number);
+    }
+
+    // ── Partial funding recovery (#357) ──────────────────────────────────────
+
+    async fn recovery_manager() -> (ChannelManager, String, FundingRecovery) {
+        let manager = ChannelManager::with_history_depth(Box::new(EchoSigner), 8);
+        let state = manager
+            .create_channel("alice".to_string(), "bob".to_string(), 1_000, 0, 100, 0)
+            .await
+            .unwrap();
+        let channel_id = state.channel_id.clone();
+        manager
+            .set_remote_public_key(&channel_id, vec![8u8; 32])
+            .unwrap();
+        let recovery = manager
+            .open_funding_recovery(&channel_id, FundingSide::Local, 500, 10)
+            .expect("valid recovery");
+        (manager, channel_id, recovery)
+    }
+
+    #[tokio::test]
+    async fn opening_recovery_marks_the_channel_unusable() {
+        let (manager, channel_id, recovery) = recovery_manager().await;
+
+        assert_eq!(recovery.deadline, 110);
+        assert_eq!(recovery.resolution, FundingResolution::Pending);
+        assert_eq!(
+            manager.get_channel(&channel_id).unwrap().status,
+            ChannelStatus::AwaitingFunding
+        );
+
+        let before = manager.get_channel(&channel_id).unwrap();
+        let err = manager
+            .execute_payment_at(&channel_id, 100, PaymentDirection::ToThem, 11)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            PaymentChannelError::ChannelAwaitingFunding {
+                channel_id: channel_id.clone()
+            }
+        );
+        assert_eq!(manager.get_channel(&channel_id).unwrap(), before);
+
+        let signed = SignedChannelState::new(&channel_id, 1, 900, 100);
+        assert!(matches!(
+            manager.settle_signed_state(&signed, &signed.digest(), 11),
+            Err(PaymentChannelError::ChannelAwaitingFunding { .. })
+        ));
+        assert!(matches!(
+            manager.rebalance(&channel_id, 100),
+            Err(PaymentChannelError::ChannelAwaitingFunding { .. })
+        ));
+        assert!(matches!(
+            manager.cooperative_close_at(&channel_id, 11),
+            Err(PaymentChannelError::ChannelAwaitingFunding { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn completing_recovery_restores_an_open_channel_and_is_idempotent() {
+        let (manager, channel_id, recovery) = recovery_manager().await;
+        let signature = recovery.digest().to_vec();
+
+        let state = manager
+            .complete_funding_recovery(&channel_id, 500, &signature, 11)
+            .expect("completion before the deadline");
+        assert_eq!(state.status, ChannelStatus::Open);
+        assert_eq!(state.our_balance, 1_000);
+        assert_eq!(state.their_balance, 500);
+        assert_eq!(state.sequence_number, 1);
+        assert_eq!(
+            manager
+                .get_funding_recovery(&channel_id)
+                .unwrap()
+                .resolution,
+            FundingResolution::Completed
+        );
+        assert_eq!(
+            manager.recorded_heights(&channel_id).unwrap(),
+            vec![0, 10, 11]
+        );
+
+        // A retry after a lost response must not move funds again.
+        let retry = manager
+            .complete_funding_recovery(&channel_id, 500, &signature, 12)
+            .unwrap();
+        assert_eq!(retry, state);
+        assert_eq!(
+            manager.recorded_heights(&channel_id).unwrap(),
+            vec![0, 10, 11]
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_is_possible_only_after_the_deadline() {
+        let (manager, channel_id, recovery) = recovery_manager().await;
+        let signature = recovery.digest().to_vec();
+
+        let early = manager
+            .abort_funding_recovery(&channel_id, &signature, 110)
+            .unwrap_err();
+        assert_eq!(
+            early,
+            PaymentChannelError::FundingDeadlineNotReached {
+                channel_id: channel_id.clone(),
+                deadline: 110,
+                observed: 110,
+            }
+        );
+        assert_eq!(
+            manager.get_channel(&channel_id).unwrap().status,
+            ChannelStatus::AwaitingFunding
+        );
+
+        let aborted = manager
+            .abort_funding_recovery(&channel_id, &signature, 111)
+            .expect("abort after the deadline");
+        assert_eq!(aborted.status, ChannelStatus::ForceClosed);
+        assert_eq!(
+            manager
+                .get_funding_recovery(&channel_id)
+                .unwrap()
+                .resolution,
+            FundingResolution::Aborted
+        );
+        assert_eq!(
+            manager
+                .abort_funding_recovery(&channel_id, &signature, 112)
+                .unwrap(),
+            aborted
+        );
+    }
+
+    #[tokio::test]
+    async fn late_completion_and_mismatched_amounts_are_refused_without_changes() {
+        let (manager, channel_id, recovery) = recovery_manager().await;
+        let signature = recovery.digest().to_vec();
+        let before = manager.get_channel(&channel_id).unwrap();
+
+        assert_eq!(
+            manager
+                .complete_funding_recovery(&channel_id, 500, &signature, 111)
+                .unwrap_err(),
+            PaymentChannelError::FundingRecoveryExpired {
+                channel_id: channel_id.clone(),
+                deadline: 110,
+                observed: 111,
+            }
+        );
+        assert_eq!(
+            manager
+                .complete_funding_recovery(&channel_id, 400, &signature, 11)
+                .unwrap_err(),
+            PaymentChannelError::FundingAmountMismatch {
+                channel_id: channel_id.clone(),
+                expected: 500,
+                provided: 400,
+            }
+        );
+        assert_eq!(
+            manager
+                .complete_funding_recovery(&channel_id, 500, &[0u8; 32], 11)
+                .unwrap_err(),
+            PaymentChannelError::FundingUnauthorized {
+                channel_id: channel_id.clone(),
+                side: FundingSide::Remote,
+            }
+        );
+        assert_eq!(manager.get_channel(&channel_id).unwrap(), before);
+        assert_eq!(
+            manager
+                .get_funding_recovery(&channel_id)
+                .unwrap()
+                .resolution,
+            FundingResolution::Pending
+        );
+        assert_eq!(manager.recorded_heights(&channel_id).unwrap(), vec![0, 10]);
+    }
+
+    #[tokio::test]
+    async fn a_second_recovery_and_an_unfunded_side_are_refused() {
+        let (manager, channel_id, _) = recovery_manager().await;
+        assert!(matches!(
+            manager.open_funding_recovery(&channel_id, FundingSide::Local, 100, 11),
+            Err(PaymentChannelError::FundingRecoveryExists { .. })
+        ));
+
+        let other = ChannelManager::with_history_depth(Box::new(EchoSigner), 8);
+        let state = other
+            .create_channel("alice".to_string(), "bob".to_string(), 1_000, 0, 100, 0)
+            .await
+            .unwrap();
+        assert!(matches!(
+            other.open_funding_recovery(&state.channel_id, FundingSide::Remote, 500, 10),
+            Err(PaymentChannelError::InvalidState(_))
+        ));
+        assert_eq!(
+            other.get_channel(&state.channel_id).unwrap().status,
+            ChannelStatus::Open
+        );
+        assert!(other.get_funding_recovery(&state.channel_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn recovery_without_a_record_is_refused() {
+        let (manager, channel_id) = manager_with_channel(8).await;
+        assert_eq!(
+            manager
+                .complete_funding_recovery(&channel_id, 1, &[0u8; 32], 1)
+                .unwrap_err(),
+            PaymentChannelError::NoFundingRecovery {
+                channel_id: channel_id.clone()
+            }
+        );
+        assert_eq!(
+            manager
+                .abort_funding_recovery(&channel_id, &[0u8; 32], 200)
+                .unwrap_err(),
+            PaymentChannelError::NoFundingRecovery { channel_id }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reorg_below_the_recovery_height_cancels_the_recovery() {
+        let (manager, channel_id, _) = recovery_manager().await;
+        let report = manager.handle_reorg(0);
+        assert!(report.is_clean());
+        assert_eq!(
+            manager.get_channel(&channel_id).unwrap().status,
+            ChannelStatus::Open
+        );
+        assert!(manager.get_funding_recovery(&channel_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_reorg_at_the_recovery_height_keeps_the_recovery() {
+        let (manager, channel_id, _) = recovery_manager().await;
+        manager.handle_reorg(10);
+        assert_eq!(
+            manager.get_channel(&channel_id).unwrap().status,
+            ChannelStatus::AwaitingFunding
+        );
+        assert!(manager.get_funding_recovery(&channel_id).is_some());
     }
 }

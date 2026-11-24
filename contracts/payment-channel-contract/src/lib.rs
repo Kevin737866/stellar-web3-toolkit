@@ -16,7 +16,7 @@ use soroban_sdk::{
     contract, contractimpl, contractmeta, Address, Bytes, BytesN, Env, IntoVal, TryFromVal,
     Vec as SorobanVec,
 };
-use types::{ChannelState, HTLCInfo, HtlcList};
+pub use types::{ChannelState, FundingRecovery, FundingResolution, HTLCInfo, HtlcList};
 
 /// Append an address's canonical strkey encoding to `out`.
 ///
@@ -36,6 +36,17 @@ pub(crate) fn append_address(out: &mut Bytes, address: &Address) {
     let mut buf = [0u8; STRKEY_BUF];
     encoded.copy_into_slice(&mut buf[..len]);
     out.extend_from_slice(&buf[..len]);
+}
+
+/// Refuse channel operations while a funding recovery is unresolved (#357).
+fn ensure_no_pending_recovery(
+    env: &Env,
+    channel_id: &BytesN<32>,
+) -> Result<(), PaymentChannelError> {
+    if state::pending_funding_recovery(env, channel_id).is_some() {
+        return Err(PaymentChannelError::ChannelAwaitingFunding);
+    }
+    Ok(())
 }
 
 contractmeta!(key = "name", val = "StellarPaymentChannel");
@@ -128,6 +139,8 @@ impl PaymentChannel {
             return Err(PaymentChannelError::ChannelAlreadyClosed);
         }
 
+        ensure_no_pending_recovery(&env, &channel_id)?;
+
         if new_balance_a < 0 || new_balance_b < 0 {
             return Err(PaymentChannelError::InvalidBalance);
         }
@@ -170,6 +183,8 @@ impl PaymentChannel {
         if state.close_time != 0 {
             return Err(PaymentChannelError::ChannelAlreadyClosed);
         }
+
+        ensure_no_pending_recovery(&env, &channel_id)?;
 
         if amount <= 0 {
             return Err(PaymentChannelError::InvalidHtlcAmount);
@@ -232,6 +247,8 @@ impl PaymentChannel {
             return Err(PaymentChannelError::ChannelAlreadyClosed);
         }
 
+        ensure_no_pending_recovery(&env, &channel_id)?;
+
         let htlc_val = state
             .htlcs
             .get(htlc_id.clone().to_val())
@@ -283,6 +300,8 @@ impl PaymentChannel {
         if state.is_cooperative_close {
             return Err(PaymentChannelError::ChannelAlreadyClosed);
         }
+
+        ensure_no_pending_recovery(&env, &channel_id)?;
 
         let htlc_val = state
             .htlcs
@@ -350,6 +369,8 @@ impl PaymentChannel {
         if state.close_time != 0 {
             return Err(PaymentChannelError::ChannelAlreadyClosed);
         }
+
+        ensure_no_pending_recovery(&env, &channel_id)?;
 
         if final_balance_a < 0 || final_balance_b < 0 {
             return Err(PaymentChannelError::InvalidBalance);
@@ -444,6 +465,8 @@ impl PaymentChannel {
             return Err(PaymentChannelError::ChannelAlreadyClosed);
         }
 
+        ensure_no_pending_recovery(&env, &channel_id)?;
+
         if new_balance_a < 0 || new_balance_b < 0 {
             return Err(PaymentChannelError::InvalidBalance);
         }
@@ -496,6 +519,8 @@ impl PaymentChannel {
         if state.close_time != 0 {
             return Err(PaymentChannelError::ChannelAlreadyClosed);
         }
+
+        ensure_no_pending_recovery(&env, &channel_id)?;
 
         if initiator != state.participant_a && initiator != state.participant_b {
             return Err(PaymentChannelError::UnauthorizedParticipant);
@@ -565,6 +590,8 @@ impl PaymentChannel {
             return Err(PaymentChannelError::ChannelAlreadyClosed);
         }
 
+        ensure_no_pending_recovery(&env, &channel_id)?;
+
         if top_up_amount <= 0 {
             return Err(PaymentChannelError::InvalidBalance);
         }
@@ -592,6 +619,170 @@ impl PaymentChannel {
         );
 
         Ok(())
+    }
+
+    /// Open a recovery window for a channel whose funding did not complete (#357).
+    ///
+    /// `funded_participant` is the side whose funding transaction is confirmed;
+    /// the other side is recorded as owing the outstanding amount. The funded
+    /// side must authorise the record because its funds are the ones at risk.
+    /// While the record is pending, state-changing entrypoints are refused with
+    /// [`PaymentChannelError::ChannelAwaitingFunding`]. The channel state
+    /// itself is not modified here, so callers that never open a recovery keep
+    /// the existing behaviour. `timeout` is interpreted as a ledger count to
+    /// match the deadline check.
+    pub fn open_funding_recovery(
+        env: Env,
+        channel_id: BytesN<32>,
+        funded_participant: Address,
+        outstanding: i128,
+    ) -> Result<FundingRecovery, PaymentChannelError> {
+        let state = state::get_channel_state(&env, &channel_id)?;
+        if state.is_cooperative_close || state.close_time != 0 {
+            return Err(PaymentChannelError::ChannelAlreadyClosed);
+        }
+        if state::has_active_htlcs(&env, &state.htlcs) {
+            return Err(PaymentChannelError::ActiveHtlcsExist);
+        }
+        if state::pending_funding_recovery(&env, &channel_id).is_some() {
+            return Err(PaymentChannelError::FundingRecoveryExists);
+        }
+        if funded_participant != state.participant_a && funded_participant != state.participant_b {
+            return Err(PaymentChannelError::UnauthorizedParticipant);
+        }
+        funded_participant.require_auth();
+
+        let (funded_balance, pending_participant) = if funded_participant == state.participant_a {
+            (state.balance_a, state.participant_b.clone())
+        } else {
+            (state.balance_b, state.participant_a.clone())
+        };
+        if funded_balance <= 0 {
+            return Err(PaymentChannelError::InvalidFundingAmount);
+        }
+
+        let recovery = FundingRecovery::new(
+            &env,
+            channel_id.clone(),
+            funded_participant,
+            pending_participant,
+            outstanding,
+            state.timeout,
+        )?;
+        state::store_funding_recovery(&env, &channel_id, &recovery);
+        env.events().publish(
+            ("funding_recovery_opened", channel_id),
+            (recovery.opened_at_ledger, recovery.deadline_ledger),
+        );
+        Ok(recovery)
+    }
+
+    /// Complete a pending recovery by supplying exactly the outstanding amount.
+    ///
+    /// Only the pending participant may call this, and only before the
+    /// deadline. A retry with the same amount after success is a no-op. The
+    /// channel balances and the recovery record are written together, so a
+    /// failed call cannot leave a half-applied top-up.
+    pub fn complete_funding_recovery(
+        env: Env,
+        channel_id: BytesN<32>,
+        amount: i128,
+    ) -> Result<(), PaymentChannelError> {
+        let recovery = state::get_funding_recovery(&env, &channel_id)?;
+        match recovery.resolution {
+            FundingResolution::Completed => {
+                return if recovery.outstanding == amount {
+                    Ok(())
+                } else {
+                    Err(PaymentChannelError::FundingAmountMismatch)
+                };
+            }
+            FundingResolution::Aborted => return Err(PaymentChannelError::InvalidChannelState),
+            FundingResolution::Pending => {}
+        }
+        if amount != recovery.outstanding {
+            return Err(PaymentChannelError::FundingAmountMismatch);
+        }
+        if recovery.is_expired(env.ledger().sequence()) {
+            return Err(PaymentChannelError::FundingRecoveryExpired);
+        }
+        recovery.pending_participant.require_auth();
+
+        let mut state = state::get_channel_state(&env, &channel_id)?;
+        if state.is_cooperative_close || state.close_time != 0 {
+            return Err(PaymentChannelError::ChannelAlreadyClosed);
+        }
+        if recovery.pending_participant == state.participant_a {
+            state.balance_a = state
+                .balance_a
+                .checked_add(amount)
+                .ok_or(PaymentChannelError::InvalidBalance)?;
+        } else {
+            state.balance_b = state
+                .balance_b
+                .checked_add(amount)
+                .ok_or(PaymentChannelError::InvalidBalance)?;
+        }
+        state.total_balance = state
+            .total_balance
+            .checked_add(amount)
+            .ok_or(PaymentChannelError::BalanceMismatch)?;
+        state.sequence_number += 1;
+
+        let mut resolved = recovery;
+        resolved.resolution = FundingResolution::Completed;
+        state::store_channel_state(&env, &channel_id, &state);
+        state::store_funding_recovery(&env, &channel_id, &resolved);
+        env.events()
+            .publish(("funding_recovery_completed", channel_id), amount);
+        Ok(())
+    }
+
+    /// Abort a pending recovery once its deadline has passed.
+    ///
+    /// Only the funded participant may call this. The channel is marked closed
+    /// and the recovery is marked aborted in the same write; the actual return
+    /// of the locked asset is handled by the funding transaction's own refund
+    /// path, which this state change records. A retry after success is a no-op.
+    pub fn abort_funding_recovery(
+        env: Env,
+        channel_id: BytesN<32>,
+    ) -> Result<(), PaymentChannelError> {
+        let recovery = state::get_funding_recovery(&env, &channel_id)?;
+        match recovery.resolution {
+            FundingResolution::Aborted => return Ok(()),
+            FundingResolution::Completed => return Err(PaymentChannelError::InvalidChannelState),
+            FundingResolution::Pending => {}
+        }
+        if !recovery.is_expired(env.ledger().sequence()) {
+            return Err(PaymentChannelError::FundingDeadlineNotReached);
+        }
+        recovery.funded_participant.require_auth();
+
+        let mut state = state::get_channel_state(&env, &channel_id)?;
+        if state.is_cooperative_close || state.close_time != 0 {
+            return Err(PaymentChannelError::ChannelAlreadyClosed);
+        }
+        state.sequence_number += 1;
+        state.is_cooperative_close = true;
+        state.close_sequence = state.sequence_number;
+        state.close_time = env.ledger().timestamp();
+
+        let mut resolved = recovery;
+        resolved.resolution = FundingResolution::Aborted;
+        state::store_channel_state(&env, &channel_id, &state);
+        state::store_funding_recovery(&env, &channel_id, &resolved);
+        env.events()
+            .publish(("funding_recovery_aborted", channel_id), state.close_time);
+        Ok(())
+    }
+
+    /// The funding recovery record for a channel, if one was opened.
+    pub fn get_funding_recovery(
+        env: Env,
+        channel_id: BytesN<32>,
+    ) -> Result<FundingRecovery, PaymentChannelError> {
+        state::get_funding_recovery(&env, &channel_id)
     }
 
     /// Get all HTLCs for a channel

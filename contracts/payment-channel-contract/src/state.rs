@@ -11,7 +11,7 @@
 use soroban_sdk::{contracttype, Address, BytesN, Env, Map, TryFromVal, Val, Vec};
 
 use crate::error::PaymentChannelError;
-use crate::types::{ChannelState, ChannelStats, HTLCInfo};
+use crate::types::{ChannelState, ChannelStats, FundingRecovery, FundingResolution, HTLCInfo};
 
 /// Storage key enum for all stored data
 #[contracttype]
@@ -20,6 +20,7 @@ pub enum StorageKey {
     Channel(BytesN<32>),
     ParticipantChannels(Address),
     ChannelStats(BytesN<32>),
+    FundingRecovery(BytesN<32>),
 }
 
 /// Store channel state
@@ -42,6 +43,31 @@ pub fn get_channel_state(
         .instance()
         .get(&StorageKey::Channel(channel_id.clone()))
         .ok_or(PaymentChannelError::ChannelNotFound)
+}
+
+/// Store a funding recovery record separately from the channel state (#357).
+pub fn store_funding_recovery(env: &Env, channel_id: &BytesN<32>, recovery: &FundingRecovery) {
+    env.storage()
+        .instance()
+        .set(&StorageKey::FundingRecovery(channel_id.clone()), recovery);
+}
+
+/// Retrieve a funding recovery record.
+pub fn get_funding_recovery(
+    env: &Env,
+    channel_id: &BytesN<32>,
+) -> Result<FundingRecovery, PaymentChannelError> {
+    env.storage()
+        .instance()
+        .get(&StorageKey::FundingRecovery(channel_id.clone()))
+        .ok_or(PaymentChannelError::FundingRecoveryNotFound)
+}
+
+/// The unresolved recovery for a channel, if any.
+pub fn pending_funding_recovery(env: &Env, channel_id: &BytesN<32>) -> Option<FundingRecovery> {
+    get_funding_recovery(env, channel_id)
+        .ok()
+        .filter(|recovery| recovery.resolution == FundingResolution::Pending)
 }
 
 /// Delete channel state from storage
@@ -245,6 +271,39 @@ mod tests {
             let stored = ChannelStats::default();
             store_channel_stats(&env, &id, &stored);
             assert_eq!(get_channel_stats(&env, &id), stored);
+        });
+    }
+
+    #[test]
+    fn funding_recovery_round_trips_and_only_pending_is_reported() {
+        let env = Env::default();
+        let contract = deploy(&env);
+        let id = channel_id(&env);
+        let recovery = FundingRecovery::new(
+            &env,
+            id.clone(),
+            Address::generate(&env),
+            Address::generate(&env),
+            500,
+            100,
+        )
+        .expect("valid recovery");
+
+        in_contract(&env, &contract, || {
+            assert!(pending_funding_recovery(&env, &id).is_none());
+            assert_eq!(
+                get_funding_recovery(&env, &id).unwrap_err(),
+                PaymentChannelError::FundingRecoveryNotFound
+            );
+
+            store_funding_recovery(&env, &id, &recovery);
+            assert_eq!(get_funding_recovery(&env, &id).unwrap(), recovery);
+            assert_eq!(pending_funding_recovery(&env, &id), Some(recovery.clone()));
+
+            let mut completed = recovery.clone();
+            completed.resolution = FundingResolution::Completed;
+            store_funding_recovery(&env, &id, &completed);
+            assert!(pending_funding_recovery(&env, &id).is_none());
         });
     }
 
