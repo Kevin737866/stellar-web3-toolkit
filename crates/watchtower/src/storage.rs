@@ -14,6 +14,18 @@ use tracing::{debug, info};
 /// A watchtower writes continuously -- a state and an update per channel per
 /// scan, plus an alert per incident -- so without retention the store grows
 /// with uptime rather than with the number of channels being watched.
+///
+/// Justice action records are the most sensitive part of the store: they
+/// contain breach evidence and are written before every justice transaction
+/// submission. Without a retention policy the action log grows without bound
+/// as the watchtower monitors channels over time, and old `Submitted` or
+/// `Confirmed` records that are no longer needed for recovery consume storage
+/// indefinitely. The fields `max_justice_actions` and
+/// `justice_action_retention_secs` bound that growth.
+///
+/// Only actions whose status is `Submitted`, `Confirmed`, or `Failed` are
+/// eligible for expiry. `Pending` actions are always kept regardless of age,
+/// because they still need to be retried.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompactionPolicy {
     /// Keep at most this many alerts, newest first.
@@ -26,6 +38,17 @@ pub struct CompactionPolicy {
     pub update_retention_secs: u64,
     /// Keep at most this many cached channel updates, newest first.
     pub max_channel_updates: usize,
+    /// Keep at most this many finalised justice action records (those with
+    /// status `Submitted`, `Confirmed`, or `Failed`). `Pending` actions are
+    /// never counted against this limit.
+    ///
+    /// A value of 0 disables the count-based limit for justice actions.
+    pub max_justice_actions: usize,
+    /// Drop finalised justice action records older than this many seconds.
+    ///
+    /// A value of 0 disables the age-based limit for justice actions.
+    /// `Pending` actions are never dropped regardless of age.
+    pub justice_action_retention_secs: u64,
 }
 
 impl Default for CompactionPolicy {
@@ -35,6 +58,10 @@ impl Default for CompactionPolicy {
             alert_retention_secs: 7 * 24 * 60 * 60, // one week
             update_retention_secs: 24 * 60 * 60,    // one day
             max_channel_updates: 10_000,
+            // Keep finalised justice action records for 90 days and no more
+            // than 100 000 of them. Pending actions are always kept.
+            max_justice_actions: 100_000,
+            justice_action_retention_secs: 90 * 24 * 60 * 60, // 90 days
         }
     }
 }
@@ -52,6 +79,10 @@ pub struct CompactionReport {
     pub channel_updates_after: usize,
     /// Duplicate subscriptions collapsed during the pass.
     pub subscriptions_deduplicated: usize,
+    /// Justice action records before the pass.
+    pub justice_actions_before: usize,
+    /// Justice action records after the pass.
+    pub justice_actions_after: usize,
 }
 
 impl CompactionReport {
@@ -66,9 +97,18 @@ impl CompactionReport {
             .saturating_sub(self.channel_updates_after)
     }
 
+    /// Justice action records removed by the pass.
+    pub fn justice_actions_removed(&self) -> usize {
+        self.justice_actions_before
+            .saturating_sub(self.justice_actions_after)
+    }
+
     /// Everything the pass removed.
     pub fn total_removed(&self) -> usize {
-        self.alerts_removed() + self.channel_updates_removed() + self.subscriptions_deduplicated
+        self.alerts_removed()
+            + self.channel_updates_removed()
+            + self.subscriptions_deduplicated
+            + self.justice_actions_removed()
     }
 
     /// Whether the pass changed anything.
@@ -352,6 +392,59 @@ impl StorageBackend for InMemoryStorage {
             report.channel_updates_removed()
         );
 
+        // Justice actions: expire finalised records (Submitted / Confirmed /
+        // Failed) that are beyond the age or count limit. Pending actions are
+        // always kept: they still need to be retried and must never be silently
+        // dropped.
+        {
+            let mut actions = self.justice_actions.write();
+            report.justice_actions_before = actions.len();
+
+            // Age-based pass: drop non-Pending actions older than the window.
+            if policy.justice_action_retention_secs > 0 {
+                let cutoff = now.saturating_sub(policy.justice_action_retention_secs);
+                actions.retain(|_, action| {
+                    action.status == crate::justice::ActionStatus::Pending
+                        || action.updated_at >= cutoff
+                });
+            }
+
+            // Count-based pass: evict the oldest finalised actions beyond the
+            // limit. We sort by `updated_at` ascending (oldest first) and evict
+            // from the front while there are more finalised records than
+            // `max_justice_actions`.
+            if policy.max_justice_actions > 0 {
+                let finalised_count = actions
+                    .values()
+                    .filter(|a| a.status != crate::justice::ActionStatus::Pending)
+                    .count();
+
+                if finalised_count > policy.max_justice_actions {
+                    let excess = finalised_count - policy.max_justice_actions;
+
+                    // Collect (id, updated_at) for all finalised records,
+                    // sorted oldest first.
+                    let mut by_age: Vec<(String, u64)> = actions
+                        .iter()
+                        .filter(|(_, a)| a.status != crate::justice::ActionStatus::Pending)
+                        .map(|(id, a)| (id.clone(), a.updated_at))
+                        .collect();
+                    by_age.sort_by_key(|(_, ts)| *ts);
+
+                    for (id, _) in by_age.into_iter().take(excess) {
+                        actions.remove(&id);
+                    }
+                }
+            }
+
+            report.justice_actions_after = actions.len();
+        }
+
+        debug!(
+            "Compacted watchtower justice actions: {} records removed",
+            report.justice_actions_removed()
+        );
+
         Ok(report)
     }
 
@@ -486,8 +579,13 @@ impl StorageBackend for SqliteStorage {
         // unconditionally, and a silent no-op here is preferable to making
         // every caller check which backend is in use.
         info!(
-            "SQLite: compact requested (max_alerts={}, alert_retention={}s, update_retention={}s)",
-            policy.max_alerts, policy.alert_retention_secs, policy.update_retention_secs
+            "SQLite: compact requested (max_alerts={}, alert_retention={}s, update_retention={}s, \
+             max_justice_actions={}, justice_action_retention={}s)",
+            policy.max_alerts,
+            policy.alert_retention_secs,
+            policy.update_retention_secs,
+            policy.max_justice_actions,
+            policy.justice_action_retention_secs,
         );
         Ok(CompactionReport::default())
     }
@@ -800,5 +898,207 @@ mod tests {
         storage.store_alert(&alert).unwrap();
         let alerts = storage.get_alerts(10).unwrap();
         assert_eq!(alerts.len(), 1);
+    }
+
+    // ── Justice action retention tests (issue #372) ───────────────────────────
+
+    fn submitted_action(id: &str, updated_at: u64) -> crate::justice::JusticeAction {
+        use crate::justice::{ActionStatus, BreachEvidence, JusticeAction};
+        let mut action = JusticeAction::new(
+            id,
+            BreachEvidence {
+                channel_id: "ch1".to_string(),
+                breach_tx_hash: "btx".to_string(),
+                detected_at: 1000,
+                old_sequence: 1,
+                new_sequence: 2,
+                total_balance: 2000,
+            },
+        );
+        action.status = ActionStatus::Submitted;
+        action.updated_at = updated_at;
+        action
+    }
+
+    fn pending_action(id: &str, updated_at: u64) -> crate::justice::JusticeAction {
+        use crate::justice::{BreachEvidence, JusticeAction};
+        let mut action = JusticeAction::new(
+            id,
+            BreachEvidence {
+                channel_id: "ch1".to_string(),
+                breach_tx_hash: "btx".to_string(),
+                detected_at: 1000,
+                old_sequence: 1,
+                new_sequence: 2,
+                total_balance: 2000,
+            },
+        );
+        // updated_at is set by new(); overwrite for reproducible timestamps.
+        action.updated_at = updated_at;
+        action
+    }
+
+    #[test]
+    fn compaction_drops_finalised_justice_actions_past_the_retention_window() {
+        let storage = InMemoryStorage::new();
+        let now = current_timestamp();
+
+        storage
+            .store_justice_action(&submitted_action("old", now - 2 * DAY))
+            .unwrap();
+        storage
+            .store_justice_action(&submitted_action("fresh", now))
+            .unwrap();
+
+        let report = storage
+            .compact(&CompactionPolicy {
+                justice_action_retention_secs: DAY,
+                ..CompactionPolicy::default()
+            })
+            .unwrap();
+
+        assert_eq!(report.justice_actions_before, 2);
+        assert_eq!(report.justice_actions_after, 1);
+        assert_eq!(report.justice_actions_removed(), 1);
+        assert!(storage.get_justice_action("old").unwrap().is_none());
+        assert!(storage.get_justice_action("fresh").unwrap().is_some());
+    }
+
+    #[test]
+    fn compaction_never_drops_pending_actions_regardless_of_age() {
+        let storage = InMemoryStorage::new();
+        // Planted with an ancient timestamp so the age pass would remove it if
+        // the pending guard were absent.
+        storage
+            .store_justice_action(&pending_action("ancient-pending", 0))
+            .unwrap();
+
+        let report = storage
+            .compact(&CompactionPolicy {
+                justice_action_retention_secs: 1, // drop anything older than 1 second
+                ..CompactionPolicy::default()
+            })
+            .unwrap();
+
+        assert_eq!(report.justice_actions_removed(), 0);
+        assert!(storage.get_justice_action("ancient-pending").unwrap().is_some());
+    }
+
+    #[test]
+    fn compaction_keeps_the_newest_finalised_actions_up_to_the_limit() {
+        let storage = InMemoryStorage::new();
+        let now = current_timestamp();
+
+        // Five finalised actions, newest = now, oldest = now - 4.
+        for i in (0..5u64).rev() {
+            storage
+                .store_justice_action(&submitted_action(&format!("a{i}"), now - i))
+                .unwrap();
+        }
+
+        let report = storage
+            .compact(&CompactionPolicy {
+                max_justice_actions: 2,
+                justice_action_retention_secs: 365 * DAY,
+                ..CompactionPolicy::default()
+            })
+            .unwrap();
+
+        assert_eq!(report.justice_actions_removed(), 3);
+        assert_eq!(report.justice_actions_after, 2);
+
+        // The two kept records must be the freshest ones.
+        assert!(storage.get_justice_action("a0").unwrap().is_some()); // newest (now)
+        assert!(storage.get_justice_action("a1").unwrap().is_some()); // second newest
+        assert!(storage.get_justice_action("a4").unwrap().is_none()); // oldest
+    }
+
+    #[test]
+    fn compaction_pending_actions_do_not_count_toward_the_limit() {
+        let storage = InMemoryStorage::new();
+        let now = current_timestamp();
+
+        // One finalised and one pending.
+        storage
+            .store_justice_action(&submitted_action("done", now))
+            .unwrap();
+        storage
+            .store_justice_action(&pending_action("waiting", now))
+            .unwrap();
+
+        // Limit is 1 — only the finalised record is eligible.
+        let report = storage
+            .compact(&CompactionPolicy {
+                max_justice_actions: 1,
+                justice_action_retention_secs: 365 * DAY,
+                ..CompactionPolicy::default()
+            })
+            .unwrap();
+
+        // Neither should be dropped: exactly one finalised record fits in limit 1.
+        assert_eq!(report.justice_actions_removed(), 0);
+        assert!(storage.get_justice_action("done").unwrap().is_some());
+        assert!(storage.get_justice_action("waiting").unwrap().is_some());
+    }
+
+    #[test]
+    fn zero_retention_secs_disables_the_age_based_pass() {
+        let storage = InMemoryStorage::new();
+        // A very old action that would be removed if retention was active.
+        storage
+            .store_justice_action(&submitted_action("old", 0))
+            .unwrap();
+
+        let report = storage
+            .compact(&CompactionPolicy {
+                justice_action_retention_secs: 0, // disabled
+                max_justice_actions: 1_000_000,  // generous limit
+                ..CompactionPolicy::default()
+            })
+            .unwrap();
+
+        assert_eq!(report.justice_actions_removed(), 0);
+        assert!(storage.get_justice_action("old").unwrap().is_some());
+    }
+
+    #[test]
+    fn zero_max_justice_actions_disables_the_count_based_pass() {
+        let storage = InMemoryStorage::new();
+        let now = current_timestamp();
+
+        for i in 0..10u64 {
+            storage
+                .store_justice_action(&submitted_action(&format!("a{i}"), now))
+                .unwrap();
+        }
+
+        let report = storage
+            .compact(&CompactionPolicy {
+                max_justice_actions: 0,                     // disabled
+                justice_action_retention_secs: 365 * DAY,  // keep anything recent
+                ..CompactionPolicy::default()
+            })
+            .unwrap();
+
+        assert_eq!(report.justice_actions_removed(), 0);
+    }
+
+    #[test]
+    fn justice_action_retention_reported_in_total_removed() {
+        let storage = InMemoryStorage::new();
+        storage
+            .store_justice_action(&submitted_action("old", 0))
+            .unwrap();
+
+        let report = storage
+            .compact(&CompactionPolicy {
+                justice_action_retention_secs: 1,
+                ..CompactionPolicy::default()
+            })
+            .unwrap();
+
+        assert_eq!(report.justice_actions_removed(), 1);
+        assert!(report.total_removed() >= 1);
+        assert!(!report.is_noop());
     }
 }
