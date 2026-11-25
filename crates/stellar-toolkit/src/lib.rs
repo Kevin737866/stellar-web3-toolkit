@@ -38,6 +38,8 @@ pub mod ts_codegen;
 pub mod wallet;
 pub mod wasm_provenance;
 
+pub use wallet::{AllowedNetwork, fund_account_on};
+
 pub use anomaly::{
     catalog as anomaly_catalog, AnomalyDetector, AnomalyReport, AnomalyRule, Baseline, Direction,
     MetricVerdict, Series,
