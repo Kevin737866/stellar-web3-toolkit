@@ -24,7 +24,7 @@
 //! ```
 
 use crate::monitor::BreachAttempt;
-use crate::storage::{StorageBackend, StorageError};
+use crate::storage::StorageBackend;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use thiserror::Error;
@@ -222,9 +222,9 @@ impl JusticeService {
         let action_id = uuid_v4();
         let mut action = JusticeAction::new(action_id, evidence.clone());
 
-        self.storage
-            .store_justice_action(&action)
-            .map_err(|e| JusticeError::BuildError(format!("failed to persist justice action: {e}")))?;
+        self.storage.store_justice_action(&action).map_err(|e| {
+            JusticeError::BuildError(format!("failed to persist justice action: {e}"))
+        })?;
 
         info!(
             "Justice action {} persisted (Pending) for channel {}",
@@ -559,8 +559,7 @@ mod tests {
 
     #[test]
     fn test_justice_transaction_creation() {
-        let _service =
-            JusticeService::new("http://localhost".to_string(), "test".to_string(), 100_000);
+        let _service = service();
 
         let _breach = valid_breach();
     }
@@ -786,11 +785,13 @@ mod tests {
         let action = JusticeAction::new("retry-test-action", evidence);
         storage.store_justice_action(&action).unwrap();
 
+        let concrete: Arc<crate::storage::InMemoryStorage> = Arc::clone(&storage);
+        let backend: Arc<dyn StorageBackend> = concrete;
         let service = JusticeService::new(
             "http://localhost".to_string(),
             "test".to_string(),
             100_000,
-            Arc::clone(&storage),
+            backend,
         );
 
         // Pending actions exist before retry.
