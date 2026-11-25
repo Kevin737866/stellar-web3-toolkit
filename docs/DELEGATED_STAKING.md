@@ -110,6 +110,24 @@ Things worth knowing before setting parameters:
 - A position that is fully emptied (no principal, no accrual, no auto-compound
   flag) is deleted, and its entry is removed from the delegator's operator list.
 
+## Reward transfer validation
+
+Reward token movements are verified before accounting is committed:
+
+- `fund_rewards` transfers the reward tokens in, then checks that the contract's
+  balance rose by exactly `amount`. A token that reports success without moving
+  funds is rejected, so `rewards_funded` cannot credit rewards the contract does
+  not hold.
+- `claim` checks the full payout (delegator net plus operator commission) against
+  `rewards_credited`, performs both transfers, and verifies each recipient's
+  balance rose by exactly the expected amount before writing `rewards_paid_out`
+  or clearing the position's accrual. `compound` and auto-compounding apply the
+  same check to the commission they pay out.
+
+These checks do not change the public interface or the stored data layout. They
+only make a non-conforming reward token fail loudly at the transfer instead of
+leaving the books claiming a payment that never moved.
+
 ## Running the tests
 
 ```bash
