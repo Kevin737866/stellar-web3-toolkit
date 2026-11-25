@@ -11,9 +11,11 @@
 //! - Automated justice transaction submission
 //! - Alert notification system
 //! - Health checks for the storage backends that hold breach evidence
+//! - Signed operator recovery bundles for key and data recovery
 
 pub mod justice;
 pub mod monitor;
+pub mod recovery;
 pub mod storage;
 
 use parking_lot::RwLock;
@@ -589,6 +591,149 @@ impl Watchtower {
         self.justice.retry_pending_actions().await
     }
 
+    /// Export a signed snapshot of the durable watchtower data (issue #377).
+    ///
+    /// The bundle covers subscriptions, channel states and updates, alerts and
+    /// every persisted justice action. It is signed with `key`; the key itself
+    /// is never written into the bundle, storage or logs.
+    pub fn export_recovery_bundle(
+        &self,
+        key: &recovery::OperatorKey,
+    ) -> Result<recovery::RecoveryBundle, WatchtowerError> {
+        let subscriptions = self.storage.get_subscriptions()?;
+        let mut channel_states = Vec::with_capacity(subscriptions.len());
+        let mut channel_updates = Vec::with_capacity(subscriptions.len());
+        for channel_id in &subscriptions {
+            if let Some(state) = self.storage.get_channel_state(channel_id)? {
+                channel_states.push(state);
+            }
+            if let Some(update) = self.storage.get_channel_update(channel_id)? {
+                channel_updates.push(update);
+            }
+        }
+
+        let payload = recovery::RecoveryPayload {
+            version: recovery::RECOVERY_FORMAT_VERSION,
+            created_at: current_timestamp(),
+            network_passphrase: self.config.network_passphrase.clone(),
+            subscriptions,
+            channel_states,
+            channel_updates,
+            alerts: self.storage.get_alerts(usize::MAX)?,
+            justice_actions: self.storage.get_all_justice_actions()?,
+        };
+
+        info!(
+            "Exported recovery bundle with key fingerprint {}: {} subscriptions, {} alerts, {} justice actions",
+            key.fingerprint(),
+            payload.subscriptions.len(),
+            payload.alerts.len(),
+            payload.justice_actions.len()
+        );
+
+        Ok(recovery::RecoveryBundle::new(payload, key))
+    }
+
+    /// Restore a watchtower from a verified bundle using a fresh store chosen
+    /// by `config.db_path` (issue #377).
+    ///
+    /// Signature, format version, passphrase and record invariants are checked
+    /// before any write. A mismatched key or network leaves the target store
+    /// untouched.
+    pub fn restore_from_bundle(
+        config: WatchtowerConfig,
+        key: &recovery::OperatorKey,
+        bundle: &recovery::RecoveryBundle,
+    ) -> Result<Self, WatchtowerError> {
+        let storage: Arc<dyn storage::StorageBackend> = match &config.db_path {
+            Some(path) => Arc::new(storage::SqliteStorage::new(path)?),
+            None => Arc::new(storage::InMemoryStorage::new()),
+        };
+        Self::restore_from_bundle_with_storage(config, key, bundle, storage)
+    }
+
+    /// Restore from a verified bundle into a caller-supplied empty backend.
+    ///
+    /// The backend must be empty; recovery never overwrites an existing store.
+    /// On any failure the partially written store is discarded instead of being
+    /// exposed as a restored watchtower.
+    pub fn restore_from_bundle_with_storage(
+        config: WatchtowerConfig,
+        key: &recovery::OperatorKey,
+        bundle: &recovery::RecoveryBundle,
+        storage: Arc<dyn storage::StorageBackend>,
+    ) -> Result<Self, WatchtowerError> {
+        bundle.verify(key)?;
+        if bundle.payload.network_passphrase != config.network_passphrase {
+            return Err(recovery::RecoveryError::Configuration(format!(
+                "bundle is for network '{}', but config targets '{}'",
+                bundle.payload.network_passphrase, config.network_passphrase
+            ))
+            .into());
+        }
+        Self::ensure_recovery_target_is_empty(&storage)?;
+
+        for channel_id in &bundle.payload.subscriptions {
+            storage.store_subscription(channel_id)?;
+        }
+        for state in &bundle.payload.channel_states {
+            storage.store_channel_state(&state.channel_id, state)?;
+        }
+        for update in &bundle.payload.channel_updates {
+            storage.store_channel_update(update)?;
+        }
+        for alert in &bundle.payload.alerts {
+            storage.store_alert(alert)?;
+        }
+        for action in &bundle.payload.justice_actions {
+            storage.store_justice_action(action)?;
+        }
+
+        let watchtower = Self::with_storage(config, storage)?;
+        watchtower
+            .state
+            .subscribed_channels
+            .write()
+            .extend(bundle.payload.subscriptions.iter().cloned());
+        watchtower.state.channel_states.write().extend(
+            bundle
+                .payload
+                .channel_states
+                .iter()
+                .map(|state| (state.channel_id.clone(), state.clone())),
+        );
+        watchtower
+            .state
+            .recent_alerts
+            .write()
+            .extend(bundle.payload.alerts.iter().cloned());
+
+        info!(
+            "Restored recovery bundle with key fingerprint {}: {} subscriptions, {} alerts, {} justice actions",
+            key.fingerprint(),
+            bundle.payload.subscriptions.len(),
+            bundle.payload.alerts.len(),
+            bundle.payload.justice_actions.len()
+        );
+
+        Ok(watchtower)
+    }
+
+    fn ensure_recovery_target_is_empty(
+        storage: &Arc<dyn storage::StorageBackend>,
+    ) -> Result<(), WatchtowerError> {
+        if !storage.get_subscriptions()?.is_empty()
+            || !storage.get_alerts(1)?.is_empty()
+            || !storage.get_all_justice_actions()?.is_empty()
+        {
+            return Err(recovery::RecoveryError::Storage(
+                "recovery target must be a fresh, empty storage backend".to_string(),
+            )
+            .into());
+        }
+        Ok(())
+    }
+
     /// Get current watchtower status
     pub fn status(&self) -> WatchtowerStatus {
         let stats = self.state.stats.read();
@@ -795,6 +940,15 @@ impl From<monitor::MonitorError> for WatchtowerError {
 impl From<justice::JusticeError> for WatchtowerError {
     fn from(e: justice::JusticeError) -> Self {
         WatchtowerError::JusticeFailed(e.to_string())
+    }
+}
+
+impl From<recovery::RecoveryError> for WatchtowerError {
+    fn from(error: recovery::RecoveryError) -> Self {
+        match error {
+            recovery::RecoveryError::Storage(reason) => WatchtowerError::StorageError(reason),
+            other => WatchtowerError::InvalidConfiguration(other.to_string()),
+        }
     }
 }
 
