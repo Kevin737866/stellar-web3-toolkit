@@ -777,15 +777,38 @@ impl Watchtower {
 }
 
 impl WatchtowerState {
-    /// Add an alert to the recent alerts list
-    pub fn add_alert(&self, alert: Alert) {
+    /// Add an alert to the recent alerts list, deduplicating identical
+    /// [`AlertType::BreachAttempt`] notifications.
+    ///
+    /// Returns `true` if the alert was recorded, or `false` if an identical
+    /// breach notification was already present. Non-breach alerts are always
+    /// recorded and return `true`.
+    pub fn add_alert_dedup(&self, alert: Alert) -> bool {
         let mut alerts = self.recent_alerts.write();
+        if matches!(alert.alert_type, AlertType::BreachAttempt { .. })
+            && alerts
+                .iter()
+                .any(|existing| existing.alert_type == alert.alert_type)
+        {
+            return false;
+        }
+
         alerts.push(alert);
 
         // Keep only last 1000 alerts
         if alerts.len() > 1000 {
             alerts.drain(0..500);
         }
+        true
+    }
+
+    /// Add an alert to the recent alerts list.
+    ///
+    /// Duplicate [`AlertType::BreachAttempt`] notifications are suppressed via
+    /// [`Self::add_alert_dedup`]; all other alert types preserve existing
+    /// append behavior.
+    pub fn add_alert(&self, alert: Alert) {
+        let _ = self.add_alert_dedup(alert);
     }
 
     /// Apply a channel update to the in-memory state and persist both the
@@ -1192,5 +1215,50 @@ mod tests {
             .unwrap()
             .expect("state should be persisted");
         assert_eq!(state.last_known_sequence, 4);
+    }
+
+    #[test]
+    fn duplicate_breach_alert_is_deduplicated() {
+        let watchtower = Watchtower::new(WatchtowerConfig::default()).unwrap();
+        let first = Alert::breach_attempt("channel-dup".to_string(), 2, 5);
+        let duplicate = Alert::breach_attempt("channel-dup".to_string(), 2, 5);
+
+        assert!(watchtower.state().add_alert_dedup(first));
+        assert!(!watchtower.state().add_alert_dedup(duplicate));
+        assert_eq!(watchtower.get_alerts(10).len(), 1);
+    }
+
+    #[test]
+    fn distinct_breach_alerts_are_not_deduplicated() {
+        let watchtower = Watchtower::new(WatchtowerConfig::default()).unwrap();
+        assert!(watchtower
+            .state()
+            .add_alert_dedup(Alert::breach_attempt("channel-a".to_string(), 2, 5)));
+        assert!(watchtower
+            .state()
+            .add_alert_dedup(Alert::breach_attempt("channel-a".to_string(), 3, 5)));
+        assert!(watchtower
+            .state()
+            .add_alert_dedup(Alert::breach_attempt("channel-b".to_string(), 2, 5)));
+        assert_eq!(watchtower.get_alerts(10).len(), 3);
+    }
+
+    #[test]
+    fn non_breach_alerts_preserve_existing_behavior() {
+        let watchtower = Watchtower::new(WatchtowerConfig::default()).unwrap();
+        let health = || Alert {
+            id: "h1".to_string(),
+            alert_type: AlertType::HealthCheckFailed {
+                component: "rpc".to_string(),
+                error: "timeout".to_string(),
+            },
+            severity: AlertSeverity::Warning,
+            timestamp: current_timestamp(),
+            context: serde_json::json!({}),
+        };
+
+        assert!(watchtower.state().add_alert_dedup(health()));
+        assert!(watchtower.state().add_alert_dedup(health()));
+        assert_eq!(watchtower.get_alerts(10).len(), 2);
     }
 }
