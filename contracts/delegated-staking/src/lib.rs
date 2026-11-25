@@ -372,8 +372,12 @@ fn take_accrued(cfg: &Config, position: &mut Position, commission_bps: u32) -> (
     (net, commission)
 }
 
-/// Re-stakes a position's accrued rewards in place when auto-compound is on.
-/// Returns the amount compounded.
+/// Settles a position's accrued rewards and, when `auto_compound` is on,
+/// re-stakes the net reward in place.
+///
+/// Always settles first even when `auto_compound` is off so that subsequent
+/// balance changes (`delegate` or `undelegate`) only apply to future
+/// intervals rather than retroactively scaling prior intervals.
 fn auto_compound(
     env: &Env,
     cfg: &mut Config,
@@ -381,6 +385,7 @@ fn auto_compound(
     operator: &mut Operator,
 ) -> i128 {
     if !position.auto_compound {
+        settle(cfg, position);
         return 0;
     }
     let (net, commission) = take_accrued(cfg, position, operator.commission_bps);
@@ -679,8 +684,11 @@ impl DelegatedStaking {
 
     // -- delegator actions ---------------------------------------------------
 
-    /// Delegates `amount` to `operator`. When auto-compound is on, rewards
-    /// accrued so far are re-staked first, so the new stake also earns on them.
+    /// Delegates `amount` to `operator`.
+    ///
+    /// Rewards accrued over any prior deposit interval are always settled first
+    /// (and re-staked when auto-compound is on), so the new stake only accrues
+    /// rewards from this timestamp onward.
     pub fn delegate(env: Env, delegator: Address, operator: Address, amount: i128) -> i128 {
         delegator.require_auth();
         assert!(amount > 0, "amount must be positive");

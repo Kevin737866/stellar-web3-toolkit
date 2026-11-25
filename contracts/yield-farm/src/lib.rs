@@ -716,6 +716,10 @@ impl YieldFarm {
     // -- user actions --------------------------------------------------------
 
     /// Deposits `amount` of a pool's LP token and settles any pending reward.
+    ///
+    /// Settling before increasing `position.amount` ensures rewards from prior
+    /// deposit intervals are locked in at the previous stake rather than
+    /// retroactively scaled to the new balance.
     pub fn deposit(env: Env, user: Address, pool_id: u32, amount: i128) -> i128 {
         user.require_auth();
         assert!(amount > 0, "amount must be positive");
