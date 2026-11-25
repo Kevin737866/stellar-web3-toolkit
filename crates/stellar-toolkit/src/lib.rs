@@ -90,7 +90,8 @@ pub use presigned_deploy::{
 };
 pub use scaffolder::{LintFinding, LintReport, LintSeverity, ScaffoldOptions, Scaffolder};
 pub use session_keys::{
-    AccountAbstractionManager, Guardian, RecoveryRequest, RecoveryVeto, SessionError, SessionKey,
+    format_active_session_summaries, format_unix_timestamp_utc, AccountAbstractionManager,
+    Guardian, RecoveryRequest, RecoveryVeto, SessionError, SessionKey, SessionKeySummary,
     SessionPolicy, VetoGuardian,
 };
 pub use signal_sync::{Signal, SignalSnapshot, SyncError, SyncReport, SNAPSHOT_VERSION};
