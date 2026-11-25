@@ -162,7 +162,12 @@ pub enum ScaffoldCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum GasCommand {
-    /// Estimate the fee for a transaction profile and print the fee bump ladder
+    /// Estimate the fee for a transaction profile and print the fee breakdown
+    ///
+    /// By default the command prints a human-readable fee breakdown table
+    /// followed by the fee bump ladder. Pass `--json` for a machine-readable
+    /// JSON report suitable for scripting and CI pipelines. Pass
+    /// `--breakdown-only` to suppress the bump ladder section.
     Estimate {
         /// Number of transaction operations
         #[arg(long, default_value_t = 1)]
@@ -188,6 +193,12 @@ pub enum GasCommand {
         /// Maximum number of fee bumps (overrides the default schedule)
         #[arg(long)]
         max_bumps: Option<u32>,
+        /// Print the fee breakdown as JSON instead of a human-readable table
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        /// Print only the fee breakdown table; suppress the bump ladder section
+        #[arg(long, default_value_t = false)]
+        breakdown_only: bool,
     },
 }
 
@@ -1338,7 +1349,7 @@ fn run_scaffold(cmd: &ScaffoldCommand) -> Result<()> {
 }
 
 fn run_gas(cmd: &GasCommand) -> Result<()> {
-    use crate::gas_simulator::{format_stroops, FeeSchedule, GasSimulator, TransactionProfile};
+    use crate::gas_simulator::{format_stroops, FeeEstimateReport, FeeSchedule, GasSimulator, TransactionProfile};
     match cmd {
         GasCommand::Estimate {
             operations,
@@ -1349,9 +1360,16 @@ fn run_gas(cmd: &GasCommand) -> Result<()> {
             base_fee,
             bump_percent,
             max_bumps,
+            json,
+            breakdown_only,
         } => {
             let mut schedule = FeeSchedule::testnet_default();
             if let Some(base_fee) = base_fee {
+                if *base_fee == 0 {
+                    return Err(ToolkitError::ExecutionError(
+                        "--base-fee must be greater than zero".to_string(),
+                    ));
+                }
                 schedule.base_fee_stroops = *base_fee;
             }
             if let Some(bump_percent) = bump_percent {
@@ -1360,7 +1378,6 @@ fn run_gas(cmd: &GasCommand) -> Result<()> {
             if let Some(max_bumps) = max_bumps {
                 schedule.max_bumps = *max_bumps;
             }
-            let base_fee = schedule.base_fee_stroops;
             let max_fee = schedule.max_fee_stroops;
 
             let simulator = GasSimulator::new(schedule);
@@ -1371,29 +1388,42 @@ fn run_gas(cmd: &GasCommand) -> Result<()> {
                 ledger_writes: *writes,
                 bid_ledgers: *bid_ledgers,
             };
-            let estimate = simulator.estimate(&profile);
-            let breakdown = estimate.breakdown;
+            let report = FeeEstimateReport::build(&simulator, profile);
+
+            if *json {
+                println!("{}", report.to_json()?);
+                return Ok(());
+            }
+
+            // ── Human-readable breakdown table ──────────────────────────────
+            let estimate = &report.estimate;
+            let breakdown = &estimate.breakdown;
+            let pct = &report.percents;
             println!("fee estimate for {} operation(s):", profile.operations);
             println!(
-                "  base fee      {:>10} stroops  ({})",
+                "  base fee      {:>10} stroops  ({})  {:>5.1}%",
                 breakdown.base_fee,
-                format_stroops(breakdown.base_fee)
+                format_stroops(breakdown.base_fee),
+                pct.base_fee_pct
             );
             println!(
-                "  resource fee  {:>10} stroops  ({})",
+                "  resource fee  {:>10} stroops  ({})  {:>5.1}%",
                 breakdown.resource_fee,
-                format_stroops(breakdown.resource_fee)
+                format_stroops(breakdown.resource_fee),
+                pct.resource_fee_pct
             );
             println!(
-                "  inclusion bid {:>10} stroops  ({}, {} ledger(s))",
+                "  inclusion bid {:>10} stroops  ({}, {} ledger(s))  {:>5.1}%",
                 breakdown.inclusion_bid,
                 format_stroops(breakdown.inclusion_bid),
-                estimate.bid_ledgers
+                estimate.bid_ledgers,
+                pct.inclusion_bid_pct
             );
             println!(
-                "  per operation {:>10} stroops  ({})",
+                "  per operation {:>10} stroops  ({})  {:>5.1}%",
                 breakdown.per_operation,
-                format_stroops(breakdown.per_operation)
+                format_stroops(breakdown.per_operation),
+                pct.per_operation_pct
             );
             println!(
                 "  total         {:>10} stroops  ({:.7} XLM)",
@@ -1401,16 +1431,12 @@ fn run_gas(cmd: &GasCommand) -> Result<()> {
                 estimate.total_xlm()
             );
 
-            let inner = estimate.total_stroops;
-            let bump = simulator.fee_bump(inner, inner, base_fee)?;
-            println!(
-                "resubmission at base fee {base_fee} stroops: outer fee {} stroops ({}), +{}% over the signed fee",
-                bump.fee_source_pays(),
-                format_stroops(bump.fee_source_pays()),
-                bump.percent_over_signed_fee()
-            );
+            if *breakdown_only {
+                return Ok(());
+            }
 
-            let ladder = simulator.bump_ladder(inner);
+            // ── Fee bump section ─────────────────────────────────────────────
+            let ladder = &report.bump_ladder;
             if ladder.is_empty() {
                 println!("fee bump ladder: no bump possible below the {max_fee} stroop cap");
             } else {
@@ -1429,7 +1455,7 @@ fn run_gas(cmd: &GasCommand) -> Result<()> {
                     );
                 }
             }
-            if !simulator.is_bumpable(inner) {
+            if !simulator.is_bumpable(estimate.total_stroops) {
                 println!("warning: current fee already sits on the {max_fee} stroop cap");
             }
             Ok(())
