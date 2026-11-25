@@ -79,11 +79,51 @@ pub enum ToolkitCommand {
     /// Session key management: revoke individual session keys (issue #334)
     #[command(subcommand)]
     Session(SessionCommand),
+    /// Deployment workflows, including submitting pre-signed deployment transactions
+    #[command(subcommand)]
+    Deploy(DeployCommand),
     /// Print the command overview wrapped to the terminal width
     Help {
         /// Wrap width in columns (defaults to $COLUMNS, otherwise 100)
         #[arg(long, default_value_t = 0)]
         width: usize,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DeployCommand {
+    /// Submit a pre-signed Soroban deployment transaction envelope XDR via RPC
+    SubmitPresigned {
+        /// Soroban RPC endpoint URL (http:// or https://)
+        #[arg(long)]
+        rpc_url: String,
+        /// Base64-encoded pre-signed transaction envelope XDR
+        #[arg(long, conflicts_with = "envelope_file")]
+        envelope_xdr: Option<String>,
+        /// File containing the base64-encoded pre-signed transaction envelope XDR
+        #[arg(long, conflicts_with = "envelope_xdr")]
+        envelope_file: Option<PathBuf>,
+        /// Optional network passphrase metadata to record in the receipt
+        #[arg(long)]
+        network_passphrase: Option<String>,
+        /// Optional local `.wasm` artifact path to verify before submission
+        #[arg(long)]
+        wasm: Option<PathBuf>,
+        /// Expected 64-character hex SHA-256 digest of `--wasm`
+        #[arg(long)]
+        expected_wasm_sha256: Option<String>,
+        /// Maximum retries for `TRY_AGAIN_LATER` or transient network errors
+        #[arg(long, default_value_t = crate::presigned_deploy::DEFAULT_MAX_RETRIES)]
+        max_retries: u32,
+        /// Per-attempt HTTP timeout in seconds
+        #[arg(long, default_value_t = crate::presigned_deploy::DEFAULT_TIMEOUT_SECS)]
+        timeout_secs: u64,
+        /// Optional path to write the JSON submission receipt atomically on success
+        #[arg(long)]
+        receipt_out: Option<PathBuf>,
+        /// Print the submission receipt as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 }
 
@@ -559,6 +599,7 @@ impl ToolkitCommand {
             Self::Verify(cmd) => run_verify(cmd),
             Self::Onboarding(cmd) => run_onboarding(cmd),
             Self::Session(cmd) => run_session(cmd),
+            Self::Deploy(cmd) => run_deploy(cmd),
             Self::Help { width } => {
                 let resolved = if *width == 0 {
                     help_text::help_width()
@@ -628,6 +669,92 @@ fn resolve_path(root: &Path, path: &Path) -> PathBuf {
         path.to_path_buf()
     } else {
         root.join(path)
+    }
+}
+
+fn run_deploy(cmd: &DeployCommand) -> Result<()> {
+    use crate::presigned_deploy::{
+        submit_presigned_deployment, PresignedDeployError, PresignedDeployRequest,
+        UreqRpcTransport, WasmArtifactCheck,
+    };
+
+    match cmd {
+        DeployCommand::SubmitPresigned {
+            rpc_url,
+            envelope_xdr,
+            envelope_file,
+            network_passphrase,
+            wasm,
+            expected_wasm_sha256,
+            max_retries,
+            timeout_secs,
+            receipt_out,
+            json,
+        } => {
+            let envelope = match (envelope_xdr, envelope_file) {
+                (Some(raw), None) => raw.clone(),
+                (None, Some(path)) => std::fs::read_to_string(path).map_err(|e| {
+                    ToolkitError::PresignedDeploy(PresignedDeployError::InvalidEnvelope(format!(
+                        "could not read envelope file `{}`: {e}",
+                        path.display()
+                    )))
+                })?,
+                _ => {
+                    return Err(ToolkitError::PresignedDeploy(
+                        PresignedDeployError::InvalidEnvelope(
+                            "provide exactly one of `--envelope-xdr` or `--envelope-file`"
+                                .to_string(),
+                        ),
+                    ));
+                }
+            };
+
+            let wasm_check = match (wasm, expected_wasm_sha256) {
+                (Some(wasm_path), Some(expected_sha256)) => Some(WasmArtifactCheck {
+                    wasm_path: wasm_path.clone(),
+                    expected_sha256: expected_sha256.clone(),
+                }),
+                (None, None) => None,
+                _ => {
+                    return Err(ToolkitError::PresignedDeploy(
+                        PresignedDeployError::InvalidConfig(
+                            "`--wasm` and `--expected-wasm-sha256` must be provided together"
+                                .to_string(),
+                        ),
+                    ));
+                }
+            };
+
+            let request = PresignedDeployRequest {
+                rpc_url: rpc_url.clone(),
+                envelope_xdr: envelope,
+                network_passphrase: network_passphrase.clone(),
+                wasm_check,
+                max_retries: *max_retries,
+                timeout_secs: *timeout_secs,
+                receipt_path: receipt_out.clone(),
+            };
+
+            let receipt = submit_presigned_deployment(&request, &UreqRpcTransport)?;
+            if *json {
+                println!("{}", receipt.to_json()?);
+            } else {
+                println!(
+                    "Submitted pre-signed deployment transaction: hash={} status={:?} attempts={}",
+                    receipt.tx_hash, receipt.status, receipt.attempts
+                );
+                if let Some(ledger) = receipt.latest_ledger {
+                    println!("  latest_ledger: {ledger}");
+                }
+                if let Some(sha) = &receipt.verified_wasm_sha256 {
+                    println!("  verified_wasm_sha256: {sha}");
+                }
+                if let Some(path) = receipt_out {
+                    println!("  receipt: {}", path.display());
+                }
+            }
+            Ok(())
+        }
     }
 }
 
