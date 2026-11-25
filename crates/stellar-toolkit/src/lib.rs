@@ -69,7 +69,7 @@ pub use help_text::{help_width, render_command_help, wrap, HelpEntry};
 pub use horizon::{
     page_path, paginate, Cursor, HorizonPage, HorizonPaginationError, DEFAULT_LIMIT, MAX_LIMIT,
 };
-pub use hsm::{ColdSigner, HsmError, SignRequest, StubHsm};
+pub use hsm::{ColdSigner, HsmError, RotationAudit, RotationRecord, SignRequest, StubHsm};
 pub use invariants::{run_suite, InvariantReport, Prng, SuiteReport};
 pub use keeper::{
     BudgetedKeeper, ExecutionBudget, ExecutionReport, KeeperBudgetConfig, KeeperBudgetError,
