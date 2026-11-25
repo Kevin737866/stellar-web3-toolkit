@@ -281,6 +281,17 @@ pub trait StorageBackend: Send + Sync {
         id: &str,
     ) -> Result<Option<crate::justice::JusticeAction>, StorageError>;
 
+    /// Retrieve every persisted justice action, regardless of status.
+    ///
+    /// Recovery export needs submitted and failed records as well as pending
+    /// ones. Backends that do not override this fail explicitly instead of
+    /// silently producing a partial snapshot.
+    fn get_all_justice_actions(&self) -> Result<Vec<crate::justice::JusticeAction>, StorageError> {
+        Err(StorageError::QueryError(
+            "backend does not support full justice action export".to_string(),
+        ))
+    }
+
     /// Retrieve all justice actions whose status is `Pending`.
     ///
     /// Used by the operator recovery path: after a restart, any `Pending`
@@ -514,6 +525,11 @@ impl StorageBackend for InMemoryStorage {
         Ok(actions.get(id).cloned())
     }
 
+    fn get_all_justice_actions(&self) -> Result<Vec<crate::justice::JusticeAction>, StorageError> {
+        let actions = self.justice_actions.read();
+        Ok(actions.values().cloned().collect())
+    }
+
     fn get_pending_justice_actions(
         &self,
     ) -> Result<Vec<crate::justice::JusticeAction>, StorageError> {
@@ -678,6 +694,13 @@ impl StorageBackend for SqliteStorage {
         // In production: SELECT * FROM justice_actions WHERE id = ?
         info!("SQLite: getting justice action {}", id);
         Ok(None)
+    }
+
+    fn get_all_justice_actions(&self) -> Result<Vec<crate::justice::JusticeAction>, StorageError> {
+        // The placeholder backend persists no rows, so an empty snapshot here
+        // is accurate rather than a partial result.
+        info!("SQLite: getting all justice actions");
+        Ok(Vec::new())
     }
 
     fn get_pending_justice_actions(
