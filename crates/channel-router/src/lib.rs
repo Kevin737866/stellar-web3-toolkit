@@ -3,13 +3,21 @@
 //! Multi-hop payment routing for Stellar payment channels.
 //! Implements path-finding algorithms for routing payments through
 //! the payment channel network.
+//!
+//! [`quote`] adds an opt-in planner that produces a worked fee and CLTV
+//! calculation for a routed payment. It does not change the results of the
+//! existing [`find_best_route`] or [`pathfinder::Pathfinder`] searches. See
+//! [`ROUTED_PAYMENT_FEES_AND_TIMEOUTS.md`](../../../docs/ROUTED_PAYMENT_FEES_AND_TIMEOUTS.md)
+//! for the formulas and worked examples.
 
 pub mod fee_cap;
 pub mod graph;
 pub mod pathfinder;
 pub mod policy;
+pub mod quote;
 
 pub use fee_cap::FeeCap;
+pub use quote::{plan_route, PaymentPlan, PaymentPlanner, QuoteHop, QuoteOptions, RouteQuote};
 
 use fxhash::FxHashMap;
 use priority_queue::PriorityQueue;
@@ -93,6 +101,37 @@ pub enum RoutingError {
 
     #[error("Route declares {declared} in fees but its hops sum to {actual}")]
     InconsistentRouteFees { declared: i128, actual: i128 },
+
+    #[error("Invalid routing request: {reason}")]
+    InvalidRequest { reason: String },
+
+    #[error("Payment expired: current ledger {current_ledger} has reached final expiry {expiry}")]
+    PaymentExpired { current_ledger: u32, expiry: u32 },
+
+    #[error("Payment deadline {deadline} is before the route's first expiry {expiry}")]
+    DeadlineExceeded { deadline: u32, expiry: u32 },
+
+    #[error("Route provides {available} ledgers of CLTV safety, {required} required")]
+    InsufficientCltvDelta { available: u32, required: u32 },
+
+    #[error("Channel {channel_id} declares an unsafe CLTV delta of {delta}")]
+    UnsafeCltvDelta { channel_id: String, delta: u32 },
+
+    #[error("Expiry {expiry} plus CLTV delta {delta} overflows the ledger height")]
+    ExpiryOverflow { expiry: u32, delta: u32 },
+
+    #[error("HTLC of {amount} on channel {channel_id} exceeds its maximum of {max}")]
+    HtlcSizeExceeded {
+        channel_id: String,
+        amount: i128,
+        max: i128,
+    },
+
+    #[error("Channel {channel_id} advertises a negative fee of {fee}")]
+    NegativeFee { channel_id: String, fee: i128 },
+
+    #[error("Arithmetic overflow while calculating {context}")]
+    ArithmeticOverflow { context: String },
 }
 
 /// Represents a node in the payment channel network
