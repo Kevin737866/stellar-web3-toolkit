@@ -178,6 +178,20 @@ impl RoutingPolicy {
             }
         }
 
+        // Check timeout budget if payment_expiry is specified
+        if let Some(max_cltv) = request
+            .payment_metadata
+            .as_ref()
+            .and_then(|m| m.payment_expiry)
+        {
+            if route.total_cltv_delta() > max_cltv {
+                return Err(RoutingError::TimeoutExceedsBudget {
+                    required: route.total_cltv_delta(),
+                    max_allowed: max_cltv,
+                });
+            }
+        }
+
         Ok(())
     }
 
