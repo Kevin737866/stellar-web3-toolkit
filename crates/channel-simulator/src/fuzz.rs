@@ -931,7 +931,7 @@ mod tests {
             min_nodes: 2,
             max_nodes: 30,
             payments_per_topology: 8,
-            ..TopologyFuzzConfig::default()
+            disconnection: None,
         });
 
         let report = fuzzer.run();
@@ -955,7 +955,7 @@ mod tests {
             min_nodes: 2,
             max_nodes: 20,
             payments_per_topology: 5,
-            ..TopologyFuzzConfig::default()
+            disconnection: None,
         };
 
         let first = TopologyFuzzer::new(config.clone()).run();
@@ -977,7 +977,7 @@ mod tests {
                 min_nodes: num_nodes,
                 max_nodes: num_nodes,
                 payments_per_topology: 3,
-                ..TopologyFuzzConfig::default()
+                disconnection: None,
             });
 
             let report = fuzzer.run();
