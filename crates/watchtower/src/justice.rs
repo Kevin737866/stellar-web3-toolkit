@@ -26,7 +26,7 @@
 //! ```
 
 use crate::monitor::BreachAttempt;
-use crate::storage::{StorageBackend, StorageError};
+use crate::storage::StorageBackend;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use thiserror::Error;
@@ -199,21 +199,52 @@ impl JusticeService {
     /// # Order of operations
     ///
     /// 1. `validate_breach` — rejects malformed or inconsistent evidence.
-    /// 2. Persist a [`JusticeAction`] with status `Pending` to durable storage.
+    /// 2. Deduplicate — rejects duplicate notifications for the same
+    ///    `(channel_id, breach_tx_hash)` if an action is already `Pending` in
+    ///    storage or already `Submitted` in memory.
+    /// 3. Persist a [`JusticeAction`] with status `Pending` to durable storage.
     ///    If this fails the method returns immediately; nothing is submitted.
-    /// 3. Build and submit the transaction.
-    /// 4. On success: update the stored action to `Submitted` with the tx hash.
+    /// 4. Build and submit the transaction.
+    /// 5. On success: update the stored action to `Submitted` with the tx hash.
     ///    On failure: leave the action as `Pending` so it can be retried by the
     ///    operator via [`Self::retry_pending_actions`].
     ///
     /// This ordering guarantees that a failed submission never silently loses
-    /// the breach evidence.
+    /// the breach evidence, and duplicate breach notifications do not trigger
+    /// duplicate justice transactions.
     pub async fn submit_justice(
         &self,
         breach: &BreachAttempt,
     ) -> Result<JusticeTransaction, JusticeError> {
         // Step 1: validate before touching any state.
         let evidence = self.validate_breach(breach)?;
+
+        // Step 2: reject duplicate breach notifications before persisting or
+        // submitting a second justice transaction.
+        let already_submitted = {
+            let pending = self.pending_txs.read();
+            pending.iter().any(|tx| {
+                tx.channel_id == evidence.channel_id
+                    && tx.breach.breach_tx_hash == evidence.breach_tx_hash
+            })
+        };
+        let already_pending = self
+            .storage
+            .get_pending_justice_actions()
+            .map_err(|e| {
+                JusticeError::BuildError(format!("failed to check pending justice actions: {e}"))
+            })?
+            .iter()
+            .any(|action| {
+                action.evidence.channel_id == evidence.channel_id
+                    && action.evidence.breach_tx_hash == evidence.breach_tx_hash
+            });
+        if already_submitted || already_pending {
+            return Err(JusticeError::DuplicateBreach {
+                channel_id: evidence.channel_id,
+                breach_tx_hash: evidence.breach_tx_hash,
+            });
+        }
 
         info!(
             "Preparing justice action for breach on channel {}",
@@ -224,9 +255,9 @@ impl JusticeService {
         let action_id = uuid_v4();
         let mut action = JusticeAction::new(action_id, evidence.clone());
 
-        self.storage
-            .store_justice_action(&action)
-            .map_err(|e| JusticeError::BuildError(format!("failed to persist justice action: {e}")))?;
+        self.storage.store_justice_action(&action).map_err(|e| {
+            JusticeError::BuildError(format!("failed to persist justice action: {e}"))
+        })?;
 
         info!(
             "Justice action {} persisted (Pending) for channel {}",
@@ -491,6 +522,12 @@ pub enum JusticeError {
     #[error("Invalid breach data: {0}")]
     InvalidBreach(String),
 
+    #[error("Duplicate breach notification for channel '{channel_id}' (tx '{breach_tx_hash}')")]
+    DuplicateBreach {
+        channel_id: String,
+        breach_tx_hash: String,
+    },
+
     #[error("Fee too high: needed {needed}, max {max}")]
     FeeTooHigh { needed: i128, max: i128 },
 }
@@ -561,8 +598,7 @@ mod tests {
 
     #[test]
     fn test_justice_transaction_creation() {
-        let _service =
-            JusticeService::new("http://localhost".to_string(), "test".to_string(), 100_000);
+        let _service = service();
 
         let _breach = valid_breach();
     }
@@ -788,11 +824,13 @@ mod tests {
         let action = JusticeAction::new("retry-test-action", evidence);
         storage.store_justice_action(&action).unwrap();
 
+        let concrete: Arc<crate::storage::InMemoryStorage> = Arc::clone(&storage);
+        let backend: Arc<dyn StorageBackend> = concrete;
         let service = JusticeService::new(
             "http://localhost".to_string(),
             "test".to_string(),
             100_000,
-            Arc::clone(&storage),
+            backend,
         );
 
         // Pending actions exist before retry.
@@ -803,5 +841,78 @@ mod tests {
 
         // After retry, the in-memory index should contain the submitted tx.
         assert_eq!(service.get_pending().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn duplicate_breach_notification_is_rejected_without_duplicate_tx() {
+        let service = service();
+        let breach = valid_breach();
+
+        let first = service.submit_justice(&breach).await.unwrap();
+        assert_eq!(first.channel_id, "test_channel");
+
+        let err = service.submit_justice(&breach).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                JusticeError::DuplicateBreach {
+                    ref channel_id,
+                    ref breach_tx_hash
+                } if channel_id == "test_channel" && breach_tx_hash == "breach_tx"
+            ),
+            "expected DuplicateBreach error, got: {err:?}"
+        );
+        assert_eq!(
+            service.get_pending().len(),
+            1,
+            "duplicate breach must not record a second justice transaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_breach_against_pending_action_is_rejected_and_recoverable() {
+        use crate::storage::InMemoryStorage;
+        use std::sync::Arc;
+
+        let storage = Arc::new(InMemoryStorage::new());
+        let breach = valid_breach();
+        let evidence = BreachEvidence {
+            channel_id: breach.channel_id.clone(),
+            breach_tx_hash: breach.breach_tx_hash.clone(),
+            detected_at: breach.detected_at,
+            old_sequence: breach.old_sequence,
+            new_sequence: breach.new_sequence,
+            total_balance: breach.old_balance_a + breach.old_balance_b,
+        };
+        storage
+            .store_justice_action(&JusticeAction::new("pending-1", evidence))
+            .unwrap();
+
+        let service = JusticeService::new(
+            "http://localhost".to_string(),
+            "test".to_string(),
+            100_000,
+            Arc::clone(&storage),
+        );
+
+        let err = service.submit_justice(&breach).await.unwrap_err();
+        assert!(matches!(err, JusticeError::DuplicateBreach { .. }));
+        assert_eq!(storage.get_pending_justice_actions().unwrap().len(), 1);
+
+        let retried = service.retry_pending_actions().await;
+        assert_eq!(retried, 1);
+        assert_eq!(service.get_pending().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn distinct_breach_tx_on_same_channel_is_accepted() {
+        let service = service();
+        let first = valid_breach();
+        let mut second = valid_breach();
+        second.breach_tx_hash = "breach_tx_2".to_string();
+
+        service.submit_justice(&first).await.unwrap();
+        service.submit_justice(&second).await.unwrap();
+        assert_eq!(service.get_pending().len(), 2);
     }
 }
