@@ -22,6 +22,8 @@ use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, E
 /// TTL drops below the threshold.
 const HOLDER_TTL_THRESHOLD: u32 = 100_000;
 const HOLDER_TTL_BUMP: u32 = 200_000;
+const MAX_ASSET_NAME_BYTES: u32 = 128;
+const MAX_METADATA_URI_BYTES: u32 = 2_048;
 
 /// Per-base-token metadata. `uri` overrides the collection `base_uri` when set.
 #[contracttype]
@@ -77,6 +79,22 @@ pub enum DataKey {
 
 #[contract]
 pub struct NftSftContract;
+
+fn validate_metadata(asset_name: &String, uri: &String) {
+    assert!(!asset_name.is_empty(), "asset name must not be empty");
+    assert!(
+        asset_name.len() <= MAX_ASSET_NAME_BYTES,
+        "asset name exceeds maximum length"
+    );
+    validate_uri(uri);
+}
+
+fn validate_uri(uri: &String) {
+    assert!(
+        uri.len() <= MAX_METADATA_URI_BYTES,
+        "metadata URI exceeds maximum length"
+    );
+}
 
 // ---------------------------------------------------------------------------
 // Storage helpers
@@ -380,6 +398,7 @@ impl NftSftContract {
         );
         admin.require_auth();
         assert!(max_supply >= 0, "max supply must not be negative");
+        validate_uri(&base_uri);
         set_config(
             &env,
             &Config {
@@ -413,6 +432,7 @@ impl NftSftContract {
     pub fn set_base_uri(env: Env, base_uri: String) {
         let mut cfg = config(&env);
         cfg.admin.require_auth();
+        validate_uri(&base_uri);
         cfg.base_uri = base_uri;
         set_config(&env, &cfg);
     }
@@ -462,6 +482,7 @@ impl NftSftContract {
             !env.storage().instance().has(&DataKey::BaseSupply(token_id)),
             "token already minted"
         );
+        validate_metadata(&asset_name, &uri);
 
         if cfg.max_supply > 0 {
             assert!(
@@ -625,6 +646,7 @@ impl NftSftContract {
             Some(holder) => holder.require_auth(),
             None => cfg.admin.require_auth(),
         }
+        validate_metadata(&asset_name, &uri);
         env.storage().instance().set(
             &DataKey::BaseMeta(token_id),
             &TokenMeta {
@@ -717,6 +739,43 @@ mod test {
             client.metadata(&1).asset_name,
             String::from_str(&env, "Golden Ticket")
         );
+    }
+
+    #[test]
+    fn metadata_rejects_empty_names_and_oversized_values() {
+        let (env, _, client) = setup();
+        let holder = Address::generate(&env);
+        let empty_name = String::from_str(&env, "");
+        let valid_uri = String::from_str(&env, "ipfs://nft/1.json");
+
+        assert!(client
+            .try_mint(&holder, &1, &ONE, &empty_name, &valid_uri)
+            .is_err());
+
+        let long_name = "a".repeat((MAX_ASSET_NAME_BYTES + 1) as usize);
+        let long_name = String::from_str(&env, &long_name);
+        assert!(client
+            .try_mint(&holder, &1, &ONE, &long_name, &valid_uri)
+            .is_err());
+
+        client.mint(
+            &holder,
+            &1,
+            &ONE,
+            &String::from_str(&env, "Ticket"),
+            &valid_uri,
+        );
+        let long_uri = "u".repeat((MAX_METADATA_URI_BYTES + 1) as usize);
+        let long_uri = String::from_str(&env, &long_uri);
+        assert!(client
+            .try_set_metadata(&1, &String::from_str(&env, "Ticket"), &long_uri)
+            .is_err());
+        assert!(client.try_set_base_uri(&long_uri).is_err());
+        assert_eq!(
+            client.metadata(&1).asset_name,
+            String::from_str(&env, "Ticket")
+        );
+        assert_eq!(client.uri(&1), String::from_str(&env, "ipfs://nft/1.json"));
     }
 
     #[test]

@@ -16,7 +16,7 @@ use soroban_sdk::{
     contract, contractimpl, contractmeta, Address, Bytes, BytesN, Env, IntoVal, TryFromVal,
     Vec as SorobanVec,
 };
-use types::{ChannelState, HTLCInfo, HtlcList};
+use types::{ChannelState, ChannelStatusReport, HTLCInfo, HtlcList};
 
 /// Append an address's canonical strkey encoding to `out`.
 ///
@@ -108,6 +108,30 @@ impl PaymentChannel {
         state::get_channel_state(&env, &channel_id)
     }
 
+    /// Get a channel status report including pending HTLC count and capacity.
+    pub fn get_channel_status(
+        env: Env,
+        channel_id: BytesN<32>,
+    ) -> Result<ChannelStatusReport, PaymentChannelError> {
+        let channel = state::get_channel_state(&env, &channel_id)?;
+        let (pending_htlc_count, pending_htlc_amount) =
+            channel::ChannelManager::compute_pending_htlc_metrics(&env, &channel.htlcs)?;
+        let capacity = channel.total_balance;
+        let available_capacity = capacity.saturating_sub(pending_htlc_amount);
+
+        Ok(ChannelStatusReport {
+            channel_id: channel.channel_id,
+            is_open: channel.close_time == 0 && !channel.is_cooperative_close,
+            is_cooperative_close: channel.is_cooperative_close,
+            balance_a: channel.balance_a,
+            balance_b: channel.balance_b,
+            capacity,
+            pending_htlc_count,
+            pending_htlc_amount,
+            available_capacity,
+        })
+    }
+
     /// Update the channel state with a new payment
     pub fn update_state(
         env: Env,
@@ -124,6 +148,10 @@ impl PaymentChannel {
             return Err(PaymentChannelError::ChannelAlreadyClosed);
         }
 
+        if state.close_time != 0 {
+            return Err(PaymentChannelError::ChannelAlreadyClosed);
+        }
+
         if new_balance_a < 0 || new_balance_b < 0 {
             return Err(PaymentChannelError::InvalidBalance);
         }
@@ -133,6 +161,9 @@ impl PaymentChannel {
         if new_total != state.total_balance {
             return Err(PaymentChannelError::BalanceMismatch);
         }
+
+        state.participant_a.require_auth();
+        state.participant_b.require_auth();
 
         state.balance_a = new_balance_a;
         state.balance_b = new_balance_b;
@@ -160,6 +191,10 @@ impl PaymentChannel {
             return Err(PaymentChannelError::ChannelAlreadyClosed);
         }
 
+        if state.close_time != 0 {
+            return Err(PaymentChannelError::ChannelAlreadyClosed);
+        }
+
         if amount <= 0 {
             return Err(PaymentChannelError::InvalidHtlcAmount);
         }
@@ -172,6 +207,8 @@ impl PaymentChannel {
         if state.balance_a < amount {
             return Err(PaymentChannelError::InsufficientBalance);
         }
+
+        state.participant_a.require_auth();
 
         // Generate HTLC ID
         let mut htlc_data = Bytes::new(&env);
@@ -238,6 +275,8 @@ impl PaymentChannel {
             return Err(PaymentChannelError::HtlcExpired);
         }
 
+        htlc.receiver.require_auth();
+
         // Verify the preimage hashes to the hashlock
         let preimage_bytes = Bytes::from_slice(&env, &preimage.to_array());
         let computed_hash: BytesN<32> = env.crypto().sha256(&preimage_bytes).into();
@@ -288,6 +327,8 @@ impl PaymentChannel {
             return Err(PaymentChannelError::HtlcNotExpired);
         }
 
+        htlc.sender.require_auth();
+
         htlc.is_refunded = true;
         state.balance_a += htlc.amount;
 
@@ -330,6 +371,10 @@ impl PaymentChannel {
         let _ = (signature_a, signature_b);
         let mut state = state::get_channel_state(&env, &channel_id)?;
 
+        if state.close_time != 0 {
+            return Err(PaymentChannelError::ChannelAlreadyClosed);
+        }
+
         if final_balance_a < 0 || final_balance_b < 0 {
             return Err(PaymentChannelError::InvalidBalance);
         }
@@ -339,6 +384,9 @@ impl PaymentChannel {
         if total != state.total_balance {
             return Err(PaymentChannelError::BalanceMismatch);
         }
+
+        state.participant_a.require_auth();
+        state.participant_b.require_auth();
 
         if state.is_cooperative_close {
             if state.balance_a == final_balance_a && state.balance_b == final_balance_b {
@@ -469,9 +517,15 @@ impl PaymentChannel {
             return Err(PaymentChannelError::ChannelAlreadyClosed);
         }
 
+        if state.close_time != 0 {
+            return Err(PaymentChannelError::ChannelAlreadyClosed);
+        }
+
         if initiator != state.participant_a && initiator != state.participant_b {
             return Err(PaymentChannelError::UnauthorizedParticipant);
         }
+
+        initiator.require_auth();
 
         let has_active = state::has_active_htlcs(&env, &state.htlcs);
         if has_active {
@@ -531,16 +585,24 @@ impl PaymentChannel {
             return Err(PaymentChannelError::ChannelAlreadyClosed);
         }
 
+        if state.close_time != 0 {
+            return Err(PaymentChannelError::ChannelAlreadyClosed);
+        }
+
         if top_up_amount <= 0 {
             return Err(PaymentChannelError::InvalidBalance);
         }
 
+        if participant != state.participant_a && participant != state.participant_b {
+            return Err(PaymentChannelError::UnauthorizedParticipant);
+        }
+
+        participant.require_auth();
+
         if participant == state.participant_a {
             state.balance_a += top_up_amount;
-        } else if participant == state.participant_b {
-            state.balance_b += top_up_amount;
         } else {
-            return Err(PaymentChannelError::UnauthorizedParticipant);
+            state.balance_b += top_up_amount;
         }
 
         state.total_balance += top_up_amount;
@@ -573,5 +635,164 @@ impl PaymentChannel {
         }
 
         HtlcList { entries }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::{testutils::Address as _, Env};
+
+    fn setup_channel(env: &Env) -> (PaymentChannelClient<'_>, Address, Address, BytesN<32>) {
+        let contract_id = env.register_contract(None, PaymentChannel);
+        let client = PaymentChannelClient::new(env, &contract_id);
+        let p_a = Address::generate(env);
+        let p_b = Address::generate(env);
+        let channel_id = client.initialize(&p_a, &p_b, &1_000, &1_000, &100, &0);
+        (client, p_a, p_b, channel_id)
+    }
+
+    #[test]
+    fn test_update_state_success() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _p_a, _p_b, channel_id) = setup_channel(&env);
+        let dummy_sig = BytesN::from_array(&env, &[0u8; 64]);
+
+        client.update_state(&channel_id, &1_200, &800, &dummy_sig, &dummy_sig);
+        let state = client.get_channel_state(&channel_id);
+        assert_eq!(state.balance_a, 1_200);
+        assert_eq!(state.balance_b, 800);
+        assert_eq!(state.sequence_number, 1);
+    }
+
+    #[test]
+    fn test_update_state_balance_mismatch() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _p_a, _p_b, channel_id) = setup_channel(&env);
+        let dummy_sig = BytesN::from_array(&env, &[0u8; 64]);
+
+        let res = client.try_update_state(&channel_id, &1_500, &800, &dummy_sig, &dummy_sig);
+        assert_eq!(res, Err(Ok(PaymentChannelError::BalanceMismatch)));
+    }
+
+    #[test]
+    fn test_update_state_negative_balance() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _p_a, _p_b, channel_id) = setup_channel(&env);
+        let dummy_sig = BytesN::from_array(&env, &[0u8; 64]);
+
+        let res = client.try_update_state(&channel_id, &-100, &2_100, &dummy_sig, &dummy_sig);
+        assert_eq!(res, Err(Ok(PaymentChannelError::InvalidBalance)));
+    }
+
+    #[test]
+    fn test_update_state_channel_already_closed() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _p_a, _p_b, channel_id) = setup_channel(&env);
+        let dummy_sig = BytesN::from_array(&env, &[0u8; 64]);
+
+        client.cooperative_close(&channel_id, &1_000, &1_000, &dummy_sig, &dummy_sig);
+        let res = client.try_update_state(&channel_id, &1_200, &800, &dummy_sig, &dummy_sig);
+        assert_eq!(res, Err(Ok(PaymentChannelError::ChannelAlreadyClosed)));
+    }
+
+    #[test]
+    fn test_unilateral_close_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _p_a, _p_b, channel_id) = setup_channel(&env);
+        let stranger = Address::generate(&env);
+
+        let res = client.try_initiate_unilateral_close(&channel_id, &stranger);
+        assert_eq!(res, Err(Ok(PaymentChannelError::UnauthorizedParticipant)));
+    }
+
+    #[test]
+    fn test_top_up_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _p_a, _p_b, channel_id) = setup_channel(&env);
+        let stranger = Address::generate(&env);
+
+        let res = client.try_top_up(&channel_id, &500, &stranger);
+        assert_eq!(res, Err(Ok(PaymentChannelError::UnauthorizedParticipant)));
+    }
+
+    #[test]
+    fn test_top_up_success() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, p_a, _p_b, channel_id) = setup_channel(&env);
+
+        client.top_up(&channel_id, &500, &p_a);
+        let state = client.get_channel_state(&channel_id);
+        assert_eq!(state.balance_a, 1_500);
+        assert_eq!(state.total_balance, 2_500);
+        assert_eq!(state.sequence_number, 1);
+    }
+
+    #[test]
+    fn test_get_channel_status_exposes_pending_htlcs_and_capacity() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, p_a, p_b, channel_id) = setup_channel(&env);
+
+        let initial = client.get_channel_status(&channel_id);
+        assert!(initial.is_open);
+        assert_eq!(initial.capacity, 2_000);
+        assert_eq!(initial.pending_htlc_count, 0);
+        assert_eq!(initial.pending_htlc_amount, 0);
+        assert_eq!(initial.available_capacity, 2_000);
+
+        // Add one active HTLC and one claimed HTLC directly in contract storage
+        // to verify only active HTLCs are counted.
+        let active_id = BytesN::from_array(&env, &[1u8; 32]);
+        let claimed_id = BytesN::from_array(&env, &[2u8; 32]);
+        let mut active_htlc = HTLCInfo::new(
+            active_id.clone(),
+            300,
+            BytesN::from_array(&env, &[7u8; 32]),
+            1_000,
+            p_a.clone(),
+            p_b.clone(),
+        );
+        active_htlc.is_claimed = false;
+        let mut claimed_htlc = HTLCInfo::new(
+            claimed_id.clone(),
+            500,
+            BytesN::from_array(&env, &[8u8; 32]),
+            1_000,
+            p_a,
+            p_b,
+        );
+        claimed_htlc.is_claimed = true;
+
+        env.as_contract(&client.address, || {
+            let mut st = state::get_channel_state(&env, &channel_id).unwrap();
+            st.htlcs.set(active_id.to_val(), active_htlc.to_val());
+            st.htlcs.set(claimed_id.to_val(), claimed_htlc.to_val());
+            state::store_channel_state(&env, &channel_id, &st);
+        });
+
+        let updated = client.get_channel_status(&channel_id);
+        assert_eq!(updated.pending_htlc_count, 1);
+        assert_eq!(updated.pending_htlc_amount, 300);
+        assert_eq!(updated.capacity, 2_000);
+        assert_eq!(updated.available_capacity, 1_700);
+    }
+
+    #[test]
+    fn test_get_channel_status_missing_channel_returns_not_found() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, PaymentChannel);
+        let client = PaymentChannelClient::new(&env, &contract_id);
+        let missing = BytesN::from_array(&env, &[9u8; 32]);
+
+        let res = client.try_get_channel_status(&missing);
+        assert_eq!(res, Err(Ok(PaymentChannelError::ChannelNotFound)));
     }
 }

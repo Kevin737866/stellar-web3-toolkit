@@ -11,6 +11,8 @@ use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, BytesN, 
 pub enum DataKey {
     Admin,
     PoolWasmHash,
+    // Reserved to preserve the storage-key discriminants of deployed versions.
+    // Pool addresses now use deterministic pair-derived salts.
     Nonce,
     Pair(PairKey),
 }
@@ -33,28 +35,51 @@ fn sort_tokens(a: Address, b: Address) -> (Address, Address) {
     }
 }
 
-fn next_salt(env: &Env) -> BytesN<32> {
-    let n: u64 = env.storage().instance().get(&DataKey::Nonce).unwrap_or(0);
-    env.storage()
-        .instance()
-        .set(&DataKey::Nonce, &(n.saturating_add(1)));
-    let mut raw = [0u8; 32];
-    raw[24..32].copy_from_slice(&n.to_be_bytes());
-    env.crypto()
-        .sha256(&Bytes::from_slice(env, &raw))
-        .to_bytes()
+fn append_address(out: &mut Bytes, address: &Address) {
+    // Soroban SDK 21 exposes an address's canonical StrKey representation.
+    // It has a fixed length, so concatenating two encodings is unambiguous.
+    let encoded = address.to_string();
+    let len = encoded.len() as usize;
+    assert!(len <= 64, "address strkey exceeds buffer");
+    let mut buf = [0u8; 64];
+    encoded.copy_into_slice(&mut buf[..len]);
+    out.extend_from_slice(&buf[..len]);
+}
+
+/// Derive one deployment salt per canonical token pair. The deployer scopes
+/// this salt to the current factory address, so separate factory instances do
+/// not compete for the same pool address.
+fn pair_salt(env: &Env, token_0: &Address, token_1: &Address) -> BytesN<32> {
+    let mut preimage = Bytes::from_slice(env, b"stellar-web3-toolkit/amm-factory/pool/v1");
+    append_address(&mut preimage, token_0);
+    append_address(&mut preimage, token_1);
+    env.crypto().sha256(&preimage).to_bytes()
 }
 
 #[contractimpl]
 impl AmmFactory {
     pub fn init(env: Env, admin: Address, pool_wasm_hash: BytesN<32>) {
-        assert!(!env.storage().instance().has(&DataKey::Admin), "admin set");
         admin.require_auth();
+
+        // Retrying deployment setup with the same configuration is harmless.
+        // A different configuration must never silently take over the factory.
+        if let Some(existing_admin) = env.storage().instance().get::<_, Address>(&DataKey::Admin) {
+            let existing_hash: BytesN<32> = env
+                .storage()
+                .instance()
+                .get(&DataKey::PoolWasmHash)
+                .expect("factory configuration is incomplete");
+            assert!(
+                existing_admin == admin && existing_hash == pool_wasm_hash,
+                "factory already initialized with different config"
+            );
+            return;
+        }
+
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
             .instance()
             .set(&DataKey::PoolWasmHash, &pool_wasm_hash);
-        env.storage().instance().set(&DataKey::Nonce, &0_u64);
     }
 
     pub fn admin(env: Env) -> Address {
@@ -78,10 +103,19 @@ impl AmmFactory {
             .instance()
             .get(&DataKey::PoolWasmHash)
             .expect("wasm");
-        let salt = next_salt(&env);
+        let salt = pair_salt(&env, &t0, &t1);
         let factory = env.current_contract_address();
         let pool = env.deployer().with_current_contract(salt).deploy(wasm_hash);
-        AmmPoolClient::new(&env, &pool).initialize(&factory, &t0, &t1);
+        let client = AmmPoolClient::new(&env, &pool);
+        client.initialize(&factory, &t0, &t1);
+        // A pool is only usable if it starts empty: a non-zero reserve here
+        // would mean the factory shipped accounting it never funded, and every
+        // quote derived from it would be wrong from the first swap (#399).
+        let (reserve_a, reserve_b) = client.get_reserves();
+        assert!(
+            reserve_a == 0 && reserve_b == 0,
+            "new pool must start with empty reserves"
+        );
         env.storage().instance().set(&DataKey::Pair(pk), &pool);
         pool
     }
@@ -177,5 +211,51 @@ mod test {
         let _ = pool.add_liquidity(&u, &50_000, &50_000, &1, &1);
         let (ra, rb) = pool.get_reserves();
         assert!(ra > 0 && rb > 0);
+    }
+
+    #[test]
+    fn init_is_idempotent_for_the_same_configuration() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let factory_id = env.register_contract(None, AmmFactory);
+        let factory = AmmFactoryClient::new(&env, &factory_id);
+        let admin = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[9u8; 32]);
+
+        factory.init(&admin, &hash);
+        factory.init(&admin, &hash);
+
+        assert_eq!(factory.admin(), admin);
+        assert_eq!(factory.pool_wasm_hash(), hash);
+    }
+
+    #[test]
+    #[should_panic(expected = "factory already initialized with different config")]
+    fn init_rejects_a_different_configuration() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let factory_id = env.register_contract(None, AmmFactory);
+        let factory = AmmFactoryClient::new(&env, &factory_id);
+        let admin = Address::generate(&env);
+        let other_admin = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[9u8; 32]);
+
+        factory.init(&admin, &hash);
+        factory.init(&other_admin, &hash);
+    }
+
+    #[test]
+    fn pair_salt_is_stable_for_canonical_pair_order_and_unique_per_pair() {
+        let env = Env::default();
+        let a = Address::generate(&env);
+        let b = Address::generate(&env);
+        let c = Address::generate(&env);
+        let (a0, a1) = sort_tokens(a.clone(), b.clone());
+        // `Address` is not `Copy`; each use after the first needs its own clone.
+        let (b0, b1) = sort_tokens(b, a.clone());
+        let (c0, c1) = sort_tokens(a, c);
+
+        assert_eq!(pair_salt(&env, &a0, &a1), pair_salt(&env, &b0, &b1));
+        assert_ne!(pair_salt(&env, &a0, &a1), pair_salt(&env, &c0, &c1));
     }
 }

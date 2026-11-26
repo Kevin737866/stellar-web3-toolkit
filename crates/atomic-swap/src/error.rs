@@ -13,6 +13,41 @@ pub enum AtomicSwapError {
     #[error("Swap has expired: {swap_id}")]
     SwapExpired { swap_id: String },
 
+    /// An offer was presented for signing at or after its deadline (#389).
+    ///
+    /// Signing an expired offer would authorise a trade the counterparty can no
+    /// longer settle, so the signing path refuses it before computing any
+    /// commitment. The deadline and the current ledger are included so the
+    /// caller can tell a slightly late attempt from a stale offer.
+    #[error(
+        "Offer {offer_id} expired at ledger {expires_at_ledger} (signing requested at ledger {current_ledger})"
+    )]
+    OfferExpired {
+        offer_id: String,
+        expires_at_ledger: u32,
+        current_ledger: u32,
+    },
+
+    /// A refund was requested while the swap was still inside its settlement
+    /// window, before the timeout ledger had passed (#396).
+    ///
+    /// At this point the preimage path is still open, so refunding would let a
+    /// participant claw back funds while the counterparty could still settle.
+    /// The timeout and current ledgers are included so an operator knows exactly
+    /// how long to wait.
+    ///
+    /// Compatibility: this is a new, distinct error. Before #396 the refund path
+    /// returned `SwapExpired` for this case, which claimed a timeout that had
+    /// not happened.
+    #[error(
+        "Cannot refund swap {swap_id}: timeout ledger {timeout_ledger} has not passed (current ledger {current_ledger})"
+    )]
+    RefundBeforeTimeout {
+        swap_id: String,
+        timeout_ledger: u32,
+        current_ledger: u32,
+    },
+
     #[error("Swap already completed: {swap_id}")]
     SwapAlreadyCompleted { swap_id: String },
 
@@ -21,6 +56,15 @@ pub enum AtomicSwapError {
 
     #[error("Asset not supported: {asset}")]
     UnsupportedAsset { asset: String },
+
+    /// An asset identifier is not a well-formed Stellar asset (#388).
+    ///
+    /// An offer is signed off-chain and settled on-chain, so a malformed code or
+    /// issuer cannot be caught by the chain at signing time: it would be
+    /// discovered only after a counterparty had committed. The offer path
+    /// therefore rejects it up front, naming the asset and the defect.
+    #[error("Invalid asset identifier `{asset}`: {reason}")]
+    InvalidAssetIdentifier { asset: String, reason: String },
 
     #[error("Network error: {0}")]
     NetworkError(#[from] reqwest::Error),
@@ -33,6 +77,18 @@ pub enum AtomicSwapError {
 
     #[error("Invalid timeout: {timeout_hours} hours")]
     InvalidTimeout { timeout_hours: u32 },
+
+    /// An offer's expiry ledger does not leave a usable window (#388).
+    ///
+    /// An offer that expires at or before the ledger it was created at can
+    /// never be accepted, so it is refused instead of being advertised.
+    #[error(
+        "Invalid offer expiry: expires_at_ledger {expires_at_ledger} must be later than created_at_ledger {created_at_ledger}"
+    )]
+    InvalidOfferExpiry {
+        created_at_ledger: u32,
+        expires_at_ledger: u32,
+    },
 
     #[error("Invalid amount: {amount}")]
     InvalidAmount { amount: i128 },

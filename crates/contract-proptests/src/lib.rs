@@ -19,6 +19,7 @@
 //!   reported counterexample is the smallest one found rather than an arbitrary
 //!   large one.
 //! * [`check`] / [`check_default`] — the runners.
+//! * [`Scenario`] — a named `given` / `when` / `then` workflow for contract tests.
 //!
 //! # Writing a property
 //!
@@ -450,6 +451,107 @@ pub fn expect(condition: bool, reason: &str) -> Result<(), String> {
     }
 }
 
+/// A named, ordered contract-testing workflow.
+pub struct Scenario<C> {
+    name: String,
+    steps: Vec<ScenarioStep<C>>,
+}
+
+type ScenarioAction<C> = dyn Fn(&mut C) -> Result<(), String>;
+
+struct ScenarioStep<C> {
+    phase: &'static str,
+    name: String,
+    action: Box<ScenarioAction<C>>,
+}
+
+/// Identifies the first failed step in a scenario.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScenarioFailure {
+    pub scenario: String,
+    pub phase: &'static str,
+    pub step: String,
+    pub reason: String,
+}
+
+impl std::fmt::Display for ScenarioFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "scenario `{}` failed in {} `{}`: {}",
+            self.scenario, self.phase, self.step, self.reason
+        )
+    }
+}
+
+impl std::error::Error for ScenarioFailure {}
+
+impl<C> Scenario<C> {
+    /// Starts a scenario with a human-readable name.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            steps: Vec::new(),
+        }
+    }
+
+    /// Adds a precondition or fixture step.
+    pub fn given(
+        self,
+        name: impl Into<String>,
+        action: impl Fn(&mut C) -> Result<(), String> + 'static,
+    ) -> Self {
+        self.push_step("given", name, action)
+    }
+
+    /// Adds an action under test.
+    pub fn when(
+        self,
+        name: impl Into<String>,
+        action: impl Fn(&mut C) -> Result<(), String> + 'static,
+    ) -> Self {
+        self.push_step("when", name, action)
+    }
+
+    /// Adds a postcondition.
+    pub fn then(
+        self,
+        name: impl Into<String>,
+        action: impl Fn(&mut C) -> Result<(), String> + 'static,
+    ) -> Self {
+        self.push_step("then", name, action)
+    }
+
+    fn push_step(
+        mut self,
+        phase: &'static str,
+        name: impl Into<String>,
+        action: impl Fn(&mut C) -> Result<(), String> + 'static,
+    ) -> Self {
+        self.steps.push(ScenarioStep {
+            phase,
+            name: name.into(),
+            action: Box::new(action),
+        });
+        self
+    }
+
+    /// Runs every step in declaration order and returns the first failure.
+    pub fn run(&self, context: &mut C) -> Result<(), ScenarioFailure> {
+        for step in &self.steps {
+            if let Err(reason) = (step.action)(context) {
+                return Err(ScenarioFailure {
+                    scenario: self.name.clone(),
+                    phase: step.phase,
+                    step: step.name.clone(),
+                    reason,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -533,5 +635,38 @@ mod test {
         let mut property = |values: &Vec<i128>| expect(!values.contains(&8), "contains 8");
         let minimal = shrink_to_counterexample(&vec![100, 8, 4], &mut property);
         assert_eq!(minimal, vec![8]);
+    }
+
+    #[test]
+    fn scenarios_run_in_order_and_report_the_first_failed_step() {
+        let scenario = Scenario::new("deposit then withdraw")
+            .given("the account starts funded", |balance: &mut i128| {
+                *balance = 10;
+                Ok(())
+            })
+            .when("the account withdraws", |balance: &mut i128| {
+                *balance -= 4;
+                Ok(())
+            })
+            .then("the remaining balance is correct", |balance: &mut i128| {
+                expect(*balance == 6, "expected six units")
+            });
+        let mut balance = 0;
+        scenario.run(&mut balance).unwrap();
+        assert_eq!(balance, 6);
+
+        let failure = Scenario::new("withdrawal limit")
+            .when("withdraw beyond the balance", |balance: &mut i128| {
+                *balance -= 1;
+                Ok(())
+            })
+            .then("balance stays non-negative", |balance: &mut i128| {
+                expect(*balance >= 0, "balance became negative")
+            })
+            .run(&mut 0)
+            .unwrap_err();
+        assert_eq!(failure.phase, "then");
+        assert_eq!(failure.step, "balance stays non-negative");
+        assert_eq!(failure.reason, "balance became negative");
     }
 }

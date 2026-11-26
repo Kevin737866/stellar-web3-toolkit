@@ -42,6 +42,9 @@
 //! * `rewards_paid_out <= rewards_credited <= rewards_funded`; the pool split and
 //!   the per-position accrual both floor, so dust can only ever stay behind.
 //! * `pause` blocks deposits and funding but never withdrawals or harvests.
+//!   Existing reward schedules continue while paused, and users may harvest
+//!   rewards accrued during the pause. This preserves the existing `set_paused`
+//!   interface and requires no configuration change.
 //! * Deactivating a pool blocks new deposits but leaves exits and harvests open.
 //! * `emergency_withdraw` returns the LP but forfeits pending rewards, so a
 //!   distrusted pool can be exited without draining reward accounting.
@@ -290,6 +293,56 @@ fn transfer_out(env: &Env, token: &Address, to: &Address, amount: i128) {
         return;
     }
     TokenClient::new(env, token).transfer(&env.current_contract_address(), to, &amount);
+}
+
+/// Transfers reward tokens in and confirms the farm's balance rose by exactly
+/// `amount` before the funding is recorded. A token that reports success without
+/// moving funds would otherwise let the farm credit a schedule it cannot back.
+fn receive_rewards(env: &Env, token: &Address, from: &Address, amount: i128) {
+    let client = TokenClient::new(env, token);
+    let contract = env.current_contract_address();
+    let before = client.balance(&contract);
+    client.transfer(from, &contract, &amount);
+    let delivered = client.balance(&contract).saturating_sub(before);
+    assert!(
+        delivered == amount,
+        "reward transfer delivered {} of {}",
+        delivered,
+        amount
+    );
+}
+
+/// Pays `amount` of reward tokens to `to` and confirms the recipient's balance
+/// rose by exactly that amount. Callers run this before committing payouts to
+/// `rewards_paid_out`, so a token that silently fails cannot leave the books
+/// claiming a payment that never moved.
+fn pay_reward(env: &Env, token: &Address, to: &Address, amount: i128) {
+    if amount <= 0 {
+        return;
+    }
+    let client = TokenClient::new(env, token);
+    let before = client.balance(to);
+    client.transfer(&env.current_contract_address(), to, &amount);
+    let delivered = client.balance(to).saturating_sub(before);
+    assert!(
+        delivered == amount,
+        "reward transfer delivered {} of {}",
+        delivered,
+        amount
+    );
+}
+
+/// Rejects a payout the reward accounting could not cover, before any tokens
+/// move or state is written.
+fn assert_payout_allowed(cfg: &Config, amount: i128) {
+    let paid = cfg
+        .rewards_paid_out
+        .checked_add(amount)
+        .expect("paid overflow");
+    assert!(
+        paid <= cfg.rewards_credited,
+        "reward solvency violated: payout exceeds credited rewards"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -579,7 +632,8 @@ impl YieldFarm {
             .publish((symbol_short!("set_admin"),), new_admin);
     }
 
-    /// Blocks deposits and funding. Withdrawals and harvests stay open.
+    /// Blocks deposits and funding. Existing schedules keep accruing, and
+    /// withdrawals and harvests stay open.
     pub fn set_paused(env: Env, paused: bool) {
         let mut cfg = config(&env);
         cfg.admin.require_auth();
@@ -693,7 +747,7 @@ impl YieldFarm {
         // derives its remainder from the stored rate, which would now be zero.
         assert!(rate > 0, "reward rate rounds to zero");
 
-        transfer_in(&env, &cfg.reward_token, &funder, amount);
+        receive_rewards(&env, &cfg.reward_token, &funder, amount);
 
         cfg.rewards_funded = cfg
             .rewards_funded
@@ -716,6 +770,10 @@ impl YieldFarm {
     // -- user actions --------------------------------------------------------
 
     /// Deposits `amount` of a pool's LP token and settles any pending reward.
+    ///
+    /// Settling before increasing `position.amount` ensures rewards from prior
+    /// deposit intervals are locked in at the previous stake rather than
+    /// retroactively scaled to the new balance.
     pub fn deposit(env: Env, user: Address, pool_id: u32, amount: i128) -> i128 {
         user.require_auth();
         assert!(amount > 0, "amount must be positive");
@@ -773,8 +831,10 @@ impl YieldFarm {
         position.amount
     }
 
-    /// Pays out pending rewards. `min_out` guards against a live rate falling
-    /// below the quote between the read and the transaction landing.
+    /// Pays out pending rewards, including while the farm is paused. Existing
+    /// schedules continue accruing until their scheduled finish. `min_out`
+    /// guards against a live rate falling below the quote between the read and
+    /// the transaction landing.
     pub fn harvest(env: Env, user: Address, pool_id: u32, min_out: i128) -> i128 {
         user.require_auth();
         assert!(min_out >= 0, "min_out must not be negative");
@@ -785,8 +845,12 @@ impl YieldFarm {
 
         let owed = position.accrued;
         assert!(owed >= min_out, "slippage: reward below min_out");
-        position.accrued = 0;
 
+        // Validate the payout and its transfer before committing any accounting.
+        assert_payout_allowed(&cfg, owed);
+        pay_reward(&env, &cfg.reward_token, &user, owed);
+
+        position.accrued = 0;
         cfg.rewards_paid_out = cfg
             .rewards_paid_out
             .checked_add(owed)
@@ -797,7 +861,6 @@ impl YieldFarm {
             untrack_user_pool(&env, &user, pool_id);
         }
         set_config(&env, &cfg);
-        transfer_out(&env, &cfg.reward_token, &user, owed);
 
         env.events()
             .publish((symbol_short!("harvest"), user), (pool_id, owed));
@@ -805,9 +868,9 @@ impl YieldFarm {
     }
 
     /// Returns the full LP balance without harvesting, forfeiting pending
-    /// rewards. The escape hatch for a pool that is misbehaving, since paying
-    /// out the accrual would draw on reward accounting the pool can no longer be
-    /// trusted with.
+    /// rewards, even while the farm is paused. The escape hatch for a pool that
+    /// is misbehaving, since paying out the accrual would draw on reward
+    /// accounting the pool can no longer be trusted with.
     pub fn emergency_withdraw(env: Env, user: Address, pool_id: u32) -> i128 {
         user.require_auth();
 
@@ -1097,6 +1160,25 @@ mod test {
     }
 
     #[test]
+    fn paused_emergency_withdraw_returns_lp_and_forfeits_rewards() {
+        let f = Fixture::new();
+        f.standard_farm();
+        f.deposit(&f.alice, 1, &f.lp_a, 100 * ONE);
+        f.client.set_paused(&true);
+        f.advance(100);
+
+        assert_eq!(f.client.pending_rewards(&f.alice, &1), 50 * ONE);
+        assert_eq!(f.client.emergency_withdraw(&f.alice, &1), 100 * ONE);
+
+        assert_eq!(f.balance(&f.lp_a, &f.alice), 100 * ONE);
+        assert_eq!(f.balance(&f.lp_a, &f.contract()), 0);
+        assert_eq!(f.client.pending_rewards(&f.alice, &1), 0);
+        assert_eq!(f.client.rewards_paid_out(), 0);
+        assert_eq!(f.client.pool_of(&1).unwrap().total_staked, 0);
+        assert!(f.client.user_pools(&f.alice).is_empty());
+    }
+
+    #[test]
     fn changing_an_allocation_does_not_reweight_an_elapsed_window() {
         let f = Fixture::new();
         f.standard_farm();
@@ -1207,6 +1289,10 @@ mod test {
         // full withdrawal returns the deposit on top of that balance.
         let wallet_before = f.balance(&f.lp_a, &f.alice);
         f.advance(100);
+        assert_eq!(f.client.pending_rewards(&f.alice, &1), 50 * ONE);
+        assert!(f.client.try_harvest(&f.alice, &1, &(50 * ONE + 1)).is_err());
+        assert_eq!(f.client.pending_rewards(&f.alice, &1), 50 * ONE);
+        assert_eq!(f.client.rewards_paid_out(), 0);
         assert_eq!(f.client.harvest(&f.alice, &1, &0), 50 * ONE);
         f.client.withdraw(&f.alice, &1, &(100 * ONE));
         assert_eq!(
@@ -1344,5 +1430,133 @@ mod test {
         ] {
             assert!(names.contains(&expected), "missing {expected:?}");
         }
+    }
+
+    // -- reward transfer validation -----------------------------------------
+
+    #[contracttype]
+    enum MockKey {
+        Balance(Address),
+        Deliver,
+    }
+
+    /// Minimal SEP-41-shaped token whose transfers can be told to silently
+    /// no-op, modelling a reward token that reports success without moving
+    /// funds.
+    #[contract]
+    pub struct MockRewardToken;
+
+    #[contractimpl]
+    impl MockRewardToken {
+        pub fn set_deliver(env: Env, deliver: bool) {
+            env.storage().instance().set(&MockKey::Deliver, &deliver);
+        }
+
+        pub fn mint(env: Env, to: Address, amount: i128) {
+            let key = MockKey::Balance(to);
+            let balance: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+            env.storage().persistent().set(&key, &(balance + amount));
+        }
+
+        pub fn balance(env: Env, id: Address) -> i128 {
+            env.storage()
+                .persistent()
+                .get(&MockKey::Balance(id))
+                .unwrap_or(0)
+        }
+
+        pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+            let deliver: bool = env
+                .storage()
+                .instance()
+                .get(&MockKey::Deliver)
+                .unwrap_or(false);
+            if !deliver {
+                return;
+            }
+            let from_key = MockKey::Balance(from);
+            let to_key = MockKey::Balance(to);
+            let from_balance: i128 = env.storage().persistent().get(&from_key).unwrap_or(0);
+            assert!(from_balance >= amount, "mock: insufficient balance");
+            env.storage()
+                .persistent()
+                .set(&from_key, &(from_balance - amount));
+            let to_balance: i128 = env.storage().persistent().get(&to_key).unwrap_or(0);
+            env.storage()
+                .persistent()
+                .set(&to_key, &(to_balance + amount));
+        }
+    }
+
+    /// Builds a farm whose reward token is `MockRewardToken`, with one LP pool.
+    fn mock_fixture(
+        deliver: bool,
+    ) -> (
+        Env,
+        MockRewardTokenClient<'static>,
+        YieldFarmClient<'static>,
+        Address,
+        Address,
+        Address,
+    ) {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_min_persistent_entry_ttl(1_000_000);
+        env.ledger().set_max_entry_ttl(1_000_000);
+        env.ledger().with_mut(|li| li.timestamp = 1_000);
+
+        let admin = Address::generate(&env);
+        let funder = Address::generate(&env);
+        let alice = Address::generate(&env);
+
+        let token_id = env.register_contract(None, MockRewardToken);
+        let token = MockRewardTokenClient::new(&env, &token_id);
+        token.set_deliver(&deliver);
+        token.mint(&funder, &(1_000 * ONE));
+        token.mint(&alice, &(1_000 * ONE));
+
+        let lp = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let id = env.register_contract(None, YieldFarm);
+        let farm = YieldFarmClient::new(&env, &id);
+        farm.initialize(&admin, &token_id);
+        farm.add_pool(&1, &lp, &1);
+
+        (env, token, farm, funder, alice, lp)
+    }
+
+    #[test]
+    fn fund_rewards_rejects_a_token_that_does_not_deliver() {
+        let (_env, _token, farm, funder, _alice, _lp) = mock_fixture(false);
+
+        assert!(farm.try_fund_rewards(&funder, &(100 * ONE), &100).is_err());
+
+        // The failed funding must not leave a schedule or accounting behind.
+        assert_eq!(farm.rewards_funded(), 0);
+        assert_eq!(farm.reward_rate(), 0);
+        assert_eq!(farm.period_finish(), 0);
+    }
+
+    #[test]
+    fn harvest_rejects_a_token_that_stops_delivering_before_committing_accounting() {
+        let (env, token, farm, funder, alice, lp) = mock_fixture(true);
+        farm.fund_rewards(&funder, &(100 * ONE), &100);
+        StellarAssetClient::new(&env, &lp).mint(&alice, &(100 * ONE));
+        farm.deposit(&alice, &1, &(100 * ONE));
+        env.ledger().with_mut(|li| li.timestamp += 100);
+
+        let pending = farm.pending_rewards(&alice, &1);
+        assert_eq!(pending, 100 * ONE);
+
+        // The token now reports success without moving tokens.
+        token.set_deliver(&false);
+        assert!(farm.try_harvest(&alice, &1, &0).is_err());
+
+        // No payout was committed and nothing was transferred.
+        assert_eq!(farm.rewards_paid_out(), 0);
+        assert_eq!(token.balance(&alice), 1_000 * ONE);
+        assert_eq!(farm.pending_rewards(&alice, &1), pending);
+        assert_eq!(farm.position(&alice, &1).accrued, 0);
     }
 }

@@ -3,9 +3,22 @@
 //! A simulator for testing Stellar payment channel networks with 100+ nodes.
 //! Supports network generation, payment simulation, and routing algorithm testing.
 
+pub mod baseline;
+pub mod disconnection;
+pub mod failure_summary;
 pub mod fuzz;
 pub mod network;
 pub mod statistics;
+
+pub use baseline::{
+    baseline_network, baseline_nodes, baseline_simulated_nodes, validate_baseline_specs,
+    BaselineChannelSpec, BaselineFailureCase, BaselineNodeSpec, BaselineRouteCase,
+    BASELINE_AMOUNT, BASELINE_CHANNELS, BASELINE_NETWORK_NAME, BASELINE_NODES, BASELINE_ROUTES,
+    BASELINE_UNROUTABLE,
+};
+pub use disconnection::{DisconnectionConfig, DisconnectionTracker, MAX_DOWNTIME_STEPS};
+pub use failure_summary::{FailedPayment, FailureCategory, FailureSummary, MAX_FAILURE_SAMPLES};
+use std::collections::BTreeMap;
 
 use channel_router::pathfinder::Pathfinder;
 use channel_router::{Channel, NetworkGraph, Node, RouteRequest};
@@ -43,6 +56,10 @@ pub struct SimulatorConfig {
     pub max_payment_amount: i128,
     /// Random seed for reproducibility
     pub seed: Option<u64>,
+    /// Optional configuration for temporary node disconnection and recovery.
+    /// When `None`, all nodes remain online throughout the simulation.
+    #[serde(default)]
+    pub disconnection: Option<DisconnectionConfig>,
 }
 
 impl Default for SimulatorConfig {
@@ -59,6 +76,7 @@ impl Default for SimulatorConfig {
             num_payments: 1000,
             max_payment_amount: 1_000_000, // 1 XLM
             seed: None,
+            disconnection: None,
         }
     }
 }
@@ -86,6 +104,18 @@ pub struct SimulationStats {
     pub network_utilization: f64,
     /// Payment latency histogram (ms)
     pub latency_ms: Vec<u64>,
+    /// Total node disconnections observed during simulation
+    #[serde(default)]
+    pub node_disconnections: usize,
+    /// Total node recoveries observed during simulation
+    #[serde(default)]
+    pub node_recoveries: usize,
+    /// Failed payments per [`FailureCategory`] key (#386).
+    ///
+    /// `default` so a stats value serialised before the breakdown existed still
+    /// deserialises; such a record simply reports no breakdown.
+    #[serde(default)]
+    pub failures_by_category: BTreeMap<String, usize>,
 }
 
 /// Payment result for simulation
@@ -119,6 +149,10 @@ pub struct Simulator {
     nodes: Arc<RwLock<HashMap<String, SimulatedNode>>>,
     /// Statistics
     stats: Arc<RwLock<SimulationStats>>,
+    /// Tracks temporarily disconnected nodes and suspended channels
+    disconnection_tracker: Arc<RwLock<DisconnectionTracker>>,
+    /// Why the last run's payments failed, aggregated by category (#386)
+    failure_summary: Arc<RwLock<FailureSummary>>,
     /// Random number generator
     rng: parking_lot::Mutex<rand::rngs::StdRng>,
 }
@@ -140,17 +174,24 @@ impl Simulator {
             network: Arc::new(RwLock::new(NetworkGraph::new())),
             nodes: Arc::new(RwLock::new(HashMap::new())),
             stats: Arc::new(RwLock::new(SimulationStats::default())),
+            disconnection_tracker: Arc::new(RwLock::new(DisconnectionTracker::new())),
+            failure_summary: Arc::new(RwLock::new(FailureSummary::new())),
             rng: parking_lot::Mutex::new(rng),
         }
     }
 
     /// Initialize the network with random topology
     pub fn initialize_network(&self) -> Result<(), SimulatorError> {
+        if let Some(ref disconnection) = self.config.disconnection {
+            disconnection.validate()?;
+        }
+
         info!("Initializing network with {} nodes", self.config.num_nodes);
 
         let mut rng = self.rng.lock();
         let mut network = self.network.write();
         let mut nodes = self.nodes.write();
+        self.disconnection_tracker.write().clear();
 
         // Create nodes
         for i in 0..self.config.num_nodes {
@@ -264,13 +305,26 @@ impl Simulator {
     /// Run the payment simulation
     #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // public API; a concurrent runner awaits this
     pub async fn run_simulation(&self) -> Result<SimulationStats, SimulatorError> {
+        if let Some(ref disconnection) = self.config.disconnection {
+            disconnection.validate()?;
+        }
+
         info!(
             "Starting simulation with {} payments",
             self.config.num_payments
         );
 
         let mut rng = self.rng.lock();
-        let node_ids: Vec<String> = self.nodes.read().keys().cloned().collect();
+        let mut node_ids: Vec<String> = self.nodes.read().keys().cloned().collect();
+        if node_ids.is_empty() {
+            return Err(SimulatorError::SimulationError(
+                "cannot run simulation on an empty network; call initialize_network first"
+                    .to_string(),
+            ));
+        }
+        if self.config.disconnection.is_some() {
+            node_ids.sort();
+        }
         let mut payments = Vec::new();
 
         // Generate random payments
@@ -290,7 +344,6 @@ impl Simulator {
         }
 
         // Run payments through the router
-        let network = self.network.read();
         let pathfinder = Pathfinder::new();
 
         let mut successful = 0;
@@ -298,8 +351,27 @@ impl Simulator {
         let mut total_value = 0i128;
         let mut total_fees = 0i128;
         let mut path_lengths = Vec::new();
+        let mut node_disconnections = 0usize;
+        let mut node_recoveries = 0usize;
+        let mut failure_summary = FailureSummary::new();
+        let total_steps = payments.len();
 
-        for (source, dest, amount) in payments {
+        for (step, (source, dest, amount)) in payments.into_iter().enumerate() {
+            if let Some(ref churn_cfg) = self.config.disconnection {
+                let mut network = self.network.write();
+                let mut nodes = self.nodes.write();
+                let mut tracker = self.disconnection_tracker.write();
+
+                node_recoveries += tracker.recover_due_nodes(&mut network, &mut nodes, step)?;
+                node_disconnections += tracker.step_random_disconnections(
+                    &mut network,
+                    &mut nodes,
+                    step,
+                    churn_cfg,
+                    &mut *rng,
+                )?;
+            }
+
             let start = std::time::Instant::now();
 
             let request = RouteRequest {
@@ -312,7 +384,12 @@ impl Simulator {
                 payment_metadata: None,
             };
 
-            match pathfinder.find_route_dijkstra(&network, &request) {
+            let route_result = {
+                let network = self.network.read();
+                pathfinder.find_route_dijkstra(&network, &request)
+            };
+
+            match route_result {
                 Ok(route) => {
                     let elapsed = start.elapsed().as_millis() as u64;
 
@@ -333,8 +410,26 @@ impl Simulator {
                 }
                 Err(e) => {
                     failed += 1;
+                    // Keep the router's message verbatim alongside the coarse
+                    // category, so a reported sample explains itself (#386).
+                    failure_summary.record(FailedPayment {
+                        source: source.clone(),
+                        destination: dest.clone(),
+                        amount,
+                        category: FailureCategory::from_routing_error(&e),
+                        reason: e.to_string(),
+                    });
                     debug!("Payment failed: {} -> {} - {:?}", source, dest, e);
                 }
+            }
+        }
+
+        if let Some(ref churn_cfg) = self.config.disconnection {
+            if churn_cfg.recover_at_end {
+                let mut network = self.network.write();
+                let mut nodes = self.nodes.write();
+                let mut tracker = self.disconnection_tracker.write();
+                node_recoveries += tracker.recover_all(&mut network, &mut nodes, total_steps)?;
             }
         }
 
@@ -346,10 +441,15 @@ impl Simulator {
         };
 
         let max_path = path_lengths.iter().max().copied().unwrap_or(0);
-        let success_rate = (successful as f64 / (successful + failed) as f64) * 100.0;
+        let total = successful + failed;
+        let success_rate = if total == 0 {
+            0.0
+        } else {
+            (successful as f64 / total as f64) * 100.0
+        };
 
         let stats = SimulationStats {
-            total_payments: successful + failed,
+            total_payments: total,
             successful_payments: successful,
             failed_payments: failed,
             total_value_routed: total_value,
@@ -359,9 +459,13 @@ impl Simulator {
             success_rate,
             network_utilization: 0.0, // Would need more complex calculation
             latency_ms: Vec::new(),
+            node_disconnections,
+            node_recoveries,
+            failures_by_category: failure_summary.by_category.clone(),
         };
 
         *self.stats.write() = stats.clone();
+        *self.failure_summary.write() = failure_summary;
 
         info!(
             "Simulation complete: {} successful, {} failed, {:.2}% success rate",
@@ -394,6 +498,51 @@ impl Simulator {
     /// Get simulation statistics
     pub fn get_stats(&self) -> SimulationStats {
         self.stats.read().clone()
+    }
+
+    /// Why the last simulation's payments failed, aggregated by category (#386).
+    ///
+    /// Empty before the first run, and after a run in which every payment
+    /// succeeded. Counts cover the last run only; a new run replaces them.
+    pub fn failure_summary(&self) -> FailureSummary {
+        self.failure_summary.read().clone()
+    }
+
+    /// Temporarily disconnect a node and suspend its active channels.
+    ///
+    /// Returns the number of channels suspended. Fails without modifying state
+    /// if the node does not exist or is already disconnected.
+    pub fn disconnect_node(&self, node_id: &str) -> Result<usize, SimulatorError> {
+        let mut network = self.network.write();
+        let mut nodes = self.nodes.write();
+        let mut tracker = self.disconnection_tracker.write();
+        tracker.disconnect_node(&mut network, &mut nodes, node_id, 0, None)
+    }
+
+    /// Recover a previously disconnected node and restore its suspended channels
+    /// whose peer endpoints are also online.
+    ///
+    /// Returns the number of channels restored. Fails without modifying state if
+    /// the node does not exist or is not currently disconnected.
+    pub fn recover_node(&self, node_id: &str) -> Result<usize, SimulatorError> {
+        let mut network = self.network.write();
+        let mut nodes = self.nodes.write();
+        let mut tracker = self.disconnection_tracker.write();
+        tracker.recover_node(&mut network, &mut nodes, node_id, 0)
+    }
+
+    /// Check whether a node is currently online.
+    pub fn is_node_online(&self, node_id: &str) -> Result<bool, SimulatorError> {
+        let nodes = self.nodes.read();
+        nodes
+            .get(node_id)
+            .map(|sim_node| sim_node.node.online)
+            .ok_or_else(|| SimulatorError::UnknownNode(node_id.to_string()))
+    }
+
+    /// Return the sorted list of currently disconnected node IDs.
+    pub fn disconnected_nodes(&self) -> Vec<String> {
+        self.disconnection_tracker.read().offline_node_ids()
     }
 
     /// Generate random bytes
@@ -527,6 +676,12 @@ pub enum SimulatorError {
 
     #[error("Invalid configuration: {0}")]
     InvalidConfig(String),
+
+    #[error("Unknown node '{0}'")]
+    UnknownNode(String),
+
+    #[error("Invalid node state: {0}")]
+    InvalidNodeState(String),
 }
 
 #[cfg(test)]
@@ -571,5 +726,113 @@ mod tests {
         let network = simulator.get_network();
         let graph = network.read();
         assert!(graph.num_channels() > 0);
+    }
+
+    #[test]
+    fn manual_node_disconnection_and_recovery_updates_graph_and_rejects_invalid_calls() {
+        let config = SimulatorConfig {
+            num_nodes: 6,
+            avg_channels_per_node: 3.0,
+            seed: Some(99),
+            ..Default::default()
+        };
+
+        let simulator = Simulator::new(config);
+        simulator.initialize_network().unwrap();
+
+        let initial_channels = simulator.get_network().read().num_channels();
+        let node_channels_before = simulator.get_node("node_000").unwrap().channels.len();
+
+        let suspended = simulator.disconnect_node("node_000").unwrap();
+        assert_eq!(suspended, node_channels_before);
+        assert!(!simulator.is_node_online("node_000").unwrap());
+        assert_eq!(simulator.disconnected_nodes(), vec!["node_000".to_string()]);
+        assert_eq!(
+            simulator.get_network().read().num_channels(),
+            initial_channels - suspended
+        );
+
+        // Disconnecting an already-disconnected node fails without changing state
+        assert!(matches!(
+            simulator.disconnect_node("node_000"),
+            Err(SimulatorError::InvalidNodeState(_))
+        ));
+        assert!(matches!(
+            simulator.disconnect_node("missing_node"),
+            Err(SimulatorError::UnknownNode(_))
+        ));
+
+        let restored = simulator.recover_node("node_000").unwrap();
+        assert_eq!(restored, suspended);
+        assert!(simulator.is_node_online("node_000").unwrap());
+        assert!(simulator.disconnected_nodes().is_empty());
+        assert_eq!(
+            simulator.get_network().read().num_channels(),
+            initial_channels
+        );
+
+        // Recovering an online node fails without changing state
+        assert!(matches!(
+            simulator.recover_node("node_000"),
+            Err(SimulatorError::InvalidNodeState(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn simulation_rejects_invalid_disconnection_config() {
+        let config = SimulatorConfig {
+            num_nodes: 5,
+            num_payments: 10,
+            seed: Some(11),
+            disconnection: Some(DisconnectionConfig {
+                disconnect_probability: 1.5,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let simulator = Simulator::new(config);
+        assert!(matches!(
+            simulator.initialize_network(),
+            Err(SimulatorError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            simulator.run_simulation().await,
+            Err(SimulatorError::InvalidConfig(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn simulation_with_disconnection_is_reproducible_and_recovers_nodes() {
+        let config = SimulatorConfig {
+            num_nodes: 12,
+            avg_channels_per_node: 4.0,
+            num_payments: 30,
+            seed: Some(777),
+            disconnection: Some(DisconnectionConfig {
+                disconnect_probability: 0.15,
+                min_downtime_steps: 2,
+                max_downtime_steps: 5,
+                max_concurrent_disconnections: Some(4),
+                recover_at_end: true,
+            }),
+            ..Default::default()
+        };
+
+        let sim_a = Simulator::new(config.clone());
+        sim_a.initialize_network().unwrap();
+        let stats_a = sim_a.run_simulation().await.unwrap();
+
+        let sim_b = Simulator::new(config);
+        sim_b.initialize_network().unwrap();
+        let stats_b = sim_b.run_simulation().await.unwrap();
+
+        assert!(stats_a.node_disconnections > 0);
+        assert_eq!(stats_a.node_disconnections, stats_a.node_recoveries);
+        assert!(sim_a.disconnected_nodes().is_empty());
+        assert_eq!(stats_a.total_payments, stats_b.total_payments);
+        assert_eq!(stats_a.successful_payments, stats_b.successful_payments);
+        assert_eq!(stats_a.node_disconnections, stats_b.node_disconnections);
+        assert_eq!(stats_a.node_recoveries, stats_b.node_recoveries);
     }
 }

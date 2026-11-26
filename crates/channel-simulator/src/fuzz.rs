@@ -28,8 +28,9 @@
 //!   capacity in the direction of travel
 //! * `total_fees` matches the hops and satisfies the protocol fee cap
 
+use crate::disconnection::{DisconnectionConfig, DisconnectionTracker};
 use crate::network::{NetworkTopology, TopologyType};
-use crate::{SimulatedNode, SimulatorConfig};
+use crate::{SimulatedNode, SimulatorConfig, SimulatorError};
 use channel_router::fee_cap::FeeCap;
 use channel_router::pathfinder::Pathfinder;
 use channel_router::{NetworkGraph, Route, RouteRequest};
@@ -65,6 +66,10 @@ pub struct TopologyFuzzConfig {
     pub max_nodes: usize,
     /// Payment attempts to route per topology.
     pub payments_per_topology: usize,
+    /// Optional temporary node disconnection and recovery modeling per payment step.
+    /// When `None`, all nodes stay online for the entire iteration.
+    #[serde(default)]
+    pub disconnection: Option<DisconnectionConfig>,
 }
 
 impl Default for TopologyFuzzConfig {
@@ -75,6 +80,7 @@ impl Default for TopologyFuzzConfig {
             min_nodes: 2,
             max_nodes: 40,
             payments_per_topology: 25,
+            disconnection: None,
         }
     }
 }
@@ -109,6 +115,10 @@ pub struct FuzzReport {
     pub routes_found: usize,
     /// Topologies that had at least one route.
     pub routable_topologies: usize,
+    /// Node disconnections simulated across all iterations.
+    pub disconnections_simulated: usize,
+    /// Node recoveries simulated across all iterations.
+    pub recoveries_simulated: usize,
     /// Invariant violations.
     pub failures: Vec<FuzzFailure>,
 }
@@ -428,9 +438,25 @@ impl TopologyFuzzer {
         TopologyFuzzer { config }
     }
 
+    /// Create a fuzzer after validating its configuration.
+    pub fn try_new(config: TopologyFuzzConfig) -> Result<Self, SimulatorError> {
+        if let Some(ref disconnection) = config.disconnection {
+            disconnection.validate()?;
+        }
+        Ok(TopologyFuzzer { config })
+    }
+
     /// The configuration being used.
     pub fn config(&self) -> &TopologyFuzzConfig {
         &self.config
+    }
+
+    /// Validate configuration and run the fuzzer.
+    pub fn try_run(&self) -> Result<FuzzReport, SimulatorError> {
+        if let Some(ref disconnection) = self.config.disconnection {
+            disconnection.validate()?;
+        }
+        Ok(self.run())
     }
 
     /// Generate and check topologies until the iteration budget is exhausted.
@@ -450,8 +476,23 @@ impl TopologyFuzzer {
         let mut rng = StdRng::seed_from_u64(seed);
         let topology = ALL_TOPOLOGIES[iteration % ALL_TOPOLOGIES.len()];
 
+        if let Some(ref disconnection) = self.config.disconnection {
+            if let Err(err) = disconnection.validate() {
+                report.iterations += 1;
+                report.failures.push(FuzzFailure {
+                    iteration,
+                    seed,
+                    topology,
+                    invariant: "config",
+                    detail: err.to_string(),
+                });
+                return;
+            }
+        }
+
         let sim_config = self.random_sim_config(&mut rng);
-        let (graph, nodes) = NetworkTopology::new(sim_config, topology).generate(&mut rng);
+        let (mut graph, mut nodes) =
+            NetworkTopology::new(sim_config, topology).generate(&mut rng);
 
         report.iterations += 1;
 
@@ -468,13 +509,67 @@ impl TopologyFuzzer {
         }
 
         let mut routed_here = false;
+        let mut tracker = self.config.disconnection.as_ref().map(|_| DisconnectionTracker::new());
 
         for payment_index in 0..self.config.payments_per_topology {
+            if let (Some(churn_cfg), Some(churn_tracker)) =
+                (self.config.disconnection.as_ref(), tracker.as_mut())
+            {
+                match churn_tracker.recover_due_nodes(&mut graph, &mut nodes, payment_index) {
+                    Ok(n) => report.recoveries_simulated += n,
+                    Err(err) => {
+                        report.failures.push(FuzzFailure {
+                            iteration,
+                            seed,
+                            topology,
+                            invariant: "recovery",
+                            detail: format!("payment {payment_index}: {err}"),
+                        });
+                        return;
+                    }
+                }
+                match churn_tracker.step_random_disconnections(
+                    &mut graph,
+                    &mut nodes,
+                    payment_index,
+                    churn_cfg,
+                    &mut rng,
+                ) {
+                    Ok(n) => report.disconnections_simulated += n,
+                    Err(err) => {
+                        report.failures.push(FuzzFailure {
+                            iteration,
+                            seed,
+                            topology,
+                            invariant: "disconnection",
+                            detail: format!("payment {payment_index}: {err}"),
+                        });
+                        return;
+                    }
+                }
+                if let Err(detail) = verify_topology(&graph, &nodes) {
+                    report.failures.push(FuzzFailure {
+                        iteration,
+                        seed,
+                        topology,
+                        invariant: "topology_after_churn",
+                        detail: format!("payment {payment_index}: {detail}"),
+                    });
+                    return;
+                }
+            }
+
             let payment = self.random_payment(&graph, &mut rng);
             let (request, pathfinder) = match payment {
                 Some(request) => (request, Pathfinder::new()),
                 // Fewer than two nodes, or no channels at all: nothing to route.
-                None => break,
+                None => {
+                    if self.config.disconnection.is_some() {
+                        // With churn enabled, nodes may recover on later steps.
+                        continue;
+                    }
+                    break;
+                }
             };
 
             report.payments_attempted += 1;
@@ -501,6 +596,60 @@ impl TopologyFuzzer {
                         topology,
                         invariant: "route",
                         detail: format!("payment {payment_index} via {algorithm}: {detail}"),
+                    });
+                }
+
+                if self.config.disconnection.is_some() {
+                    let source_online = nodes
+                        .get(&request.source)
+                        .is_some_and(|n| n.node.online);
+                    let offline_hop = route
+                        .hops
+                        .iter()
+                        .find(|hop| !nodes.get(&hop.node_id).is_some_and(|n| n.node.online));
+                    if !source_online || offline_hop.is_some() {
+                        report.failures.push(FuzzFailure {
+                            iteration,
+                            seed,
+                            topology,
+                            invariant: "route_offline_node",
+                            detail: format!(
+                                "payment {payment_index} via {algorithm} used an offline node"
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+
+        if let (Some(churn_cfg), Some(mut churn_tracker)) =
+            (self.config.disconnection.as_ref(), tracker)
+        {
+            if churn_cfg.recover_at_end {
+                match churn_tracker.recover_all(
+                    &mut graph,
+                    &mut nodes,
+                    self.config.payments_per_topology,
+                ) {
+                    Ok(n) => report.recoveries_simulated += n,
+                    Err(err) => {
+                        report.failures.push(FuzzFailure {
+                            iteration,
+                            seed,
+                            topology,
+                            invariant: "final_recovery",
+                            detail: err.to_string(),
+                        });
+                        return;
+                    }
+                }
+                if let Err(detail) = verify_topology(&graph, &nodes) {
+                    report.failures.push(FuzzFailure {
+                        iteration,
+                        seed,
+                        topology,
+                        invariant: "topology_after_recovery",
+                        detail,
                     });
                 }
             }
@@ -541,6 +690,7 @@ impl TopologyFuzzer {
             num_payments: self.config.payments_per_topology,
             max_payment_amount: min_capacity * rng.gen_range(1i128..8),
             seed: None,
+            disconnection: None,
         }
     }
 
@@ -783,6 +933,7 @@ mod tests {
             min_nodes: 2,
             max_nodes: 30,
             payments_per_topology: 8,
+            disconnection: None,
         });
 
         let report = fuzzer.run();
@@ -806,6 +957,7 @@ mod tests {
             min_nodes: 2,
             max_nodes: 20,
             payments_per_topology: 5,
+            disconnection: None,
         };
 
         let first = TopologyFuzzer::new(config.clone()).run();
@@ -827,6 +979,7 @@ mod tests {
                 min_nodes: num_nodes,
                 max_nodes: num_nodes,
                 payments_per_topology: 3,
+                disconnection: None,
             });
 
             let report = fuzzer.run();
@@ -857,5 +1010,80 @@ mod tests {
         }
 
         assert_eq!(seen.len(), ALL_TOPOLOGIES.len());
+    }
+
+    #[test]
+    fn fuzzing_with_disconnection_and_recovery_preserves_invariants() {
+        let fuzzer = TopologyFuzzer::try_new(TopologyFuzzConfig {
+            iterations: 28,
+            seed: 0xFACE_B00C,
+            min_nodes: 3,
+            max_nodes: 25,
+            payments_per_topology: 10,
+            disconnection: Some(DisconnectionConfig {
+                disconnect_probability: 0.2,
+                min_downtime_steps: 2,
+                max_downtime_steps: 4,
+                max_concurrent_disconnections: Some(4),
+                recover_at_end: true,
+            }),
+        })
+        .unwrap();
+
+        let report = fuzzer.try_run().unwrap();
+        assert!(
+            report.is_clean(),
+            "disconnection fuzzing violations: {}",
+            report.summarize()
+        );
+        assert!(report.disconnections_simulated > 0);
+        assert_eq!(report.disconnections_simulated, report.recoveries_simulated);
+    }
+
+    #[test]
+    fn fuzzing_with_disconnection_is_deterministic() {
+        let config = TopologyFuzzConfig {
+            iterations: 14,
+            seed: 999,
+            min_nodes: 3,
+            max_nodes: 18,
+            payments_per_topology: 8,
+            disconnection: Some(DisconnectionConfig {
+                disconnect_probability: 0.15,
+                min_downtime_steps: 1,
+                max_downtime_steps: 3,
+                max_concurrent_disconnections: Some(3),
+                recover_at_end: true,
+            }),
+        };
+
+        let first = TopologyFuzzer::new(config.clone()).run();
+        let second = TopologyFuzzer::new(config).run();
+
+        assert_eq!(first.routes_checked, second.routes_checked);
+        assert_eq!(first.routes_found, second.routes_found);
+        assert_eq!(first.disconnections_simulated, second.disconnections_simulated);
+        assert_eq!(first.recoveries_simulated, second.recoveries_simulated);
+        assert_eq!(first.failures, second.failures);
+    }
+
+    #[test]
+    fn fuzzing_rejects_invalid_disconnection_config() {
+        let bad_config = TopologyFuzzConfig {
+            disconnection: Some(DisconnectionConfig {
+                min_downtime_steps: 0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            TopologyFuzzer::try_new(bad_config.clone()),
+            Err(SimulatorError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            TopologyFuzzer::new(bad_config).try_run(),
+            Err(SimulatorError::InvalidConfig(_))
+        ));
     }
 }

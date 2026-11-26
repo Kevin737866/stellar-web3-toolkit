@@ -4,6 +4,23 @@
 //! plans the fee bump transactions used to resubmit a transaction that was not
 //! included in a ledger because the network base fee moved. Fees are expressed in
 //! stroops (1 XLM = `10_000_000` stroops) to match the Stellar protocol.
+//!
+//! # Fee breakdown
+//!
+//! [`GasSimulator::estimate`] returns a [`FeeEstimate`] that includes a
+//! [`FeeBreakdown`] with four named components:
+//!
+//! | Component | What it covers |
+//! |-----------|----------------|
+//! | `base_fee` | Protocol minimum, one unit per operation |
+//! | `resource_fee` | Soroban instructions + read/write footprint |
+//! | `inclusion_bid` | Per-ledger inclusion incentive |
+//! | `per_operation` | Fixed per-op overhead (signature, envelope) |
+//!
+//! [`FeeEstimateReport`] wraps the estimate together with the transaction
+//! profile and per-component percentage labels for display and machine
+//! consumption. Use [`FeeEstimateReport::to_json`] to get a stable JSON
+//! representation suitable for scripting and CI pipelines.
 
 use crate::error::{Result, ToolkitError};
 use serde::{Deserialize, Serialize};
@@ -88,6 +105,36 @@ pub struct FeeBreakdown {
     pub per_operation: u32,
 }
 
+impl FeeBreakdown {
+    /// Percentage of `total` that each component accounts for, rounded to one
+    /// decimal place. Returns `0.0` when `total` is zero.
+    #[must_use]
+    pub fn percent_of(&self, total: u32) -> FeeBreakdownPercents {
+        let pct = |part: u32| -> f64 {
+            if total == 0 {
+                0.0
+            } else {
+                (f64::from(part) / f64::from(total) * 1000.0).round() / 10.0
+            }
+        };
+        FeeBreakdownPercents {
+            base_fee_pct: pct(self.base_fee),
+            resource_fee_pct: pct(self.resource_fee),
+            inclusion_bid_pct: pct(self.inclusion_bid),
+            per_operation_pct: pct(self.per_operation),
+        }
+    }
+}
+
+/// Per-component percentage share of the total fee (one decimal place).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct FeeBreakdownPercents {
+    pub base_fee_pct: f64,
+    pub resource_fee_pct: f64,
+    pub inclusion_bid_pct: f64,
+    pub per_operation_pct: f64,
+}
+
 /// Total fee required to submit a transaction with the current base fee.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeeEstimate {
@@ -100,6 +147,138 @@ impl FeeEstimate {
     #[must_use]
     pub fn total_xlm(&self) -> f64 {
         f64::from(self.total_stroops) / STROOPS_PER_XLM as f64
+    }
+}
+
+/// Full structured report combining the estimate, the profile that produced it,
+/// the fee-bump ladder, and per-component percentage labels.
+///
+/// Use [`FeeEstimateReport::to_json`] for a stable machine-readable
+/// representation. The JSON schema is documented below.
+///
+/// # JSON schema
+///
+/// ```json
+/// {
+///   "profile": {
+///     "operations": 1,
+///     "instructions": 100000,
+///     "ledger_reads": 3,
+///     "ledger_writes": 1,
+///     "bid_ledgers": 1
+///   },
+///   "estimate": {
+///     "total_stroops": 1008300,
+///     "total_xlm": "0.1008300 XLM",
+///     "breakdown": {
+///       "base_fee":      { "stroops": 100,     "xlm": "0.0000100 XLM", "pct": 0.0 },
+///       "resource_fee":  { "stroops": 1008000, "xlm": "0.1008000 XLM", "pct": 99.9 },
+///       "inclusion_bid": { "stroops": 100,     "xlm": "0.0000100 XLM", "pct": 0.0, "bid_ledgers": 1 },
+///       "per_operation": { "stroops": 100,     "xlm": "0.0000100 XLM", "pct": 0.0 }
+///     }
+///   },
+///   "bump_ladder": [
+///     { "attempt": 1, "inner_stroops": 1008300, "outer_stroops": 1512450, "outer_xlm": "0.1512450 XLM", "pct_over_signed": 150 }
+///   ]
+/// }
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeeEstimateReport {
+    /// Transaction profile used to compute the estimate.
+    pub profile: TransactionProfile,
+    /// Fee estimate including the per-component breakdown.
+    pub estimate: FeeEstimate,
+    /// Percentage share of each component in the total fee.
+    pub percents: FeeBreakdownPercents,
+    /// Fee bump ladder for automated retries.
+    pub bump_ladder: Vec<FeeBump>,
+}
+
+impl FeeEstimateReport {
+    /// Build a report for `profile` using `simulator`.
+    #[must_use]
+    pub fn build(simulator: &GasSimulator, profile: TransactionProfile) -> Self {
+        let estimate = simulator.estimate(&profile);
+        let percents = estimate.breakdown.percent_of(estimate.total_stroops);
+        let bump_ladder = simulator.bump_ladder(estimate.total_stroops);
+        Self {
+            profile,
+            estimate,
+            percents,
+            bump_ladder,
+        }
+    }
+
+    /// Serialise the report to compact, pretty-printed JSON.
+    ///
+    /// The output is stable across patch versions of this crate: existing keys
+    /// are never removed and new keys are always added at the end of their
+    /// object.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ToolkitError::ExecutionError`] if `serde_json` fails to
+    /// serialise the report (this cannot happen with the types used here, but
+    /// the method signature is `Result` to match other `to_json` methods in this
+    /// crate).
+    pub fn to_json(&self) -> Result<String> {
+        // Build a richer JSON value that includes the XLM string alongside the
+        // raw stroops so callers do not have to implement the conversion.
+        let bd = &self.estimate.breakdown;
+        let pct = &self.percents;
+        let total = self.estimate.total_stroops;
+
+        let breakdown = serde_json::json!({
+            "base_fee": {
+                "stroops": bd.base_fee,
+                "xlm": format_stroops(bd.base_fee),
+                "pct": pct.base_fee_pct
+            },
+            "resource_fee": {
+                "stroops": bd.resource_fee,
+                "xlm": format_stroops(bd.resource_fee),
+                "pct": pct.resource_fee_pct
+            },
+            "inclusion_bid": {
+                "stroops": bd.inclusion_bid,
+                "xlm": format_stroops(bd.inclusion_bid),
+                "pct": pct.inclusion_bid_pct,
+                "bid_ledgers": self.estimate.bid_ledgers
+            },
+            "per_operation": {
+                "stroops": bd.per_operation,
+                "xlm": format_stroops(bd.per_operation),
+                "pct": pct.per_operation_pct
+            }
+        });
+
+        let ladder: Vec<serde_json::Value> = self
+            .bump_ladder
+            .iter()
+            .enumerate()
+            .map(|(i, bump)| {
+                serde_json::json!({
+                    "attempt": i + 1,
+                    "inner_stroops": bump.inner_fee_stroops,
+                    "outer_stroops": bump.outer_fee_stroops,
+                    "outer_xlm": format_stroops(bump.outer_fee_stroops),
+                    "pct_over_signed": bump.percent_over_signed_fee()
+                })
+            })
+            .collect();
+
+        let doc = serde_json::json!({
+            "profile": self.profile,
+            "estimate": {
+                "total_stroops": total,
+                "total_xlm": format_stroops(total),
+                "breakdown": breakdown
+            },
+            "bump_ladder": ladder
+        });
+
+        serde_json::to_string_pretty(&doc)
+            .map_err(|e| ToolkitError::ExecutionError(format!("json serialise: {e}")))
     }
 }
 
@@ -293,6 +472,114 @@ mod tests {
         assert_eq!(estimate.total_stroops, 1_008_300);
     }
 
+    // ── FeeBreakdown percentage helpers ──────────────────────────────────────
+
+    #[test]
+    fn breakdown_percents_sum_to_one_hundred_for_default_profile() {
+        let simulator = testnet();
+        let estimate = simulator.estimate(&TransactionProfile::default());
+        let pct = estimate.breakdown.percent_of(estimate.total_stroops);
+        let sum = pct.base_fee_pct + pct.resource_fee_pct + pct.inclusion_bid_pct + pct.per_operation_pct;
+        // Allow ±0.4 for rounding across four components rounded to 1 decimal place.
+        assert!((sum - 100.0).abs() < 0.4, "percents sum to ~100, got {sum}");
+    }
+
+    #[test]
+    fn breakdown_percents_zero_total_returns_all_zeros() {
+        let bd = FeeBreakdown {
+            base_fee: 0,
+            resource_fee: 0,
+            inclusion_bid: 0,
+            per_operation: 0,
+        };
+        let pct = bd.percent_of(0);
+        assert_eq!(pct.base_fee_pct, 0.0);
+        assert_eq!(pct.resource_fee_pct, 0.0);
+        assert_eq!(pct.inclusion_bid_pct, 0.0);
+        assert_eq!(pct.per_operation_pct, 0.0);
+    }
+
+    #[test]
+    fn breakdown_percents_single_component_is_100() {
+        let bd = FeeBreakdown {
+            base_fee: 500,
+            resource_fee: 0,
+            inclusion_bid: 0,
+            per_operation: 0,
+        };
+        let pct = bd.percent_of(500);
+        assert_eq!(pct.base_fee_pct, 100.0);
+        assert_eq!(pct.resource_fee_pct, 0.0);
+    }
+
+    // ── FeeEstimateReport ─────────────────────────────────────────────────────
+
+    #[test]
+    fn fee_estimate_report_build_round_trips_estimate() {
+        let simulator = testnet();
+        let profile = TransactionProfile::default();
+        let report = FeeEstimateReport::build(&simulator, profile);
+        // The report's estimate must equal a direct call.
+        let direct = simulator.estimate(&profile);
+        assert_eq!(report.estimate.total_stroops, direct.total_stroops);
+        assert_eq!(report.estimate.breakdown.resource_fee, direct.breakdown.resource_fee);
+    }
+
+    #[test]
+    fn fee_estimate_report_to_json_emits_valid_json_with_required_keys() {
+        let simulator = testnet();
+        let report = FeeEstimateReport::build(&simulator, TransactionProfile::default());
+        let json = report.to_json().expect("to_json must not fail");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+
+        // Top-level keys.
+        assert!(v["profile"].is_object(), "profile key must be an object");
+        assert!(v["estimate"].is_object(), "estimate key must be an object");
+        assert!(v["bump_ladder"].is_array(), "bump_ladder key must be an array");
+
+        // Breakdown sub-keys.
+        let bd = &v["estimate"]["breakdown"];
+        for key in ["base_fee", "resource_fee", "inclusion_bid", "per_operation"] {
+            assert!(bd[key]["stroops"].is_number(), "{key}.stroops must be a number");
+            assert!(bd[key]["xlm"].is_string(), "{key}.xlm must be a string");
+            assert!(bd[key]["pct"].is_number(), "{key}.pct must be a number");
+        }
+        assert!(bd["inclusion_bid"]["bid_ledgers"].is_number(), "bid_ledgers must be present");
+
+        // total_xlm must look like an XLM string.
+        let xlm = v["estimate"]["total_xlm"].as_str().unwrap_or("");
+        assert!(xlm.ends_with(" XLM"), "total_xlm must end with ' XLM', got '{xlm}'");
+    }
+
+    #[test]
+    fn fee_estimate_report_to_json_bump_ladder_entries_are_well_formed() {
+        let simulator = testnet();
+        let report = FeeEstimateReport::build(&simulator, TransactionProfile::default());
+        let json = report.to_json().expect("to_json must not fail");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let ladder = v["bump_ladder"].as_array().unwrap();
+
+        for (i, entry) in ladder.iter().enumerate() {
+            assert_eq!(entry["attempt"].as_u64(), Some(i as u64 + 1), "attempt numbers are 1-indexed");
+            assert!(entry["inner_stroops"].is_number(), "inner_stroops must be a number");
+            assert!(entry["outer_stroops"].is_number(), "outer_stroops must be a number");
+            assert!(entry["outer_xlm"].is_string(), "outer_xlm must be a string");
+            assert!(entry["pct_over_signed"].is_number(), "pct_over_signed must be a number");
+        }
+    }
+
+    #[test]
+    fn fee_estimate_report_to_json_empty_ladder_when_at_cap() {
+        let mut schedule = FeeSchedule::testnet_default();
+        schedule.max_fee_stroops = 100; // below any realistic fee
+        let simulator = GasSimulator::new(schedule);
+        let report = FeeEstimateReport::build(&simulator, TransactionProfile::default());
+        let json = report.to_json().expect("to_json must not fail");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        // Ladder may be empty when capped.
+        assert!(v["bump_ladder"].is_array());
+    }
+
     #[test]
     fn test_estimate_charges_base_fee_per_operation() {
         let simulator = testnet();
@@ -307,6 +594,19 @@ mod tests {
         assert_eq!(estimate.breakdown.base_fee, 200);
         assert_eq!(estimate.breakdown.per_operation, 200);
         assert_eq!(estimate.total_stroops, 400);
+    }
+
+    #[test]
+    fn hostile_resource_profiles_saturate_instead_of_wrapping() {
+        let estimate = testnet().estimate(&TransactionProfile {
+            operations: u32::MAX,
+            instructions: u32::MAX,
+            ledger_reads: u32::MAX,
+            ledger_writes: u32::MAX,
+            bid_ledgers: u32::MAX,
+        });
+        assert_eq!(estimate.total_stroops, u32::MAX);
+        assert_eq!(estimate.breakdown.resource_fee, u32::MAX);
     }
 
     #[test]
@@ -369,6 +669,31 @@ mod tests {
             .map(|b| b.outer_fee_stroops)
             .collect();
         assert_eq!(fees, vec![1_500, 2_000]);
+    }
+
+    #[test]
+    fn bump_ladders_remain_bounded_for_extreme_fee_inputs() {
+        for max_fee in [1, 100, 10_000, u32::MAX] {
+            for start_fee in [0, 1, 100, u32::MAX] {
+                for bump_percent in [0, 1, 50, u32::MAX] {
+                    for max_bumps in [0, 1, 3, 32] {
+                        let mut schedule = FeeSchedule::testnet_default();
+                        schedule.max_fee_stroops = max_fee;
+                        schedule.bump_percent = bump_percent;
+                        schedule.max_bumps = max_bumps;
+                        let ladder = GasSimulator::new(schedule).bump_ladder(start_fee);
+                        let mut previous = start_fee.max(schedule.base_fee_stroops);
+
+                        assert!(ladder.len() <= max_bumps as usize);
+                        for bump in ladder {
+                            assert!(bump.outer_fee_stroops <= max_fee);
+                            assert!(bump.outer_fee_stroops > previous);
+                            previous = bump.outer_fee_stroops;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

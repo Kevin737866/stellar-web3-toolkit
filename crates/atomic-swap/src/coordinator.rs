@@ -310,7 +310,15 @@ impl AtomicSwapCoordinator {
         Ok(swap.clone())
     }
 
-    /// Complete a swap by providing the preimage
+    /// Complete a swap by revealing its preimage.
+    ///
+    /// The preimage path stays open through the timeout ledger: at
+    /// `current_ledger == timeout_ledger` the swap has not expired yet, so
+    /// completion still succeeds and reveals the preimage; at
+    /// `timeout_ledger + 1` it is refused with [`AtomicSwapError::SwapExpired`].
+    /// A swap that already settled is refused with
+    /// [`AtomicSwapError::SwapAlreadyCompleted`], and a preimage that does not
+    /// hash to the swap's lock with [`AtomicSwapError::InvalidPreimage`] (#396).
     pub async fn complete_swap(
         &self,
         swap_id: String,
@@ -362,7 +370,15 @@ impl AtomicSwapCoordinator {
         Ok(())
     }
 
-    /// Refund a swap after timeout
+    /// Refund a swap after its timeout ledger has passed.
+    ///
+    /// The refund path opens only *after* the timeout ledger: at
+    /// `current_ledger == timeout_ledger` the swap can still settle, so
+    /// refunding then would let a participant claw back funds while the
+    /// counterparty could still reveal the preimage. A pending swap refunded
+    /// before its timeout is refused with [`AtomicSwapError::RefundBeforeTimeout`]
+    /// (#396); a swap that already reached a terminal state is refused with
+    /// [`AtomicSwapError::SwapExpired`].
     pub async fn refund_swap(&self, swap_id: String, current_ledger: u32) -> Result<()> {
         let mut swaps = self.swaps.write().await;
         let swap = swaps
@@ -371,8 +387,19 @@ impl AtomicSwapCoordinator {
                 swap_id: swap_id.clone(),
             })?;
 
-        // Verify swap can be refunded
+        // Verify swap can be refunded. `can_refund` is `is_pending() &&
+        // is_expired(current_ledger)`, so the two ways it fails get distinct,
+        // actionable errors: a pending swap inside its window is too early to
+        // refund, and a swap that already settled/timed out has nothing left
+        // to refund (#396).
         if !swap.can_refund(current_ledger) {
+            if swap.is_pending() {
+                return Err(AtomicSwapError::RefundBeforeTimeout {
+                    swap_id,
+                    timeout_ledger: swap.timeout_ledger,
+                    current_ledger,
+                });
+            }
             return Err(AtomicSwapError::SwapExpired { swap_id });
         }
 
@@ -1894,5 +1921,260 @@ mod tests {
             coordinator.get_swap(swap_id).await.unwrap().status,
             SwapStatus::Pending
         );
+    }
+
+    // ---- Timeout boundary for the preimage and refund paths (#396) ----
+    //
+    // `initiate_swap` opens a swap at ledger 100_000 with a 24h timeout, i.e.
+    // `timeout_ledger = 100_000 + 24 * 720 = 117_280`. Rather than hard-code that
+    // arithmetic, each test reads the boundary straight off the created swap.
+
+    /// The timeout ledger a just-initiated swap was opened with.
+    async fn timeout_ledger_of(coordinator: &AtomicSwapCoordinator, swap_id: &str) -> u32 {
+        coordinator
+            .get_swap(swap_id.to_string())
+            .await
+            .expect("swap should exist")
+            .timeout_ledger
+    }
+
+    /// Preimage path, boundary success: completing at exactly the timeout
+    /// ledger reveals the preimage and is recorded as settled.
+    #[tokio::test]
+    async fn the_preimage_can_be_revealed_at_the_timeout_ledger() {
+        let coordinator = coordinator_with_usdc().await;
+        let response = coordinator
+            .initiate_swap("initiator".to_string(), request_with_origin(None))
+            .await
+            .unwrap();
+        let swap_id = response.swap_id.clone();
+        let preimage = response.preimage.clone().unwrap();
+        let boundary = timeout_ledger_of(&coordinator, &swap_id).await;
+
+        coordinator
+            .complete_swap(swap_id.clone(), preimage.clone(), boundary)
+            .await
+            .expect("completion at the timeout ledger must succeed");
+
+        let swap = coordinator.get_swap(swap_id.clone()).await.unwrap();
+        assert!(swap.is_completed());
+        assert_eq!(swap.preimage.as_deref(), Some(preimage.as_str()));
+        assert_eq!(swap.completed_at_ledger, Some(boundary));
+
+        let entries = journal_entries(&coordinator, &swap_id);
+        assert_eq!(entries.last().unwrap().kind, TransitionKind::Settled);
+        assert_eq!(entries.last().unwrap().ledger, boundary);
+        assert_eq!(
+            entries.last().unwrap().snapshot.status,
+            SwapStatus::Completed
+        );
+    }
+
+    /// Preimage path, boundary failure: one ledger past the timeout, completion
+    /// is refused with `SwapExpired` and leaves no partial state behind.
+    #[tokio::test]
+    async fn the_preimage_path_closes_one_ledger_past_the_timeout() {
+        let coordinator = coordinator_with_usdc().await;
+        let response = coordinator
+            .initiate_swap("initiator".to_string(), request_with_origin(None))
+            .await
+            .unwrap();
+        let swap_id = response.swap_id.clone();
+        let preimage = response.preimage.clone().unwrap();
+        let boundary = timeout_ledger_of(&coordinator, &swap_id).await;
+
+        let error = coordinator
+            .complete_swap(swap_id.clone(), preimage, boundary + 1)
+            .await
+            .expect_err("completing after the timeout must be refused");
+        assert!(matches!(error, AtomicSwapError::SwapExpired { .. }));
+
+        // No partial state: the swap is untouched and nothing was journalled as
+        // settled, so a restart cannot pretend it settled (#390, #396).
+        let swap = coordinator.get_swap(swap_id.clone()).await.unwrap();
+        assert!(swap.is_pending());
+        assert!(swap.preimage.is_none());
+        let entries = journal_entries(&coordinator, &swap_id);
+        assert!(
+            !entries.iter().any(|r| r.kind == TransitionKind::Settled),
+            "a refused completion must leave no settled record"
+        );
+    }
+
+    /// Preimage path, failure case: a preimage that does not match the hash lock
+    /// is refused without changing state.
+    #[tokio::test]
+    async fn a_wrong_preimage_is_refused_without_changing_state() {
+        let coordinator = coordinator_with_usdc().await;
+        let response = coordinator
+            .initiate_swap("initiator".to_string(), request_with_origin(None))
+            .await
+            .unwrap();
+        let swap_id = response.swap_id.clone();
+        // A well-formed 32-byte preimage that does not hash to the swap's lock.
+        let wrong = hex::encode(vec![0u8; 32]);
+
+        let error = coordinator
+            .complete_swap(swap_id.clone(), wrong, 100_500)
+            .await
+            .expect_err("a preimage that does not match the lock must be refused");
+        assert!(matches!(error, AtomicSwapError::InvalidPreimage { .. }));
+
+        let swap = coordinator.get_swap(swap_id.clone()).await.unwrap();
+        assert!(swap.is_pending());
+        assert!(swap.preimage.is_none());
+    }
+
+    /// Refund path, boundary failure: refunding at exactly the timeout ledger
+    /// is refused with `RefundBeforeTimeout` (the preimage path is still open)
+    /// and leaves no partial state.
+    #[tokio::test]
+    async fn the_refund_path_is_closed_at_the_timeout_ledger() {
+        let coordinator = coordinator_with_usdc().await;
+        let response = coordinator
+            .initiate_swap("initiator".to_string(), request_with_origin(None))
+            .await
+            .unwrap();
+        let swap_id = response.swap_id.clone();
+        let boundary = timeout_ledger_of(&coordinator, &swap_id).await;
+
+        let error = coordinator
+            .refund_swap(swap_id.clone(), boundary)
+            .await
+            .expect_err("refunding at the timeout ledger must be refused");
+        assert!(matches!(
+            error,
+            AtomicSwapError::RefundBeforeTimeout {
+                swap_id: _,
+                timeout_ledger,
+                current_ledger
+            } if timeout_ledger == boundary && current_ledger == boundary
+        ));
+
+        // No partial state: the swap is still pending, the preimage path is
+        // still open at this ledger, and no refund was recorded.
+        let swap = coordinator.get_swap(swap_id.clone()).await.unwrap();
+        assert!(swap.is_pending());
+        assert!(swap.can_complete(boundary));
+        let entries = journal_entries(&coordinator, &swap_id);
+        assert!(
+            !entries.iter().any(|r| r.kind == TransitionKind::Refunded),
+            "a refused refund must leave no refunded record"
+        );
+    }
+
+    /// Refund path, boundary success: refunding one ledger past the timeout
+    /// settles the swap as refunded and records it.
+    #[tokio::test]
+    async fn the_refund_path_opens_one_ledger_past_the_timeout() {
+        let coordinator = coordinator_with_usdc().await;
+        let response = coordinator
+            .initiate_swap("initiator".to_string(), request_with_origin(None))
+            .await
+            .unwrap();
+        let swap_id = response.swap_id.clone();
+        let boundary = timeout_ledger_of(&coordinator, &swap_id).await;
+
+        coordinator
+            .refund_swap(swap_id.clone(), boundary + 1)
+            .await
+            .expect("refunding just past the timeout must succeed");
+
+        let swap = coordinator.get_swap(swap_id.clone()).await.unwrap();
+        assert_eq!(swap.status, SwapStatus::Refunded);
+        let entries = journal_entries(&coordinator, &swap_id);
+        assert_eq!(entries.last().unwrap().kind, TransitionKind::Refunded);
+        assert_eq!(entries.last().unwrap().ledger, boundary + 1);
+        assert_eq!(
+            entries.last().unwrap().snapshot.status,
+            SwapStatus::Refunded
+        );
+    }
+
+    /// Refund path, failure case: a swap that already settled is terminal, so a
+    /// later refund is refused (with `SwapExpired`, the pre-existing error for an
+    /// already-terminal swap) and the completed state is left intact.
+    #[tokio::test]
+    async fn a_completed_swap_cannot_be_refunded() {
+        let coordinator = coordinator_with_usdc().await;
+        let response = coordinator
+            .initiate_swap("initiator".to_string(), request_with_origin(None))
+            .await
+            .unwrap();
+        let swap_id = response.swap_id.clone();
+        let boundary = timeout_ledger_of(&coordinator, &swap_id).await;
+
+        coordinator
+            .complete_swap(swap_id.clone(), response.preimage.clone().unwrap(), boundary)
+            .await
+            .unwrap();
+
+        let error = coordinator
+            .refund_swap(swap_id.clone(), boundary + 1)
+            .await
+            .expect_err("a completed swap cannot be refunded");
+        assert!(matches!(error, AtomicSwapError::SwapExpired { .. }));
+
+        // The completed state is intact; no refund record was appended.
+        let swap = coordinator.get_swap(swap_id.clone()).await.unwrap();
+        assert!(swap.is_completed());
+        let entries = journal_entries(&coordinator, &swap_id);
+        assert_eq!(entries.last().unwrap().kind, TransitionKind::Settled);
+    }
+
+    /// Restart recovery preserves the timeout boundary: a swap restored from a
+    /// durable journal keeps its original timeout ledger, so the preimage path
+    /// is still open at the boundary and the refund path still closed, exactly
+    /// as before the restart (#390, #396).
+    #[tokio::test]
+    async fn recovery_preserves_the_timeout_boundary_for_both_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("boundary-journal.jsonl");
+
+        let (swap_id, preimage, boundary) = {
+            let journal = std::sync::Arc::new(crate::journal::FileJournal::open(&path).unwrap());
+            let coordinator =
+                AtomicSwapCoordinator::with_journal(SwapConfig::default(), 3, journal);
+            coordinator
+                .register_asset(AssetInfo::custom(
+                    "USDC".to_string(),
+                    "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4ZLLFLA5".to_string(),
+                    7,
+                ))
+                .await
+                .unwrap();
+            let response = coordinator
+                .initiate_swap("initiator".to_string(), request_with_origin(None))
+                .await
+                .unwrap();
+            (
+                response.swap_id,
+                response.preimage.unwrap(),
+                response.timeout_ledger,
+            )
+        };
+
+        // A fresh coordinator over the same journal is a restart.
+        let journal = std::sync::Arc::new(crate::journal::FileJournal::open(&path).unwrap());
+        let restarted = AtomicSwapCoordinator::with_journal(SwapConfig::default(), 3, journal);
+        assert_eq!(restarted.recover_from_journal().await.unwrap(), 1);
+
+        let recovered = restarted.get_swap(swap_id.clone()).await.unwrap();
+        assert_eq!(recovered.status, SwapStatus::Pending);
+        assert_eq!(recovered.timeout_ledger, boundary);
+
+        // The boundary is unchanged: settle at `boundary`, refund only after it.
+        assert!(recovered.can_complete(boundary));
+        assert!(!recovered.can_refund(boundary));
+        assert!(!recovered.can_complete(boundary + 1));
+        assert!(recovered.can_refund(boundary + 1));
+
+        // The recovered swap can actually be settled at the boundary.
+        restarted
+            .complete_swap(swap_id.clone(), preimage, boundary)
+            .await
+            .expect("the recovered swap can still settle at the timeout ledger");
+        let settled = restarted.get_swap(swap_id).await.unwrap();
+        assert!(settled.is_completed());
     }
 }
