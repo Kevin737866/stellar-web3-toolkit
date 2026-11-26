@@ -1,7 +1,7 @@
 //! Integration tests for `env validate --json` output mode (issue #308).
 //!
 //! These tests exercise the public library API end-to-end using a temporary
-//! config directory, mirroring the `tests/keystore_workflow.rs` conventions.
+//! config directory, mirroring the `keystore_workflow.rs` conventions.
 
 use stellar_toolkit::{validate_directory, EnvFinding, EnvSeverity, EnvValidation, EnvValidationReport};
 use std::path::PathBuf;
