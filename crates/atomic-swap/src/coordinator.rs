@@ -1958,7 +1958,7 @@ mod tests {
 
         let swap = coordinator.get_swap(swap_id.clone()).await.unwrap();
         assert!(swap.is_completed());
-        assert_eq!(swap.preimage.as_deref(), Some(&preimage));
+        assert_eq!(swap.preimage.as_deref(), Some(preimage.as_str()));
         assert_eq!(swap.completed_at_ledger, Some(boundary));
 
         let entries = journal_entries(&coordinator, &swap_id);
@@ -2045,6 +2045,7 @@ mod tests {
         assert!(matches!(
             error,
             AtomicSwapError::RefundBeforeTimeout {
+                swap_id: _,
                 timeout_ledger,
                 current_ledger
             } if timeout_ledger == boundary && current_ledger == boundary
