@@ -4,14 +4,16 @@
 //! creation, service endpoint management, and resolution compliant with the
 //! [W3C DID Core specification](https://www.w3.org/TR/did-core/).
 
-pub mod resolver;
+pub mod conformance;
 pub mod service;
+pub mod verification;
 
-pub use resolver::{
-    DidHistoryEntry, DidResolver, PaginatedHistoryResponse, PaginationParams, DEFAULT_PAGE_LIMIT,
-    MAX_PAGE_LIMIT,
+pub use conformance::{
+    resolution_json, to_core_value, to_json, validate, ConformanceError, DID_CORE_CONTEXT,
+    RESERVED_SERVICE_PROPERTIES,
 };
 pub use service::{DidDocument, DidError, Service, ServiceEndpoint};
+pub use verification::VerificationMethod;
 
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")

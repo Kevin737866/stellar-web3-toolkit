@@ -3,13 +3,22 @@
 //! Multi-hop payment routing for Stellar payment channels.
 //! Implements path-finding algorithms for routing payments through
 //! the payment channel network.
+//!
+//! Policy rejections can be explained with [`find_best_route_with_policy`] and
+//! [`evaluate_route_policy`], which report the candidate route and the exact
+//! rule it broke (issue #365).
 
 pub mod fee_cap;
 pub mod graph;
 pub mod pathfinder;
 pub mod policy;
+pub mod policy_report;
 
 pub use fee_cap::FeeCap;
+pub use policy_report::{
+    CandidateRouteFailure, CandidateRouteSummary, PolicyFailureReason, RouteEvaluationReport,
+    RoutePolicyError,
+};
 
 use fxhash::FxHashMap;
 use priority_queue::PriorityQueue;
@@ -63,6 +72,9 @@ pub enum RoutingError {
     #[error("Invalid node address")]
     InvalidNodeAddress,
 
+    #[error("Route failed policy checks: {0}")]
+    PolicyCheckFailed(String),
+
     #[error(
         "Channel {channel_id} advertises a fee rate of {fee_rate} ppm, above the protocol cap of {cap} ppm"
     )]
@@ -93,6 +105,15 @@ pub enum RoutingError {
 
     #[error("Route declares {declared} in fees but its hops sum to {actual}")]
     InconsistentRouteFees { declared: i128, actual: i128 },
+
+    #[error("Route requires total CLTV delta {required}, above budget of {max_allowed}")]
+    TimeoutExceedsBudget { required: u32, max_allowed: u32 },
+
+    #[error("Invalid timeout requirement on channel {channel_id}: {reason}")]
+    InvalidHopTimeout { channel_id: String, reason: String },
+
+    #[error("Cumulative CLTV timeout delta overflowed u32")]
+    TimeoutOverflow,
 }
 
 /// Represents a node in the payment channel network
@@ -181,6 +202,41 @@ pub struct Route {
     pub metadata: RouteMetadata,
 }
 
+impl Route {
+    /// Per-hop timeout requirements ordered from source to destination.
+    pub fn hop_timeouts(&self) -> &[HopTimeout] {
+        &self.metadata.hop_timeouts
+    }
+
+    /// Total cumulative CLTV delta required at the first hop of the route.
+    pub fn total_cltv_delta(&self) -> u32 {
+        self.metadata.total_cltv_delta
+    }
+
+    /// Resolve per-hop absolute expiry heights relative to `base_height`.
+    ///
+    /// Each hop's `expiry_height` is `base_height + incoming_cltv_delta`,
+    /// preserving strictly decreasing timeouts from source to destination.
+    pub fn hop_timeouts_from_height(
+        &self,
+        base_height: u32,
+    ) -> Result<Vec<HopTimeout>, RoutingError> {
+        self.metadata
+            .hop_timeouts
+            .iter()
+            .map(|t| {
+                let expiry_height = base_height
+                    .checked_add(t.incoming_cltv_delta)
+                    .ok_or(RoutingError::TimeoutOverflow)?;
+                Ok(HopTimeout {
+                    expiry_height,
+                    ..t.clone()
+                })
+            })
+            .collect()
+    }
+}
+
 /// A single hop in a route
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteHop {
@@ -226,6 +282,29 @@ impl RouteHop {
     }
 }
 
+/// Per-hop timeout requirement derived from channel CLTV deltas and optional
+/// payment metadata.
+///
+/// For a route `source -> h_0 -> h_1 -> ... -> h_{n-1} (destination)`,
+/// `incoming_cltv_delta` is the cumulative time-lock delta required on the
+/// HTLC entering this hop, and `outgoing_cltv_delta` is the delta forwarded
+/// to the next hop (`incoming_cltv_delta - outgoing_cltv_delta == cltv_delta`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HopTimeout {
+    /// Channel ID for this hop.
+    pub channel_id: String,
+    /// Node ID reached by this hop.
+    pub node_id: String,
+    /// Time-lock delta required by this hop's channel.
+    pub cltv_delta: u32,
+    /// Cumulative CLTV delta from this hop through the destination.
+    pub incoming_cltv_delta: u32,
+    /// Cumulative CLTV delta forwarded to the next hop.
+    pub outgoing_cltv_delta: u32,
+    /// Expiry height (equals `incoming_cltv_delta` unless offset from a base height).
+    pub expiry_height: u32,
+}
+
 /// Additional metadata for a route
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteMetadata {
@@ -237,6 +316,74 @@ pub struct RouteMetadata {
     pub estimated_time_ms: u64,
     /// Whether this is a direct route
     pub is_direct: bool,
+    /// Total cumulative CLTV delta required across the route
+    #[serde(default)]
+    pub total_cltv_delta: u32,
+    /// Per-hop timeout requirements ordered from source to destination
+    #[serde(default)]
+    pub hop_timeouts: Vec<HopTimeout>,
+}
+
+/// Compute per-hop timeout requirements backwards from destination to source,
+/// populating `expiry_height` on each [`RouteHop`] and enforcing timeout safety
+/// and optional CLTV budget bounds.
+pub fn compute_hop_timeouts(
+    hops: &mut [RouteHop],
+    final_cltv_delta: u32,
+    max_cltv_budget: Option<u32>,
+) -> Result<(u32, Vec<HopTimeout>), RoutingError> {
+    if hops.is_empty() {
+        return Ok((final_cltv_delta, Vec::new()));
+    }
+
+    let mut outgoing_delta = final_cltv_delta;
+    let mut timeouts = vec![
+        HopTimeout {
+            channel_id: String::new(),
+            node_id: String::new(),
+            cltv_delta: 0,
+            incoming_cltv_delta: 0,
+            outgoing_cltv_delta: 0,
+            expiry_height: 0,
+        };
+        hops.len()
+    ];
+
+    let num_hops = hops.len();
+    for (idx, hop) in hops.iter_mut().enumerate().rev() {
+        if idx + 1 < num_hops && hop.cltv_delta == 0 {
+            return Err(RoutingError::InvalidHopTimeout {
+                channel_id: hop.channel_id.clone(),
+                reason: "intermediate hop must have a positive cltv_delta for timeout safety"
+                    .to_string(),
+            });
+        }
+        let incoming_delta = outgoing_delta
+            .checked_add(hop.cltv_delta)
+            .ok_or(RoutingError::TimeoutOverflow)?;
+        hop.expiry_height = incoming_delta;
+        timeouts[idx] = HopTimeout {
+            channel_id: hop.channel_id.clone(),
+            node_id: hop.node_id.clone(),
+            cltv_delta: hop.cltv_delta,
+            incoming_cltv_delta: incoming_delta,
+            outgoing_cltv_delta: outgoing_delta,
+            expiry_height: incoming_delta,
+        };
+        outgoing_delta = incoming_delta;
+    }
+
+    let total_cltv_delta = outgoing_delta;
+    if let Some(max_allowed) = max_cltv_budget {
+        if total_cltv_delta > max_allowed {
+            return Err(RoutingError::TimeoutExceedsBudget {
+                required: total_cltv_delta,
+                max_allowed,
+            });
+        }
+    }
+
+    Ok((total_cltv_delta, timeouts))
 }
 
 /// Route request parameters
@@ -256,6 +403,39 @@ pub struct RouteRequest {
     pub find_any: bool,
     /// Payment metadata
     pub payment_metadata: Option<PaymentMetadata>,
+    /// Channels that are known to be temporarily unavailable and must not be
+    /// used for this routing attempt.  Callers that have no exclusions leave
+    /// this empty; existing call sites that construct `RouteRequest` without
+    /// this field compile unchanged when they switch to struct-update syntax
+    /// (`..RouteRequest { excluded_unavailable: vec![], .. }`).
+    pub excluded_unavailable: Vec<UnavailableChannel>,
+}
+
+impl RouteRequest {
+    /// Create a new route request (Issue #364)
+    pub fn new(source: String, destination: String, amount: i128) -> Self {
+        RouteRequest {
+            source,
+            destination,
+            amount,
+            max_fee_budget: None,
+            max_hops: None,
+            find_any: false,
+            payment_metadata: None,
+        }
+    }
+
+    /// Configure maximum allowed hops for this request (Issue #364)
+    pub fn with_max_hops(mut self, max_hops: usize) -> Self {
+        self.max_hops = Some(max_hops);
+        self
+    }
+
+    /// Configure maximum fee budget for this request
+    pub fn with_max_fee_budget(mut self, budget: i128) -> Self {
+        self.max_fee_budget = Some(budget);
+        self
+    }
 }
 
 /// Payment metadata for routing decisions
@@ -498,6 +678,10 @@ pub fn find_best_route_with_cap(
         });
     }
 
+    // Validate and compile the temporary-exclusion list before the search so
+    // that invalid entries are caught atomically rather than mid-route.
+    let excluded = build_exclusion_set(&request.excluded_unavailable)?;
+
     let max_hops = request.max_hops.unwrap_or(MAX_ROUTE_HOPS);
 
     // Dijkstra's algorithm with weighted edges (fees)
@@ -532,6 +716,11 @@ pub fn find_best_route_with_cap(
         if let Some(neighbors) = graph.adjacency.get(&node_id) {
             for (neighbor_id, channel_id) in neighbors {
                 if let Some(channel) = graph.channels.get(channel_id) {
+                    // Skip channels that are temporarily unavailable.
+                    if excluded.contains(channel_id.as_str()) {
+                        continue;
+                    }
+
                     // A hop that advertises an absurd fee schedule is never
                     // admitted, no matter how cheap the rest of the route is.
                     if cap.check_channel(channel).is_err() {
@@ -640,6 +829,13 @@ pub fn find_best_route_with_cap(
         }
     }
 
+    let (final_cltv_delta, max_cltv_budget) = match &request.payment_metadata {
+        Some(meta) => (meta.required_cltv_delta.unwrap_or(0), meta.payment_expiry),
+        None => (0, None),
+    };
+    let (total_cltv_delta, hop_timeouts) =
+        compute_hop_timeouts(&mut hops, final_cltv_delta, max_cltv_budget)?;
+
     let route = Route {
         hops,
         total_fees,
@@ -653,6 +849,8 @@ pub fn find_best_route_with_cap(
             num_nodes: num_hops,
             estimated_time_ms: 100,
             is_direct: num_hops == 1,
+            total_cltv_delta,
+            hop_timeouts,
         },
     };
 
@@ -660,6 +858,60 @@ pub fn find_best_route_with_cap(
     cap.check_route(request.amount, &route)?;
 
     Ok(route)
+}
+
+/// Explain why candidate routes failed policy checks.
+///
+/// The returned report lists every simple candidate examined and the exact
+/// rule that rejected it. A report with `accepted > 0` means a route exists;
+/// it does not change any graph or request state.
+pub fn evaluate_route_policy(
+    graph: &NetworkGraph,
+    request: &RouteRequest,
+    policy: &policy::RoutingPolicy,
+) -> Result<RouteEvaluationReport, RoutePolicyError> {
+    Ok(policy_report::evaluate(graph, request, policy)?.report)
+}
+
+/// Find the best route under an explicit routing policy, reporting why every
+/// rejected candidate failed (issue #365).
+///
+/// Selection is deterministic: candidates are sorted by total fee, hop count
+/// and then channel ids, so equal-cost routes never depend on hash iteration.
+/// Existing [`find_best_route`] callers are unaffected.
+pub fn find_best_route_with_policy(
+    graph: &NetworkGraph,
+    request: &RouteRequest,
+    policy: &policy::RoutingPolicy,
+) -> Result<Route, RoutePolicyError> {
+    let evaluation = policy_report::evaluate(graph, request, policy)?;
+    let best = match evaluation.best() {
+        Some(best) => best,
+        None if evaluation.report.failures.is_empty() => {
+            return Err(RoutePolicyError::NoCandidates {
+                origin: request.source.clone(),
+                destination: request.destination.clone(),
+            })
+        }
+        None => return Err(RoutePolicyError::Rejected(evaluation.report.clone())),
+    };
+
+    let num_hops = best.hops.len();
+    Ok(Route {
+        hops: best.hops.clone(),
+        total_fees: best.summary.total_fees,
+        total_amount: request.amount,
+        success_probability: 0.95,
+        metadata: RouteMetadata {
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            num_nodes: num_hops,
+            estimated_time_ms: 100 * num_hops as u64,
+            is_direct: num_hops == 1,
+        },
+    })
 }
 
 /// Find multiple routes using k-shortest paths
@@ -796,6 +1048,7 @@ mod tests {
             max_hops: Some(3),
             find_any: false,
             payment_metadata: None,
+            excluded_unavailable: vec![],
         };
 
         let route = find_best_route(&graph, &request).unwrap();
@@ -843,6 +1096,7 @@ mod tests {
             max_hops: None,
             find_any: false,
             payment_metadata: None,
+            excluded_unavailable: vec![],
         }
     }
 
@@ -1029,5 +1283,92 @@ mod tests {
 
         let routes = find_k_routes(&graph, &request("alice", "carol", 1_000), 3).unwrap();
         assert!(routes.is_empty());
+    }
+
+    #[test]
+    fn route_exposes_per_hop_timeout_requirements() {
+        let mut graph = NetworkGraph::new();
+        for id in ["alice", "bob", "carol"] {
+            add_node(&mut graph, id);
+        }
+        add_edge(&mut graph, "ch1", "alice", "bob", 1_000);
+        add_edge(&mut graph, "ch2", "bob", "carol", 1_000);
+
+        let mut req = request("alice", "carol", 1_000);
+        req.payment_metadata = Some(PaymentMetadata {
+            payment_type: PaymentType::Regular,
+            required_cltv_delta: Some(18),
+            payment_expiry: Some(200),
+        });
+
+        let route = find_best_route(&graph, &req).unwrap();
+        let timeouts = route.hop_timeouts();
+        assert_eq!(timeouts.len(), 2);
+
+        // Hop 1 (bob -> carol): outgoing = 18, incoming = 18 + 40 = 58
+        assert_eq!(timeouts[1].channel_id, "ch2");
+        assert_eq!(timeouts[1].cltv_delta, 40);
+        assert_eq!(timeouts[1].outgoing_cltv_delta, 18);
+        assert_eq!(timeouts[1].incoming_cltv_delta, 58);
+
+        // Hop 0 (alice -> bob): outgoing = 58, incoming = 58 + 40 = 98
+        assert_eq!(timeouts[0].channel_id, "ch1");
+        assert_eq!(timeouts[0].cltv_delta, 40);
+        assert_eq!(timeouts[0].outgoing_cltv_delta, 58);
+        assert_eq!(timeouts[0].incoming_cltv_delta, 98);
+        assert_eq!(route.total_cltv_delta(), 98);
+        assert_eq!(route.hops[0].expiry_height, 98);
+        assert_eq!(route.hops[1].expiry_height, 58);
+
+        // Absolute heights from a base ledger height
+        let abs = route.hop_timeouts_from_height(1_000).unwrap();
+        assert_eq!(abs[0].expiry_height, 1_098);
+        assert_eq!(abs[1].expiry_height, 1_058);
+    }
+
+    #[test]
+    fn route_rejects_timeout_exceeding_budget() {
+        let mut graph = NetworkGraph::new();
+        for id in ["alice", "bob", "carol"] {
+            add_node(&mut graph, id);
+        }
+        add_edge(&mut graph, "ch1", "alice", "bob", 1_000);
+        add_edge(&mut graph, "ch2", "bob", "carol", 1_000);
+
+        let mut req = request("alice", "carol", 1_000);
+        req.payment_metadata = Some(PaymentMetadata {
+            payment_type: PaymentType::Regular,
+            required_cltv_delta: Some(20),
+            payment_expiry: Some(99), // needs 40 + 40 + 20 = 100
+        });
+
+        let err = find_best_route(&graph, &req).unwrap_err();
+        assert!(matches!(
+            err,
+            RoutingError::TimeoutExceedsBudget {
+                required: 100,
+                max_allowed: 99
+            }
+        ));
+    }
+
+    #[test]
+    fn compute_hop_timeouts_rejects_zero_cltv_intermediate_hop_and_overflow() {
+        let mut hops = vec![
+            RouteHop::new("ch1".to_string(), "bob".to_string(), 100, 1, 0),
+            RouteHop::new("ch2".to_string(), "carol".to_string(), 100, 1, 40),
+        ];
+        let err = compute_hop_timeouts(&mut hops, 0, None).unwrap_err();
+        assert!(matches!(err, RoutingError::InvalidHopTimeout { .. }));
+
+        let mut overflow_hops = vec![RouteHop::new(
+            "ch1".to_string(),
+            "bob".to_string(),
+            100,
+            1,
+            u32::MAX,
+        )];
+        let err = compute_hop_timeouts(&mut overflow_hops, 1, None).unwrap_err();
+        assert!(matches!(err, RoutingError::TimeoutOverflow));
     }
 }

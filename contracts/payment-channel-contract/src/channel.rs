@@ -7,10 +7,10 @@
 // deleted, so the allow is scoped to this module instead of the whole crate.
 #![allow(dead_code)]
 
-use soroban_sdk::{Address, Bytes, BytesN, Env};
+use soroban_sdk::{Address, Bytes, BytesN, Env, Map, TryFromVal, Val};
 
 use crate::error::PaymentChannelError;
-use crate::types::{ChannelConfig, ChannelState, RouteHop};
+use crate::types::{ChannelConfig, ChannelState, HTLCInfo, RouteHop};
 
 /// Channel manager for handling channel operations
 pub struct ChannelManager;
@@ -238,9 +238,42 @@ impl ChannelManager {
         Ok(())
     }
 
+    /// Compute `(pending_htlc_count, pending_htlc_amount)` for active
+    /// (unclaimed and unrefunded) HTLCs in a channel's HTLC map.
+    pub fn compute_pending_htlc_metrics(
+        env: &Env,
+        htlcs: &Map<Val, Val>,
+    ) -> Result<(u32, i128), PaymentChannelError> {
+        let mut count: u32 = 0;
+        let mut total_amount: i128 = 0;
+
+        for (_, val) in htlcs.iter() {
+            if let Ok(htlc) = HTLCInfo::try_from_val(env, &val) {
+                if !htlc.is_claimed && !htlc.is_refunded {
+                    if htlc.amount < 0 {
+                        return Err(PaymentChannelError::InvalidHtlcAmount);
+                    }
+                    count = count
+                        .checked_add(1)
+                        .ok_or(PaymentChannelError::MaxHtlcsReached)?;
+                    total_amount = total_amount
+                        .checked_add(htlc.amount)
+                        .ok_or(PaymentChannelError::InvalidHtlcAmount)?;
+                }
+            }
+        }
+
+        Ok((count, total_amount))
+    }
+
     /// Get a summary of channel state for debugging/monitoring
-    pub fn get_channel_summary(channel: &ChannelState) -> ChannelSummary {
-        ChannelSummary {
+    pub fn get_channel_summary(
+        env: &Env,
+        channel: &ChannelState,
+    ) -> Result<ChannelSummary, PaymentChannelError> {
+        let (pending_htlc_count, pending_htlc_amount) =
+            Self::compute_pending_htlc_metrics(env, &channel.htlcs)?;
+        Ok(ChannelSummary {
             channel_id: channel.channel_id.clone(),
             participant_a: channel.participant_a.clone(),
             participant_b: channel.participant_b.clone(),
@@ -248,9 +281,12 @@ impl ChannelManager {
             balance_a: channel.balance_a,
             balance_b: channel.balance_b,
             utilization: Self::get_utilization(channel),
-            is_open: channel.close_time == 0,
+            is_open: channel.close_time == 0 && !channel.is_cooperative_close,
             num_htlcs: channel.htlcs.len(),
-        }
+            pending_htlc_count,
+            pending_htlc_amount,
+            capacity: channel.total_balance,
+        })
     }
 }
 
@@ -266,4 +302,7 @@ pub struct ChannelSummary {
     pub utilization: u32,
     pub is_open: bool,
     pub num_htlcs: u32,
+    pub pending_htlc_count: u32,
+    pub pending_htlc_amount: i128,
+    pub capacity: i128,
 }
