@@ -70,6 +70,8 @@ impl Pathfinder {
         graph: &NetworkGraph,
         request: &RouteRequest,
     ) -> Result<Route, RoutingError> {
+        let excluded = build_exclusion_set(&request.excluded_unavailable)?;
+
         let mut dist: FxHashMap<String, (i128, Vec<RouteHop>)> = FxHashMap::default();
         let mut pq: PriorityQueue<String, Reverse<i128>> = PriorityQueue::new();
 
@@ -105,6 +107,11 @@ impl Pathfinder {
             if let Some(neighbors) = graph.adjacency.get(&node) {
                 for (neighbor, channel_id) in neighbors {
                     if let Some(channel) = graph.channels.get(channel_id) {
+                        // Skip temporarily unavailable channels.
+                        if excluded.contains(channel_id.as_str()) {
+                            continue;
+                        }
+
                         if self.fee_cap.check_channel(channel).is_err() {
                             continue;
                         }
@@ -164,6 +171,8 @@ impl Pathfinder {
         graph: &NetworkGraph,
         request: &RouteRequest,
     ) -> Result<Route, RoutingError> {
+        let excluded = build_exclusion_set(&request.excluded_unavailable)?;
+
         let mut open_set: PriorityQueue<String, Reverse<i128>> = PriorityQueue::new();
         let mut g_score: FxHashMap<String, i128> = FxHashMap::default();
         let mut f_score: FxHashMap<String, i128> = FxHashMap::default();
@@ -197,6 +206,11 @@ impl Pathfinder {
                     let Some(channel) = graph.channels.get(channel_id) else {
                         continue;
                     };
+
+                    // Skip temporarily unavailable channels.
+                    if excluded.contains(channel_id.as_str()) {
+                        continue;
+                    }
 
                     if self.fee_cap.check_channel(channel).is_err() {
                         continue;
@@ -247,6 +261,8 @@ impl Pathfinder {
         graph: &NetworkGraph,
         request: &RouteRequest,
     ) -> Result<Route, RoutingError> {
+        let excluded = build_exclusion_set(&request.excluded_unavailable)?;
+
         let mut queue: VecDeque<(String, Vec<RouteHop>)> = VecDeque::new();
         let mut visited: HashSet<String> = HashSet::new();
 
@@ -279,6 +295,11 @@ impl Pathfinder {
                     }
 
                     if let Some(channel) = graph.channels.get(channel_id) {
+                        // Skip temporarily unavailable channels.
+                        if excluded.contains(channel_id.as_str()) {
+                            continue;
+                        }
+
                         if self.fee_cap.check_channel(channel).is_err() {
                             continue;
                         }
@@ -339,6 +360,8 @@ impl Pathfinder {
     ) -> Result<Route, RoutingError> {
         use rand::seq::SliceRandom;
 
+        let excluded = build_exclusion_set(&request.excluded_unavailable)?;
+
         let mut visited: HashSet<String> = HashSet::new();
         let mut path: Vec<RouteHop> = Vec::new();
         let mut current = request.source.clone();
@@ -353,11 +376,15 @@ impl Pathfinder {
                 .map(|n| n.iter().collect::<Vec<_>>())
                 .unwrap_or_default();
 
-            // Filter out visited nodes and nodes without capacity
+            // Filter out visited nodes, excluded channels, and nodes without capacity
             let valid_neighbors: Vec<_> = neighbors
                 .into_iter()
                 .filter(|(node_id, channel_id)| {
                     if visited.contains(*node_id) {
+                        return false;
+                    }
+                    // Skip temporarily unavailable channels.
+                    if excluded.contains(channel_id.as_str()) {
                         return false;
                     }
                     if let Some(channel) = graph.channels.get(*channel_id) {
@@ -607,6 +634,7 @@ mod tests {
             max_hops: None,
             find_any: false,
             payment_metadata: None,
+            excluded_unavailable: vec![],
         }
     }
 

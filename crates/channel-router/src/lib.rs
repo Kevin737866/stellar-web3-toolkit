@@ -403,6 +403,12 @@ pub struct RouteRequest {
     pub find_any: bool,
     /// Payment metadata
     pub payment_metadata: Option<PaymentMetadata>,
+    /// Channels that are known to be temporarily unavailable and must not be
+    /// used for this routing attempt.  Callers that have no exclusions leave
+    /// this empty; existing call sites that construct `RouteRequest` without
+    /// this field compile unchanged when they switch to struct-update syntax
+    /// (`..RouteRequest { excluded_unavailable: vec![], .. }`).
+    pub excluded_unavailable: Vec<UnavailableChannel>,
 }
 
 impl RouteRequest {
@@ -672,6 +678,10 @@ pub fn find_best_route_with_cap(
         });
     }
 
+    // Validate and compile the temporary-exclusion list before the search so
+    // that invalid entries are caught atomically rather than mid-route.
+    let excluded = build_exclusion_set(&request.excluded_unavailable)?;
+
     let max_hops = request.max_hops.unwrap_or(MAX_ROUTE_HOPS);
 
     // Dijkstra's algorithm with weighted edges (fees)
@@ -706,6 +716,11 @@ pub fn find_best_route_with_cap(
         if let Some(neighbors) = graph.adjacency.get(&node_id) {
             for (neighbor_id, channel_id) in neighbors {
                 if let Some(channel) = graph.channels.get(channel_id) {
+                    // Skip channels that are temporarily unavailable.
+                    if excluded.contains(channel_id.as_str()) {
+                        continue;
+                    }
+
                     // A hop that advertises an absurd fee schedule is never
                     // admitted, no matter how cheap the rest of the route is.
                     if cap.check_channel(channel).is_err() {
@@ -1033,6 +1048,7 @@ mod tests {
             max_hops: Some(3),
             find_any: false,
             payment_metadata: None,
+            excluded_unavailable: vec![],
         };
 
         let route = find_best_route(&graph, &request).unwrap();
@@ -1080,6 +1096,7 @@ mod tests {
             max_hops: None,
             find_any: false,
             payment_metadata: None,
+            excluded_unavailable: vec![],
         }
     }
 
