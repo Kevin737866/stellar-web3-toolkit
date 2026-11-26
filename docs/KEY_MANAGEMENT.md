@@ -187,6 +187,32 @@ be able to strand an account.
 4. Record the incident; the audit log retention in `config/prod.toml` is 365
    days precisely so this is possible after the fact.
 
+### Periodic secret rotation audit
+
+Run this audit on a fixed schedule (for example quarterly) and after any
+change of operator, so rotation is checked rather than assumed. Record the date
+and outcome in the deployment audit log.
+
+1. **Inventory.** List every secret the deployment depends on: signer keys on
+   each account and contract-admin role, any keystore files
+   (§8), and any credential configured outside this repository (CI or
+   hosting settings). Nothing in `.github/workflows/` should reference a
+   `secrets.*` value for signing; a workflow that does is a finding.
+2. **Age.** For each item, note when it was last rotated. Anything older than
+   the interval you committed to is due. A signer that has never been rotated is
+   treated as due.
+3. **Exposure.** Run `stellar-toolkit security secrets` on the reviewed commit
+   and a history scanner (`gitleaks` or `trufflehog`), because the built-in
+   scan has no history mode (see *Known limitations*). Any hit means follow the
+   exposed-key steps above, not just deletion.
+4. **Rotate what is due**, using the add-then-remove order from the first list
+   in this section, and re-run `scripts/verify-bytecode.sh` afterwards.
+5. **Verify revocation.** Confirm on-chain that the old signer is no longer on
+   the account and that the thresholds still match `config/prod.toml`.
+6. **Record.** Append the audit result and any rotations to
+   `logs/deployment-audit.log`, and keep the log for the 365-day retention
+   window.
+
 ---
 
 ## 6. Automated checks
