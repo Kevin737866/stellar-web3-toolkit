@@ -115,6 +115,24 @@ Behaviour to be aware of before setting weights:
 - `emergency_withdraw` forfeits pending rewards, so exiting a distrusted pool
   cannot drain reward accounting.
 
+## Reward transfer validation
+
+Reward token movements are verified before accounting is committed:
+
+- `fund_rewards` transfers the reward tokens in, then checks that the farm's
+  reward-token balance rose by exactly `amount`. A token that reports success
+  without moving funds is rejected, so `rewards_funded` can never credit a
+  schedule the farm does not actually hold.
+- `harvest` checks the payout against `rewards_credited`, performs the transfer,
+  and checks that the harvester's balance rose by exactly the amount owed before
+  writing `rewards_paid_out` or clearing the position's accrual. A silently
+  failing reward token therefore aborts the transaction with no accounting
+  change.
+
+These checks do not change the public interface or the stored data layout. They
+only make a non-conforming reward token fail loudly at the transfer instead of
+leaving farm accounting overstating funded or paid rewards.
+
 ## Running the tests
 
 ```bash
