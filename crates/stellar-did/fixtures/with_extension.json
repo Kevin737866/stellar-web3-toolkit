@@ -1,0 +1,1 @@
+{"@context":"https://www.w3.org/ns/did/v1","id":"did:stellar:testnet:GABC","service":[{"accept":["application/didcomm-msg+json"],"id":"did:stellar:testnet:GABC#hub","routingKeys":["did:stellar:testnet:GABC#key-1"],"serviceEndpoint":"https://hub.example.com","type":"IdentityHub"}]}
