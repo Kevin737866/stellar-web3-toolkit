@@ -30,7 +30,7 @@
 
 use crate::disconnection::{DisconnectionConfig, DisconnectionTracker};
 use crate::network::{NetworkTopology, TopologyType};
-use crate::{SimulatedNode, SimulatorConfig, SimulatorError};
+use crate::{LiquidityModel, SimulatedNode, SimulatorConfig, SimulatorError};
 use channel_router::fee_cap::FeeCap;
 use channel_router::pathfinder::Pathfinder;
 use channel_router::{NetworkGraph, Route, RouteRequest};
@@ -491,8 +491,7 @@ impl TopologyFuzzer {
         }
 
         let sim_config = self.random_sim_config(&mut rng);
-        let (mut graph, mut nodes) =
-            NetworkTopology::new(sim_config, topology).generate(&mut rng);
+        let (mut graph, mut nodes) = NetworkTopology::new(sim_config, topology).generate(&mut rng);
 
         report.iterations += 1;
 
@@ -509,7 +508,11 @@ impl TopologyFuzzer {
         }
 
         let mut routed_here = false;
-        let mut tracker = self.config.disconnection.as_ref().map(|_| DisconnectionTracker::new());
+        let mut tracker = self
+            .config
+            .disconnection
+            .as_ref()
+            .map(|_| DisconnectionTracker::new());
 
         for payment_index in 0..self.config.payments_per_topology {
             if let (Some(churn_cfg), Some(churn_tracker)) =
@@ -559,18 +562,15 @@ impl TopologyFuzzer {
                 }
             }
 
-            let payment = self.random_payment(&graph, &mut rng);
-            let (request, pathfinder) = match payment {
-                Some(request) => (request, Pathfinder::new()),
-                // Fewer than two nodes, or no channels at all: nothing to route.
-                None => {
-                    if self.config.disconnection.is_some() {
-                        // With churn enabled, nodes may recover on later steps.
-                        continue;
-                    }
-                    break;
+            // Fewer than two nodes, or no channels at all: nothing to route.
+            let Some(request) = self.random_payment(&graph, &mut rng) else {
+                if self.config.disconnection.is_some() {
+                    // With churn enabled, nodes may recover on later steps.
+                    continue;
                 }
+                break;
             };
+            let pathfinder = Pathfinder::new();
 
             report.payments_attempted += 1;
             report.route_attempts += 3;
@@ -600,9 +600,7 @@ impl TopologyFuzzer {
                 }
 
                 if self.config.disconnection.is_some() {
-                    let source_online = nodes
-                        .get(&request.source)
-                        .is_some_and(|n| n.node.online);
+                    let source_online = nodes.get(&request.source).is_some_and(|n| n.node.online);
                     let offline_hop = route
                         .hops
                         .iter()
@@ -691,6 +689,9 @@ impl TopologyFuzzer {
             max_payment_amount: min_capacity * rng.gen_range(1i128..8),
             seed: None,
             disconnection: None,
+            // Fuzzing checks topology and routing invariants; moving balances
+            // is exercised by the simulator's own liquidity tests.
+            liquidity_model: LiquidityModel::Static,
         }
     }
 
@@ -1062,7 +1063,10 @@ mod tests {
 
         assert_eq!(first.routes_checked, second.routes_checked);
         assert_eq!(first.routes_found, second.routes_found);
-        assert_eq!(first.disconnections_simulated, second.disconnections_simulated);
+        assert_eq!(
+            first.disconnections_simulated,
+            second.disconnections_simulated
+        );
         assert_eq!(first.recoveries_simulated, second.recoveries_simulated);
         assert_eq!(first.failures, second.failures);
     }

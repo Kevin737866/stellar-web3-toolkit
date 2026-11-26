@@ -7,6 +7,7 @@ pub mod baseline;
 pub mod disconnection;
 pub mod failure_summary;
 pub mod fuzz;
+pub mod liquidity;
 pub mod network;
 pub mod statistics;
 
@@ -60,6 +61,13 @@ pub struct SimulatorConfig {
     /// When `None`, all nodes remain online throughout the simulation.
     #[serde(default)]
     pub disconnection: Option<DisconnectionConfig>,
+    /// How channel balances behave across payments.
+    ///
+    /// Defaults to [`LiquidityModel::Static`], which keeps the balances the
+    /// network was generated with; [`LiquidityModel::Depleting`] moves value
+    /// across every channel a payment uses.
+    #[serde(default)]
+    pub liquidity_model: LiquidityModel,
 }
 
 impl Default for SimulatorConfig {
@@ -77,6 +85,7 @@ impl Default for SimulatorConfig {
             max_payment_amount: 1_000_000, // 1 XLM
             seed: None,
             disconnection: None,
+            liquidity_model: LiquidityModel::Static,
         }
     }
 }
@@ -222,7 +231,13 @@ impl Simulator {
         // number of distinct node pairs and the retry loop is bounded, so a
         // configuration asking for more channels than the node count allows
         // finishes with a full graph instead of spinning forever.
-        let node_ids: Vec<String> = nodes.keys().cloned().collect();
+        //
+        // Sorted, not `HashMap` iteration order: each map instance has its own
+        // random seed, so drawing endpoints from `keys()` made the same
+        // configuration produce a different topology on every run, and a
+        // simulation that cannot be replayed cannot be debugged.
+        let mut node_ids: Vec<String> = nodes.keys().cloned().collect();
+        node_ids.sort();
         let max_possible_channels =
             self.config.num_nodes * self.config.num_nodes.saturating_sub(1) / 2;
         let target_channels = ((self.config.num_nodes as f64 * self.config.avg_channels_per_node)
@@ -315,6 +330,9 @@ impl Simulator {
         );
 
         let mut rng = self.rng.lock();
+        // Always sorted: `HashMap` iteration order is randomised per map, so
+        // drawing payment endpoints from it made the same seed produce a
+        // different simulation on every run.
         let mut node_ids: Vec<String> = self.nodes.read().keys().cloned().collect();
         if node_ids.is_empty() {
             return Err(SimulatorError::SimulationError(
@@ -322,9 +340,7 @@ impl Simulator {
                     .to_string(),
             ));
         }
-        if self.config.disconnection.is_some() {
-            node_ids.sort();
-        }
+        node_ids.sort();
         let mut payments = Vec::new();
 
         // Generate random payments
@@ -392,6 +408,23 @@ impl Simulator {
             match route_result {
                 Ok(route) => {
                     let elapsed = start.elapsed().as_millis() as u64;
+
+                    // With depletion enabled the payment only succeeds once the
+                    // value has actually moved across its channels. A route the
+                    // router found against stale balances is rejected here
+                    // rather than counted as settled.
+                    if self.config.liquidity_model == LiquidityModel::Depleting {
+                        if let Err(err) =
+                            liquidity::apply_route_liquidity(&mut self.network.write(), &route)
+                        {
+                            failed += 1;
+                            debug!(
+                                "Payment failed while depleting liquidity: {} -> {} - {}",
+                                source, dest, err
+                            );
+                            continue;
+                        }
+                    }
 
                     successful += 1;
                     total_value += amount;
@@ -545,6 +578,11 @@ impl Simulator {
         self.disconnection_tracker.read().offline_node_ids()
     }
 
+    /// Number of channels with no capacity left in at least one direction.
+    pub fn depleted_channels(&self) -> usize {
+        liquidity::depleted_channels(&self.network.read())
+    }
+
     /// Generate random bytes
     fn generate_random_bytes(len: usize, rng: &mut impl rand::Rng) -> Vec<u8> {
         (0..len).map(|_| rng.gen()).collect()
@@ -682,6 +720,22 @@ pub enum SimulatorError {
 
     #[error("Invalid node state: {0}")]
     InvalidNodeState(String),
+
+    #[error(
+        "Insufficient channel liquidity on {channel_id}: needed {needed}, available {available}"
+    )]
+    InsufficientLiquidity {
+        channel_id: String,
+        needed: i128,
+        available: i128,
+    },
+
+    #[error("Route hop {hop} does not connect {from} to {to}")]
+    InvalidRouteHop {
+        hop: usize,
+        from: String,
+        to: String,
+    },
 }
 
 #[cfg(test)]
@@ -800,6 +854,119 @@ mod tests {
             simulator.run_simulation().await,
             Err(SimulatorError::InvalidConfig(_))
         ));
+    }
+
+    fn total_channel_capacity(simulator: &Simulator) -> i128 {
+        simulator
+            .get_network()
+            .read()
+            .channels
+            .values()
+            .map(|channel| channel.capacity_a_to_b + channel.capacity_b_to_a)
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn depleting_liquidity_moves_value_and_conserves_capacity() {
+        // Small, thin channels so a few hundred payments are enough to drain
+        // one: the point is that draining is observable, not that it is rare.
+        let config = SimulatorConfig {
+            num_nodes: 4,
+            avg_channels_per_node: 2.0,
+            min_channel_capacity: 1_000,
+            max_channel_capacity: 2_000,
+            num_payments: 300,
+            max_payment_amount: 1_500,
+            seed: Some(2024),
+            liquidity_model: LiquidityModel::Depleting,
+            ..Default::default()
+        };
+
+        let simulator = Simulator::new(config.clone());
+        simulator.initialize_network().unwrap();
+
+        let capacity_before = total_channel_capacity(&simulator);
+        let balances_before: Vec<(String, i128, i128)> = simulator
+            .get_network()
+            .read()
+            .channels
+            .values()
+            .map(|c| (c.id.clone(), c.capacity_a_to_b, c.capacity_b_to_a))
+            .collect();
+
+        let stats = simulator.run_simulation().await.unwrap();
+
+        assert!(stats.successful_payments > 0);
+        assert_eq!(
+            capacity_before,
+            total_channel_capacity(&simulator),
+            "payments move value, they do not create it"
+        );
+        assert_eq!(
+            simulator.get_stats().depleted_channels,
+            simulator.depleted_channels()
+        );
+        assert!(
+            simulator.get_stats().depleted_channels
+                <= simulator.get_network().read().num_channels(),
+            "the dry-channel count cannot exceed the channel count"
+        );
+
+        // The same payments against the same topology, but without moving
+        // balances. Depletion changes what the network can carry: it can lower
+        // settlements by stranding liquidity, or raise them by rebalancing a
+        // channel that had none in the direction a later payment needs. Either
+        // way the model has to be observable in the results.
+        let static_sim = Simulator::new(SimulatorConfig {
+            liquidity_model: LiquidityModel::Static,
+            ..simulator.config.clone()
+        });
+        static_sim.initialize_network().unwrap();
+        let static_stats = static_sim.run_simulation().await.unwrap();
+        assert_ne!(
+            stats.successful_payments, static_stats.successful_payments,
+            "moving balances must change what settles"
+        );
+
+        let balances_after: Vec<(String, i128, i128)> = simulator
+            .get_network()
+            .read()
+            .channels
+            .values()
+            .map(|c| (c.id.clone(), c.capacity_a_to_b, c.capacity_b_to_a))
+            .collect();
+        assert_ne!(balances_before, balances_after);
+
+        // Same seed, same depletion.
+        let replay = Simulator::new(config);
+        replay.initialize_network().unwrap();
+        let replay_stats = replay.run_simulation().await.unwrap();
+        assert_eq!(stats.successful_payments, replay_stats.successful_payments);
+        assert_eq!(stats.total_value_routed, replay_stats.total_value_routed);
+        assert_eq!(stats.depleted_channels, replay_stats.depleted_channels);
+    }
+
+    #[tokio::test]
+    async fn the_static_model_leaves_balances_untouched() {
+        let config = SimulatorConfig {
+            num_nodes: 8,
+            avg_channels_per_node: 3.0,
+            num_payments: 60,
+            seed: Some(77),
+            ..Default::default()
+        };
+        assert_eq!(config.liquidity_model, LiquidityModel::Static);
+
+        let simulator = Simulator::new(config);
+        simulator.initialize_network().unwrap();
+
+        let before = total_channel_capacity(&simulator);
+        let stats = simulator.run_simulation().await.unwrap();
+
+        assert!(stats.successful_payments > 0);
+        assert_eq!(before, total_channel_capacity(&simulator));
+        assert_eq!(simulator.depleted_channels(), 0);
+        assert_eq!(stats.depleted_channels, 0);
     }
 
     #[tokio::test]
