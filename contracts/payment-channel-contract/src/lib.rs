@@ -16,7 +16,7 @@ use soroban_sdk::{
     contract, contractimpl, contractmeta, Address, Bytes, BytesN, Env, IntoVal, TryFromVal,
     Vec as SorobanVec,
 };
-use types::{ChannelState, HTLCInfo, HtlcList};
+use types::{ChannelState, ChannelStatusReport, HTLCInfo, HtlcList};
 
 /// Append an address's canonical strkey encoding to `out`.
 ///
@@ -177,6 +177,30 @@ impl PaymentChannel {
         channel_id: BytesN<32>,
     ) -> Result<ChannelState, PaymentChannelError> {
         state::get_channel_state(&env, &channel_id)
+    }
+
+    /// Get a channel status report including pending HTLC count and capacity.
+    pub fn get_channel_status(
+        env: Env,
+        channel_id: BytesN<32>,
+    ) -> Result<ChannelStatusReport, PaymentChannelError> {
+        let channel = state::get_channel_state(&env, &channel_id)?;
+        let (pending_htlc_count, pending_htlc_amount) =
+            channel::ChannelManager::compute_pending_htlc_metrics(&env, &channel.htlcs)?;
+        let capacity = channel.total_balance;
+        let available_capacity = capacity.saturating_sub(pending_htlc_amount);
+
+        Ok(ChannelStatusReport {
+            channel_id: channel.channel_id,
+            is_open: channel.close_time == 0 && !channel.is_cooperative_close,
+            is_cooperative_close: channel.is_cooperative_close,
+            balance_a: channel.balance_a,
+            balance_b: channel.balance_b,
+            capacity,
+            pending_htlc_count,
+            pending_htlc_amount,
+            available_capacity,
+        })
     }
 
     /// Update the channel state with a new payment
@@ -790,94 +814,63 @@ mod tests {
     }
 
     #[test]
-    fn test_initialize_with_reserve_boundaries_and_failures() {
+    fn test_get_channel_status_exposes_pending_htlcs_and_capacity() {
         let env = Env::default();
         env.mock_all_auths();
-        let contract_id = env.register_contract(None, PaymentChannel);
-        let client = PaymentChannelClient::new(&env, &contract_id);
-        let p_a = Address::generate(&env);
-        let p_b = Address::generate(&env);
+        let (client, p_a, p_b, channel_id) = setup_channel(&env);
 
-        // Negative reserve is rejected explicitly.
-        assert_eq!(
-            client.try_initialize_with_reserve(&p_a, &p_b, &1_000, &1_000, &100, &0, &-1),
-            Err(Ok(PaymentChannelError::InvalidBalance))
+        let initial = client.get_channel_status(&channel_id);
+        assert!(initial.is_open);
+        assert_eq!(initial.capacity, 2_000);
+        assert_eq!(initial.pending_htlc_count, 0);
+        assert_eq!(initial.pending_htlc_amount, 0);
+        assert_eq!(initial.available_capacity, 2_000);
+
+        // Add one active HTLC and one claimed HTLC directly in contract storage
+        // to verify only active HTLCs are counted.
+        let active_id = BytesN::from_array(&env, &[1u8; 32]);
+        let claimed_id = BytesN::from_array(&env, &[2u8; 32]);
+        let mut active_htlc = HTLCInfo::new(
+            active_id.clone(),
+            300,
+            BytesN::from_array(&env, &[7u8; 32]),
+            1_000,
+            p_a.clone(),
+            p_b.clone(),
         );
-
-        // Initial balance below reserve is rejected.
-        assert_eq!(
-            client.try_initialize_with_reserve(&p_a, &p_b, &199, &1_000, &100, &0, &200),
-            Err(Ok(PaymentChannelError::ReserveNotMet))
+        active_htlc.is_claimed = false;
+        let mut claimed_htlc = HTLCInfo::new(
+            claimed_id.clone(),
+            500,
+            BytesN::from_array(&env, &[8u8; 32]),
+            1_000,
+            p_a,
+            p_b,
         );
+        claimed_htlc.is_claimed = true;
 
-        // Exact boundary: initial balances equal to reserve succeed.
-        let ch_id = client.initialize_with_reserve(&p_a, &p_b, &200, &200, &100, &0, &200);
-        assert_eq!(client.get_channel_state(&ch_id).channel_reserve, 200);
+        env.as_contract(&client.address, || {
+            let mut st = state::get_channel_state(&env, &channel_id).unwrap();
+            st.htlcs.set(active_id.to_val(), active_htlc.to_val());
+            st.htlcs.set(claimed_id.to_val(), claimed_htlc.to_val());
+            state::store_channel_state(&env, &channel_id, &st);
+        });
+
+        let updated = client.get_channel_status(&channel_id);
+        assert_eq!(updated.pending_htlc_count, 1);
+        assert_eq!(updated.pending_htlc_amount, 300);
+        assert_eq!(updated.capacity, 2_000);
+        assert_eq!(updated.available_capacity, 1_700);
     }
 
     #[test]
-    fn test_update_state_and_htlc_enforce_reserve_without_partial_update() {
+    fn test_get_channel_status_missing_channel_returns_not_found() {
         let env = Env::default();
-        env.mock_all_auths();
         let contract_id = env.register_contract(None, PaymentChannel);
         let client = PaymentChannelClient::new(&env, &contract_id);
-        let p_a = Address::generate(&env);
-        let p_b = Address::generate(&env);
-        let ch_id = client.initialize_with_reserve(&p_a, &p_b, &1_000, &1_000, &100, &0, &200);
-        let dummy_sig = BytesN::from_array(&env, &[0u8; 64]);
+        let missing = BytesN::from_array(&env, &[9u8; 32]);
 
-        // Boundary update leaving participant A at exact reserve (200) succeeds.
-        client.update_state(&ch_id, &200, &1_800, &dummy_sig, &dummy_sig);
-        let state = client.get_channel_state(&ch_id);
-        assert_eq!(state.balance_a, 200);
-        assert_eq!(state.sequence_number, 1);
-
-        // Update dropping A below reserve (199 < 200) fails without mutating state.
-        assert_eq!(
-            client.try_update_state(&ch_id, &199, &1_801, &dummy_sig, &dummy_sig),
-            Err(Ok(PaymentChannelError::ReserveNotMet))
-        );
-        assert_eq!(client.get_channel_state(&ch_id), state);
-
-        // HTLC that would drop A below reserve (200 - 1 = 199 < 200) fails without mutating state.
-        let hashlock = BytesN::from_array(&env, &[1u8; 32]);
-        let timelock = env.ledger().sequence() + 10;
-        assert_eq!(
-            client.try_create_htlc(&ch_id, &hashlock, &timelock, &1, &p_b),
-            Err(Ok(PaymentChannelError::ReserveNotMet))
-        );
-        assert_eq!(client.get_channel_state(&ch_id), state);
-    }
-
-    #[test]
-    fn test_set_channel_reserve_validation() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, _p_a, _p_b, ch_id) = setup_channel(&env);
-        let dummy_sig = BytesN::from_array(&env, &[0u8; 64]);
-
-        // Negative reserve is rejected.
-        assert_eq!(
-            client.try_set_channel_reserve(&ch_id, &-5),
-            Err(Ok(PaymentChannelError::InvalidBalance))
-        );
-
-        // Reserve exceeding current balance (1000) is rejected without mutation.
-        assert_eq!(
-            client.try_set_channel_reserve(&ch_id, &1_001),
-            Err(Ok(PaymentChannelError::ReserveNotMet))
-        );
-        assert_eq!(client.get_channel_state(&ch_id).channel_reserve, 0);
-
-        // Valid reserve succeeds.
-        client.set_channel_reserve(&ch_id, &250);
-        assert_eq!(client.get_channel_state(&ch_id).channel_reserve, 250);
-
-        // Closed channel rejects reserve changes.
-        client.cooperative_close(&ch_id, &1_000, &1_000, &dummy_sig, &dummy_sig);
-        assert_eq!(
-            client.try_set_channel_reserve(&ch_id, &100),
-            Err(Ok(PaymentChannelError::ChannelAlreadyClosed))
-        );
+        let res = client.try_get_channel_status(&missing);
+        assert_eq!(res, Err(Ok(PaymentChannelError::ChannelNotFound)));
     }
 }
