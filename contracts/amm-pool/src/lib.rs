@@ -1,11 +1,31 @@
 #![no_std]
+//! Constant-product AMM pool.
+//!
+//! # Overflow policy (#399)
+//!
+//! Every mutation of a reserve, an LP balance, the LP total supply or an
+//! allowance goes through the checked helpers in [`math`], which abort the
+//! invocation with a message naming the field and operands. Nothing on these
+//! paths uses `saturating_*`: saturating a reserve at `i128::MAX` would leave
+//! the stored reserve out of sync with the tokens the pool actually holds and
+//! silently misprice every later swap. A panic is safe here because Soroban
+//! rolls back the whole invocation, so a failed operation never leaves partial
+//! state behind.
+//!
+//! The only intentional saturation left is the TWAP accumulator in
+//! `grow_cumulative`: it is a derived, monotonically increasing oracle value
+//! rather than a balance, and clamping it is a documented degradation instead
+//! of an accounting error.
 
 // Public so the quorum/quorum-status helpers and `sqrt_u128` are part of the
 // crate's reachable API: as a private module their `pub` items tripped
 // `dead_code` under `clippy -D warnings`.
 pub mod math;
 
-use math::{amount_out, flash_k_ok, liquidity_amounts_first_deposit, quote};
+use math::{
+    amount_out, checked_add_amount, checked_mul_div, checked_sub_amount, flash_k_ok,
+    liquidity_amounts_first_deposit, quote,
+};
 use soroban_sdk::token::{TokenClient, TokenInterface};
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, IntoVal, String};
 
@@ -23,6 +43,7 @@ pub enum DataKey {
     CumB,
     Bal(Address),
     Allow(AllowKey),
+    FlashSwapActive,
 }
 
 #[contracttype]
@@ -79,6 +100,16 @@ fn reserves(env: &Env) -> (i128, i128) {
 fn set_reserves(env: &Env, a: i128, b: i128) {
     write_i128(env, DataKey::ReserveA, a);
     write_i128(env, DataKey::ReserveB, b);
+}
+
+fn assert_not_in_flash_swap(env: &Env) {
+    assert!(
+        !env.storage()
+            .instance()
+            .get(&DataKey::FlashSwapActive)
+            .unwrap_or(false),
+        "reentrant call during flash swap"
+    );
 }
 
 fn total_lp(env: &Env) -> i128 {
@@ -145,16 +176,22 @@ fn allowance_effective(env: &Env, data: &AllowanceData) -> i128 {
 fn mint_lp(env: &Env, to: Address, amount: i128) {
     assert!(amount > 0, "mint lp");
     let b = lp_balance_read(env, &to);
-    lp_balance_write(env, to, b.saturating_add(amount));
-    set_total_lp(env, total_lp(env).saturating_add(amount));
+    lp_balance_write(env, to, checked_add_amount(b, amount, "lp balance mint"));
+    set_total_lp(
+        env,
+        checked_add_amount(total_lp(env), amount, "lp total supply mint"),
+    );
 }
 
 fn burn_lp(env: &Env, from: Address, amount: i128) {
     assert!(amount > 0, "burn lp");
     let b = lp_balance_read(env, &from);
     assert!(b >= amount, "bal");
-    lp_balance_write(env, from, b - amount);
-    set_total_lp(env, total_lp(env).saturating_sub(amount));
+    lp_balance_write(env, from, checked_sub_amount(b, amount, "lp balance burn"));
+    set_total_lp(
+        env,
+        checked_sub_amount(total_lp(env), amount, "lp total supply burn"),
+    );
 }
 
 fn burn_lp_withdraw(env: &Env, from: Address, amount: i128) {
@@ -162,14 +199,8 @@ fn burn_lp_withdraw(env: &Env, from: Address, amount: i128) {
     let (reserve_a, reserve_b) = reserves(env);
     let supply = total_lp(env);
     assert!(amount > 0 && supply > 0, "burn w");
-    let amount_a = amount
-        .saturating_mul(reserve_a)
-        .checked_div(supply)
-        .unwrap();
-    let amount_b = amount
-        .saturating_mul(reserve_b)
-        .checked_div(supply)
-        .unwrap();
+    let amount_a = checked_mul_div(amount, reserve_a, supply, "withdraw amount A");
+    let amount_b = checked_mul_div(amount, reserve_b, supply, "withdraw amount B");
     grow_cumulative(env);
     burn_lp(env, from.clone(), amount);
     let (ta, tb) = get_tokens(env);
@@ -177,8 +208,8 @@ fn burn_lp_withdraw(env: &Env, from: Address, amount: i128) {
     TokenClient::new(env, &tb).transfer(&pool, &from, &amount_b);
     set_reserves(
         env,
-        reserve_a.saturating_sub(amount_a),
-        reserve_b.saturating_sub(amount_b),
+        checked_sub_amount(reserve_a, amount_a, "reserve A withdraw"),
+        checked_sub_amount(reserve_b, amount_b, "reserve B withdraw"),
     );
     grow_cumulative(env);
 }
@@ -241,6 +272,7 @@ impl AmmPool {
         min_a: i128,
         min_b: i128,
     ) -> i128 {
+        assert_not_in_flash_swap(&env);
         user.require_auth();
         assert!(amount_a_desired > 0 && amount_b_desired > 0, "amounts");
         let pool = env.current_contract_address();
@@ -271,19 +303,14 @@ impl AmmPool {
         let liq = if total_lp(&env) == 0 {
             liquidity_amounts_first_deposit(amount_a, amount_b)
         } else {
-            let l1 = amount_a
-                .saturating_mul(total_lp(&env))
-                .checked_div(reserve_a)
-                .unwrap_or(0);
-            let l2 = amount_b
-                .saturating_mul(total_lp(&env))
-                .checked_div(reserve_b)
-                .unwrap_or(0);
+            let supply = total_lp(&env);
+            let l1 = checked_mul_div(amount_a, supply, reserve_a, "add liquidity LP for A");
+            let l2 = checked_mul_div(amount_b, supply, reserve_b, "add liquidity LP for B");
             l1.min(l2)
         };
         assert!(liq > 0, "liq");
-        let new_a = reserve_a.saturating_add(amount_a);
-        let new_b = reserve_b.saturating_add(amount_b);
+        let new_a = checked_add_amount(reserve_a, amount_a, "reserve A deposit");
+        let new_b = checked_add_amount(reserve_b, amount_b, "reserve B deposit");
         set_reserves(&env, new_a, new_b);
         mint_lp(&env, user, liq);
         grow_cumulative(&env);
@@ -301,6 +328,7 @@ impl AmmPool {
         min_a: i128,
         min_b: i128,
     ) -> (i128, i128) {
+        assert_not_in_flash_swap(&env);
         user.require_auth();
         assert!(lp_amount > 0, "lp");
         let pool = env.current_contract_address();
@@ -308,14 +336,8 @@ impl AmmPool {
         let supply = total_lp(&env);
         assert!(supply > 0, "supply");
 
-        let amount_a = lp_amount
-            .saturating_mul(reserve_a)
-            .checked_div(supply)
-            .unwrap();
-        let amount_b = lp_amount
-            .saturating_mul(reserve_b)
-            .checked_div(supply)
-            .unwrap();
+        let amount_a = checked_mul_div(lp_amount, reserve_a, supply, "remove liquidity amount A");
+        let amount_b = checked_mul_div(lp_amount, reserve_b, supply, "remove liquidity amount B");
         assert!(amount_a >= min_a && amount_b >= min_b, "slippage rm");
 
         grow_cumulative(&env);
@@ -327,8 +349,8 @@ impl AmmPool {
 
         set_reserves(
             &env,
-            reserve_a.saturating_sub(amount_a),
-            reserve_b.saturating_sub(amount_b),
+            checked_sub_amount(reserve_a, amount_a, "reserve A removal"),
+            checked_sub_amount(reserve_b, amount_b, "reserve B removal"),
         );
         grow_cumulative(&env);
         (amount_a, amount_b)
@@ -340,6 +362,7 @@ impl AmmPool {
     /// Both the fee-adjusted input (`amount_in * 997 / 1000`) and the output amount
     /// round down (truncate toward zero), favoring pool reserves. Enforces `out >= min_out`.
     pub fn swap(env: Env, token_in: Address, to: Address, min_out: i128) -> i128 {
+        assert_not_in_flash_swap(&env);
         assert!(to != env.current_contract_address(), "to");
         let pool = env.current_contract_address();
         let (ta, tb) = get_tokens(&env);
@@ -355,7 +378,10 @@ impl AmmPool {
         };
 
         let bal_in = TokenClient::new(&env, &token_in).balance(&pool);
-        let amount_in = bal_in.saturating_sub(reserve_in);
+        // A balance below the recorded reserve means the pool's accounting has
+        // already drifted from the token it holds; swapping against the
+        // difference would pay out from a phantom input.
+        let amount_in = checked_sub_amount(bal_in, reserve_in, "swap input balance");
         assert!(amount_in > 0, "amount_in");
 
         let out = amount_out(amount_in, reserve_in, reserve_out);
@@ -363,8 +389,8 @@ impl AmmPool {
         assert!(out < reserve_out, "out");
 
         grow_cumulative(&env);
-        let new_in = reserve_in.saturating_add(amount_in);
-        let new_out = reserve_out.saturating_sub(out);
+        let new_in = checked_add_amount(reserve_in, amount_in, "reserve in after swap");
+        let new_out = checked_sub_amount(reserve_out, out, "reserve out after swap");
         if token_in == ta {
             set_reserves(&env, new_in, new_out);
         } else {
@@ -387,6 +413,7 @@ impl AmmPool {
         amount_b_out: i128,
         callback: Address,
     ) {
+        assert_not_in_flash_swap(&env);
         assert!(amount_a_out >= 0 && amount_b_out >= 0, "out amt");
         assert!(amount_a_out > 0 || amount_b_out > 0, "need out");
         let pool = env.current_contract_address();
@@ -398,6 +425,9 @@ impl AmmPool {
             "liquidity out"
         );
 
+        env.storage()
+            .instance()
+            .set(&DataKey::FlashSwapActive, &true);
         grow_cumulative(&env);
 
         if amount_a_out > 0 {
@@ -421,6 +451,7 @@ impl AmmPool {
         );
         set_reserves(&env, bal_a, bal_b);
         grow_cumulative(&env);
+        env.storage().instance().remove(&DataKey::FlashSwapActive);
     }
 }
 
@@ -432,6 +463,7 @@ impl TokenInterface for AmmPool {
     }
 
     fn approve(env: Env, from: Address, spender: Address, amount: i128, expiration_ledger: u32) {
+        assert_not_in_flash_swap(&env);
         from.require_auth();
         allowance_store(
             &env,
@@ -449,43 +481,58 @@ impl TokenInterface for AmmPool {
     }
 
     fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+        assert_not_in_flash_swap(&env);
         from.require_auth();
         assert!(amount > 0, "amt");
         let b = lp_balance_read(&env, &from);
         assert!(b >= amount, "bal");
-        lp_balance_write(&env, from, b - amount);
+        lp_balance_write(
+            &env,
+            from,
+            checked_sub_amount(b, amount, "lp transfer from"),
+        );
         let b_to = lp_balance_read(&env, &to);
-        lp_balance_write(&env, to, b_to.saturating_add(amount));
+        lp_balance_write(&env, to, checked_add_amount(b_to, amount, "lp transfer to"));
     }
 
     fn transfer_from(env: Env, spender: Address, from: Address, to: Address, amount: i128) {
+        assert_not_in_flash_swap(&env);
         spender.require_auth();
         assert!(amount > 0, "amt");
         let mut al = allowance_load(&env, from.clone(), spender.clone());
         let eff = allowance_effective(&env, &al);
         assert!(eff >= amount, "allow");
-        let new_allow = eff.saturating_sub(amount);
-        al.amount = new_allow;
+        al.amount = checked_sub_amount(eff, amount, "allowance spend");
         allowance_store(&env, from.clone(), spender, al);
 
         let b = lp_balance_read(&env, &from);
         assert!(b >= amount, "bal");
-        lp_balance_write(&env, from.clone(), b - amount);
+        lp_balance_write(
+            &env,
+            from.clone(),
+            checked_sub_amount(b, amount, "lp transfer_from from"),
+        );
         let b_to = lp_balance_read(&env, &to);
-        lp_balance_write(&env, to, b_to.saturating_add(amount));
+        lp_balance_write(
+            &env,
+            to,
+            checked_add_amount(b_to, amount, "lp transfer_from to"),
+        );
     }
 
     fn burn(env: Env, from: Address, amount: i128) {
+        assert_not_in_flash_swap(&env);
         from.require_auth();
         burn_lp_withdraw(&env, from, amount);
     }
 
     fn burn_from(env: Env, spender: Address, from: Address, amount: i128) {
+        assert_not_in_flash_swap(&env);
         spender.require_auth();
         let mut al = allowance_load(&env, from.clone(), spender.clone());
         let eff = allowance_effective(&env, &al);
         assert!(eff >= amount, "allow");
-        al.amount = eff.saturating_sub(amount);
+        al.amount = checked_sub_amount(eff, amount, "allowance spend on burn");
         allowance_store(&env, from.clone(), spender.clone(), al);
         burn_lp_withdraw(&env, from, amount);
     }
@@ -508,6 +555,46 @@ mod test {
     use super::*;
     use soroban_sdk::testutils::{Address as _, Ledger as _};
     use soroban_sdk::token::{StellarAssetClient, TokenClient};
+
+    #[contracttype]
+    #[derive(Clone)]
+    enum CallbackKey {
+        TokenA,
+    }
+
+    #[contract]
+    struct ReentrantFlashCallback;
+
+    #[contractimpl]
+    impl ReentrantFlashCallback {
+        pub fn set_token_a(env: Env, token_a: Address) {
+            env.storage().instance().set(&CallbackKey::TokenA, &token_a);
+        }
+
+        pub fn on_flash(
+            env: Env,
+            pool_id: Address,
+            recipient: Address,
+            amount_a_out: i128,
+            amount_b_out: i128,
+        ) {
+            assert_eq!(amount_b_out, 0, "test callback expects no token B output");
+            let callback_id = env.current_contract_address();
+            let pool = AmmPoolClient::new(&env, &pool_id);
+            assert!(
+                pool.try_flash_swap(&recipient, &1, &0, &callback_id)
+                    .is_err(),
+                "nested flash swap should be rejected"
+            );
+
+            let token_a: Address = env
+                .storage()
+                .instance()
+                .get(&CallbackKey::TokenA)
+                .expect("token A configured");
+            TokenClient::new(&env, &token_a).transfer(&recipient, &pool_id, &(amount_a_out + 4));
+        }
+    }
 
     fn setup_tokens(env: &Env) -> (Address, Address) {
         let admin = Address::generate(env);
@@ -595,5 +682,107 @@ mod test {
         let _ = pool.swap(&ta, &u, &1);
         let (c1, d1, _) = pool.observe();
         assert!(c1 > c0 || d1 > d0);
+    }
+
+    #[test]
+    fn flash_swap_rejects_reentrant_pool_mutations() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (ta, tb) = setup_tokens(&env);
+        let pool_id = env.register_contract(None, AmmPool);
+        let pool = AmmPoolClient::new(&env, &pool_id);
+        let factory = Address::generate(&env);
+        pool.initialize(&factory, &ta, &tb);
+
+        let liquidity_provider = Address::generate(&env);
+        mint(&env, ta.clone(), liquidity_provider.clone(), 10_000_000);
+        mint(&env, tb.clone(), liquidity_provider.clone(), 10_000_000);
+        pool.add_liquidity(&liquidity_provider, &1_000_000, &1_000_000, &0, &0);
+
+        let callback_id = env.register_contract(None, ReentrantFlashCallback);
+        ReentrantFlashCallbackClient::new(&env, &callback_id).set_token_a(&ta);
+        mint(&env, ta, callback_id.clone(), 4);
+        pool.flash_swap(&callback_id, &1_000, &0, &callback_id);
+
+        assert_eq!(pool.get_reserves(), (1_000_004, 1_000_000));
+    }
+
+    #[test]
+    fn proportional_deposit_rejects_a_quote_that_overflows_i128() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (ta, tb) = setup_tokens(&env);
+        let pool_id = env.register_contract(None, AmmPool);
+        let pool = AmmPoolClient::new(&env, &pool_id);
+        pool.initialize(&Address::generate(&env), &ta, &tb);
+
+        let u = Address::generate(&env);
+        mint(&env, ta.clone(), u.clone(), 10_000_000);
+        mint(&env, tb.clone(), u.clone(), 10_000_000);
+        pool.add_liquidity(&u, &1_000_000, &1_000_000, &1, &1);
+
+        // Push the LP supply to the i128 boundary. `1_001 * supply` then has no
+        // representable product and the old `saturating_mul` would have quoted
+        // `i128::MAX` LP instead of failing.
+        env.as_contract(&pool_id, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::TotalLp, &(i128::MAX - 1));
+        });
+        let before = pool.get_reserves();
+
+        assert!(
+            pool.try_add_liquidity(&u, &1_001, &1_001, &1, &1).is_err(),
+            "an overflowing LP quote must abort the deposit"
+        );
+        // The aborted call must leave no partial update behind.
+        assert_eq!(pool.get_reserves(), before);
+        assert_eq!(pool.balance(&u), 1_000_000);
+    }
+
+    #[test]
+    fn lp_transfer_to_a_saturated_balance_is_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (ta, tb) = setup_tokens(&env);
+        let pool_id = env.register_contract(None, AmmPool);
+        let pool = AmmPoolClient::new(&env, &pool_id);
+        pool.initialize(&Address::generate(&env), &ta, &tb);
+
+        let u = Address::generate(&env);
+        mint(&env, ta.clone(), u.clone(), 1_000_000);
+        mint(&env, tb.clone(), u.clone(), 1_000_000);
+        let lp = pool.add_liquidity(&u, &1_000, &1_000, &1, &1);
+
+        let recipient = Address::generate(&env);
+        env.as_contract(&pool_id, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::Bal(recipient.clone()), &i128::MAX);
+        });
+
+        let token = TokenClient::new(&env, &pool_id);
+        assert!(
+            token.try_transfer(&u, &recipient, &1).is_err(),
+            "adding to a saturated LP balance must abort instead of capping"
+        );
+        assert_eq!(token.balance(&u), lp);
+    }
+
+    #[test]
+    fn active_flash_swap_guard_rejects_lp_token_mutations() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let pool_id = env.register_contract(None, AmmPool);
+        env.as_contract(&pool_id, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::FlashSwapActive, &true);
+        });
+
+        let pool = AmmPoolClient::new(&env, &pool_id);
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+        assert!(pool.try_approve(&owner, &spender, &1, &10).is_err());
     }
 }

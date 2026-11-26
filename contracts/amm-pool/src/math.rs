@@ -16,6 +16,83 @@ pub const FEE_NUM: i128 = 997;
 /// Denominator for swap fee scaling (parts per thousand: `1000` = 100%, `3` = 0.3% = 30 bps).
 pub const FEE_DEN: i128 = 1000;
 
+/// Add two reserve, LP or allowance amounts, aborting on overflow (#399).
+///
+/// # Why this exists
+///
+/// The pool used to guard these mutations with `saturating_add` /
+/// `saturating_sub`. Saturation never panics, which sounds safe, but here it is
+/// the opposite: a reserve or LP total pinned at `i128::MAX` silently leaves the
+/// pool's accounting inconsistent with the token balances it actually holds, and
+/// every later quote is computed from the wrong reserve. Failing loudly is the
+/// only outcome that keeps the invariant `sum(lp balances) == total_lp` and
+/// `reserves == token balances` intact, because a panic aborts the Soroban
+/// invocation and rolls the whole transaction back.
+///
+/// The panic message names the field and both operands so an operator reading a
+/// failed transaction can tell which invariant was about to break, rather than
+/// decoding the compiler's bare `attempt to add with overflow`.
+pub fn checked_add_amount(a: i128, b: i128, context: &str) -> i128 {
+    match a.checked_add(b) {
+        Some(sum) => sum,
+        None => panic!("{context}: {a} + {b} overflows i128"),
+    }
+}
+
+/// Subtract two reserve, LP or allowance amounts, aborting on a negative
+/// result (#399).
+///
+/// See [`checked_add_amount`] for why saturation is the wrong default here. A
+/// subtraction that would go negative means the pool is about to hand out more
+/// than it holds, so it must abort rather than clamp to zero. `i128` subtraction
+/// alone would happily return `-1` here, so the non-negative result is part of
+/// the check.
+pub fn checked_sub_amount(a: i128, b: i128, context: &str) -> i128 {
+    match a.checked_sub(b) {
+        Some(difference) if difference >= 0 => difference,
+        Some(difference) => panic!("{context}: {a} - {b} = {difference} would be negative"),
+        None => panic!("{context}: {a} - {b} underflows i128"),
+    }
+}
+
+/// Compute `a * b / divisor` with checked intermediate arithmetic (#399).
+///
+/// Proportional LP math (`amount * total_lp / reserve`) is the one place in the
+/// pool where a legitimate input can push the *intermediate* product past
+/// `i128::MAX` even though the quotient fits. Two exact reductions are tried
+/// before multiplying, which covers the common case where the divisor divides
+/// one of the factors; otherwise the product is checked and an overflow aborts
+/// with an actionable message instead of silently saturating to a wrong amount.
+///
+/// Returns a value in `0..=b` whenever `a <= divisor`, which is the shape the LP
+/// callers rely on. Panics when `divisor` is not positive, when either factor is
+/// negative, or when the product overflows `i128`.
+pub fn checked_mul_div(a: i128, b: i128, divisor: i128, context: &str) -> i128 {
+    assert!(a >= 0 && b >= 0, "{context}: factors must be non-negative");
+    assert!(divisor > 0, "{context}: divisor must be positive");
+
+    // Exact reductions first: `(a / d) * b` cannot overflow when the true
+    // quotient fits and `d` divides `a`, and likewise for `b`.
+    if a % divisor == 0 {
+        return checked_mul_amount(a / divisor, b, context);
+    }
+    if b % divisor == 0 {
+        return checked_mul_amount(b / divisor, a, context);
+    }
+
+    let product = checked_mul_amount(a, b, context);
+    product / divisor
+}
+
+/// Multiply two non-negative amounts, aborting with `context` on overflow (#399).
+pub fn checked_mul_amount(a: i128, b: i128, context: &str) -> i128 {
+    assert!(a >= 0 && b >= 0, "{context}: factors must be non-negative");
+    match a.checked_mul(b) {
+        Some(product) => product,
+        None => panic!("{context}: {a} * {b} overflows i128"),
+    }
+}
+
 /// Exact 128x128 -> 256-bit unsigned multiplication returning `(high, low)` (#216).
 ///
 /// Used as an overflow fallback so constant-product ratios and invariant checks
@@ -811,6 +888,53 @@ mod math_tests {
         assert_eq!(count_distinct_voters(&votes, 100), 98);
         assert!(quorum_status(60, 100, count_distinct_voters(&votes, 100)).is_met());
         assert!(!quorum_status(99, 100, count_distinct_voters(&votes, 100)).is_met());
+    }
+
+    #[test]
+    fn checked_amount_helpers_accept_in_range_values() {
+        use super::{checked_add_amount, checked_mul_div, checked_sub_amount};
+
+        assert_eq!(checked_add_amount(7, 5, "t"), 12);
+        assert_eq!(checked_add_amount(i128::MAX - 1, 1, "t"), i128::MAX);
+        assert_eq!(checked_sub_amount(7, 5, "t"), 2);
+        assert_eq!(checked_sub_amount(0, 0, "t"), 0);
+        // Exact reductions keep `amount * supply / reserve` in range.
+        assert_eq!(checked_mul_div(1_000, 2_000, 2_000, "t"), 1_000);
+        assert_eq!(checked_mul_div(1_000, 2_000, 1_000, "t"), 2_000);
+        assert_eq!(checked_mul_div(7, 5, 3, "t"), 11);
+        assert_eq!(checked_mul_div(0, i128::MAX, 7, "t"), 0);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "lp total supply: 170141183460469231731687303715884105727 + 1 overflows i128"
+    )]
+    fn checked_add_amount_names_the_field_and_operands() {
+        use super::checked_add_amount;
+        let _ = checked_add_amount(i128::MAX, 1, "lp total supply");
+    }
+
+    #[test]
+    #[should_panic(expected = "reserve B: 0 - 1 = -1 would be negative")]
+    fn checked_sub_amount_rejects_a_negative_result() {
+        use super::checked_sub_amount;
+        let _ = checked_sub_amount(0, 1, "reserve B");
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "lp mint: 170141183460469231731687303715884105727 * 3 overflows i128"
+    )]
+    fn checked_mul_div_rejects_a_product_that_does_not_fit() {
+        use super::checked_mul_div;
+        let _ = checked_mul_div(i128::MAX, 3, 2, "lp mint");
+    }
+
+    #[test]
+    #[should_panic(expected = "lp mint: divisor must be positive")]
+    fn checked_mul_div_rejects_a_zero_divisor() {
+        use super::checked_mul_div;
+        let _ = checked_mul_div(1, 1, 0, "lp mint");
     }
 
     #[test]

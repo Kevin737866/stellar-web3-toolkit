@@ -79,6 +79,37 @@ the owner's implicit `PERM_ALL`), `get_owner(collection)`,
 - Only the contract admin may `register_collection`; once registered, ownership
   and grants are managed by the collection owner or `PERM_ADMIN` holders.
 
+## Access-control matrix
+
+The registry separates the **contract-wide administrator** from the
+**collection-level roles**. The administrator can register collections and
+manage a collection's permissions, but is not automatically returned as a
+collection owner by `has_permission`. The collection owner, by contrast,
+implicitly has every defined permission bit.
+
+| Operation / protected action | Contract admin | Collection owner | `PERM_ADMIN` | `PERM_MINTER` | `PERM_BURNER` | `PERM_METADATA` | `PERM_TRANSFER` |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Register a collection | Yes | No | No | No | No | No | No |
+| Grant, revoke or set account permissions | Yes | Yes | Yes | No | No | No | No |
+| Set collection-wide default permissions | Yes | Yes | Yes | No | No | No | No |
+| Transfer collection ownership | Yes | Yes | Yes | No | No | No | No |
+| Mint assets (consumer contract checks the bit) | No implicit grant | Yes | No implicit grant | Yes | No | No | No |
+| Burn assets (consumer contract checks the bit) | No implicit grant | Yes | No implicit grant | No | Yes | No | No |
+| Update metadata (consumer contract checks the bit) | No implicit grant | Yes | No implicit grant | No | No | Yes | No |
+| Administer transfers / approvals (consumer contract checks the bit) | No implicit grant | Yes | No implicit grant | No | No | No | Yes |
+| Read permissions and ownership | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+
+“Contract admin” in the management rows means the configured global admin
+address. “Collection owner” and each permission column are evaluated for the
+collection being acted on. A `PERM_ADMIN` grant authorizes registry-management
+operations; it does not implicitly grant mint, burn, metadata, or transfer
+rights. Consumer contracts must check the corresponding action bit themselves.
+
+Default permissions are additive: they are ORed with an account's explicit
+grants. They can therefore grant an action to every account, but do not grant
+`PERM_ADMIN` unless that bit is deliberately included. The owner remains
+implicitly `PERM_ALL` regardless of defaults.
+
 ## Example Integration
 
 `contracts/nft-drop/tests/integration.rs` wires this registry into the NFT drop

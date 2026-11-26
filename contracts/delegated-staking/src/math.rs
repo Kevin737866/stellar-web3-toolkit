@@ -310,4 +310,62 @@ mod math_tests {
         assert!(!detect_delegation_loop(&edges, 4, 5));
         assert!(!detect_delegation_loop(&edges, 1, 4));
     }
+
+    #[test]
+    fn a_unit_stake_earns_a_unit_at_the_precision_boundary() {
+        // One token of rewards over one unit of stake is exactly one index step
+        // of PRECISION, the smallest move that can pay a whole base unit out.
+        let (delta, credited) = reward_index_delta(1, 1, 1);
+        assert_eq!(delta, PRECISION);
+        assert_eq!(credited, 1);
+        assert_eq!(accrued_rewards(1, PRECISION, 0), 1);
+        // One base unit below the boundary is dust and pays nothing.
+        assert_eq!(accrued_rewards(1, PRECISION - 1, 0), 0);
+    }
+
+    #[test]
+    fn sub_unit_shares_are_left_as_dust_rather_than_paid_out() {
+        // One token split across three equal stakers is a third of a base unit
+        // each, so every position floors to zero and nothing is credited.
+        let (delta, credited) = reward_index_delta(1, 1, 3);
+        assert_eq!(credited, 0, "a floor below one base unit must not credit");
+        assert_eq!(delta, PRECISION / 3);
+        for _ in 0..3 {
+            assert_eq!(accrued_rewards(1, delta, 0), 0);
+        }
+    }
+
+    #[test]
+    fn per_position_rounding_never_exceeds_what_the_index_credited() {
+        // 100 tokens over 7 equal, indivisible stakes. Each position floors its
+        // own share, so the accruals trail `credited` by dust the pool keeps.
+        let total = 7;
+        let rewards = 100;
+        let (delta, credited) = reward_index_delta(rewards, 1, total);
+        let mut paid = 0;
+        for _ in 0..total {
+            paid += accrued_rewards(1, delta, 0);
+        }
+        assert_eq!(credited, 99);
+        assert_eq!(paid, 98);
+        assert!(paid <= credited);
+        assert!(credited <= rewards);
+    }
+
+    #[test]
+    fn a_high_ratio_split_still_pays_every_base_unit() {
+        // A whale and a one-unit staker share a pool where the index moves by
+        // exactly one token per token, so the split is exact and the accruals
+        // add up to the credit with no rounding loss.
+        let total = 1_000;
+        let (delta, credited) = reward_index_delta(total, 1, total);
+        assert_eq!(delta, PRECISION);
+        assert_eq!(credited, total);
+
+        let whale = accrued_rewards(999, delta, 0);
+        let tiny = accrued_rewards(1, delta, 0);
+        assert_eq!(whale, 999);
+        assert_eq!(tiny, 1);
+        assert_eq!(whale + tiny, credited);
+    }
 }

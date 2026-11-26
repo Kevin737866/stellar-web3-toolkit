@@ -200,14 +200,33 @@ impl AtomicSwap {
         matches!(self.status, SwapStatus::Completed)
     }
 
+    /// True once `current_ledger` has passed the timeout ledger.
+    ///
+    /// The boundary is exclusive on the timeout side: a swap whose timeout is
+    /// `T` is expired at `T + 1` but not at `T`. The timeout ledger is therefore
+    /// the *last* ledger at which the swap can still settle, so a caller
+    /// presenting the preimage at exactly `timeout_ledger` can still complete
+    /// (#396).
     pub fn is_expired(&self, current_ledger: u32) -> bool {
         current_ledger > self.timeout_ledger
     }
 
+    /// True while the swap is pending and the timeout ledger has not passed.
+    ///
+    /// This is the precondition for revealing the preimage: at
+    /// `current_ledger == timeout_ledger` completion is still allowed (the swap
+    /// has not expired yet), and at `timeout_ledger + 1` it is not. See
+    /// [`is_expired`](Self::is_expired) for the boundary.
     pub fn can_complete(&self, current_ledger: u32) -> bool {
         self.is_pending() && !self.is_expired(current_ledger)
     }
 
+    /// True while the swap is pending and the timeout ledger has passed.
+    ///
+    /// Refund is the timeout escape hatch and the mirror of
+    /// [`can_complete`](Self::can_complete): unavailable at `timeout_ledger`
+    /// (the swap can still settle there) and available from
+    /// `timeout_ledger + 1` on (#396).
     pub fn can_refund(&self, current_ledger: u32) -> bool {
         self.is_pending() && self.is_expired(current_ledger)
     }
@@ -429,6 +448,66 @@ mod tests {
         assert!(swap.is_completed());
         assert!(!swap.can_complete(5000));
         assert!(!swap.can_refund(5000));
+    }
+
+    // ---- Timeout boundary for the preimage and refund paths (#396) ----
+    //
+    // The timeout ledger is the last ledger at which a swap can settle: the
+    // boundary is exclusive on the timeout side, so `is_expired(T)` is false and
+    // `is_expired(T + 1)` is true. The tests below pin that off-by-one point for
+    // both the preimage (completion) path and the refund path.
+
+    /// Normal, boundary and failure cases for the timeout predicates in one
+    /// place: one ledger before, exactly at, and one ledger past the timeout.
+    #[test]
+    fn the_timeout_boundary_is_exclusive_on_the_timeout_side() {
+        let swap = sample_swap(); // timeout_ledger = 10_000
+
+        // Before the timeout: fully inside the settlement window.
+        assert!(!swap.is_expired(9_999));
+        assert!(swap.can_complete(9_999));
+        assert!(!swap.can_refund(9_999));
+
+        // At the timeout ledger exactly: NOT expired. This is the last ledger
+        // at which the preimage can still be revealed.
+        assert!(!swap.is_expired(10_000));
+        assert!(swap.can_complete(10_000));
+        assert!(!swap.can_refund(10_000));
+
+        // One ledger past the timeout: the preimage path closes and the refund
+        // path opens.
+        assert!(swap.is_expired(10_001));
+        assert!(!swap.can_complete(10_001));
+        assert!(swap.can_refund(10_001));
+    }
+
+    /// The preimage path stays open through the timeout ledger and closes for
+    /// good once the swap settles.
+    #[test]
+    fn the_preimage_path_stays_open_through_the_timeout_ledger() {
+        let mut swap = sample_swap();
+
+        // Revealing the preimage at the timeout ledger is the last allowed
+        // settlement.
+        swap.mark_completed("deadbeef".to_string(), 10_000);
+        assert!(swap.is_completed());
+        assert_eq!(swap.preimage.as_deref(), Some("deadbeef"));
+        assert_eq!(swap.completed_at_ledger, Some(10_000));
+
+        // Once completed, the swap is terminal: neither path reopens, even
+        // past the timeout.
+        assert!(!swap.can_complete(10_001));
+        assert!(!swap.can_refund(10_001));
+    }
+
+    /// Failure case: a swap that already reached a terminal state admits
+    /// neither the preimage nor the refund path.
+    #[test]
+    fn a_terminal_swap_admits_neither_path() {
+        let mut swap = sample_swap();
+        swap.mark_refunded();
+        assert!(!swap.can_complete(10_000));
+        assert!(!swap.can_refund(10_001));
     }
 
     fn sample_swap() -> AtomicSwap {

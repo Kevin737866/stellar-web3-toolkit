@@ -23,7 +23,7 @@ echo ""
 # Use Docker if available and --docker flag passed
 if [[ "${1:-}" == "--docker" ]]; then
   echo ">> Building inside Docker (stellar-toolkit-builder:1.86)..."
-  docker build -t stellar-toolkit-builder:1.86 -f Dockerfile .
+  DOCKER_BUILDKIT=1 docker build -t stellar-toolkit-builder:1.86 -f Dockerfile .
   docker run --rm -v "$ROOT":/workspace -w /workspace stellar-toolkit-builder:1.86 \
     bash -c "cargo build --workspace --exclude stellar-toolkit --exclude stellar-did --exclude payment-channel --exclude channel-router --exclude channel-simulator --exclude watchtower --exclude atomic-swap --exclude contract-proptests --target wasm32v1-none --release && sha256sum target/wasm32v1-none/release/*.wasm"
   exit 0

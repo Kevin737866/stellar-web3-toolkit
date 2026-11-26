@@ -30,6 +30,9 @@ pub enum DataKey {
     FeeRecipient,
     NextListingId,
     Listing(u64),
+    /// Optional expiry ledger timestamp for a listing. Absent means the listing
+    /// never expires.
+    Expiry(u64),
 }
 
 /// Current state of a listing.
@@ -107,6 +110,73 @@ fn write_listing(env: &Env, listing: &Listing) {
         .extend_ttl(&key, LISTING_TTL_THRESHOLD, LISTING_TTL_BUMP);
 }
 
+/// Returns the expiry timestamp for a listing, or `0` when it never expires.
+fn read_expiry(env: &Env, listing_id: u64) -> u64 {
+    let key = DataKey::Expiry(listing_id);
+    let expires_at: u64 = env.storage().persistent().get(&key).unwrap_or(0);
+    if expires_at != 0 {
+        // Keep the expiry alive alongside the listing; otherwise a lapsed
+        // entry would silently turn a time-limited order into a permanent one.
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LISTING_TTL_THRESHOLD, LISTING_TTL_BUMP);
+    }
+    expires_at
+}
+
+fn clear_expiry(env: &Env, listing_id: u64) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::Expiry(listing_id));
+}
+
+fn create_listing_inner(
+    env: &Env,
+    seller: Address,
+    asset: Address,
+    token_id: u128,
+    amount: i128,
+    price: i128,
+    payment_token: Address,
+    expires_at: u64,
+) -> u64 {
+    seller.require_auth();
+    assert!(amount > 0, "amount must be positive");
+    assert!(price > 0, "price must be positive");
+
+    // Escrow the digital asset (SEP-41 transfer into the marketplace).
+    TokenClient::new(env, &asset).transfer(&seller, &env.current_contract_address(), &amount);
+
+    let id = read_next_listing_id(env);
+    write_next_listing_id(env, id.saturating_add(1));
+
+    let listing = Listing {
+        id,
+        seller: seller.clone(),
+        asset,
+        token_id,
+        amount,
+        price,
+        payment_token,
+        status: ListingStatus::Active,
+        created_at: env.ledger().timestamp() as u32,
+    };
+    write_listing(env, &listing);
+
+    if expires_at != 0 {
+        let key = DataKey::Expiry(id);
+        env.storage().persistent().set(&key, &expires_at);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LISTING_TTL_THRESHOLD, LISTING_TTL_BUMP);
+    }
+
+    env.events()
+        .publish((symbol_short!("listed"), seller), (id, amount, price));
+
+    id
+}
+
 #[contractimpl]
 impl MarketplaceContract {
     /// One-time configuration of the marketplace fee (in basis points) and the
@@ -141,33 +211,51 @@ impl MarketplaceContract {
         price: i128,
         payment_token: Address,
     ) -> u64 {
-        seller.require_auth();
-        assert!(amount > 0, "amount must be positive");
-        assert!(price > 0, "price must be positive");
-
-        // Escrow the digital asset (SEP-41 transfer into the marketplace).
-        TokenClient::new(&env, &asset).transfer(&seller, &env.current_contract_address(), &amount);
-
-        let id = read_next_listing_id(&env);
-        write_next_listing_id(&env, id.saturating_add(1));
-
-        let listing = Listing {
-            id,
-            seller: seller.clone(),
+        create_listing_inner(
+            &env,
+            seller,
             asset,
             token_id,
             amount,
             price,
             payment_token,
-            status: ListingStatus::Active,
-            created_at: env.ledger().timestamp() as u32,
-        };
-        write_listing(&env, &listing);
+            0,
+        )
+    }
 
-        env.events()
-            .publish((symbol_short!("listed"), seller), (id, amount, price));
+    /// Lists `amount` units of a SEP-41 `asset` with an expiry timestamp.
+    ///
+    /// Behaves exactly like `create_listing`, but the listing can only be bought
+    /// while `env.ledger().timestamp() < expires_at`. `expires_at` must be in
+    /// the future; an already-expired listing is rejected at creation time so no
+    /// escrow is taken for an order that cannot settle. Expiry timestamps are
+    /// ledger timestamps (seconds), not ledger sequence numbers. Sellers can
+    /// still cancel an expired listing to recover their escrow.
+    pub fn create_listing_with_expiry(
+        env: Env,
+        seller: Address,
+        asset: Address,
+        token_id: u128,
+        amount: i128,
+        price: i128,
+        payment_token: Address,
+        expires_at: u64,
+    ) -> u64 {
+        assert!(
+            expires_at > env.ledger().timestamp(),
+            "expiry must be in the future"
+        );
 
-        id
+        create_listing_inner(
+            &env,
+            seller,
+            asset,
+            token_id,
+            amount,
+            price,
+            payment_token,
+            expires_at,
+        )
     }
 
     /// Purchases an active listing. The buyer pays `price` in the listing's
@@ -183,6 +271,12 @@ impl MarketplaceContract {
             "listing not active"
         );
         assert!(listing.seller != buyer, "seller cannot buy own listing");
+
+        let expires_at = read_expiry(&env, listing_id);
+        assert!(
+            expires_at == 0 || env.ledger().timestamp() < expires_at,
+            "listing expired"
+        );
 
         let fee = listing
             .price
@@ -206,6 +300,7 @@ impl MarketplaceContract {
 
         listing.status = ListingStatus::Sold;
         write_listing(&env, &listing);
+        clear_expiry(&env, listing_id);
 
         env.events().publish(
             (symbol_short!("sold"), buyer),
@@ -234,6 +329,7 @@ impl MarketplaceContract {
 
         listing.status = ListingStatus::Cancelled;
         write_listing(&env, &listing);
+        clear_expiry(&env, listing_id);
 
         env.events()
             .publish((symbol_short!("canceled"), seller), listing_id);
@@ -288,6 +384,17 @@ impl MarketplaceContract {
         read_listing(&env, listing_id)
     }
 
+    /// Returns the expiry ledger timestamp of a listing, or `None` when the
+    /// listing never expires.
+    pub fn get_listing_expiry(env: Env, listing_id: u64) -> Option<u64> {
+        let expires_at = read_expiry(&env, listing_id);
+        if expires_at == 0 {
+            None
+        } else {
+            Some(expires_at)
+        }
+    }
+
     /// Total number of listings ever created.
     pub fn listing_count(env: Env) -> u64 {
         read_next_listing_id(&env)
@@ -308,6 +415,7 @@ impl MarketplaceContract {
 mod test {
     use super::*;
     use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::Ledger as _;
     use soroban_sdk::token::{StellarAssetClient, TokenClient};
 
     fn setup_token(env: &Env, admin: &Address) -> Address {
@@ -526,6 +634,148 @@ mod test {
         market.initialize(&admin, &0, &admin);
 
         market.create_listing(&seller, &asset, &0_u128, &0_i128, &100_i128, &payment);
+    }
+
+    #[test]
+    fn buy_before_expiry_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(100);
+
+        let admin = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let asset = setup_token(&env, &admin);
+        let payment = setup_token(&env, &admin);
+
+        let market_id = env.register_contract(None, MarketplaceContract);
+        let market = MarketplaceContractClient::new(&env, &market_id);
+        market.initialize(&admin, &0, &admin);
+
+        mint(&env, &asset, &seller, 1);
+        mint(&env, &payment, &buyer, 100);
+        let id = market.create_listing_with_expiry(
+            &seller, &asset, &0_u128, &1_i128, &100_i128, &payment, &200,
+        );
+        assert_eq!(market.get_listing_expiry(&id), Some(200));
+
+        // The listing is still valid one second before it expires.
+        env.ledger().set_timestamp(199);
+        assert_eq!(market.buy(&buyer, &id), 100);
+        assert_eq!(balance(&env, &asset, &buyer), 1);
+        assert_eq!(market.get_listing(&id).status, ListingStatus::Sold);
+    }
+
+    #[test]
+    #[should_panic(expected = "listing expired")]
+    fn expired_listing_cannot_be_bought() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(100);
+
+        let admin = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let asset = setup_token(&env, &admin);
+        let payment = setup_token(&env, &admin);
+
+        let market_id = env.register_contract(None, MarketplaceContract);
+        let market = MarketplaceContractClient::new(&env, &market_id);
+        market.initialize(&admin, &0, &admin);
+
+        mint(&env, &asset, &seller, 1);
+        mint(&env, &payment, &buyer, 100);
+        let id = market.create_listing_with_expiry(
+            &seller, &asset, &0_u128, &1_i128, &100_i128, &payment, &200,
+        );
+
+        // At the expiry timestamp the order is no longer valid and nothing is
+        // paid out or released.
+        env.ledger().set_timestamp(200);
+        market.buy(&buyer, &id);
+    }
+
+    #[test]
+    fn expired_listing_keeps_escrow_and_can_be_cancelled() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(100);
+
+        let admin = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let asset = setup_token(&env, &admin);
+        let payment = setup_token(&env, &admin);
+
+        let market_id = env.register_contract(None, MarketplaceContract);
+        let market = MarketplaceContractClient::new(&env, &market_id);
+        market.initialize(&admin, &0, &admin);
+
+        mint(&env, &asset, &seller, 1);
+        mint(&env, &payment, &buyer, 100);
+        let id = market.create_listing_with_expiry(
+            &seller, &asset, &0_u128, &1_i128, &100_i128, &payment, &200,
+        );
+
+        // A failed purchase must not move the payment token or release escrow.
+        env.ledger().set_timestamp(500);
+        let result = market.try_buy(&buyer, &id);
+        assert!(result.is_err());
+        assert_eq!(balance(&env, &payment, &buyer), 100);
+        assert_eq!(balance(&env, &asset, &market_id), 1);
+        assert_eq!(market.get_listing(&id).status, ListingStatus::Active);
+
+        // The seller can still reclaim the escrowed asset.
+        market.cancel_listing(&seller, &id);
+        assert_eq!(balance(&env, &asset, &seller), 1);
+        assert_eq!(balance(&env, &asset, &market_id), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "expiry must be in the future")]
+    fn create_listing_rejects_past_expiry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(100);
+
+        let admin = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let asset = setup_token(&env, &admin);
+        let payment = setup_token(&env, &admin);
+
+        let market_id = env.register_contract(None, MarketplaceContract);
+        let market = MarketplaceContractClient::new(&env, &market_id);
+        market.initialize(&admin, &0, &admin);
+
+        mint(&env, &asset, &seller, 1);
+        market.create_listing_with_expiry(
+            &seller, &asset, &0_u128, &1_i128, &100_i128, &payment, &100,
+        );
+    }
+
+    #[test]
+    fn listing_without_expiry_never_expires() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(100);
+
+        let admin = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let asset = setup_token(&env, &admin);
+        let payment = setup_token(&env, &admin);
+
+        let market_id = env.register_contract(None, MarketplaceContract);
+        let market = MarketplaceContractClient::new(&env, &market_id);
+        market.initialize(&admin, &0, &admin);
+
+        mint(&env, &asset, &seller, 1);
+        mint(&env, &payment, &buyer, 100);
+        let id = market.create_listing(&seller, &asset, &0_u128, &1_i128, &100_i128, &payment);
+        assert_eq!(market.get_listing_expiry(&id), None);
+
+        env.ledger().set_timestamp(1_000_000);
+        assert_eq!(market.buy(&buyer, &id), 100);
     }
 
     #[test]

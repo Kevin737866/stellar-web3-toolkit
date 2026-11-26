@@ -88,7 +88,8 @@ pub fn recover_wallet(phrase: &str) -> Result<GeneratedWallet> {
 /// hardened-only derivation at the given path.
 fn slip10_derive(seed: &[u8], path: &[u32]) -> [u8; 32] {
     // Master key: I = HMAC-SHA512(key="ed25519 seed", data=seed).
-    let mut mac = HmacSha512::new_from_slice(b"ed25519 seed").expect("hmac accepts fixed key");
+    let mut mac =
+        <HmacSha512 as Mac>::new_from_slice(b"ed25519 seed").expect("hmac accepts fixed key");
     mac.update(seed);
     let i = mac.finalize().into_bytes();
 
@@ -102,7 +103,8 @@ fn slip10_derive(seed: &[u8], path: &[u32]) -> [u8; 32] {
         data.extend_from_slice(&private);
         data.extend_from_slice(&index.wrapping_add(0x8000_0000).to_be_bytes());
 
-        let mut mac = HmacSha512::new_from_slice(&chain_code).expect("hmac accepts fixed key");
+        let mut mac =
+            <HmacSha512 as Mac>::new_from_slice(&chain_code).expect("hmac accepts fixed key");
         mac.update(&data);
         let i = mac.finalize().into_bytes();
 
@@ -211,13 +213,23 @@ impl std::fmt::Debug for ImportedKeystore {
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct KeystoreDocument {
-    version: u32, kdf: String, memory_kib: u32, iterations: u32, parallelism: u32,
-    salt: String, cipher: String, nonce: String, ciphertext: String,
+    version: u32,
+    kdf: String,
+    memory_kib: u32,
+    iterations: u32,
+    parallelism: u32,
+    salt: String,
+    cipher: String,
+    nonce: String,
+    ciphertext: String,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct KeystorePayload { secret: String, account: String }
+struct KeystorePayload {
+    secret: String,
+    account: String,
+}
 
 /// Encrypt a Stellar wallet key into portable JSON using Argon2id and AES-256-GCM.
 /// The mnemonic is intentionally excluded; the passphrase must be at least 12 characters.
@@ -229,29 +241,39 @@ pub fn export_keystore(wallet: &GeneratedWallet, passphrase: &str) -> Result<Str
         return Err(ToolkitError::Wallet("wallet account does not match its secret key".into()));
     }
     let mut payload = serde_json::to_vec(&KeystorePayload {
-        secret: wallet.secret.clone(), account: wallet.account.clone(),
-    }).map_err(|_| ToolkitError::Wallet("could not serialize keystore payload".into()))?;
+        secret: wallet.secret.clone(),
+        account: wallet.account.clone(),
+    })
+    .map_err(|_| ToolkitError::Wallet("could not serialize keystore payload".into()))?;
 
     let mut salt = [0u8; KEYSTORE_SALT_LENGTH];
     let mut nonce = [0u8; KEYSTORE_NONCE_LENGTH];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut salt);
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
-    let key = derive_keystore_key(passphrase, &salt)?;
+    let mut key = derive_keystore_key(passphrase, &salt)?;
     let cipher = aes_gcm::Aes256Gcm::new_from_slice(&key)
         .map_err(|_| ToolkitError::Wallet("could not initialize keystore encryption".into()))?;
-    let mut key = key;
     key.zeroize();
     let encrypted = aes_gcm::aead::Aead::encrypt(
-        &cipher, aes_gcm::Nonce::from_slice(&nonce),
-        aes_gcm::aead::Payload { msg: &payload, aad: KEYSTORE_AAD },
-    ).map_err(|_| ToolkitError::Wallet("keystore encryption failed".into()))?;
+        &cipher,
+        aes_gcm::Nonce::from_slice(&nonce),
+        aes_gcm::aead::Payload {
+            msg: &payload,
+            aad: KEYSTORE_AAD,
+        },
+    )
+    .map_err(|_| ToolkitError::Wallet("keystore encryption failed".into()))?;
     payload.zeroize();
 
     let document = KeystoreDocument {
-        version: KEYSTORE_VERSION, kdf: "argon2id".into(),
-        memory_kib: KEYSTORE_KDF_MEMORY_KIB, iterations: KEYSTORE_KDF_ITERATIONS,
-        parallelism: KEYSTORE_KDF_PARALLELISM, salt: hex::encode(salt),
-        cipher: "aes-256-gcm".into(), nonce: hex::encode(nonce),
+        version: KEYSTORE_VERSION,
+        kdf: "argon2id".into(),
+        memory_kib: KEYSTORE_KDF_MEMORY_KIB,
+        iterations: KEYSTORE_KDF_ITERATIONS,
+        parallelism: KEYSTORE_KDF_PARALLELISM,
+        salt: hex::encode(salt),
+        cipher: "aes-256-gcm".into(),
+        nonce: hex::encode(nonce),
         ciphertext: hex::encode(encrypted),
     };
     serde_json::to_string_pretty(&document)
@@ -264,12 +286,16 @@ pub fn import_keystore(document: &str, passphrase: &str) -> Result<ImportedKeyst
     validate_keystore_passphrase(passphrase)?;
     let parsed: KeystoreDocument = serde_json::from_str(document)
         .map_err(|_| ToolkitError::Wallet("invalid keystore JSON or schema".into()))?;
-    if parsed.version != KEYSTORE_VERSION || parsed.kdf != "argon2id"
+    if parsed.version != KEYSTORE_VERSION
+        || parsed.kdf != "argon2id"
         || parsed.memory_kib != KEYSTORE_KDF_MEMORY_KIB
         || parsed.iterations != KEYSTORE_KDF_ITERATIONS
         || parsed.parallelism != KEYSTORE_KDF_PARALLELISM
-        || parsed.cipher != "aes-256-gcm" {
-        return Err(ToolkitError::Wallet("unsupported keystore version or cryptographic parameters".into()));
+        || parsed.cipher != "aes-256-gcm"
+    {
+        return Err(ToolkitError::Wallet(
+            "unsupported keystore version or cryptographic parameters".into(),
+        ));
     }
     let salt = hex::decode(&parsed.salt)
         .map_err(|_| ToolkitError::Wallet("invalid keystore salt encoding".into()))?;
@@ -277,18 +303,31 @@ pub fn import_keystore(document: &str, passphrase: &str) -> Result<ImportedKeyst
         .map_err(|_| ToolkitError::Wallet("invalid keystore nonce encoding".into()))?;
     let ciphertext = hex::decode(&parsed.ciphertext)
         .map_err(|_| ToolkitError::Wallet("invalid keystore ciphertext encoding".into()))?;
-    if salt.len() != KEYSTORE_SALT_LENGTH || nonce.len() != KEYSTORE_NONCE_LENGTH || ciphertext.len() < 16 {
-        return Err(ToolkitError::Wallet("invalid keystore salt, nonce, or ciphertext length".into()));
+    if salt.len() != KEYSTORE_SALT_LENGTH
+        || nonce.len() != KEYSTORE_NONCE_LENGTH
+        || ciphertext.len() < 16
+    {
+        return Err(ToolkitError::Wallet(
+            "invalid keystore salt, nonce, or ciphertext length".into(),
+        ));
     }
-    let key = derive_keystore_key(passphrase, &salt)?;
+    let mut key = derive_keystore_key(passphrase, &salt)?;
     let cipher = aes_gcm::Aes256Gcm::new_from_slice(&key)
         .map_err(|_| ToolkitError::Wallet("could not initialize keystore decryption".into()))?;
-    let mut key = key;
     key.zeroize();
     let mut plaintext = aes_gcm::aead::Aead::decrypt(
-        &cipher, aes_gcm::Nonce::from_slice(&nonce),
-        aes_gcm::aead::Payload { msg: &ciphertext, aad: KEYSTORE_AAD },
-    ).map_err(|_| ToolkitError::Wallet("keystore authentication failed (wrong passphrase or damaged file)".into()))?;
+        &cipher,
+        aes_gcm::Nonce::from_slice(&nonce),
+        aes_gcm::aead::Payload {
+            msg: &ciphertext,
+            aad: KEYSTORE_AAD,
+        },
+    )
+    .map_err(|_| {
+        ToolkitError::Wallet(
+            "keystore authentication failed (wrong passphrase or damaged file)".into(),
+        )
+    })?;
     let payload_result = serde_json::from_slice::<KeystorePayload>(&plaintext);
     plaintext.zeroize();
     let payload: KeystorePayload = payload_result
@@ -298,7 +337,10 @@ pub fn import_keystore(document: &str, passphrase: &str) -> Result<ImportedKeyst
     if payload.account != expected {
         return Err(ToolkitError::Wallet("keystore account does not match its secret key".into()));
     }
-    Ok(ImportedKeystore { secret: payload.secret, account: payload.account })
+    Ok(ImportedKeystore {
+        secret: payload.secret,
+        account: payload.account,
+    })
 }
 
 fn validate_keystore_passphrase(passphrase: &str) -> Result<()> {
@@ -311,18 +353,179 @@ fn validate_keystore_passphrase(passphrase: &str) -> Result<()> {
 }
 
 fn derive_keystore_key(passphrase: &str, salt: &[u8]) -> Result<[u8; 32]> {
-    let params = argon2::Params::new(KEYSTORE_KDF_MEMORY_KIB, KEYSTORE_KDF_ITERATIONS,
-        KEYSTORE_KDF_PARALLELISM, Some(32))
-        .map_err(|_| ToolkitError::Wallet("invalid keystore KDF parameters".into()))?;
+    let params = argon2::Params::new(
+        KEYSTORE_KDF_MEMORY_KIB,
+        KEYSTORE_KDF_ITERATIONS,
+        KEYSTORE_KDF_PARALLELISM,
+        Some(32),
+    )
+    .map_err(|_| ToolkitError::Wallet("invalid keystore KDF parameters".into()))?;
     let argon = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
     let mut key = [0u8; 32];
-    argon.hash_password_into(passphrase.as_bytes(), salt, &mut key)
+    argon
+        .hash_password_into(passphrase.as_bytes(), salt, &mut key)
         .map_err(|_| ToolkitError::Wallet("keystore key derivation failed".into()))?;
     Ok(key)
 }
 
 
+// ── Network allowlist for wallet funding (issue #332) ────────────────────────
+
+/// A named Stellar network that the wallet funding path is allowed to contact.
+///
+/// Callers that want to fund an account must explicitly name the network, so
+/// that a misconfigured URL or an unexpected `network_passphrase` in the
+/// environment cannot silently fund an account on the wrong chain.
+///
+/// # Compatibility
+///
+/// The original `fund_account` helper (which contacts the public Friendbot
+/// without a network check) is still available for callers that have not yet
+/// adopted the allowlist. It is unchanged and will compile as before.
+///
+/// # Examples
+///
+/// ```rust
+/// use stellar_toolkit::wallet::{AllowedNetwork, fund_account_on};
+///
+/// // Fund on testnet — the only network where Friendbot exists:
+/// let result = fund_account_on(
+///     "GDQP2KPQGKIHYJGXNUIYOMHARUARCA7DJT5FO2FFOOKY3B2WSQHG4W37",
+///     AllowedNetwork::Testnet,
+/// );
+/// // This will fail in a unit test (no real HTTP), but it won't panic.
+/// let _ = result;
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllowedNetwork {
+    /// Stellar public testnet (Friendbot available at <https://friendbot.stellar.org>).
+    Testnet,
+    /// Stellar Futurenet (Friendbot available at <https://friendbot-futurenet.stellar.org>).
+    Futurenet,
+}
+
+impl AllowedNetwork {
+    /// The network passphrase that must match when performing a passphrase check.
+    pub fn passphrase(self) -> &'static str {
+        match self {
+            AllowedNetwork::Testnet => "Test SDF Network ; September 2015",
+            AllowedNetwork::Futurenet => "Test SDF Future Network ; October 2022",
+        }
+    }
+
+    /// The Friendbot URL for this network.
+    pub fn friendbot_url(self) -> &'static str {
+        match self {
+            AllowedNetwork::Testnet => "https://friendbot.stellar.org",
+            AllowedNetwork::Futurenet => "https://friendbot-futurenet.stellar.org",
+        }
+    }
+
+    /// Return the [`AllowedNetwork`] that owns `passphrase`, or an error if
+    /// `passphrase` does not match any entry in the allowlist.
+    ///
+    /// The comparison is case-sensitive and trim-free: the caller must supply
+    /// the exact passphrase string without leading or trailing whitespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolkitError::Wallet`] when `passphrase` is not in the
+    /// allowlist, naming the rejected value so the caller can diagnose a
+    /// misconfiguration without guessing which field is wrong.
+    pub fn from_passphrase(passphrase: &str) -> Result<Self> {
+        for network in [AllowedNetwork::Testnet, AllowedNetwork::Futurenet] {
+            if network.passphrase() == passphrase {
+                return Ok(network);
+            }
+        }
+        Err(ToolkitError::Wallet(format!(
+            "network passphrase is not in the funding allowlist: \"{passphrase}\""
+        )))
+    }
+}
+
+impl std::fmt::Display for AllowedNetwork {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AllowedNetwork::Testnet => write!(f, "testnet"),
+            AllowedNetwork::Futurenet => write!(f, "futurenet"),
+        }
+    }
+}
+
+/// Fund an account on a specific network using the Friendbot faucet.
+///
+/// Only networks in the [`AllowedNetwork`] allowlist are accepted. Passing a
+/// network that does not support Friendbot (e.g. mainnet) is a compile-time
+/// error: there is no `AllowedNetwork::Mainnet` variant.
+///
+/// The account id must be a valid Stellar G... address. An address that fails
+/// the strkey check is rejected before any HTTP request is made.
+///
+/// # Errors
+///
+/// - [`ToolkitError::Wallet`] when `account` is not a valid Stellar account id.
+/// - [`ToolkitError::Wallet`] when the Friendbot HTTP request fails.
+/// - [`ToolkitError::Wallet`] when Friendbot returns an error body.
+///
+/// # Examples
+///
+/// ```rust
+/// use stellar_toolkit::wallet::{AllowedNetwork, fund_account_on};
+///
+/// // Compile-time guarantee: only testnet or futurenet can be passed here.
+/// let result = fund_account_on(
+///     "GDQP2KPQGKIHYJGXNUIYOMHARUARCA7DJT5FO2FFOOKY3B2WSQHG4W37",
+///     AllowedNetwork::Testnet,
+/// );
+/// let _ = result; // would actually hit the network in a live context
+/// ```
+pub fn fund_account_on(account: &str, network: AllowedNetwork) -> Result<()> {
+    // Validate the account id before making any HTTP request so a typo is
+    // caught immediately with a clear error rather than a confusing Friendbot
+    // response.
+    stellar_strkey::ed25519::PublicKey::from_string(account).map_err(|e| {
+        ToolkitError::Wallet(format!(
+            "invalid account id `{}`: {e}",
+            crate::key_hygiene::mask_secret(account)
+        ))
+    })?;
+
+    let url = format!("{}?addr={account}", network.friendbot_url());
+    let response = ureq::get(&url)
+        .call()
+        .map_err(|e| {
+            ToolkitError::Wallet(format!(
+                "friendbot request for {} on {} failed: {e}",
+                crate::key_hygiene::mask_secret(account),
+                network,
+            ))
+        })?;
+    let body = response
+        .into_string()
+        .map_err(|e| ToolkitError::Wallet(format!("could not read friendbot response: {e}")))?;
+    let json: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| ToolkitError::Wallet(format!("could not parse friendbot response: {e}")))?;
+
+    if let Some(hash) = json["hash"].as_str() {
+        println!("Funded {account} on {network} (tx {hash})");
+        Ok(())
+    } else if let Some(err) = json["detail"].as_str() {
+        Err(ToolkitError::Wallet(format!(
+            "friendbot rejected the request: {err}"
+        )))
+    } else {
+        Err(ToolkitError::Wallet(format!(
+            "unexpected friendbot response: {body}"
+        )))
+    }
+}
+
 /// Fund an account on the Stellar testnet using the Friendbot faucet.
+///
+/// This is the original single-network helper. New callers should prefer
+/// [`fund_account_on`] with an explicit [`AllowedNetwork`], which prevents
+/// accidental funding on the wrong chain.
 pub fn fund_account(account: &str) -> Result<()> {
     let url = format!("https://friendbot.stellar.org?addr={account}");
     let response = ureq::get(&url)
@@ -370,7 +573,8 @@ mod tests {
         assert!(import_keystore(&document, "incorrect horse battery staple").is_err());
         let mut value: serde_json::Value = serde_json::from_str(&document).unwrap();
         value["ciphertext"] = serde_json::Value::String("00".repeat(64));
-        assert!(import_keystore(&serde_json::to_string(&value).unwrap(), "correct horse battery staple").is_err());
+        let tampered = serde_json::to_string(&value).unwrap();
+        assert!(import_keystore(&tampered, "correct horse battery staple").is_err());
     }
 
     #[test]
@@ -380,7 +584,8 @@ mod tests {
         let document = export_keystore(&wallet, "correct horse battery staple").expect("export");
         let mut value: serde_json::Value = serde_json::from_str(&document).unwrap();
         value["version"] = serde_json::json!(999);
-        assert!(import_keystore(&serde_json::to_string(&value).unwrap(), "correct horse battery staple").is_err());
+        let unknown_ver = serde_json::to_string(&value).unwrap();
+        assert!(import_keystore(&unknown_ver, "correct horse battery staple").is_err());
     }
 
     #[test]
@@ -528,5 +733,104 @@ mod tests {
         // The secret is highlighted, never dimmed or recoloured as a value.
         assert!(out.contains("\x1b[1;35m"));
         assert!(out.contains(&format!("\n{}\n", wallet.secret)));
+    }
+
+    // ── Network allowlist tests (issue #332) ──────────────────────────────────
+
+    #[test]
+    fn allowed_network_passphrases_round_trip() {
+        assert_eq!(
+            AllowedNetwork::from_passphrase("Test SDF Network ; September 2015").unwrap(),
+            AllowedNetwork::Testnet,
+        );
+        assert_eq!(
+            AllowedNetwork::from_passphrase("Test SDF Future Network ; October 2022").unwrap(),
+            AllowedNetwork::Futurenet,
+        );
+    }
+
+    #[test]
+    fn from_passphrase_rejects_unknown_passphrase() {
+        let err = AllowedNetwork::from_passphrase(
+            "Public Global Stellar Network ; September 2015",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("not in the funding allowlist"),
+            "error should name the reason: {err}"
+        );
+        // The rejected passphrase is included in the error so operators can
+        // diagnose a misconfiguration without guessing.
+        assert!(
+            err.to_string()
+                .contains("Public Global Stellar Network ; September 2015"),
+            "rejected passphrase must appear in error: {err}"
+        );
+    }
+
+    #[test]
+    fn from_passphrase_rejects_empty_string() {
+        assert!(AllowedNetwork::from_passphrase("").is_err());
+    }
+
+    #[test]
+    fn from_passphrase_is_case_sensitive() {
+        // Lower-casing any character must yield a rejection, not a fuzzy match.
+        assert!(
+            AllowedNetwork::from_passphrase("test sdf network ; september 2015").is_err()
+        );
+    }
+
+    #[test]
+    fn testnet_friendbot_url_points_to_stellar_org() {
+        assert!(AllowedNetwork::Testnet
+            .friendbot_url()
+            .starts_with("https://friendbot.stellar.org"));
+    }
+
+    #[test]
+    fn futurenet_friendbot_url_is_distinct_from_testnet() {
+        assert_ne!(
+            AllowedNetwork::Testnet.friendbot_url(),
+            AllowedNetwork::Futurenet.friendbot_url(),
+        );
+    }
+
+    #[test]
+    fn fund_account_on_rejects_invalid_account_id_before_any_http() {
+        // A malformed account id must be rejected with a wallet error before
+        // any outbound HTTP request is attempted — the network allowlist check
+        // happens after address validation.
+        let err = fund_account_on("not-a-stellar-address", AllowedNetwork::Testnet)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("invalid account id"),
+            "expected address-validation error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn fund_account_on_rejects_a_secret_key_instead_of_an_account_id() {
+        // S... keys are not G... public keys; the validator must reject them.
+        let wallet = generate_wallet().expect("generate");
+        let err = fund_account_on(&wallet.secret, AllowedNetwork::Testnet)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("invalid account id"),
+            "expected address-validation error, got: {err}"
+        );
+        // The secret key must not be echoed verbatim in the error message.
+        assert!(
+            !err.contains(&wallet.secret),
+            "secret key must not appear in error: {err}"
+        );
+    }
+
+    #[test]
+    fn allowed_network_display_is_human_readable() {
+        assert_eq!(AllowedNetwork::Testnet.to_string(), "testnet");
+        assert_eq!(AllowedNetwork::Futurenet.to_string(), "futurenet");
     }
 }
