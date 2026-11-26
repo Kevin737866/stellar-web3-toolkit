@@ -19,6 +19,7 @@ pub mod help_text;
 pub mod horizon;
 pub mod hsm;
 pub mod invariants;
+pub mod keeper;
 pub mod key_hygiene;
 pub mod merkle;
 pub mod migration_diff;
@@ -27,6 +28,7 @@ pub mod onboarding;
 pub mod one_click_airdrop;
 pub mod oracle_resilience;
 pub mod p2p_qr_payment;
+pub mod presigned_deploy;
 pub mod scaffolder;
 pub mod session_keys;
 pub mod signal_sync;
@@ -37,6 +39,8 @@ pub mod treasury_stream;
 pub mod ts_codegen;
 pub mod wallet;
 pub mod wasm_provenance;
+
+pub use wallet::{AllowedNetwork, fund_account_on};
 
 pub use anomaly::{
     catalog as anomaly_catalog, AnomalyDetector, AnomalyReport, AnomalyRule, Baseline, Direction,
@@ -64,13 +68,17 @@ pub use env_config::{
 };
 pub use error::{Result, ToolkitError};
 pub use example_gallery::{ContractExample, ExampleGalleryRegistry};
-pub use gas_simulator::{FeeBump, FeeEstimate, FeeSchedule, GasSimulator, TransactionProfile};
+pub use gas_simulator::{FeeBump, FeeBreakdown, FeeBreakdownPercents, FeeEstimate, FeeEstimateReport, FeeSchedule, GasSimulator, TransactionProfile};
 pub use help_text::{help_width, render_command_help, wrap, HelpEntry};
 pub use horizon::{
     page_path, paginate, Cursor, HorizonPage, HorizonPaginationError, DEFAULT_LIMIT, MAX_LIMIT,
 };
-pub use hsm::{ColdSigner, HsmError, SignRequest, StubHsm};
+pub use hsm::{ColdSigner, HsmError, RotationAudit, RotationRecord, SignRequest, StubHsm};
 pub use invariants::{run_suite, InvariantReport, Prng, SuiteReport};
+pub use keeper::{
+    BudgetedKeeper, ExecutionBudget, ExecutionReport, KeeperBudgetConfig, KeeperBudgetError,
+    KeeperOperation, KeeperStrategy,
+};
 pub use key_hygiene::{
     scan_paths, scan_text, Finding as SecretFinding, SarifLog, SarifResult, SarifRule, SarifRun,
     ScanReport, SecretKind,
@@ -78,9 +86,16 @@ pub use key_hygiene::{
 pub use one_click_airdrop::{AirdropClaimRequest, ClaimStatus, OneClickAirdropClaimer};
 pub use oracle_resilience::{assess_quorum_liveness, LivenessError, QuorumLiveness};
 pub use p2p_qr_payment::{P2PQRPaymentFlow, PaymentStatus, QRPaymentRequest};
+pub use presigned_deploy::{
+    submit_presigned_deployment, PresignedDeployError, PresignedDeployReceipt,
+    PresignedDeployRequest, RpcHttpResponse, RpcTransport, SubmissionStatus, TransportError,
+    UreqRpcTransport, WasmArtifactCheck, DEFAULT_MAX_RETRIES, DEFAULT_TIMEOUT_SECS,
+    MAX_ALLOWED_RETRIES, MAX_ENVELOPE_XDR_BYTES, MAX_TIMEOUT_SECS,
+};
 pub use scaffolder::{LintFinding, LintReport, LintSeverity, ScaffoldOptions, Scaffolder};
 pub use session_keys::{
-    AccountAbstractionManager, Guardian, RecoveryRequest, RecoveryVeto, SessionError, SessionKey,
+    format_active_session_summaries, format_unix_timestamp_utc, AccountAbstractionManager,
+    Guardian, RecoveryRequest, RecoveryVeto, SessionError, SessionKey, SessionKeySummary,
     SessionPolicy, VetoGuardian,
 };
 pub use signal_sync::{Signal, SignalSnapshot, SyncError, SyncReport, SNAPSHOT_VERSION};

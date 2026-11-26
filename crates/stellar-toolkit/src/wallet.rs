@@ -369,7 +369,163 @@ fn derive_keystore_key(passphrase: &str, salt: &[u8]) -> Result<[u8; 32]> {
 }
 
 
+// ── Network allowlist for wallet funding (issue #332) ────────────────────────
+
+/// A named Stellar network that the wallet funding path is allowed to contact.
+///
+/// Callers that want to fund an account must explicitly name the network, so
+/// that a misconfigured URL or an unexpected `network_passphrase` in the
+/// environment cannot silently fund an account on the wrong chain.
+///
+/// # Compatibility
+///
+/// The original `fund_account` helper (which contacts the public Friendbot
+/// without a network check) is still available for callers that have not yet
+/// adopted the allowlist. It is unchanged and will compile as before.
+///
+/// # Examples
+///
+/// ```rust
+/// use stellar_toolkit::wallet::{AllowedNetwork, fund_account_on};
+///
+/// // Fund on testnet — the only network where Friendbot exists:
+/// let result = fund_account_on(
+///     "GDQP2KPQGKIHYJGXNUIYOMHARUARCA7DJT5FO2FFOOKY3B2WSQHG4W37",
+///     AllowedNetwork::Testnet,
+/// );
+/// // This will fail in a unit test (no real HTTP), but it won't panic.
+/// let _ = result;
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllowedNetwork {
+    /// Stellar public testnet (Friendbot available at <https://friendbot.stellar.org>).
+    Testnet,
+    /// Stellar Futurenet (Friendbot available at <https://friendbot-futurenet.stellar.org>).
+    Futurenet,
+}
+
+impl AllowedNetwork {
+    /// The network passphrase that must match when performing a passphrase check.
+    pub fn passphrase(self) -> &'static str {
+        match self {
+            AllowedNetwork::Testnet => "Test SDF Network ; September 2015",
+            AllowedNetwork::Futurenet => "Test SDF Future Network ; October 2022",
+        }
+    }
+
+    /// The Friendbot URL for this network.
+    pub fn friendbot_url(self) -> &'static str {
+        match self {
+            AllowedNetwork::Testnet => "https://friendbot.stellar.org",
+            AllowedNetwork::Futurenet => "https://friendbot-futurenet.stellar.org",
+        }
+    }
+
+    /// Return the [`AllowedNetwork`] that owns `passphrase`, or an error if
+    /// `passphrase` does not match any entry in the allowlist.
+    ///
+    /// The comparison is case-sensitive and trim-free: the caller must supply
+    /// the exact passphrase string without leading or trailing whitespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolkitError::Wallet`] when `passphrase` is not in the
+    /// allowlist, naming the rejected value so the caller can diagnose a
+    /// misconfiguration without guessing which field is wrong.
+    pub fn from_passphrase(passphrase: &str) -> Result<Self> {
+        for network in [AllowedNetwork::Testnet, AllowedNetwork::Futurenet] {
+            if network.passphrase() == passphrase {
+                return Ok(network);
+            }
+        }
+        Err(ToolkitError::Wallet(format!(
+            "network passphrase is not in the funding allowlist: \"{passphrase}\""
+        )))
+    }
+}
+
+impl std::fmt::Display for AllowedNetwork {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AllowedNetwork::Testnet => write!(f, "testnet"),
+            AllowedNetwork::Futurenet => write!(f, "futurenet"),
+        }
+    }
+}
+
+/// Fund an account on a specific network using the Friendbot faucet.
+///
+/// Only networks in the [`AllowedNetwork`] allowlist are accepted. Passing a
+/// network that does not support Friendbot (e.g. mainnet) is a compile-time
+/// error: there is no `AllowedNetwork::Mainnet` variant.
+///
+/// The account id must be a valid Stellar G... address. An address that fails
+/// the strkey check is rejected before any HTTP request is made.
+///
+/// # Errors
+///
+/// - [`ToolkitError::Wallet`] when `account` is not a valid Stellar account id.
+/// - [`ToolkitError::Wallet`] when the Friendbot HTTP request fails.
+/// - [`ToolkitError::Wallet`] when Friendbot returns an error body.
+///
+/// # Examples
+///
+/// ```rust
+/// use stellar_toolkit::wallet::{AllowedNetwork, fund_account_on};
+///
+/// // Compile-time guarantee: only testnet or futurenet can be passed here.
+/// let result = fund_account_on(
+///     "GDQP2KPQGKIHYJGXNUIYOMHARUARCA7DJT5FO2FFOOKY3B2WSQHG4W37",
+///     AllowedNetwork::Testnet,
+/// );
+/// let _ = result; // would actually hit the network in a live context
+/// ```
+pub fn fund_account_on(account: &str, network: AllowedNetwork) -> Result<()> {
+    // Validate the account id before making any HTTP request so a typo is
+    // caught immediately with a clear error rather than a confusing Friendbot
+    // response.
+    stellar_strkey::ed25519::PublicKey::from_string(account).map_err(|e| {
+        ToolkitError::Wallet(format!(
+            "invalid account id `{}`: {e}",
+            crate::key_hygiene::mask_secret(account)
+        ))
+    })?;
+
+    let url = format!("{}?addr={account}", network.friendbot_url());
+    let response = ureq::get(&url)
+        .call()
+        .map_err(|e| {
+            ToolkitError::Wallet(format!(
+                "friendbot request for {} on {} failed: {e}",
+                crate::key_hygiene::mask_secret(account),
+                network,
+            ))
+        })?;
+    let body = response
+        .into_string()
+        .map_err(|e| ToolkitError::Wallet(format!("could not read friendbot response: {e}")))?;
+    let json: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| ToolkitError::Wallet(format!("could not parse friendbot response: {e}")))?;
+
+    if let Some(hash) = json["hash"].as_str() {
+        println!("Funded {account} on {network} (tx {hash})");
+        Ok(())
+    } else if let Some(err) = json["detail"].as_str() {
+        Err(ToolkitError::Wallet(format!(
+            "friendbot rejected the request: {err}"
+        )))
+    } else {
+        Err(ToolkitError::Wallet(format!(
+            "unexpected friendbot response: {body}"
+        )))
+    }
+}
+
 /// Fund an account on the Stellar testnet using the Friendbot faucet.
+///
+/// This is the original single-network helper. New callers should prefer
+/// [`fund_account_on`] with an explicit [`AllowedNetwork`], which prevents
+/// accidental funding on the wrong chain.
 pub fn fund_account(account: &str) -> Result<()> {
     let url = format!("https://friendbot.stellar.org?addr={account}");
     let response = ureq::get(&url)
@@ -577,5 +733,104 @@ mod tests {
         // The secret is highlighted, never dimmed or recoloured as a value.
         assert!(out.contains("\x1b[1;35m"));
         assert!(out.contains(&format!("\n{}\n", wallet.secret)));
+    }
+
+    // ── Network allowlist tests (issue #332) ──────────────────────────────────
+
+    #[test]
+    fn allowed_network_passphrases_round_trip() {
+        assert_eq!(
+            AllowedNetwork::from_passphrase("Test SDF Network ; September 2015").unwrap(),
+            AllowedNetwork::Testnet,
+        );
+        assert_eq!(
+            AllowedNetwork::from_passphrase("Test SDF Future Network ; October 2022").unwrap(),
+            AllowedNetwork::Futurenet,
+        );
+    }
+
+    #[test]
+    fn from_passphrase_rejects_unknown_passphrase() {
+        let err = AllowedNetwork::from_passphrase(
+            "Public Global Stellar Network ; September 2015",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("not in the funding allowlist"),
+            "error should name the reason: {err}"
+        );
+        // The rejected passphrase is included in the error so operators can
+        // diagnose a misconfiguration without guessing.
+        assert!(
+            err.to_string()
+                .contains("Public Global Stellar Network ; September 2015"),
+            "rejected passphrase must appear in error: {err}"
+        );
+    }
+
+    #[test]
+    fn from_passphrase_rejects_empty_string() {
+        assert!(AllowedNetwork::from_passphrase("").is_err());
+    }
+
+    #[test]
+    fn from_passphrase_is_case_sensitive() {
+        // Lower-casing any character must yield a rejection, not a fuzzy match.
+        assert!(
+            AllowedNetwork::from_passphrase("test sdf network ; september 2015").is_err()
+        );
+    }
+
+    #[test]
+    fn testnet_friendbot_url_points_to_stellar_org() {
+        assert!(AllowedNetwork::Testnet
+            .friendbot_url()
+            .starts_with("https://friendbot.stellar.org"));
+    }
+
+    #[test]
+    fn futurenet_friendbot_url_is_distinct_from_testnet() {
+        assert_ne!(
+            AllowedNetwork::Testnet.friendbot_url(),
+            AllowedNetwork::Futurenet.friendbot_url(),
+        );
+    }
+
+    #[test]
+    fn fund_account_on_rejects_invalid_account_id_before_any_http() {
+        // A malformed account id must be rejected with a wallet error before
+        // any outbound HTTP request is attempted — the network allowlist check
+        // happens after address validation.
+        let err = fund_account_on("not-a-stellar-address", AllowedNetwork::Testnet)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("invalid account id"),
+            "expected address-validation error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn fund_account_on_rejects_a_secret_key_instead_of_an_account_id() {
+        // S... keys are not G... public keys; the validator must reject them.
+        let wallet = generate_wallet().expect("generate");
+        let err = fund_account_on(&wallet.secret, AllowedNetwork::Testnet)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("invalid account id"),
+            "expected address-validation error, got: {err}"
+        );
+        // The secret key must not be echoed verbatim in the error message.
+        assert!(
+            !err.contains(&wallet.secret),
+            "secret key must not appear in error: {err}"
+        );
+    }
+
+    #[test]
+    fn allowed_network_display_is_human_readable() {
+        assert_eq!(AllowedNetwork::Testnet.to_string(), "testnet");
+        assert_eq!(AllowedNetwork::Futurenet.to_string(), "futurenet");
     }
 }
