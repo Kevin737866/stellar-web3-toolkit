@@ -51,6 +51,7 @@ cargo build --workspace --exclude stellar-toolkit --target wasm32v1-none --relea
 
 - **Base:** `rust:1.98-bookworm` with `wasm32v1-none`, `binaryen`, `wabt`, `soroban-cli 21.5.0`, `wasm-pack`.
 - **Determinism:** `SOURCE_DATE_EPOCH=0`, `RUSTFLAGS="-C target-feature=-crt-static"`, clean incremental caches, pinned `Cargo.lock`.
+- **BuildKit:** `scripts/reproducible-build.sh --docker` and `scripts/verify-bytecode.sh --docker` run `docker build` with `DOCKER_BUILDKIT=1`, so independent stages build in parallel and layer caching is the BuildKit one on every Docker version.
 - **Quickstart:**
 
 ```bash
@@ -89,8 +90,8 @@ CI's `wasm` job mirrors `scripts/reproducible-build.sh` exactly, so a green CI m
 ### Jobs
 
 1. **build** — reproducible WASM build, runs both `cargo build …` and `scripts/reproducible-build.sh`, packages `dist/`.
-2. **release** — only on tags, publishes Release + checksums + notes (how to verify).
-3. **deploy-testnet** — `environment: test` (or `dev`/`prod`), `workflow_dispatch` only; dry-run by default; loads `config/<env>.toml`, prints checksums, appends `logs/deployment-audit.log`.
+2. **release** — only on tags, attests build provenance for `dist/*.wasm` and `wasm-checksums.txt` (`actions/attest-build-provenance`), then publishes Release + checksums + notes (how to verify). Check a downloaded file with `gh attestation verify <file> --repo Kevin737866/stellar-web3-toolkit`.
+3. **deploy-testnet** — `environment: test` (or `dev`/`prod`), `workflow_dispatch` only; dry-run by default; loads `config/<env>.toml`, prints checksums, runs a rollback smoke test (every `dist/*.wasm` must still match `dist/wasm-checksums.txt`, so the artifact set a rollback would redeploy is intact), appends `logs/deployment-audit.log`.
 4. **deploy-prod-gate** — `environment: prod` with GitHub Environment protection (manual approval required).
 
 ### Environment configs
