@@ -21,7 +21,7 @@ pub use journal::{
     TransitionRecord, UnresolvedAction,
 };
 pub use monitor::{MonitoringConfig, SwapMonitor};
-pub use offer::SwapOffer;
+pub use offer::{OfferSignature, SwapOffer, OFFER_DIGEST_DOMAIN_TAG};
 pub use preimage::{Preimage, PreimageManager};
 pub use replay::{
     CrossChainIntent, NonceWindow, ReplayDomain, ReplayError, ReplayGuard, ReplayStats,

@@ -13,6 +13,21 @@ pub enum AtomicSwapError {
     #[error("Swap has expired: {swap_id}")]
     SwapExpired { swap_id: String },
 
+    /// An offer was presented for signing at or after its deadline (#389).
+    ///
+    /// Signing an expired offer would authorise a trade the counterparty can no
+    /// longer settle, so the signing path refuses it before computing any
+    /// commitment. The deadline and the current ledger are included so the
+    /// caller can tell a slightly late attempt from a stale offer.
+    #[error(
+        "Offer {offer_id} expired at ledger {expires_at_ledger} (signing requested at ledger {current_ledger})"
+    )]
+    OfferExpired {
+        offer_id: String,
+        expires_at_ledger: u32,
+        current_ledger: u32,
+    },
+
     /// A refund was requested while the swap was still inside its settlement
     /// window, before the timeout ledger had passed (#396).
     ///

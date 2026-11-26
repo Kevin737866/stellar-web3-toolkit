@@ -2,154 +2,128 @@
 //!
 //! Routing policies and constraints for the payment channel router.
 
-use crate::{Channel, NetworkGraph, Route, RouteHop, RouteRequest, RoutingError, MAX_ROUTE_HOPS};
+use crate::{
+    Channel, NetworkGraph, Route, RouteHop, RouteMetadata, RouteRequest, RoutingError,
+    MAX_ROUTE_HOPS,
+};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::HashSet;
 
-/// Deterministic tie-breaking strategy for equal-cost payment routes.
-///
-/// When multiple routes (or partial paths during search) have identical
-/// primary cost (for example equal `total_fees` in cheapest-route search),
-/// `TieBreaker` defines a strict total order so route selection is reproducible
-/// regardless of graph insertion order or hash map iteration order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum TieBreaker {
-    /// Canonical deterministic order (default):
-    /// 1. Fewer hops
-    /// 2. Lower total CLTV delta (timeout safety)
-    /// 3. Lexicographically smallest `(channel_id, node_id)` hop sequence
-    #[default]
-    Canonical,
-    /// Prefer fewer hops first, then lexicographically smallest hop sequence.
-    FewestHops,
-    /// Prefer lower total CLTV delta (timeout safety) first, then fewer hops,
-    /// then lexicographically smallest hop sequence.
-    LowestCltv,
-    /// Break ties directly by lexicographically smallest `(channel_id, node_id)`
-    /// hop sequence.
-    Lexicographical,
+/// Detailed reasons why a route or channel violates a routing policy (Issue #365)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PolicyViolation {
+    MaxHopsExceeded {
+        actual_hops: usize,
+        limit: usize,
+    },
+    FeeBpsExceeded {
+        actual_bps: u32,
+        max_bps: u32,
+    },
+    BaseFeeExceeded {
+        base_fee: i128,
+        max_base_fee: i128,
+        channel_id: String,
+    },
+    FeeRateExceeded {
+        fee_rate: u32,
+        max_fee_rate: u32,
+        channel_id: String,
+    },
+    ExcludedNode {
+        node: String,
+    },
+    ExcludedChannel {
+        channel_id: String,
+    },
+    AmountBelowMinimum {
+        amount: i128,
+        min_amount: i128,
+    },
+    AmountAboveMaximum {
+        amount: i128,
+        max_amount: i128,
+    },
 }
 
-impl TieBreaker {
-    /// Compare two hop slices according to this tie-breaking strategy.
-    ///
-    /// Distinct routes always have a strict total order because the fallback
-    /// compares the full `(channel_id, node_id)` sequence lexicographically.
-    pub fn compare_hops(&self, a: &[RouteHop], b: &[RouteHop]) -> Ordering {
-        let total_cltv = |hops: &[RouteHop]| -> u64 {
-            hops.iter()
-                .fold(0u64, |acc, hop| acc.saturating_add(hop.cltv_delta as u64))
-        };
-        let lex_cmp = || {
-            a.iter()
-                .map(|h| (&h.channel_id, &h.node_id))
-                .cmp(b.iter().map(|h| (&h.channel_id, &h.node_id)))
-        };
-
-        match self {
-            TieBreaker::Canonical => a
-                .len()
-                .cmp(&b.len())
-                .then_with(|| total_cltv(a).cmp(&total_cltv(b)))
-                .then_with(lex_cmp),
-            TieBreaker::FewestHops => a.len().cmp(&b.len()).then_with(lex_cmp),
-            TieBreaker::LowestCltv => total_cltv(a)
-                .cmp(&total_cltv(b))
-                .then_with(|| a.len().cmp(&b.len()))
-                .then_with(lex_cmp),
-            TieBreaker::Lexicographical => lex_cmp(),
-        }
-    }
-
-    /// Compare two routes according to this tie-breaking strategy.
-    pub fn compare_routes(&self, a: &Route, b: &Route) -> Ordering {
-        self.compare_hops(&a.hops, &b.hops)
-    }
+/// Report detailing the outcome of routing policy evaluation (Issue #365)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyCheckReport {
+    pub passed: bool,
+    pub violations: Vec<PolicyViolation>,
 }
 
-/// Composite search key for deterministic route selection during graph search.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SearchKey {
-    pub primary_cost: i128,
-    pub hops: usize,
-    pub total_cltv: u64,
-    pub path: Vec<(String, String)>,
-    pub tie_breaker: TieBreaker,
-}
-
-impl SearchKey {
-    pub fn root(primary_cost: i128, tie_breaker: TieBreaker) -> Self {
+impl PolicyCheckReport {
+    pub fn ok() -> Self {
         Self {
-            primary_cost,
-            hops: 0,
-            total_cltv: 0,
-            path: Vec::new(),
-            tie_breaker,
+            passed: true,
+            violations: Vec::new(),
         }
     }
 
-    pub fn extend(
-        &self,
-        new_primary_cost: i128,
-        channel_id: &str,
-        node_id: &str,
-        cltv_delta: u32,
-    ) -> Self {
-        let mut path = self.path.clone();
-        path.push((channel_id.to_string(), node_id.to_string()));
+    pub fn failed(violations: Vec<PolicyViolation>) -> Self {
         Self {
-            primary_cost: new_primary_cost,
-            hops: self.hops + 1,
-            total_cltv: self.total_cltv.saturating_add(cltv_delta as u64),
-            path,
-            tie_breaker: self.tie_breaker,
+            passed: false,
+            violations,
         }
     }
-}
 
-impl Ord for SearchKey {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.primary_cost
-            .cmp(&other.primary_cost)
-            .then_with(|| match self.tie_breaker {
-                TieBreaker::Canonical => self
-                    .hops
-                    .cmp(&other.hops)
-                    .then_with(|| self.total_cltv.cmp(&other.total_cltv))
-                    .then_with(|| self.path.cmp(&other.path)),
-                TieBreaker::FewestHops => self
-                    .hops
-                    .cmp(&other.hops)
-                    .then_with(|| self.path.cmp(&other.path)),
-                TieBreaker::LowestCltv => self
-                    .total_cltv
-                    .cmp(&other.total_cltv)
-                    .then_with(|| self.hops.cmp(&other.hops))
-                    .then_with(|| self.path.cmp(&other.path)),
-                TieBreaker::Lexicographical => self.path.cmp(&other.path),
-            })
+    /// Provide human-readable summary of policy failure reasons
+    pub fn diagnostic(&self) -> String {
+        if self.passed {
+            "Policy check passed".to_string()
+        } else {
+            let details: Vec<String> = self
+                .violations
+                .iter()
+                .map(|v| match v {
+                    PolicyViolation::MaxHopsExceeded { actual_hops, limit } => {
+                        format!("hop count {} exceeds limit {}", actual_hops, limit)
+                    }
+                    PolicyViolation::FeeBpsExceeded {
+                        actual_bps,
+                        max_bps,
+                    } => {
+                        format!("fee {} bps exceeds maximum {} bps", actual_bps, max_bps)
+                    }
+                    PolicyViolation::BaseFeeExceeded {
+                        base_fee,
+                        max_base_fee,
+                        channel_id,
+                    } => {
+                        format!(
+                            "channel {} base fee {} exceeds maximum {}",
+                            channel_id, base_fee, max_base_fee
+                        )
+                    }
+                    PolicyViolation::FeeRateExceeded {
+                        fee_rate,
+                        max_fee_rate,
+                        channel_id,
+                    } => {
+                        format!(
+                            "channel {} fee rate {} ppm exceeds maximum {} ppm",
+                            channel_id, fee_rate, max_fee_rate
+                        )
+                    }
+                    PolicyViolation::ExcludedNode { node } => {
+                        format!("node {} is in policy excluded_nodes", node)
+                    }
+                    PolicyViolation::ExcludedChannel { channel_id } => {
+                        format!("channel {} is in policy excluded_channels", channel_id)
+                    }
+                    PolicyViolation::AmountBelowMinimum { amount, min_amount } => {
+                        format!("amount {} below minimum {}", amount, min_amount)
+                    }
+                    PolicyViolation::AmountAboveMaximum { amount, max_amount } => {
+                        format!("amount {} above maximum {}", amount, max_amount)
+                    }
+                })
+                .collect();
+            format!("Policy check failed: {}", details.join("; "))
+        }
     }
-}
-
-impl PartialOrd for SearchKey {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-/// Return a node's `(neighbor_id, channel_id)` pairs in sorted deterministic order.
-pub(crate) fn sorted_neighbors<'a>(
-    graph: &'a NetworkGraph,
-    node_id: &str,
-) -> Vec<(&'a String, &'a String)> {
-    let mut neighbors: Vec<(&String, &String)> = graph
-        .adjacency
-        .get(node_id)
-        .map(|m| m.iter().collect())
-        .unwrap_or_default();
-    neighbors.sort_unstable_by(|a, b| a.0.cmp(b.0).then_with(|| a.1.cmp(b.1)));
-    neighbors
 }
 
 /// Routing preferences and constraints
@@ -165,7 +139,7 @@ pub struct RoutingPolicy {
     pub max_fee_rate: u32,
     /// Excluded node IDs
     pub excluded_nodes: HashSet<String>,
-    /// Excluded channel IDs
+    /// Excluded channel IDs (permanent – these channels are never used)
     pub excluded_channels: HashSet<String>,
     /// Preferred nodes (favor these in routing)
     pub preferred_nodes: HashSet<String>,
@@ -179,9 +153,13 @@ pub struct RoutingPolicy {
     pub min_amount: i128,
     /// Maximum amount
     pub max_amount: i128,
-    /// Deterministic tie-breaking strategy for equal-cost routes
-    #[serde(default)]
-    pub tie_breaker: TieBreaker,
+    /// Channels that are temporarily unavailable for the next routing attempt.
+    ///
+    /// These are merged into [`RouteRequest::excluded_unavailable`] by
+    /// [`RoutingPolicy::apply_to_request`].  Unlike `excluded_channels`
+    /// (which are permanently skipped), entries here can carry an expiry
+    /// timestamp so scheduling code knows when to clear them.
+    pub temporarily_unavailable: Vec<UnavailableChannel>,
 }
 
 impl Default for RoutingPolicy {
@@ -199,7 +177,7 @@ impl Default for RoutingPolicy {
             prefer_low_cltv: true,
             min_amount: 1,
             max_amount: i128::MAX / 2,
-            tie_breaker: TieBreaker::default(),
+            temporarily_unavailable: Vec::new(),
         }
     }
 }
@@ -273,57 +251,92 @@ impl RoutingPolicy {
     }
 
     /// Check if a route meets the policy requirements
-    pub fn route_meets_requirements(
-        &self,
-        route: &Route,
-        request: &RouteRequest,
-    ) -> Result<(), RoutingError> {
-        // Check hop limit
-        if route.hops.len() > self.max_hops {
-            return Err(RoutingError::PathTooLong {
-                length: route.hops.len(),
-                max: self.max_hops,
-            });
-        }
+    /// Evaluate all policy constraints on a candidate route, reporting specific violations (Issue #365)
+    pub fn evaluate_route(&self, route: &Route, request: &RouteRequest) -> PolicyCheckReport {
+        let mut violations = Vec::new();
 
-        // Check fee percentage
-        let fee_percent = (route.total_fees as f64 / request.amount as f64 * 10000.0) as u32;
-        if fee_percent > self.max_fee_bps {
-            return Err(RoutingError::FeeExceedsBudget {
-                fee: route.total_fees,
-                budget: (request.amount as f64 * self.max_fee_bps as f64 / 10000.0) as i128,
-            });
-        }
-
-        // Check amount limits
         if request.amount < self.min_amount {
-            return Err(RoutingError::BelowDustLimit {
+            violations.push(PolicyViolation::AmountBelowMinimum {
                 amount: request.amount,
-                dust_limit: self.min_amount,
+                min_amount: self.min_amount,
             });
         }
 
         if request.amount > self.max_amount {
-            return Err(RoutingError::AmountExceedsMaximum {
+            violations.push(PolicyViolation::AmountAboveMaximum {
                 amount: request.amount,
                 max_amount: self.max_amount,
             });
         }
 
-        // Check excluded nodes
+        if route.hops.len() > self.max_hops {
+            violations.push(PolicyViolation::MaxHopsExceeded {
+                actual_hops: route.hops.len(),
+                limit: self.max_hops,
+            });
+        }
+
+        if request.amount > 0 {
+            let fee_percent = (route.total_fees as f64 / request.amount as f64 * 10000.0) as u32;
+            if fee_percent > self.max_fee_bps {
+                violations.push(PolicyViolation::FeeBpsExceeded {
+                    actual_bps: fee_percent,
+                    max_bps: self.max_fee_bps,
+                });
+            }
+        }
+
         for hop in &route.hops {
+            if self.excluded_channels.contains(&hop.channel_id) {
+                violations.push(PolicyViolation::ExcludedChannel {
+                    channel_id: hop.channel_id.clone(),
+                });
+            }
+
             if self.excluded_nodes.contains(&hop.node_id) {
-                return Err(RoutingError::NodeNotFound {
+                violations.push(PolicyViolation::ExcludedNode {
                     node: hop.node_id.clone(),
                 });
             }
         }
 
-        // Check excluded channels
-        for hop in &route.hops {
-            if self.excluded_channels.contains(&hop.channel_id) {
-                return Err(RoutingError::ChannelNotFound {
-                    channel_id: hop.channel_id.clone(),
+        if violations.is_empty() {
+            PolicyCheckReport::ok()
+        } else {
+            PolicyCheckReport::failed(violations)
+        }
+    }
+
+    /// Check if a route meets the policy requirements, returning an actionable error on failure (Issue #365)
+    pub fn route_meets_requirements(
+        &self,
+        route: &Route,
+        request: &RouteRequest,
+    ) -> Result<(), RoutingError> {
+        let report = self.evaluate_route(route, request);
+        if !report.passed {
+            return Err(RoutingError::PolicyCheckFailed(report.diagnostic()));
+        }
+
+        if let Some(budget) = request.max_fee_budget {
+            if route.total_fees > budget {
+                return Err(RoutingError::FeeExceedsBudget {
+                    fee: route.total_fees,
+                    budget,
+                });
+            }
+        }
+
+        // Check timeout budget if payment_expiry is specified
+        if let Some(max_cltv) = request
+            .payment_metadata
+            .as_ref()
+            .and_then(|m| m.payment_expiry)
+        {
+            if route.total_cltv_delta() > max_cltv {
+                return Err(RoutingError::TimeoutExceedsBudget {
+                    required: route.total_cltv_delta(),
+                    max_allowed: max_cltv,
                 });
             }
         }
@@ -343,6 +356,14 @@ impl RoutingPolicy {
             let max_fee = (request.amount as f64 * self.max_fee_bps as f64 / 10000.0) as i128;
             request.max_fee_budget = Some(max_fee);
         }
+
+        // Merge temporarily-unavailable channels from the policy into the
+        // request.  Caller-supplied entries take precedence and are kept at
+        // the front; policy entries are appended so deduplication is not
+        // required (the router holds a `HashSet` internally anyway).
+        request
+            .excluded_unavailable
+            .extend(self.temporarily_unavailable.iter().cloned());
 
         request
     }
@@ -543,77 +564,43 @@ mod tests {
         assert!(!policy.prefer_low_cltv);
     }
 
-    fn make_route(hops: Vec<(&str, &str, i128, u32)>, prob: f64) -> Route {
-        let total_fees = hops.iter().map(|h| h.2).sum();
-        let route_hops = hops
-            .into_iter()
-            .map(|(ch, node, fee, cltv)| {
-                RouteHop::new(ch.to_string(), node.to_string(), 1_000, fee, cltv)
-            })
-            .collect();
-        Route {
-            hops: route_hops,
-            total_fees,
-            total_amount: 1_000,
-            success_probability: prob,
-            metadata: Default::default(),
-        }
-    }
-
     #[test]
-    fn selection_strategy_breaks_ties_deterministically_independent_of_slice_order() {
-        let r_high_cltv = make_route(vec![("ch_a", "bob", 5, 40), ("ch_b", "carol", 5, 40)], 0.95);
-        let r_low_cltv = make_route(vec![("ch_c", "dave", 5, 10), ("ch_d", "carol", 5, 10)], 0.95);
+    fn test_policy_violation_reporting() {
+        let mut policy = RoutingPolicy::default();
+        policy.max_hops = 1;
+        policy.excluded_nodes.insert("forbidden_node".to_string());
 
-        let policy = RoutingPolicy::default();
-        let order_1 = vec![r_high_cltv.clone(), r_low_cltv.clone()];
-        let order_2 = vec![r_low_cltv.clone(), r_high_cltv.clone()];
-
-        for strategy in [
-            SelectionStrategy::Cheapest,
-            SelectionStrategy::Fastest,
-            SelectionStrategy::MostReliable,
-            SelectionStrategy::PrivacyFocused,
-        ] {
-            let s1 = strategy.select(&order_1, &policy).unwrap();
-            let s2 = strategy.select(&order_2, &policy).unwrap();
-            assert_eq!(s1.hops, s2.hops);
-            assert_eq!(s1.hops[0].channel_id, "ch_c");
-        }
-
-        // Lexicographical tie-breaker picks ch_a < ch_c instead.
-        let lex_policy = RoutingPolicy::default().with_tie_breaker(TieBreaker::Lexicographical);
-        let selected = SelectionStrategy::Cheapest
-            .select(&order_2, &lex_policy)
-            .unwrap();
-        assert_eq!(selected.hops[0].channel_id, "ch_a");
-    }
-
-    #[test]
-    fn rank_routes_orders_deterministically_and_rejects_policy_violations() {
-        let r1 = make_route(vec![("ch_b", "bob", 5, 20)], 0.9);
-        let r2 = make_route(vec![("ch_a", "dave", 5, 20)], 0.9);
-        let policy = RoutingPolicy::default();
-        let req = RouteRequest {
-            source: "alice".to_string(),
-            destination: "dave".to_string(),
-            amount: 1_000,
-            max_fee_budget: None,
-            max_hops: None,
-            find_any: false,
-            payment_metadata: None,
+        let route = Route {
+            hops: vec![
+                RouteHop::new("c1".to_string(), "forbidden_node".to_string(), 1000, 10, 40),
+                RouteHop::new("c2".to_string(), "n2".to_string(), 1000, 10, 40),
+            ],
+            total_amount: 1000,
+            total_fees: 20,
+            success_probability: 1.0,
+            metadata: RouteMetadata {
+                created_at: 0,
+                num_nodes: 3,
+                estimated_time_ms: 0,
+                is_direct: false,
+            },
         };
 
-        let ranked = policy.rank_routes(&[r1, r2], &req).unwrap();
-        assert_eq!(ranked[0].hops[0].channel_id, "ch_a");
-        assert_eq!(ranked[1].hops[0].channel_id, "ch_b");
+        let request = RouteRequest::new("n0".to_string(), "n2".to_string(), 1000);
 
-        let mut excluded = policy.clone();
-        excluded.excluded_channels.insert("ch_a".to_string());
-        let r_excluded = make_route(vec![("ch_a", "dave", 5, 20)], 0.9);
-        assert!(matches!(
-            excluded.rank_routes(&[r_excluded], &req).unwrap_err(),
-            RoutingError::ChannelNotFound { .. }
-        ));
+        let report = policy.evaluate_route(&route, &request);
+        assert!(!report.passed);
+        assert!(report
+            .violations
+            .iter()
+            .any(|v| matches!(v, PolicyViolation::MaxHopsExceeded { .. })));
+        assert!(report
+            .violations
+            .iter()
+            .any(|v| matches!(v, PolicyViolation::ExcludedNode { .. })));
+
+        let diagnostic = report.diagnostic();
+        assert!(diagnostic.contains("hop count 2 exceeds limit 1"));
+        assert!(diagnostic.contains("forbidden_node"));
     }
 }

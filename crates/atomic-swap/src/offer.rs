@@ -11,12 +11,21 @@
 //! Because creation either returns an offer or an error, there is no partial
 //! offer to clean up.
 //!
-//! Expiry handling (refusing to sign an offer whose deadline has passed) lives
-//! in the signing path built on top of this type.
+//! Offers also have a deadline. [`SwapOffer::sign`] refuses to produce signing
+//! material for an offer whose deadline has passed, so an expired offer cannot
+//! be handed to a wallet and signed by accident. The crate holds no signer
+//! keys: `sign` produces the canonical SHA-256 commitment that a wallet or HSM
+//! signs, and [`OfferSignature`] records it with the ledger it was authorised
+//! at.
 
 use crate::asset::AssetInfo;
 use crate::error::{AtomicSwapError, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+/// Domain tag that separates offer digests from every other digest this crate
+/// computes (swap digests, preimage hashes).
+pub const OFFER_DIGEST_DOMAIN_TAG: &[u8] = b"STELLAR_SWAP_OFFER_V1";
 
 /// A maker's advertised swap terms.
 ///
@@ -101,6 +110,107 @@ impl SwapOffer {
             self.taker_asset.display_key(),
         )
     }
+
+    /// True once `current_ledger` has reached the offer's deadline.
+    ///
+    /// `expires_at_ledger` is the *first* ledger at which the offer is no
+    /// longer valid: [`sign`](Self::sign) at `expires_at_ledger - 1` succeeds,
+    /// and at `expires_at_ledger` (or later) it is refused. This is the offer
+    /// analogue of an exclusive deadline, and is the opposite convention to a
+    /// swap's timeout ledger, where the timeout ledger is still the last
+    /// settleable ledger.
+    pub fn is_expired(&self, current_ledger: u32) -> bool {
+        current_ledger >= self.expires_at_ledger
+    }
+
+    /// Canonical SHA-256 commitment over every field a signer authorises.
+    ///
+    /// Fields are length-prefixed and big-endian, with a domain tag, so two
+    /// different offers cannot encode to the same bytes by shifting a field
+    /// boundary. Amounts and ledgers are included: a signer that approved 100
+    /// units for 10,000 ledgers has not approved any other combination.
+    ///
+    /// The digest does not depend on wall-clock time or process state, so it
+    /// can be recomputed after a restart from the same offer fields.
+    pub fn signing_digest(&self) -> Result<[u8; 32]> {
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(OFFER_DIGEST_DOMAIN_TAG);
+        write_length_prefixed(&mut encoded, self.id.as_bytes(), "offer id")?;
+        write_length_prefixed(&mut encoded, self.maker.as_bytes(), "maker")?;
+        write_length_prefixed(
+            &mut encoded,
+            self.maker_asset.display_key().as_bytes(),
+            "maker asset",
+        )?;
+        write_length_prefixed(
+            &mut encoded,
+            self.taker_asset.display_key().as_bytes(),
+            "taker asset",
+        )?;
+        encoded.extend_from_slice(&self.maker_amount.to_be_bytes());
+        encoded.extend_from_slice(&self.taker_amount.to_be_bytes());
+        encoded.extend_from_slice(&self.created_at_ledger.to_be_bytes());
+        encoded.extend_from_slice(&self.expires_at_ledger.to_be_bytes());
+
+        let digest = Sha256::digest(&encoded);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&digest);
+        Ok(out)
+    }
+
+    /// Produce the signing commitment for this offer at `current_ledger`.
+    ///
+    /// An expired offer is refused with [`AtomicSwapError::OfferExpired`]
+    /// *before* any digest is computed, so no signing material exists for an
+    /// offer a counterparty can no longer act on. The check reads `&self` and
+    /// writes nothing, so a refusal leaves the offer untouched and it can be
+    /// re-signed while still live.
+    pub fn sign(&self, current_ledger: u32) -> Result<OfferSignature> {
+        if self.is_expired(current_ledger) {
+            return Err(AtomicSwapError::OfferExpired {
+                offer_id: self.id.clone(),
+                expires_at_ledger: self.expires_at_ledger,
+                current_ledger,
+            });
+        }
+
+        Ok(OfferSignature {
+            offer_id: self.id.clone(),
+            digest: hex::encode(self.signing_digest()?),
+            signed_at_ledger: current_ledger,
+        })
+    }
+}
+
+/// The commitment a signer authorises for an offer.
+///
+/// `digest` is the hex-encoded [`SwapOffer::signing_digest`] value. The offer id
+/// and ledger are carried alongside it so a signature can be tied back to the
+/// offer after a restart without guessing which offer it belonged to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OfferSignature {
+    /// Offer this commitment authorises.
+    pub offer_id: String,
+    /// Hex-encoded SHA-256 commitment over the offer fields.
+    pub digest: String,
+    /// Ledger at which signing was authorised (strictly before expiry).
+    pub signed_at_ledger: u32,
+}
+
+/// Write a `u16` big-endian length followed by the field bytes.
+///
+/// Lengths are checked rather than truncated: two different values that both
+/// truncated to the same prefix would produce the same digest.
+fn write_length_prefixed(buffer: &mut Vec<u8>, bytes: &[u8], field: &'static str) -> Result<()> {
+    let len = u16::try_from(bytes.len()).map_err(|_| {
+        AtomicSwapError::HashComputationError(format!(
+            "offer {field} is {} bytes, longer than the u16 length prefix allows",
+            bytes.len()
+        ))
+    })?;
+    buffer.extend_from_slice(&len.to_be_bytes());
+    buffer.extend_from_slice(bytes);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -242,5 +352,89 @@ mod tests {
         let json = serde_json::to_string(&offer).unwrap();
         let restored: SwapOffer = serde_json::from_str(&json).unwrap();
         assert_eq!(restored, offer);
+    }
+
+    // ---- Expiry at signing time (#389) ----
+
+    #[test]
+    fn signing_is_refused_from_the_deadline_onwards() {
+        let offer = offer(usdc(), AssetInfo::xlm()).unwrap(); // expires at 200
+
+        // Last ledger before the deadline: still signable.
+        let signature = offer
+            .sign(199)
+            .expect("an offer inside its window must be signable");
+        assert_eq!(signature.offer_id, "offer-1");
+        assert_eq!(signature.signed_at_ledger, 199);
+        assert_eq!(signature.digest.len(), 64);
+
+        // Exactly at the deadline: expired.
+        let error = offer
+            .sign(200)
+            .expect_err("an offer at its deadline must be refused");
+        assert!(matches!(
+            error,
+            AtomicSwapError::OfferExpired {
+                ref offer_id,
+                expires_at_ledger: 200,
+                current_ledger: 200,
+            } if offer_id == "offer-1"
+        ));
+
+        // After the deadline: still refused, and the offer is untouched.
+        assert!(offer.sign(201).is_err());
+        assert_eq!(offer.expires_at_ledger, 200);
+        assert!(!offer.is_expired(199));
+        assert!(offer.is_expired(200));
+    }
+
+    #[test]
+    fn the_signing_digest_is_deterministic_and_field_sensitive() {
+        let offer = offer(usdc(), AssetInfo::xlm()).unwrap();
+        let base = offer.signing_digest().unwrap();
+
+        // Same fields, same digest -- including across a clone (restart-safe).
+        assert_eq!(offer.signing_digest().unwrap(), base);
+        assert_eq!(offer.clone().signing_digest().unwrap(), base);
+
+        // Signing at different live ledgers commits to the same offer terms.
+        assert_eq!(
+            offer.sign(100).unwrap().digest,
+            offer.sign(199).unwrap().digest
+        );
+
+        let mut changed_amount = offer.clone();
+        changed_amount.maker_amount += 1;
+        assert_ne!(changed_amount.signing_digest().unwrap(), base);
+
+        let mut changed_expiry = offer.clone();
+        changed_expiry.expires_at_ledger += 1;
+        assert_ne!(changed_expiry.signing_digest().unwrap(), base);
+
+        let mut changed_maker = offer.clone();
+        changed_maker.maker = "GOTHER".to_string();
+        assert_ne!(changed_maker.signing_digest().unwrap(), base);
+
+        let mut changed_asset = offer.clone();
+        changed_asset.taker_asset =
+            AssetInfo::custom("EURC".to_string(), USDC_ISSUER.to_string(), 7);
+        assert_ne!(changed_asset.signing_digest().unwrap(), base);
+    }
+
+    #[test]
+    fn field_boundaries_cannot_be_shifted_between_offers() {
+        let mut a = offer(usdc(), AssetInfo::xlm()).unwrap();
+        a.id = "AB".to_string();
+        a.maker = "GMAKER".to_string();
+
+        let mut b = offer(usdc(), AssetInfo::xlm()).unwrap();
+        b.id = "A".to_string();
+        b.maker = "BGMAKER".to_string();
+
+        assert_ne!(
+            a.signing_digest().unwrap(),
+            b.signing_digest().unwrap(),
+            "length-prefixed fields must not be ambiguous"
+        );
     }
 }

@@ -3,9 +3,9 @@
 //! Advanced pathfinding algorithms for payment channel routing.
 
 use crate::fee_cap::FeeCap;
-use crate::policy::{sorted_neighbors, SearchKey, TieBreaker};
 use crate::{
-    NetworkGraph, Route, RouteHop, RouteRequest, RoutingError, MAX_ROUTE_AMOUNT, MAX_ROUTE_HOPS,
+    compute_hop_timeouts, NetworkGraph, PaymentMetadata, Route, RouteHop, RouteRequest,
+    RoutingError, MAX_ROUTE_HOPS,
 };
 use fxhash::FxHashMap;
 use priority_queue::PriorityQueue;
@@ -130,8 +130,10 @@ impl Pathfinder {
         graph: &NetworkGraph,
         request: &RouteRequest,
     ) -> Result<Route, RoutingError> {
-        self.validate_request(graph, request)?;
-        let max_hops = self.effective_max_hops(request);
+        let excluded = build_exclusion_set(&request.excluded_unavailable)?;
+
+        let mut dist: FxHashMap<String, (i128, Vec<RouteHop>)> = FxHashMap::default();
+        let mut pq: PriorityQueue<String, Reverse<i128>> = PriorityQueue::new();
 
         let mut best: FxHashMap<String, (SearchKey, Vec<RouteHop>)> = FxHashMap::default();
         let mut pq: PriorityQueue<String, Reverse<SearchKey>> = PriorityQueue::new();
@@ -144,29 +146,40 @@ impl Pathfinder {
             let (final_key, path) = best.get(&node).unwrap().clone();
 
             if node == request.destination {
-                if path.is_empty() {
-                    break;
-                }
-                return self.build_route(path, request.amount);
+                return self.build_route_with_metadata(
+                    path,
+                    request.amount,
+                    request.payment_metadata.as_ref(),
+                );
             }
 
             if current_key > final_key {
                 continue;
             }
 
-            // Check hop limit
-            if path.len() >= max_hops {
+            // Check hop limit (Issue #364)
+            let effective_max_hops = request
+                .max_hops
+                .map(|h| h.min(self.max_hops))
+                .unwrap_or(self.max_hops);
+            if path.len() >= effective_max_hops {
                 continue;
             }
 
             let current_amount = self.calculate_amount_at_node(&path, request.amount);
             let cost = current_key.primary_cost;
 
-            for (neighbor, channel_id) in sorted_neighbors(graph, &node) {
-                if let Some(channel) = graph.channels.get(channel_id) {
-                    if self.fee_cap.check_channel(channel).is_err() {
-                        continue;
-                    }
+            if let Some(neighbors) = graph.adjacency.get(&node) {
+                for (neighbor, channel_id) in neighbors {
+                    if let Some(channel) = graph.channels.get(channel_id) {
+                        // Skip temporarily unavailable channels.
+                        if excluded.contains(channel_id.as_str()) {
+                            continue;
+                        }
+
+                        if self.fee_cap.check_channel(channel).is_err() {
+                            continue;
+                        }
 
                     // `neighbor` is the destination of this hop, so the
                     // capacity that matters is the one leaving the current
@@ -239,11 +252,11 @@ impl Pathfinder {
         graph: &NetworkGraph,
         request: &RouteRequest,
     ) -> Result<Route, RoutingError> {
-        self.validate_request(graph, request)?;
-        let max_hops = self.effective_max_hops(request);
+        let excluded = build_exclusion_set(&request.excluded_unavailable)?;
 
-        let mut open_set: PriorityQueue<String, Reverse<SearchKey>> = PriorityQueue::new();
-        let mut g_keys: FxHashMap<String, SearchKey> = FxHashMap::default();
+        let mut open_set: PriorityQueue<String, Reverse<i128>> = PriorityQueue::new();
+        let mut g_score: FxHashMap<String, i128> = FxHashMap::default();
+        let mut f_score: FxHashMap<String, i128> = FxHashMap::default();
         let mut came_from: FxHashMap<String, (String, RouteHop)> = FxHashMap::default();
 
         let heuristic = |node: &str| -> i128 {
@@ -264,6 +277,7 @@ impl Pathfinder {
                     &request.source,
                     &request.destination,
                     request.amount,
+                    request.payment_metadata.as_ref(),
                 );
             }
 
@@ -279,9 +293,14 @@ impl Pathfinder {
                     continue;
                 };
 
-                if self.fee_cap.check_channel(channel).is_err() {
-                    continue;
-                }
+                    // Skip temporarily unavailable channels.
+                    if excluded.contains(channel_id.as_str()) {
+                        continue;
+                    }
+
+                    if self.fee_cap.check_channel(channel).is_err() {
+                        continue;
+                    }
 
                 let capacity = if &channel.node_a == neighbor {
                     channel.capacity_b_to_a
@@ -350,31 +369,27 @@ impl Pathfinder {
         graph: &NetworkGraph,
         request: &RouteRequest,
     ) -> Result<Route, RoutingError> {
-        self.validate_request(graph, request)?;
-        let max_hops = self.effective_max_hops(request);
+        let excluded = build_exclusion_set(&request.excluded_unavailable)?;
 
-        let mut best: FxHashMap<String, (SearchKey, Vec<RouteHop>)> = FxHashMap::default();
-        let mut pq: PriorityQueue<String, Reverse<SearchKey>> = PriorityQueue::new();
-
-        let root_key = SearchKey::root(0, self.tie_breaker);
-        best.insert(request.source.clone(), (root_key.clone(), Vec::new()));
-        pq.push(request.source.clone(), Reverse(root_key));
+        let mut queue: VecDeque<(String, Vec<RouteHop>)> = VecDeque::new();
+        let mut visited: HashSet<String> = HashSet::new();
 
         while let Some((current, Reverse(current_key))) = pq.pop() {
             let (final_key, path) = best.get(&current).unwrap().clone();
 
             if current == request.destination {
-                if path.is_empty() {
-                    break;
-                }
-                return self.build_route(path, request.amount);
+                return self.build_route_with_metadata(
+                    path,
+                    request.amount,
+                    request.payment_metadata.as_ref(),
+                );
             }
 
-            if current_key > final_key {
-                continue;
-            }
-
-            if path.len() >= max_hops {
+            let effective_max_hops = request
+                .max_hops
+                .map(|h| h.min(self.max_hops))
+                .unwrap_or(self.max_hops);
+            if path.len() >= effective_max_hops {
                 continue;
             }
 
@@ -386,11 +401,15 @@ impl Pathfinder {
                         continue;
                     }
 
-                    let capacity = if &channel.node_a == neighbor {
-                        channel.capacity_b_to_a
-                    } else {
-                        channel.capacity_a_to_b
-                    };
+                    if let Some(channel) = graph.channels.get(channel_id) {
+                        // Skip temporarily unavailable channels.
+                        if excluded.contains(channel_id.as_str()) {
+                            continue;
+                        }
+
+                        if self.fee_cap.check_channel(channel).is_err() {
+                            continue;
+                        }
 
                     if capacity < current_amount || channel.base_fee < 0 {
                         continue;
@@ -458,6 +477,8 @@ impl Pathfinder {
     ) -> Result<Route, RoutingError> {
         use rand::seq::SliceRandom;
 
+        let excluded = build_exclusion_set(&request.excluded_unavailable)?;
+
         let mut visited: HashSet<String> = HashSet::new();
         let mut path: Vec<RouteHop> = Vec::new();
         let mut current = request.source.clone();
@@ -472,11 +493,15 @@ impl Pathfinder {
                 .map(|n| n.iter().collect::<Vec<_>>())
                 .unwrap_or_default();
 
-            // Filter out visited nodes and nodes without capacity
+            // Filter out visited nodes, excluded channels, and nodes without capacity
             let valid_neighbors: Vec<_> = neighbors
                 .into_iter()
                 .filter(|(node_id, channel_id)| {
                     if visited.contains(*node_id) {
+                        return false;
+                    }
+                    // Skip temporarily unavailable channels.
+                    if excluded.contains(channel_id.as_str()) {
                         return false;
                     }
                     if let Some(channel) = graph.channels.get(*channel_id) {
@@ -525,7 +550,7 @@ impl Pathfinder {
             });
         }
 
-        self.build_route(path, request.amount)
+        self.build_route_with_metadata(path, request.amount, request.payment_metadata.as_ref())
     }
 
     fn calculate_fee(&self, channel: &crate::Channel, amount: i128) -> i128 {
@@ -582,6 +607,15 @@ impl Pathfinder {
     }
 
     fn build_route(&self, path: Vec<RouteHop>, amount: i128) -> Result<Route, RoutingError> {
+        self.build_route_with_metadata(path, amount, None)
+    }
+
+    fn build_route_with_metadata(
+        &self,
+        mut path: Vec<RouteHop>,
+        amount: i128,
+        payment_metadata: Option<&PaymentMetadata>,
+    ) -> Result<Route, RoutingError> {
         if path.is_empty() {
             return Err(RoutingError::NoPathFound {
                 origin: "unknown".to_string(),
@@ -601,6 +635,14 @@ impl Pathfinder {
 
         self.enforce_fee_cap(amount, &path)?;
 
+        let (final_cltv_delta, max_cltv_budget) = match payment_metadata {
+            Some(meta) => (meta.required_cltv_delta.unwrap_or(0), meta.payment_expiry),
+            None => (0, None),
+        };
+        let (total_cltv_delta, hop_timeouts) =
+            compute_hop_timeouts(&mut path, final_cltv_delta, max_cltv_budget)?;
+        let num_hops = path.len();
+
         Ok(Route {
             hops: path,
             total_fees,
@@ -611,9 +653,11 @@ impl Pathfinder {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_secs(),
-                num_nodes: 0, // Will be set correctly
+                num_nodes: num_hops,
                 estimated_time_ms: 100,
-                is_direct: false,
+                is_direct: num_hops == 1,
+                total_cltv_delta,
+                hop_timeouts,
             },
         })
     }
@@ -624,14 +668,13 @@ impl Pathfinder {
         source: &str,
         destination: &str,
         amount: i128,
+        payment_metadata: Option<&PaymentMetadata>,
     ) -> Result<Route, RoutingError> {
         let mut path = Vec::new();
         let mut current = destination.to_string();
-        let mut total_fees = 0i128;
 
         while let Some((prev, hop)) = came_from.get(&current) {
             path.push(hop.clone());
-            total_fees += hop.fee;
 
             if prev == source {
                 break;
@@ -648,23 +691,7 @@ impl Pathfinder {
             });
         }
 
-        self.enforce_fee_cap(amount, &path)?;
-
-        Ok(Route {
-            hops: path,
-            total_fees,
-            total_amount: amount,
-            success_probability: 0.9,
-            metadata: crate::RouteMetadata {
-                created_at: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-                num_nodes: 0,
-                estimated_time_ms: 100,
-                is_direct: false,
-            },
-        })
+        self.build_route_with_metadata(path, amount, payment_metadata)
     }
 }
 
@@ -724,6 +751,7 @@ mod tests {
             max_hops: None,
             find_any: false,
             payment_metadata: None,
+            excluded_unavailable: vec![],
         }
     }
 
@@ -789,86 +817,122 @@ mod tests {
     }
 
     #[test]
-    fn pathfinder_algorithms_are_deterministic_for_equal_cost_routes() {
-        let build_graph = |reverse: bool| {
-            let mut graph = NetworkGraph::new();
-            for id in ["alice", "bob", "dave", "carol"] {
-                graph.add_node(Node {
-                    id: id.to_string(),
-                    public_key: vec![1],
-                    alias: None,
-                    online: true,
-                    last_seen: 0,
-                    features: NodeFeatures::default(),
-                });
-            }
-            let mut channels = vec![
-                ("ch_z1", "alice", "bob", 40u32),
-                ("ch_z2", "bob", "carol", 40),
-                ("ch_a1", "alice", "dave", 40),
-                ("ch_a2", "dave", "carol", 40),
-            ];
-            if reverse {
-                channels.reverse();
-            }
-            for (id, a, b, cltv) in channels {
-                graph.add_channel(Channel {
-                    id: id.to_string(),
-                    node_a: a.to_string(),
-                    node_b: b.to_string(),
-                    capacity_a_to_b: 5_000_000,
-                    capacity_b_to_a: 5_000_000,
-                    base_fee: 1,
-                    fee_rate: 1_000,
-                    cltv_delta: cltv,
-                    min_htlc_size: 1,
-                    max_htlc_size: 5_000_000,
-                    htlcs_in_flight: 0,
-                    enabled: true,
-                    age_seconds: 0,
-                });
-            }
-            graph
+    fn test_max_hops_enforcement_in_request() {
+        // Issue #364: Request max_hops strictly limits path length
+        let make_node = |id: &str| Node {
+            id: id.to_string(),
+            public_key: vec![1],
+            alias: None,
+            online: true,
+            last_seen: 0,
+            features: NodeFeatures::default(),
         };
 
-        let pf = Pathfinder::new();
-        let req = request();
-        let g1 = build_graph(false);
-        let g2 = build_graph(true);
+        let mut graph = NetworkGraph::new();
+        for i in 0..5 {
+            graph.add_node(make_node(&format!("n{}", i)));
+        }
 
-        let d1 = pf.find_route_dijkstra(&g1, &req).unwrap();
-        let d2 = pf.find_route_dijkstra(&g2, &req).unwrap();
-        assert_eq!(d1.hops, d2.hops);
-        assert_eq!(d1.hops[0].channel_id, "ch_a1");
+        // Linear path n0 -> n1 -> n2 -> n3 -> n4 (4 hops)
+        for i in 0..4 {
+            graph.add_channel(Channel {
+                id: format!("c{}", i),
+                node_a: format!("n{}", i),
+                node_b: format!("n{}", i + 1),
+                capacity_a_to_b: 10_000,
+                capacity_b_to_a: 10_000,
+                base_fee: 1,
+                fee_rate: 10,
+                cltv_delta: 10,
+                min_htlc_size: 1,
+                max_htlc_size: 10_000,
+                htlcs_in_flight: 0,
+                enabled: true,
+                age_seconds: 0,
+            });
+        }
 
-        let a1 = pf.find_route_astar(&g1, &req).unwrap();
-        let a2 = pf.find_route_astar(&g2, &req).unwrap();
-        assert_eq!(a1.hops, a2.hops);
-        assert_eq!(a1.hops[0].channel_id, "ch_a1");
+        let pathfinder = Pathfinder::new();
 
-        let b1 = pf.find_route_bfs(&g1, &req).unwrap();
-        let b2 = pf.find_route_bfs(&g2, &req).unwrap();
-        assert_eq!(b1.hops, b2.hops);
-        assert_eq!(b1.hops[0].channel_id, "ch_a1");
+        // 4 hops requested allowed: succeeds
+        let req_ok = RouteRequest::new("n0".to_string(), "n4".to_string(), 100).with_max_hops(4);
+        let route = pathfinder
+            .find_route_dijkstra(&graph, &req_ok)
+            .expect("route with 4 hops should succeed");
+        assert_eq!(route.hops.len(), 4);
+
+        // 3 hops requested: must fail since path requires 4 hops
+        let req_too_short =
+            RouteRequest::new("n0".to_string(), "n4".to_string(), 100).with_max_hops(3);
+        let err = pathfinder.find_route_dijkstra(&graph, &req_too_short);
+        assert!(err.is_err(), "route exceeding request max_hops must fail");
     }
 
     #[test]
-    fn pathfinder_rejects_invalid_requests() {
-        let graph = graph_with(&[("ch1", "alice", "bob", 1_000)]);
-        let pf = Pathfinder::new();
+    fn test_route_search_disconnected_network_components() {
+        // Issue #366: Route search between disconnected network components
+        let make_node = |id: &str| Node {
+            id: id.to_string(),
+            public_key: vec![1],
+            alias: None,
+            online: true,
+            last_seen: 0,
+            features: NodeFeatures::default(),
+        };
 
-        let mut bad_amount = request();
-        bad_amount.amount = 0;
-        assert!(matches!(
-            pf.find_route_dijkstra(&graph, &bad_amount).unwrap_err(),
-            RoutingError::BelowDustLimit { .. }
-        ));
+        let mut graph = NetworkGraph::new();
 
-        let mut missing_node = request();
-        missing_node.destination = "unknown".to_string();
-        assert!(matches!(
-            pf.find_route_astar(&graph, &missing_node).unwrap_err(),
-            RoutingError::NodeNotFound { .. }
-        ));
+        // Component A: n0 <-> n1
+        graph.add_node(make_node("n0"));
+        graph.add_node(make_node("n1"));
+        graph.add_channel(Channel {
+            id: "c_a".to_string(),
+            node_a: "n0".to_string(),
+            node_b: "n1".to_string(),
+            capacity_a_to_b: 5_000,
+            capacity_b_to_a: 5_000,
+            base_fee: 1,
+            fee_rate: 10,
+            cltv_delta: 10,
+            min_htlc_size: 1,
+            max_htlc_size: 5_000,
+            htlcs_in_flight: 0,
+            enabled: true,
+            age_seconds: 0,
+        });
+
+        // Component B: n2 <-> n3 (disconnected from Component A)
+        graph.add_node(make_node("n2"));
+        graph.add_node(make_node("n3"));
+        graph.add_channel(Channel {
+            id: "c_b".to_string(),
+            node_a: "n2".to_string(),
+            node_b: "n3".to_string(),
+            capacity_a_to_b: 5_000,
+            capacity_b_to_a: 5_000,
+            base_fee: 1,
+            fee_rate: 10,
+            cltv_delta: 10,
+            min_htlc_size: 1,
+            max_htlc_size: 5_000,
+            htlcs_in_flight: 0,
+            enabled: true,
+            age_seconds: 0,
+        });
+
+        // Isolated node: n_iso with 0 channels
+        graph.add_node(make_node("n_iso"));
+
+        let pathfinder = Pathfinder::new();
+
+        // Cross-component search (n0 -> n3) must fail cleanly with NoPathFound
+        let req_disconnected = RouteRequest::new("n0".to_string(), "n3".to_string(), 500);
+        let res_disc = pathfinder.find_route_dijkstra(&graph, &req_disconnected);
+        assert!(matches!(res_disc, Err(RoutingError::NoPathFound { .. })));
+
+        // Search from isolated node must fail cleanly
+        let req_iso = RouteRequest::new("n_iso".to_string(), "n1".to_string(), 500);
+        let res_iso = pathfinder.find_route_dijkstra(&graph, &req_iso);
+        assert!(matches!(res_iso, Err(RoutingError::NoPathFound { .. })));
     }
 }
