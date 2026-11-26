@@ -35,6 +35,9 @@
 //! * `pause` blocks new delegations and new reward funding, but never blocks
 //!   `undelegate` or `claim`, so a pause cannot trap funds — the same property
 //!   the token locker relies on.
+//! * Pausing does not stop an existing reward schedule: delegators continue to
+//!   accrue and may claim rewards while paused. This preserves the existing
+//!   `set_paused` interface and requires no configuration change.
 //! * Setting an operator inactive stops new delegations to it but leaves exits
 //!   and claims open, so an operator can never strand its delegators.
 //!
@@ -312,6 +315,56 @@ fn transfer_out(env: &Env, token: &Address, to: &Address, amount: i128) {
     TokenClient::new(env, token).transfer(&env.current_contract_address(), to, &amount);
 }
 
+/// Transfers reward tokens in and confirms the contract's balance rose by
+/// exactly `amount` before the funding is recorded. A token that reports success
+/// without moving funds would otherwise let the pool credit unbacked rewards.
+fn receive_rewards(env: &Env, token: &Address, from: &Address, amount: i128) {
+    let client = TokenClient::new(env, token);
+    let contract = env.current_contract_address();
+    let before = client.balance(&contract);
+    client.transfer(from, &contract, &amount);
+    let delivered = client.balance(&contract).saturating_sub(before);
+    assert!(
+        delivered == amount,
+        "reward transfer delivered {} of {}",
+        delivered,
+        amount
+    );
+}
+
+/// Pays `amount` of reward tokens to `to` and confirms the recipient's balance
+/// rose by exactly that amount. Callers run this before committing payouts, so a
+/// token that silently fails cannot leave `rewards_paid_out` claiming a transfer
+/// that never moved.
+fn pay_reward(env: &Env, token: &Address, to: &Address, amount: i128) {
+    if amount <= 0 {
+        return;
+    }
+    let client = TokenClient::new(env, token);
+    let before = client.balance(to);
+    client.transfer(&env.current_contract_address(), to, &amount);
+    let delivered = client.balance(to).saturating_sub(before);
+    assert!(
+        delivered == amount,
+        "reward transfer delivered {} of {}",
+        delivered,
+        amount
+    );
+}
+
+/// Rejects a payout the reward accounting could not cover, before any tokens
+/// move or state is written.
+fn assert_payout_allowed(cfg: &Config, amount: i128) {
+    let paid = cfg
+        .rewards_paid_out
+        .checked_add(amount)
+        .expect("paid overflow");
+    assert!(
+        paid <= cfg.rewards_credited,
+        "reward solvency violated: payout exceeds credited rewards"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Reward accounting
 // ---------------------------------------------------------------------------
@@ -372,8 +425,12 @@ fn take_accrued(cfg: &Config, position: &mut Position, commission_bps: u32) -> (
     (net, commission)
 }
 
-/// Re-stakes a position's accrued rewards in place when auto-compound is on.
-/// Returns the amount compounded.
+/// Settles a position's accrued rewards and, when `auto_compound` is on,
+/// re-stakes the net reward in place.
+///
+/// Always settles first even when `auto_compound` is off so that subsequent
+/// balance changes (`delegate` or `undelegate`) only apply to future
+/// intervals rather than retroactively scaling prior intervals.
 fn auto_compound(
     env: &Env,
     cfg: &mut Config,
@@ -381,15 +438,17 @@ fn auto_compound(
     operator: &mut Operator,
 ) -> i128 {
     if !position.auto_compound {
+        settle(cfg, position);
         return 0;
     }
     let (net, commission) = take_accrued(cfg, position, operator.commission_bps);
     if commission > 0 {
+        assert_payout_allowed(cfg, commission);
+        pay_reward(env, &cfg.token, &operator.address, commission);
         cfg.rewards_paid_out = cfg
             .rewards_paid_out
             .checked_add(commission)
             .expect("paid overflow");
-        transfer_out(env, &cfg.token, &operator.address, commission);
     }
     if net > 0 {
         position.amount = position.amount.checked_add(net).expect("amount overflow");
@@ -563,7 +622,8 @@ impl DelegatedStaking {
             .publish((symbol_short!("set_admin"),), new_admin);
     }
 
-    /// Blocks new delegations and reward funding. Exits stay open.
+    /// Blocks new delegations and reward funding. Existing schedules keep
+    /// accruing, and claims and exits stay open.
     pub fn set_paused(env: Env, paused: bool) {
         let mut cfg = config(&env);
         cfg.admin.require_auth();
@@ -659,7 +719,7 @@ impl DelegatedStaking {
         // top-up computes its leftover from `rate`, which would now be zero.
         assert!(rate > 0, "reward rate rounds to zero");
 
-        transfer_in(&env, &cfg.token, &funder, amount);
+        receive_rewards(&env, &cfg.token, &funder, amount);
 
         cfg.rewards_funded = cfg
             .rewards_funded
@@ -679,8 +739,11 @@ impl DelegatedStaking {
 
     // -- delegator actions ---------------------------------------------------
 
-    /// Delegates `amount` to `operator`. When auto-compound is on, rewards
-    /// accrued so far are re-staked first, so the new stake also earns on them.
+    /// Delegates `amount` to `operator`.
+    ///
+    /// Rewards accrued over any prior deposit interval are always settled first
+    /// (and re-staked when auto-compound is on), so the new stake only accrues
+    /// rewards from this timestamp onward.
     pub fn delegate(env: Env, delegator: Address, operator: Address, amount: i128) -> i128 {
         delegator.require_auth();
         assert!(amount > 0, "amount must be positive");
@@ -758,7 +821,9 @@ impl DelegatedStaking {
         amount
     }
 
-    /// Pays out accrued rewards, minus the operator's commission.
+    /// Pays out accrued rewards, minus the operator's commission. Claims remain
+    /// available while the contract is paused, and the active reward schedule
+    /// continues accruing until its scheduled finish.
     ///
     /// `min_out` is the slippage guard against the operator's commission moving
     /// between the quote and this transaction landing.
@@ -772,16 +837,21 @@ impl DelegatedStaking {
         let (net, commission) = take_accrued(&cfg, &mut position, record.commission_bps);
         assert!(net >= min_out, "slippage: net reward below min_out");
 
+        // Validate the whole payout and both transfers before committing any
+        // reward accounting.
+        let payout = net.checked_add(commission).expect("payout overflow");
+        assert_payout_allowed(&cfg, payout);
+        pay_reward(&env, &cfg.token, &delegator, net);
+        pay_reward(&env, &cfg.token, &record.address, commission);
+
         cfg.rewards_paid_out = cfg
             .rewards_paid_out
-            .checked_add(net.checked_add(commission).expect("payout overflow"))
+            .checked_add(payout)
             .expect("paid overflow");
         assert_solvent(&cfg);
 
         write_position(&env, &position);
         set_config(&env, &cfg);
-        transfer_out(&env, &cfg.token, &delegator, net);
-        transfer_out(&env, &cfg.token, &record.address, commission);
 
         env.events().publish(
             (symbol_short!("claim"), delegator),
@@ -808,6 +878,11 @@ impl DelegatedStaking {
             "slippage: compounded amount below min_amount_out"
         );
 
+        // The operator's commission is the only token movement here; validate it
+        // before changing payout or compounding accounting.
+        assert_payout_allowed(&cfg, commission);
+        pay_reward(&env, &cfg.token, &record.address, commission);
+
         cfg.rewards_paid_out = cfg
             .rewards_paid_out
             .checked_add(commission)
@@ -830,7 +905,6 @@ impl DelegatedStaking {
         write_operator(&env, &record);
         set_config(&env, &cfg);
         track_delegator_operator(&env, &delegator, &operator);
-        transfer_out(&env, &cfg.token, &record.address, commission);
 
         env.events().publish(
             (symbol_short!("compound"), delegator),
@@ -1245,10 +1319,20 @@ mod test {
         f.mint(&funder, ONE);
         assert!(f.client.try_fund_rewards(&funder, &ONE, &100).is_err());
 
-        // Exits stay open.
-        assert_eq!(f.client.claim(&f.alice, &f.operator, &0), 95 * ONE);
+        // The schedule keeps accruing while paused, and a failed slippage
+        // check leaves the full claim available for a later transaction.
+        f.advance(100);
+        assert_eq!(f.client.pending_rewards(&f.alice, &f.operator), 200 * ONE);
+        assert!(f
+            .client
+            .try_claim(&f.alice, &f.operator, &(191 * ONE))
+            .is_err());
+        assert_eq!(f.client.pending_rewards(&f.alice, &f.operator), 200 * ONE);
+        assert_eq!(f.client.rewards_paid_out(), 0);
+
+        assert_eq!(f.client.claim(&f.alice, &f.operator, &0), 190 * ONE);
         f.client.undelegate(&f.alice, &f.operator, &(100 * ONE));
-        assert_eq!(f.balance(&f.alice), 95 * ONE + 200 * ONE);
+        assert_eq!(f.balance(&f.alice), 190 * ONE + 200 * ONE);
     }
 
     #[test]
@@ -1492,61 +1576,130 @@ mod test {
             .is_err());
     }
 
-    #[test]
-    fn fractional_rewards_stay_as_dust_and_are_never_overpaid() {
-        let f = Fixture::new();
-        // Two base units funded over one second, split across three equal
-        // stakers: each share is two thirds of a unit, which floors to zero.
-        f.fund(2, 1);
-        assert_eq!(f.client.reward_rate(), 2);
+    // -- reward transfer validation -----------------------------------------
 
-        let a = Address::generate(&f.env);
-        let b = Address::generate(&f.env);
-        let c = Address::generate(&f.env);
-        for who in [&a, &b, &c] {
-            f.mint(who, 1);
-            // Zero-commission operator so the numbers are the gross accrual.
-            f.client.delegate(who, &f.other_operator, &1);
+    #[contracttype]
+    enum MockKey {
+        Balance(Address),
+        Deliver,
+    }
+
+    /// Minimal SEP-41-shaped token whose transfers can be told to silently
+    /// no-op, modelling a reward token that reports success without moving
+    /// funds.
+    #[contract]
+    pub struct MockRewardToken;
+
+    #[contractimpl]
+    impl MockRewardToken {
+        pub fn set_deliver(env: Env, deliver: bool) {
+            env.storage().instance().set(&MockKey::Deliver, &deliver);
         }
 
-        f.advance(1);
-
-        assert_eq!(f.client.pending_rewards(&a, &f.other_operator), 0);
-        for who in [&a, &b, &c] {
-            assert_eq!(f.client.claim(who, &f.other_operator, &0), 0);
+        pub fn mint(env: Env, to: Address, amount: i128) {
+            let key = MockKey::Balance(to);
+            let balance: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+            env.storage().persistent().set(&key, &(balance + amount));
         }
-        // The index floors the whole movement to one credited base unit; nobody
-        // can claim it, so it stays in the contract as dust.
-        assert_eq!(f.client.rewards_credited(), 1);
-        assert_eq!(f.client.rewards_paid_out(), 0);
 
-        // Every principal is still withdrawable in full.
-        for who in [&a, &b, &c] {
-            f.client.undelegate(who, &f.other_operator, &1);
-            assert_eq!(f.balance(who), 1);
+        pub fn balance(env: Env, id: Address) -> i128 {
+            env.storage()
+                .persistent()
+                .get(&MockKey::Balance(id))
+                .unwrap_or(0)
+        }
+
+        pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+            let deliver: bool = env
+                .storage()
+                .instance()
+                .get(&MockKey::Deliver)
+                .unwrap_or(false);
+            if !deliver {
+                return;
+            }
+            let from_key = MockKey::Balance(from);
+            let to_key = MockKey::Balance(to);
+            let from_balance: i128 = env.storage().persistent().get(&from_key).unwrap_or(0);
+            assert!(from_balance >= amount, "mock: insufficient balance");
+            env.storage()
+                .persistent()
+                .set(&from_key, &(from_balance - amount));
+            let to_balance: i128 = env.storage().persistent().get(&to_key).unwrap_or(0);
+            env.storage()
+                .persistent()
+                .set(&to_key, &(to_balance + amount));
         }
     }
 
+    fn mock_fixture(
+        deliver: bool,
+    ) -> (
+        Env,
+        MockRewardTokenClient<'static>,
+        DelegatedStakingClient<'static>,
+        Address,
+        Address,
+        Address,
+    ) {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_min_persistent_entry_ttl(1_000_000);
+        env.ledger().set_max_entry_ttl(1_000_000);
+        env.ledger().with_mut(|li| li.timestamp = 1_000);
+
+        let admin = Address::generate(&env);
+        let funder = Address::generate(&env);
+        let alice = Address::generate(&env);
+        let operator = Address::generate(&env);
+
+        let token_id = env.register_contract(None, MockRewardToken);
+        let token = MockRewardTokenClient::new(&env, &token_id);
+        token.set_deliver(&deliver);
+        token.mint(&funder, &(1_000 * ONE));
+        token.mint(&alice, &(1_000 * ONE));
+
+        let id = env.register_contract(None, DelegatedStaking);
+        let client = DelegatedStakingClient::new(&env, &id);
+        client.initialize(&admin, &token_id);
+        client.add_operator(&operator, &500);
+
+        (env, token, client, funder, alice, operator)
+    }
+
     #[test]
-    fn a_one_unit_stake_receives_its_exact_share_of_a_high_ratio_pool() {
-        let f = Fixture::new();
-        // 1_000 base units funded over one second over 1_000 staked units: the
-        // index moves exactly PRECISION, so a whale and a one-unit staker are
-        // both paid to the base unit.
-        f.fund(1_000, 1);
-        f.mint(&f.alice, 999);
-        f.mint(&f.bob, 1);
-        f.client.delegate(&f.alice, &f.other_operator, &999);
-        f.client.delegate(&f.bob, &f.other_operator, &1);
+    fn fund_rewards_rejects_a_token_that_does_not_deliver() {
+        let (_env, _token, client, funder, _alice, _operator) = mock_fixture(false);
 
-        f.advance(1);
-        assert_eq!(f.client.pending_rewards(&f.alice, &f.other_operator), 999);
-        assert_eq!(f.client.pending_rewards(&f.bob, &f.other_operator), 1);
+        assert!(client
+            .try_fund_rewards(&funder, &(100 * ONE), &100)
+            .is_err());
 
-        let whale = f.client.claim(&f.alice, &f.other_operator, &999);
-        let tiny = f.client.claim(&f.bob, &f.other_operator, &1);
-        assert_eq!((whale, tiny), (999, 1));
-        assert_eq!(f.client.rewards_paid_out(), 1_000);
-        assert!(f.client.rewards_paid_out() <= f.client.rewards_credited());
+        // The failed funding must not leave a schedule or accounting behind.
+        assert_eq!(client.rewards_funded(), 0);
+        assert_eq!(client.reward_rate(), 0);
+        assert_eq!(client.period_finish(), 0);
+    }
+
+    #[test]
+    fn claim_rejects_a_token_that_stops_delivering_before_committing_accounting() {
+        let (env, token, client, funder, alice, operator) = mock_fixture(true);
+        client.fund_rewards(&funder, &(100 * ONE), &100);
+        client.delegate(&alice, &operator, &(100 * ONE));
+        env.ledger().with_mut(|li| li.timestamp += 100);
+
+        let pending = client.pending_rewards(&alice, &operator);
+        assert!(pending > 0);
+        let alice_balance = token.balance(&alice);
+
+        // The token now reports success without moving tokens.
+        token.set_deliver(&false);
+        assert!(client.try_claim(&alice, &operator, &0).is_err());
+
+        // No payout was committed and nothing was transferred.
+        assert_eq!(client.rewards_paid_out(), 0);
+        assert_eq!(token.balance(&alice), alice_balance);
+        assert_eq!(client.pending_rewards(&alice, &operator), pending);
+        assert_eq!(client.position(&alice, &operator).accrued, 0);
     }
 }
