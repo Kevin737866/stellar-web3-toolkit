@@ -4,7 +4,8 @@
 
 use crate::fee_cap::FeeCap;
 use crate::{
-    build_exclusion_set, NetworkGraph, Route, RouteHop, RouteRequest, RoutingError, MAX_ROUTE_HOPS,
+    compute_hop_timeouts, NetworkGraph, PaymentMetadata, Route, RouteHop, RouteRequest,
+    RoutingError, MAX_ROUTE_HOPS,
 };
 use fxhash::FxHashMap;
 use priority_queue::PriorityQueue;
@@ -81,15 +82,23 @@ impl Pathfinder {
             let (final_cost, path) = dist.get(&node).unwrap().clone();
 
             if node == request.destination {
-                return self.build_route(path, request.amount);
+                return self.build_route_with_metadata(
+                    path,
+                    request.amount,
+                    request.payment_metadata.as_ref(),
+                );
             }
 
             if cost > final_cost {
                 continue;
             }
 
-            // Check hop limit
-            if path.len() >= self.max_hops {
+            // Check hop limit (Issue #364)
+            let effective_max_hops = request
+                .max_hops
+                .map(|h| h.min(self.max_hops))
+                .unwrap_or(self.max_hops);
+            if path.len() >= effective_max_hops {
                 continue;
             }
 
@@ -186,6 +195,7 @@ impl Pathfinder {
                     &request.source,
                     &request.destination,
                     request.amount,
+                    request.payment_metadata.as_ref(),
                 );
             }
 
@@ -261,10 +271,18 @@ impl Pathfinder {
 
         while let Some((current, path)) = queue.pop_front() {
             if current == request.destination {
-                return self.build_route(path, request.amount);
+                return self.build_route_with_metadata(
+                    path,
+                    request.amount,
+                    request.payment_metadata.as_ref(),
+                );
             }
 
-            if path.len() >= self.max_hops {
+            let effective_max_hops = request
+                .max_hops
+                .map(|h| h.min(self.max_hops))
+                .unwrap_or(self.max_hops);
+            if path.len() >= effective_max_hops {
                 continue;
             }
 
@@ -415,7 +433,7 @@ impl Pathfinder {
             });
         }
 
-        self.build_route(path, request.amount)
+        self.build_route_with_metadata(path, request.amount, request.payment_metadata.as_ref())
     }
 
     fn calculate_fee(&self, channel: &crate::Channel, amount: i128) -> i128 {
@@ -472,6 +490,15 @@ impl Pathfinder {
     }
 
     fn build_route(&self, path: Vec<RouteHop>, amount: i128) -> Result<Route, RoutingError> {
+        self.build_route_with_metadata(path, amount, None)
+    }
+
+    fn build_route_with_metadata(
+        &self,
+        mut path: Vec<RouteHop>,
+        amount: i128,
+        payment_metadata: Option<&PaymentMetadata>,
+    ) -> Result<Route, RoutingError> {
         if path.is_empty() {
             return Err(RoutingError::NoPathFound {
                 origin: "unknown".to_string(),
@@ -491,6 +518,14 @@ impl Pathfinder {
 
         self.enforce_fee_cap(amount, &path)?;
 
+        let (final_cltv_delta, max_cltv_budget) = match payment_metadata {
+            Some(meta) => (meta.required_cltv_delta.unwrap_or(0), meta.payment_expiry),
+            None => (0, None),
+        };
+        let (total_cltv_delta, hop_timeouts) =
+            compute_hop_timeouts(&mut path, final_cltv_delta, max_cltv_budget)?;
+        let num_hops = path.len();
+
         Ok(Route {
             hops: path,
             total_fees,
@@ -501,9 +536,11 @@ impl Pathfinder {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_secs(),
-                num_nodes: 0, // Will be set correctly
+                num_nodes: num_hops,
                 estimated_time_ms: 100,
-                is_direct: false,
+                is_direct: num_hops == 1,
+                total_cltv_delta,
+                hop_timeouts,
             },
         })
     }
@@ -514,14 +551,13 @@ impl Pathfinder {
         source: &str,
         destination: &str,
         amount: i128,
+        payment_metadata: Option<&PaymentMetadata>,
     ) -> Result<Route, RoutingError> {
         let mut path = Vec::new();
         let mut current = destination.to_string();
-        let mut total_fees = 0i128;
 
         while let Some((prev, hop)) = came_from.get(&current) {
             path.push(hop.clone());
-            total_fees += hop.fee;
 
             if prev == source {
                 break;
@@ -538,23 +574,7 @@ impl Pathfinder {
             });
         }
 
-        self.enforce_fee_cap(amount, &path)?;
-
-        Ok(Route {
-            hops: path,
-            total_fees,
-            total_amount: amount,
-            success_probability: 0.9,
-            metadata: crate::RouteMetadata {
-                created_at: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-                num_nodes: 0,
-                estimated_time_ms: 100,
-                is_direct: false,
-            },
-        })
+        self.build_route_with_metadata(path, amount, payment_metadata)
     }
 }
 
@@ -679,130 +699,123 @@ mod tests {
             .is_ok());
     }
 
-    // ── Temporarily-unavailable channel exclusion (Pathfinder) ───────────────
-
-    fn request_exclude(channel_id: &str) -> RouteRequest {
-        use crate::{UnavailabilityReason, UnavailableChannel};
-        RouteRequest {
-            excluded_unavailable: vec![UnavailableChannel::until(
-                channel_id.to_string(),
-                UnavailabilityReason::ForwardingFailure,
-                None,
-            )],
-            ..request()
-        }
-    }
-
-    /// All four search algorithms respect the `excluded_unavailable` list.
     #[test]
-    fn all_algorithms_skip_excluded_unavailable_channels() {
-        // ch2 is the only way to reach carol; excluding it must block all
-        // algorithms.
-        let graph = graph_with(&[
-            ("ch1", "alice", "bob", 1_000),
-            ("ch2", "bob", "carol", 1_000),
-        ]);
-        let req = request_exclude("ch2");
-        let pathfinder = Pathfinder::new();
-
-        assert!(pathfinder.find_route_dijkstra(&graph, &req).is_err());
-        assert!(pathfinder.find_route_astar(&graph, &req).is_err());
-        assert!(pathfinder.find_route_bfs(&graph, &req).is_err());
-        assert!(pathfinder.find_random_route(&graph, &req).is_err());
-    }
-
-    /// When the excluded channel has a valid alternative, all algorithms find
-    /// the alternative.
-    #[test]
-    fn all_algorithms_find_alternative_when_one_channel_excluded() {
-        // Build a four-node graph so the alternative is two hops from alice.
-        let mut graph = NetworkGraph::new();
-        for id in ["alice", "bob", "carol", "dave"] {
-            graph.add_node(Node {
-                id: id.to_string(),
-                public_key: vec![1],
-                alias: None,
-                online: true,
-                last_seen: 0,
-                features: NodeFeatures::default(),
-            });
-        }
-        // Direct path alice->bob->carol
-        for (id, a, b) in [("ch1", "alice", "bob"), ("ch2", "bob", "carol")] {
-            graph.add_channel(Channel {
-                id: id.to_string(),
-                node_a: a.to_string(),
-                node_b: b.to_string(),
-                capacity_a_to_b: 5_000_000,
-                capacity_b_to_a: 5_000_000,
-                base_fee: 1,
-                fee_rate: 1_000,
-                cltv_delta: 40,
-                min_htlc_size: 1,
-                max_htlc_size: 5_000_000,
-                htlcs_in_flight: 0,
-                enabled: true,
-                age_seconds: 0,
-            });
-        }
-        // Alternative path alice->dave->carol
-        for (id, a, b) in [("ch3", "alice", "dave"), ("ch4", "dave", "carol")] {
-            graph.add_channel(Channel {
-                id: id.to_string(),
-                node_a: a.to_string(),
-                node_b: b.to_string(),
-                capacity_a_to_b: 5_000_000,
-                capacity_b_to_a: 5_000_000,
-                base_fee: 1,
-                fee_rate: 1_000,
-                cltv_delta: 40,
-                min_htlc_size: 1,
-                max_htlc_size: 5_000_000,
-                htlcs_in_flight: 0,
-                enabled: true,
-                age_seconds: 0,
-            });
-        }
-
-        let req = request_exclude("ch2"); // block direct path
-        let pathfinder = Pathfinder::new();
-
-        for route in [
-            pathfinder.find_route_dijkstra(&graph, &req).unwrap(),
-            pathfinder.find_route_astar(&graph, &req).unwrap(),
-            pathfinder.find_route_bfs(&graph, &req).unwrap(),
-        ] {
-            assert!(
-                route.hops.iter().all(|h| h.channel_id != "ch2"),
-                "route must not use excluded channel"
-            );
-        }
-    }
-
-    /// An invalid exclusion entry (empty channel ID) causes all algorithms to
-    /// return an error immediately.
-    #[test]
-    fn invalid_exclusion_aborts_all_algorithms() {
-        use crate::{UnavailabilityReason, UnavailableChannel};
-        let graph = graph_with(&[("ch1", "alice", "bob", 1_000)]);
-        let req = RouteRequest {
-            source: "alice".to_string(),
-            destination: "bob".to_string(),
-            amount: 1_000,
-            max_fee_budget: None,
-            max_hops: None,
-            find_any: false,
-            payment_metadata: None,
-            excluded_unavailable: vec![UnavailableChannel::until(
-                String::new(), // invalid
-                UnavailabilityReason::Other,
-                None,
-            )],
+    fn test_max_hops_enforcement_in_request() {
+        // Issue #364: Request max_hops strictly limits path length
+        let make_node = |id: &str| Node {
+            id: id.to_string(),
+            public_key: vec![1],
+            alias: None,
+            online: true,
+            last_seen: 0,
+            features: NodeFeatures::default(),
         };
+
+        let mut graph = NetworkGraph::new();
+        for i in 0..5 {
+            graph.add_node(make_node(&format!("n{}", i)));
+        }
+
+        // Linear path n0 -> n1 -> n2 -> n3 -> n4 (4 hops)
+        for i in 0..4 {
+            graph.add_channel(Channel {
+                id: format!("c{}", i),
+                node_a: format!("n{}", i),
+                node_b: format!("n{}", i + 1),
+                capacity_a_to_b: 10_000,
+                capacity_b_to_a: 10_000,
+                base_fee: 1,
+                fee_rate: 10,
+                cltv_delta: 10,
+                min_htlc_size: 1,
+                max_htlc_size: 10_000,
+                htlcs_in_flight: 0,
+                enabled: true,
+                age_seconds: 0,
+            });
+        }
+
         let pathfinder = Pathfinder::new();
-        assert!(pathfinder.find_route_dijkstra(&graph, &req).is_err());
-        assert!(pathfinder.find_route_astar(&graph, &req).is_err());
-        assert!(pathfinder.find_route_bfs(&graph, &req).is_err());
-        assert!(pathfinder.find_random_route(&graph, &req).is_err());
+
+        // 4 hops requested allowed: succeeds
+        let req_ok = RouteRequest::new("n0".to_string(), "n4".to_string(), 100).with_max_hops(4);
+        let route = pathfinder
+            .find_route_dijkstra(&graph, &req_ok)
+            .expect("route with 4 hops should succeed");
+        assert_eq!(route.hops.len(), 4);
+
+        // 3 hops requested: must fail since path requires 4 hops
+        let req_too_short =
+            RouteRequest::new("n0".to_string(), "n4".to_string(), 100).with_max_hops(3);
+        let err = pathfinder.find_route_dijkstra(&graph, &req_too_short);
+        assert!(err.is_err(), "route exceeding request max_hops must fail");
+    }
+
+    #[test]
+    fn test_route_search_disconnected_network_components() {
+        // Issue #366: Route search between disconnected network components
+        let make_node = |id: &str| Node {
+            id: id.to_string(),
+            public_key: vec![1],
+            alias: None,
+            online: true,
+            last_seen: 0,
+            features: NodeFeatures::default(),
+        };
+
+        let mut graph = NetworkGraph::new();
+
+        // Component A: n0 <-> n1
+        graph.add_node(make_node("n0"));
+        graph.add_node(make_node("n1"));
+        graph.add_channel(Channel {
+            id: "c_a".to_string(),
+            node_a: "n0".to_string(),
+            node_b: "n1".to_string(),
+            capacity_a_to_b: 5_000,
+            capacity_b_to_a: 5_000,
+            base_fee: 1,
+            fee_rate: 10,
+            cltv_delta: 10,
+            min_htlc_size: 1,
+            max_htlc_size: 5_000,
+            htlcs_in_flight: 0,
+            enabled: true,
+            age_seconds: 0,
+        });
+
+        // Component B: n2 <-> n3 (disconnected from Component A)
+        graph.add_node(make_node("n2"));
+        graph.add_node(make_node("n3"));
+        graph.add_channel(Channel {
+            id: "c_b".to_string(),
+            node_a: "n2".to_string(),
+            node_b: "n3".to_string(),
+            capacity_a_to_b: 5_000,
+            capacity_b_to_a: 5_000,
+            base_fee: 1,
+            fee_rate: 10,
+            cltv_delta: 10,
+            min_htlc_size: 1,
+            max_htlc_size: 5_000,
+            htlcs_in_flight: 0,
+            enabled: true,
+            age_seconds: 0,
+        });
+
+        // Isolated node: n_iso with 0 channels
+        graph.add_node(make_node("n_iso"));
+
+        let pathfinder = Pathfinder::new();
+
+        // Cross-component search (n0 -> n3) must fail cleanly with NoPathFound
+        let req_disconnected = RouteRequest::new("n0".to_string(), "n3".to_string(), 500);
+        let res_disc = pathfinder.find_route_dijkstra(&graph, &req_disconnected);
+        assert!(matches!(res_disc, Err(RoutingError::NoPathFound { .. })));
+
+        // Search from isolated node must fail cleanly
+        let req_iso = RouteRequest::new("n_iso".to_string(), "n1".to_string(), 500);
+        let res_iso = pathfinder.find_route_dijkstra(&graph, &req_iso);
+        assert!(matches!(res_iso, Err(RoutingError::NoPathFound { .. })));
     }
 }

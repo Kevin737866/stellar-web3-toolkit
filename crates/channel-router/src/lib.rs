@@ -4,47 +4,21 @@
 //! Implements path-finding algorithms for routing payments through
 //! the payment channel network.
 //!
-//! ## Excluding temporarily unavailable channels
-//!
-//! Callers that know a channel is currently offline (e.g. because a previous
-//! payment attempt just returned a forwarding failure) can exclude it from the
-//! next route search without permanently removing it from the graph.  Pass one
-//! or more [`UnavailableChannel`] entries in
-//! [`RouteRequest::excluded_unavailable`]:
-//!
-//! ```rust,no_run
-//! use channel_router::{RouteRequest, UnavailableChannel, UnavailabilityReason};
-//!
-//! let request = RouteRequest {
-//!     source: "alice".to_string(),
-//!     destination: "carol".to_string(),
-//!     amount: 100_000,
-//!     max_fee_budget: None,
-//!     max_hops: None,
-//!     find_any: false,
-//!     payment_metadata: None,
-//!     excluded_unavailable: vec![
-//!         UnavailableChannel::until(
-//!             "ch_flaky".to_string(),
-//!             UnavailabilityReason::ForwardingFailure,
-//!             Some(1_700_000_060),   // Unix timestamp after which it may be retried
-//!         ),
-//!     ],
-//! };
-//! ```
-//!
-//! Channels in `excluded_unavailable` are skipped by **all** route-search
-//! code paths: [`find_best_route`], [`find_best_route_with_cap`], and every
-//! algorithm inside [`pathfinder::Pathfinder`].  Callers that do not need this
-//! feature leave `excluded_unavailable` as an empty `Vec` and see no change in
-//! behaviour.
+//! Policy rejections can be explained with [`find_best_route_with_policy`] and
+//! [`evaluate_route_policy`], which report the candidate route and the exact
+//! rule it broke (issue #365).
 
 pub mod fee_cap;
 pub mod graph;
 pub mod pathfinder;
 pub mod policy;
+pub mod policy_report;
 
 pub use fee_cap::FeeCap;
+pub use policy_report::{
+    CandidateRouteFailure, CandidateRouteSummary, PolicyFailureReason, RouteEvaluationReport,
+    RoutePolicyError,
+};
 
 use fxhash::FxHashMap;
 use priority_queue::PriorityQueue;
@@ -98,6 +72,9 @@ pub enum RoutingError {
     #[error("Invalid node address")]
     InvalidNodeAddress,
 
+    #[error("Route failed policy checks: {0}")]
+    PolicyCheckFailed(String),
+
     #[error(
         "Channel {channel_id} advertises a fee rate of {fee_rate} ppm, above the protocol cap of {cap} ppm"
     )]
@@ -129,119 +106,14 @@ pub enum RoutingError {
     #[error("Route declares {declared} in fees but its hops sum to {actual}")]
     InconsistentRouteFees { declared: i128, actual: i128 },
 
-    #[error(
-        "Channel {channel_id} is temporarily unavailable ({reason:?}) \
-         and was excluded from routing"
-    )]
-    ChannelTemporarilyUnavailable {
-        channel_id: String,
-        reason: UnavailabilityReason,
-    },
-}
+    #[error("Route requires total CLTV delta {required}, above budget of {max_allowed}")]
+    TimeoutExceedsBudget { required: u32, max_allowed: u32 },
 
-// ── Temporary channel exclusion ─────────────────────────────────────────────
+    #[error("Invalid timeout requirement on channel {channel_id}: {reason}")]
+    InvalidHopTimeout { channel_id: String, reason: String },
 
-/// Why a channel is being excluded for the duration of a single routing
-/// attempt.
-///
-/// This is informational: the router skips the channel regardless of which
-/// variant is used.  Callers should choose the variant that best matches what
-/// they observed so that logs and metrics are meaningful.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum UnavailabilityReason {
-    /// The channel returned a forwarding failure on a recent payment attempt.
-    ForwardingFailure,
-    /// The remote peer is not reachable right now.
-    PeerOffline,
-    /// The channel is offline or in a closing/negotiation state.
-    ChannelOffline,
-    /// The channel has insufficient liquidity in the required direction.
-    InsufficientLiquidity,
-    /// A caller-defined reason not covered by the variants above.
-    Other,
-}
-
-/// A channel that must not be used for the current routing attempt.
-///
-/// Include one of these in [`RouteRequest::excluded_unavailable`] to prevent
-/// the router from using a channel that is known to be temporarily
-/// non-functional.  The exclusion applies only to the single
-/// [`RouteRequest`] in which it appears; the channel remains in the
-/// [`NetworkGraph`] and will be considered again the next time a route is
-/// searched.
-///
-/// # Invariants
-///
-/// * `channel_id` must not be empty — an empty string is rejected with
-///   [`RoutingError::ChannelNotFound`].
-/// * `unavailable_until` is optional.  If `Some`, it is a Unix timestamp
-///   (seconds since the epoch) after which the channel *may* be retried.
-///   The router itself does not consult this value at search time — it is
-///   stored so that callers can pass it through scheduling code — but it must
-///   not be zero when present (zero is treated as "no expiry" and is rejected
-///   to avoid ambiguity; callers that truly mean "expire immediately" should
-///   pass `None`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UnavailableChannel {
-    /// ID of the channel to exclude.
-    pub channel_id: String,
-    /// Why the channel is unavailable.
-    pub reason: UnavailabilityReason,
-    /// Unix timestamp after which the channel may be retried, if known.
-    pub unavailable_until: Option<u64>,
-}
-
-impl UnavailableChannel {
-    /// Construct an [`UnavailableChannel`], validating that `channel_id` is
-    /// non-empty and that `unavailable_until`, when present, is non-zero.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RoutingError::ChannelNotFound`] if `channel_id` is empty.
-    /// Returns [`RoutingError::InvalidNodeAddress`] if `unavailable_until`
-    /// is `Some(0)` (zero is ambiguous; use `None` for "no expiry").
-    pub fn until(
-        channel_id: String,
-        reason: UnavailabilityReason,
-        unavailable_until: Option<u64>,
-    ) -> Self {
-        // The constructing caller is trusted to supply valid data; validation
-        // is performed by `validate()` before the entry is used by the router.
-        UnavailableChannel {
-            channel_id,
-            reason,
-            unavailable_until,
-        }
-    }
-
-    /// Validate this entry.
-    ///
-    /// Called automatically by the routing functions before the exclusion list
-    /// is applied.
-    pub fn validate(&self) -> Result<(), RoutingError> {
-        if self.channel_id.is_empty() {
-            return Err(RoutingError::ChannelNotFound {
-                channel_id: "(empty)".to_string(),
-            });
-        }
-        if self.unavailable_until == Some(0) {
-            return Err(RoutingError::InvalidNodeAddress);
-        }
-        Ok(())
-    }
-}
-
-/// Build a lookup set of channel IDs that must be skipped, validating each
-/// entry first.  Returns the first validation error encountered.
-pub(crate) fn build_exclusion_set(
-    entries: &[UnavailableChannel],
-) -> Result<HashSet<&str>, RoutingError> {
-    let mut set = HashSet::with_capacity(entries.len());
-    for entry in entries {
-        entry.validate()?;
-        set.insert(entry.channel_id.as_str());
-    }
-    Ok(set)
+    #[error("Cumulative CLTV timeout delta overflowed u32")]
+    TimeoutOverflow,
 }
 
 /// Represents a node in the payment channel network
@@ -330,6 +202,41 @@ pub struct Route {
     pub metadata: RouteMetadata,
 }
 
+impl Route {
+    /// Per-hop timeout requirements ordered from source to destination.
+    pub fn hop_timeouts(&self) -> &[HopTimeout] {
+        &self.metadata.hop_timeouts
+    }
+
+    /// Total cumulative CLTV delta required at the first hop of the route.
+    pub fn total_cltv_delta(&self) -> u32 {
+        self.metadata.total_cltv_delta
+    }
+
+    /// Resolve per-hop absolute expiry heights relative to `base_height`.
+    ///
+    /// Each hop's `expiry_height` is `base_height + incoming_cltv_delta`,
+    /// preserving strictly decreasing timeouts from source to destination.
+    pub fn hop_timeouts_from_height(
+        &self,
+        base_height: u32,
+    ) -> Result<Vec<HopTimeout>, RoutingError> {
+        self.metadata
+            .hop_timeouts
+            .iter()
+            .map(|t| {
+                let expiry_height = base_height
+                    .checked_add(t.incoming_cltv_delta)
+                    .ok_or(RoutingError::TimeoutOverflow)?;
+                Ok(HopTimeout {
+                    expiry_height,
+                    ..t.clone()
+                })
+            })
+            .collect()
+    }
+}
+
 /// A single hop in a route
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteHop {
@@ -375,6 +282,29 @@ impl RouteHop {
     }
 }
 
+/// Per-hop timeout requirement derived from channel CLTV deltas and optional
+/// payment metadata.
+///
+/// For a route `source -> h_0 -> h_1 -> ... -> h_{n-1} (destination)`,
+/// `incoming_cltv_delta` is the cumulative time-lock delta required on the
+/// HTLC entering this hop, and `outgoing_cltv_delta` is the delta forwarded
+/// to the next hop (`incoming_cltv_delta - outgoing_cltv_delta == cltv_delta`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HopTimeout {
+    /// Channel ID for this hop.
+    pub channel_id: String,
+    /// Node ID reached by this hop.
+    pub node_id: String,
+    /// Time-lock delta required by this hop's channel.
+    pub cltv_delta: u32,
+    /// Cumulative CLTV delta from this hop through the destination.
+    pub incoming_cltv_delta: u32,
+    /// Cumulative CLTV delta forwarded to the next hop.
+    pub outgoing_cltv_delta: u32,
+    /// Expiry height (equals `incoming_cltv_delta` unless offset from a base height).
+    pub expiry_height: u32,
+}
+
 /// Additional metadata for a route
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteMetadata {
@@ -386,6 +316,74 @@ pub struct RouteMetadata {
     pub estimated_time_ms: u64,
     /// Whether this is a direct route
     pub is_direct: bool,
+    /// Total cumulative CLTV delta required across the route
+    #[serde(default)]
+    pub total_cltv_delta: u32,
+    /// Per-hop timeout requirements ordered from source to destination
+    #[serde(default)]
+    pub hop_timeouts: Vec<HopTimeout>,
+}
+
+/// Compute per-hop timeout requirements backwards from destination to source,
+/// populating `expiry_height` on each [`RouteHop`] and enforcing timeout safety
+/// and optional CLTV budget bounds.
+pub fn compute_hop_timeouts(
+    hops: &mut [RouteHop],
+    final_cltv_delta: u32,
+    max_cltv_budget: Option<u32>,
+) -> Result<(u32, Vec<HopTimeout>), RoutingError> {
+    if hops.is_empty() {
+        return Ok((final_cltv_delta, Vec::new()));
+    }
+
+    let mut outgoing_delta = final_cltv_delta;
+    let mut timeouts = vec![
+        HopTimeout {
+            channel_id: String::new(),
+            node_id: String::new(),
+            cltv_delta: 0,
+            incoming_cltv_delta: 0,
+            outgoing_cltv_delta: 0,
+            expiry_height: 0,
+        };
+        hops.len()
+    ];
+
+    let num_hops = hops.len();
+    for (idx, hop) in hops.iter_mut().enumerate().rev() {
+        if idx + 1 < num_hops && hop.cltv_delta == 0 {
+            return Err(RoutingError::InvalidHopTimeout {
+                channel_id: hop.channel_id.clone(),
+                reason: "intermediate hop must have a positive cltv_delta for timeout safety"
+                    .to_string(),
+            });
+        }
+        let incoming_delta = outgoing_delta
+            .checked_add(hop.cltv_delta)
+            .ok_or(RoutingError::TimeoutOverflow)?;
+        hop.expiry_height = incoming_delta;
+        timeouts[idx] = HopTimeout {
+            channel_id: hop.channel_id.clone(),
+            node_id: hop.node_id.clone(),
+            cltv_delta: hop.cltv_delta,
+            incoming_cltv_delta: incoming_delta,
+            outgoing_cltv_delta: outgoing_delta,
+            expiry_height: incoming_delta,
+        };
+        outgoing_delta = incoming_delta;
+    }
+
+    let total_cltv_delta = outgoing_delta;
+    if let Some(max_allowed) = max_cltv_budget {
+        if total_cltv_delta > max_allowed {
+            return Err(RoutingError::TimeoutExceedsBudget {
+                required: total_cltv_delta,
+                max_allowed,
+            });
+        }
+    }
+
+    Ok((total_cltv_delta, timeouts))
 }
 
 /// Route request parameters
@@ -411,6 +409,33 @@ pub struct RouteRequest {
     /// this field compile unchanged when they switch to struct-update syntax
     /// (`..RouteRequest { excluded_unavailable: vec![], .. }`).
     pub excluded_unavailable: Vec<UnavailableChannel>,
+}
+
+impl RouteRequest {
+    /// Create a new route request (Issue #364)
+    pub fn new(source: String, destination: String, amount: i128) -> Self {
+        RouteRequest {
+            source,
+            destination,
+            amount,
+            max_fee_budget: None,
+            max_hops: None,
+            find_any: false,
+            payment_metadata: None,
+        }
+    }
+
+    /// Configure maximum allowed hops for this request (Issue #364)
+    pub fn with_max_hops(mut self, max_hops: usize) -> Self {
+        self.max_hops = Some(max_hops);
+        self
+    }
+
+    /// Configure maximum fee budget for this request
+    pub fn with_max_fee_budget(mut self, budget: i128) -> Self {
+        self.max_fee_budget = Some(budget);
+        self
+    }
 }
 
 /// Payment metadata for routing decisions
@@ -804,6 +829,13 @@ pub fn find_best_route_with_cap(
         }
     }
 
+    let (final_cltv_delta, max_cltv_budget) = match &request.payment_metadata {
+        Some(meta) => (meta.required_cltv_delta.unwrap_or(0), meta.payment_expiry),
+        None => (0, None),
+    };
+    let (total_cltv_delta, hop_timeouts) =
+        compute_hop_timeouts(&mut hops, final_cltv_delta, max_cltv_budget)?;
+
     let route = Route {
         hops,
         total_fees,
@@ -817,6 +849,8 @@ pub fn find_best_route_with_cap(
             num_nodes: num_hops,
             estimated_time_ms: 100,
             is_direct: num_hops == 1,
+            total_cltv_delta,
+            hop_timeouts,
         },
     };
 
@@ -824,6 +858,60 @@ pub fn find_best_route_with_cap(
     cap.check_route(request.amount, &route)?;
 
     Ok(route)
+}
+
+/// Explain why candidate routes failed policy checks.
+///
+/// The returned report lists every simple candidate examined and the exact
+/// rule that rejected it. A report with `accepted > 0` means a route exists;
+/// it does not change any graph or request state.
+pub fn evaluate_route_policy(
+    graph: &NetworkGraph,
+    request: &RouteRequest,
+    policy: &policy::RoutingPolicy,
+) -> Result<RouteEvaluationReport, RoutePolicyError> {
+    Ok(policy_report::evaluate(graph, request, policy)?.report)
+}
+
+/// Find the best route under an explicit routing policy, reporting why every
+/// rejected candidate failed (issue #365).
+///
+/// Selection is deterministic: candidates are sorted by total fee, hop count
+/// and then channel ids, so equal-cost routes never depend on hash iteration.
+/// Existing [`find_best_route`] callers are unaffected.
+pub fn find_best_route_with_policy(
+    graph: &NetworkGraph,
+    request: &RouteRequest,
+    policy: &policy::RoutingPolicy,
+) -> Result<Route, RoutePolicyError> {
+    let evaluation = policy_report::evaluate(graph, request, policy)?;
+    let best = match evaluation.best() {
+        Some(best) => best,
+        None if evaluation.report.failures.is_empty() => {
+            return Err(RoutePolicyError::NoCandidates {
+                origin: request.source.clone(),
+                destination: request.destination.clone(),
+            })
+        }
+        None => return Err(RoutePolicyError::Rejected(evaluation.report.clone())),
+    };
+
+    let num_hops = best.hops.len();
+    Ok(Route {
+        hops: best.hops.clone(),
+        total_fees: best.summary.total_fees,
+        total_amount: request.amount,
+        success_probability: 0.95,
+        metadata: RouteMetadata {
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            num_nodes: num_hops,
+            estimated_time_ms: 100 * num_hops as u64,
+            is_direct: num_hops == 1,
+        },
+    })
 }
 
 /// Find multiple routes using k-shortest paths
@@ -1197,67 +1285,8 @@ mod tests {
         assert!(routes.is_empty());
     }
 
-    // ── Temporarily-unavailable channel exclusion ────────────────────────────
-
-    /// A channel in `excluded_unavailable` is never chosen, even when it is
-    /// the only path that would otherwise satisfy the request.
     #[test]
-    fn excluded_unavailable_channel_causes_no_path_found() {
-        let mut graph = NetworkGraph::new();
-        for id in ["alice", "bob"] {
-            add_node(&mut graph, id);
-        }
-        add_edge(&mut graph, "ch1", "alice", "bob", 1_000);
-
-        let req = RouteRequest {
-            excluded_unavailable: vec![UnavailableChannel::until(
-                "ch1".to_string(),
-                UnavailabilityReason::ForwardingFailure,
-                None,
-            )],
-            ..request("alice", "bob", 100)
-        };
-
-        assert!(matches!(
-            find_best_route(&graph, &req).unwrap_err(),
-            RoutingError::NoPathFound { .. }
-        ));
-    }
-
-    /// When an alternative path exists the router uses it and avoids the
-    /// excluded channel.
-    #[test]
-    fn router_finds_alternative_when_one_channel_excluded() {
-        let mut graph = NetworkGraph::new();
-        for id in ["alice", "bob", "carol"] {
-            add_node(&mut graph, id);
-        }
-        // Direct channel – will be excluded
-        add_edge(&mut graph, "ch_direct", "alice", "bob", 1_000);
-        // Two-hop alternative: alice -> carol -> bob
-        add_edge(&mut graph, "ch_ac", "alice", "carol", 1_000);
-        add_edge(&mut graph, "ch_cb", "carol", "bob", 1_000);
-
-        let req = RouteRequest {
-            excluded_unavailable: vec![UnavailableChannel::until(
-                "ch_direct".to_string(),
-                UnavailabilityReason::PeerOffline,
-                Some(1_700_000_060),
-            )],
-            ..request("alice", "bob", 100)
-        };
-
-        let route = find_best_route(&graph, &req).unwrap();
-        assert!(
-            route.hops.iter().all(|h| h.channel_id != "ch_direct"),
-            "route must not use the excluded channel"
-        );
-        assert_eq!(route.hops.len(), 2);
-    }
-
-    /// Multiple channels can be excluded simultaneously.
-    #[test]
-    fn multiple_channels_can_be_excluded() {
+    fn route_exposes_per_hop_timeout_requirements() {
         let mut graph = NetworkGraph::new();
         for id in ["alice", "bob", "carol"] {
             add_node(&mut graph, id);
@@ -1265,120 +1294,81 @@ mod tests {
         add_edge(&mut graph, "ch1", "alice", "bob", 1_000);
         add_edge(&mut graph, "ch2", "bob", "carol", 1_000);
 
-        // Exclude both hops on the only path.
-        let req = RouteRequest {
-            excluded_unavailable: vec![
-                UnavailableChannel::until(
-                    "ch1".to_string(),
-                    UnavailabilityReason::ChannelOffline,
-                    None,
-                ),
-                UnavailableChannel::until(
-                    "ch2".to_string(),
-                    UnavailabilityReason::InsufficientLiquidity,
-                    None,
-                ),
-            ],
-            ..request("alice", "carol", 100)
-        };
+        let mut req = request("alice", "carol", 1_000);
+        req.payment_metadata = Some(PaymentMetadata {
+            payment_type: PaymentType::Regular,
+            required_cltv_delta: Some(18),
+            payment_expiry: Some(200),
+        });
 
-        assert!(matches!(
-            find_best_route(&graph, &req).unwrap_err(),
-            RoutingError::NoPathFound { .. }
-        ));
+        let route = find_best_route(&graph, &req).unwrap();
+        let timeouts = route.hop_timeouts();
+        assert_eq!(timeouts.len(), 2);
+
+        // Hop 1 (bob -> carol): outgoing = 18, incoming = 18 + 40 = 58
+        assert_eq!(timeouts[1].channel_id, "ch2");
+        assert_eq!(timeouts[1].cltv_delta, 40);
+        assert_eq!(timeouts[1].outgoing_cltv_delta, 18);
+        assert_eq!(timeouts[1].incoming_cltv_delta, 58);
+
+        // Hop 0 (alice -> bob): outgoing = 58, incoming = 58 + 40 = 98
+        assert_eq!(timeouts[0].channel_id, "ch1");
+        assert_eq!(timeouts[0].cltv_delta, 40);
+        assert_eq!(timeouts[0].outgoing_cltv_delta, 58);
+        assert_eq!(timeouts[0].incoming_cltv_delta, 98);
+        assert_eq!(route.total_cltv_delta(), 98);
+        assert_eq!(route.hops[0].expiry_height, 98);
+        assert_eq!(route.hops[1].expiry_height, 58);
+
+        // Absolute heights from a base ledger height
+        let abs = route.hop_timeouts_from_height(1_000).unwrap();
+        assert_eq!(abs[0].expiry_height, 1_098);
+        assert_eq!(abs[1].expiry_height, 1_058);
     }
 
-    /// An empty `excluded_unavailable` list is a no-op; routing behaves
-    /// exactly as before.
     #[test]
-    fn empty_excluded_list_is_a_noop() {
+    fn route_rejects_timeout_exceeding_budget() {
         let mut graph = NetworkGraph::new();
-        for id in ["alice", "bob"] {
+        for id in ["alice", "bob", "carol"] {
             add_node(&mut graph, id);
         }
         add_edge(&mut graph, "ch1", "alice", "bob", 1_000);
+        add_edge(&mut graph, "ch2", "bob", "carol", 1_000);
 
-        let req = RouteRequest {
-            excluded_unavailable: vec![],
-            ..request("alice", "bob", 100)
-        };
+        let mut req = request("alice", "carol", 1_000);
+        req.payment_metadata = Some(PaymentMetadata {
+            payment_type: PaymentType::Regular,
+            required_cltv_delta: Some(20),
+            payment_expiry: Some(99), // needs 40 + 40 + 20 = 100
+        });
 
-        assert!(find_best_route(&graph, &req).is_ok());
-    }
-
-    /// `UnavailableChannel::validate` rejects an empty channel ID.
-    #[test]
-    fn empty_channel_id_in_exclusion_is_rejected() {
-        let entry = UnavailableChannel::until(
-            String::new(),
-            UnavailabilityReason::Other,
-            None,
-        );
+        let err = find_best_route(&graph, &req).unwrap_err();
         assert!(matches!(
-            entry.validate().unwrap_err(),
-            RoutingError::ChannelNotFound { .. }
+            err,
+            RoutingError::TimeoutExceedsBudget {
+                required: 100,
+                max_allowed: 99
+            }
         ));
     }
 
-    /// `UnavailableChannel::validate` rejects `unavailable_until = Some(0)`.
     #[test]
-    fn zero_expiry_in_exclusion_is_rejected() {
-        let entry = UnavailableChannel::until(
+    fn compute_hop_timeouts_rejects_zero_cltv_intermediate_hop_and_overflow() {
+        let mut hops = vec![
+            RouteHop::new("ch1".to_string(), "bob".to_string(), 100, 1, 0),
+            RouteHop::new("ch2".to_string(), "carol".to_string(), 100, 1, 40),
+        ];
+        let err = compute_hop_timeouts(&mut hops, 0, None).unwrap_err();
+        assert!(matches!(err, RoutingError::InvalidHopTimeout { .. }));
+
+        let mut overflow_hops = vec![RouteHop::new(
             "ch1".to_string(),
-            UnavailabilityReason::Other,
-            Some(0),
-        );
-        assert!(matches!(
-            entry.validate().unwrap_err(),
-            RoutingError::InvalidNodeAddress
-        ));
-    }
-
-    /// An exclusion list with an invalid entry causes `find_best_route` to
-    /// return an error immediately, before any graph traversal.
-    #[test]
-    fn invalid_exclusion_entry_aborts_routing() {
-        let mut graph = NetworkGraph::new();
-        for id in ["alice", "bob"] {
-            add_node(&mut graph, id);
-        }
-        add_edge(&mut graph, "ch1", "alice", "bob", 1_000);
-
-        let req = RouteRequest {
-            excluded_unavailable: vec![UnavailableChannel::until(
-                String::new(), // invalid
-                UnavailabilityReason::Other,
-                None,
-            )],
-            ..request("alice", "bob", 100)
-        };
-
-        assert!(matches!(
-            find_best_route(&graph, &req).unwrap_err(),
-            RoutingError::ChannelNotFound { .. }
-        ));
-    }
-
-    /// A non-existent channel ID in the exclusion list is silently ignored
-    /// (the channel isn't in the graph, so skipping it has no effect).
-    #[test]
-    fn excluding_nonexistent_channel_is_harmless() {
-        let mut graph = NetworkGraph::new();
-        for id in ["alice", "bob"] {
-            add_node(&mut graph, id);
-        }
-        add_edge(&mut graph, "ch1", "alice", "bob", 1_000);
-
-        let req = RouteRequest {
-            excluded_unavailable: vec![UnavailableChannel::until(
-                "ch_does_not_exist".to_string(),
-                UnavailabilityReason::Other,
-                None,
-            )],
-            ..request("alice", "bob", 100)
-        };
-
-        // The real channel ch1 is still available.
-        assert!(find_best_route(&graph, &req).is_ok());
+            "bob".to_string(),
+            100,
+            1,
+            u32::MAX,
+        )];
+        let err = compute_hop_timeouts(&mut overflow_hops, 1, None).unwrap_err();
+        assert!(matches!(err, RoutingError::TimeoutOverflow));
     }
 }
