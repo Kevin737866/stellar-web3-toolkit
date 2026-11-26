@@ -13,6 +13,7 @@
 //! - Health checks for the storage backends that hold breach evidence
 //! - Signed operator recovery bundles for key and data recovery
 
+pub mod alert;
 pub mod justice;
 pub mod monitor;
 pub mod recovery;
@@ -45,6 +46,9 @@ pub struct WatchtowerConfig {
     pub db_path: Option<String>,
     /// Alert webhook URL
     pub alert_webhook_url: Option<String>,
+    /// Retry policy for alert delivery
+    #[serde(default)]
+    pub alert_delivery: alert::AlertDeliveryConfig,
     /// Retention rules applied when the store is compacted
     #[serde(default)]
     pub compaction: storage::CompactionPolicy,
@@ -82,6 +86,7 @@ impl Default for WatchtowerConfig {
             justice_fee_budget: 100_000, // 0.1 XLM
             db_path: None,
             alert_webhook_url: None,
+            alert_delivery: alert::AlertDeliveryConfig::default(),
             compaction: storage::CompactionPolicy::default(),
             compaction_interval_secs: default_compaction_interval_secs(),
             storage_health_check_interval_secs: 0,
@@ -287,6 +292,10 @@ pub struct WatchtowerStats {
     pub justice_actions_persisted: u64,
     /// Total alerts generated
     pub alerts_generated: u64,
+    /// Total alerts successfully delivered
+    pub alerts_delivered: u64,
+    /// Total alert delivery attempts that failed
+    pub alert_deliveries_failed: u64,
     /// Last scan timestamp
     pub last_scan_ts: u64,
     /// Uptime in seconds
@@ -307,6 +316,8 @@ pub struct Watchtower {
     monitor: monitor::ChannelMonitor,
     /// Justice service
     justice: justice::JusticeService,
+    /// Retryable alert delivery service
+    alert_delivery: alert::AlertDeliveryService,
     /// Persistent storage for subscriptions, channel state and alerts
     storage: Arc<dyn storage::StorageBackend>,
 }
@@ -314,6 +325,19 @@ pub struct Watchtower {
 impl Watchtower {
     /// Create a new watchtower with the given configuration
     pub fn new(config: WatchtowerConfig) -> Result<Self, WatchtowerError> {
+        Self::with_alert_transport(config, Arc::new(alert::WebhookAlertTransport))
+    }
+
+    /// Create a new watchtower with a custom [`alert::AlertTransport`].
+    pub fn with_alert_transport(
+        config: WatchtowerConfig,
+        transport: Arc<dyn alert::AlertTransport>,
+    ) -> Result<Self, WatchtowerError> {
+        config.alert_delivery.validate()?;
+        if let Some(ref url) = config.alert_webhook_url {
+            alert::validate_destination(url)?;
+        }
+
         let storage: Arc<dyn storage::StorageBackend> = match &config.db_path {
             Some(path) => Arc::new(storage::SqliteStorage::new(path)?),
             None => Arc::new(storage::InMemoryStorage::new()),
@@ -349,6 +373,12 @@ impl Watchtower {
             Arc::clone(&storage),
         );
 
+        let alert_delivery = alert::AlertDeliveryService::new(
+            config.alert_delivery,
+            Arc::clone(&storage),
+            transport,
+        )?;
+
         let state = Arc::new(WatchtowerState {
             subscribed_channels: RwLock::new(std::collections::HashSet::new()),
             channel_states: RwLock::new(std::collections::HashMap::new()),
@@ -366,6 +396,7 @@ impl Watchtower {
             state,
             monitor,
             justice,
+            alert_delivery,
             storage,
         })
     }
@@ -382,6 +413,7 @@ impl Watchtower {
         let config = self.config.clone();
         let monitor = self.monitor.clone();
         let justice = self.justice.clone();
+        let alert_delivery = self.alert_delivery.clone();
 
         tokio::spawn(async move {
             loop {
@@ -406,7 +438,23 @@ impl Watchtower {
                                     breach.old_sequence,
                                     breach.new_sequence,
                                 );
-                                state.add_alert(alert);
+                                state.add_alert(alert.clone());
+                                state.stats.write().alerts_generated += 1;
+
+                                if let Some(ref webhook_url) = config.alert_webhook_url {
+                                    match alert_delivery
+                                        .enqueue_and_deliver(&alert, webhook_url)
+                                        .await
+                                    {
+                                        Ok(_) => {
+                                            state.stats.write().alerts_delivered += 1;
+                                        }
+                                        Err(e) => {
+                                            state.stats.write().alert_deliveries_failed += 1;
+                                            error!("Failed to deliver breach alert: {:?}", e);
+                                        }
+                                    }
+                                }
 
                                 // Submit justice if enabled
                                 if config.auto_justice {
@@ -433,6 +481,21 @@ impl Watchtower {
                         Err(e) => {
                             error!("Error checking channel {}: {:?}", channel_id, e);
                         }
+                    }
+                }
+
+                // Retry any pending alert deliveries whose backoff has elapsed.
+                match alert_delivery.retry_pending_deliveries().await {
+                    Ok(report) => {
+                        if report.delivered > 0 || report.failed > 0 {
+                            let mut stats = state.stats.write();
+                            stats.alerts_delivered += report.delivered as u64;
+                            stats.alert_deliveries_failed +=
+                                (report.rescheduled + report.failed) as u64;
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to retry pending alert deliveries: {:?}", e);
                     }
                 }
 
@@ -944,8 +1007,26 @@ pub enum WatchtowerError {
     #[error("Justice transaction failed: {0}")]
     JusticeFailed(String),
 
+    #[error("Invalid configuration: {0}")]
+    InvalidConfig(String),
+
+    #[error("Alert delivery failed: {0}")]
+    AlertDeliveryFailed(String),
+
     #[error("Watchtower not running")]
     NotRunning,
+}
+
+impl From<alert::AlertDeliveryError> for WatchtowerError {
+    fn from(e: alert::AlertDeliveryError) -> Self {
+        match e {
+            alert::AlertDeliveryError::InvalidConfig(msg)
+            | alert::AlertDeliveryError::InvalidDestination(msg) => {
+                WatchtowerError::InvalidConfig(msg)
+            }
+            other => WatchtowerError::AlertDeliveryFailed(other.to_string()),
+        }
+    }
 }
 
 impl From<storage::StorageError> for WatchtowerError {
@@ -976,7 +1057,7 @@ impl From<recovery::RecoveryError> for WatchtowerError {
 }
 
 /// Generate a UUID v4
-fn uuid_v4() -> String {
+pub(crate) fn uuid_v4() -> String {
     use rand::Rng;
     let mut rng = rand::thread_rng();
     let bytes: [u8; 16] = rng.gen();
