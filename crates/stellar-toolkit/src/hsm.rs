@@ -26,10 +26,121 @@
 //! The [`ColdSigner`] trait is the seam for a real HSM: production code depends
 //! on the trait, the stub implements it, and swapping in a PKCS#11 / cloud-KMS
 //! backend changes no caller.
+//!
+//! # Key rotation audit
+//!
+//! Rotating the signing key on an HSM slot is an irreversible change whose
+//! operator trail must be preserved. [`RotationRecord`] captures everything an
+//! auditor needs: the old public key, the new public key, the slot handle, the
+//! last sequence signed before the rotation, the wall-clock timestamp, and an
+//! optional free-text reason. [`RotationAudit`] is an append-only log of those
+//! records. Past entries cannot be overwritten or deleted; a fresh log is the
+//! only way to start over.
+//!
+//! [`StubHsm::rotate_key`] enforces the write path:
+//!
+//! * the signer must be unlocked (rotating a locked key is refused, just as
+//!   signing is);
+//! * the caller supplies the new 32-byte seed in a `[u8; 32]` — no raw
+//!   `SigningKey`, so key material never crosses the API boundary;
+//! * after a successful rotation the signer holds the new key, all prior
+//!   approvals are cleared (they were issued for a digest signed by the old
+//!   key, so they are meaningless now), and a [`RotationRecord`] is appended
+//!   to the audit log;
+//! * rotating to the same seed as the current key is refused — a no-op
+//!   rotation would produce a misleading audit entry.
 
 use ed25519_dalek::{Signature as Ed25519Signature, Signer as _, SigningKey, VerifyingKey};
 use std::collections::BTreeSet;
 use std::fmt;
+
+// ── Rotation audit ────────────────────────────────────────────────────────────
+
+/// A single key-rotation event on an HSM slot.
+///
+/// Every field is immutable after creation; the [`RotationAudit`] log that
+/// owns these records is append-only, so a past rotation cannot be rewritten.
+///
+/// Both public keys are stored as hex strings so the record is self-contained
+/// when serialised (no dependency on the `ed25519-dalek` types at the
+/// deserialization site).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RotationRecord {
+    /// Identifying label of the slot that was rotated.
+    pub handle: String,
+    /// Ed25519 public key that was active **before** the rotation, hex-encoded.
+    pub previous_public_key_hex: String,
+    /// Ed25519 public key that became active **after** the rotation, hex-encoded.
+    pub new_public_key_hex: String,
+    /// The last sequence this slot signed **before** the rotation, or `None`
+    /// if the slot had never produced a signature.
+    pub last_sequence_before_rotation: Option<u64>,
+    /// Unix timestamp (seconds since epoch) when the rotation was recorded.
+    ///
+    /// For the stub this is taken from [`std::time::SystemTime`]. In a real
+    /// HSM the hardware clock is authoritative; callers can override via
+    /// [`StubHsm::rotate_key_at`].
+    pub rotated_at: u64,
+    /// Optional free-text reason supplied by the operator (e.g.
+    /// "scheduled 90-day rotation" or "emergency: key exposure suspected").
+    pub reason: Option<String>,
+}
+
+/// Append-only log of key-rotation events for an HSM slot.
+///
+/// Records accumulate in insertion order. The only mutation the log permits
+/// is appending a new record; existing records cannot be removed or changed.
+///
+/// # Compatibility
+///
+/// The log is an in-memory structure. Persistence and replay are the
+/// responsibility of the calling application; the log provides no I/O.
+#[derive(Debug, Default, Clone)]
+pub struct RotationAudit {
+    records: Vec<RotationRecord>,
+}
+
+impl RotationAudit {
+    /// Create a new, empty audit log.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append a rotation record to the log.
+    ///
+    /// This is the only way to add an entry; there is no way to remove or
+    /// modify an existing one.
+    pub fn append(&mut self, record: RotationRecord) {
+        self.records.push(record);
+    }
+
+    /// All records in insertion order. The returned slice is immutable.
+    #[must_use]
+    pub fn records(&self) -> &[RotationRecord] {
+        &self.records
+    }
+
+    /// Number of rotations recorded.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    /// Whether the log contains no records.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    /// The most recently appended record, or `None` if the log is empty.
+    #[must_use]
+    pub fn last(&self) -> Option<&RotationRecord> {
+        self.records.last()
+    }
+}
+
+// ── Error variants for rotation ───────────────────────────────────────────────
 
 /// Domain separator mixed into every request digest.
 ///
@@ -120,6 +231,11 @@ pub enum HsmError {
     ReviewAlreadySpent { digest: String },
     #[error("sequence {sequence} was already signed (last signed sequence {last_signed})")]
     ReplayedSequence { sequence: u64, last_signed: u64 },
+    /// The caller attempted to rotate the key to a seed that produces the
+    /// same public key as the current key. A no-op rotation would create a
+    /// misleading audit entry and is refused.
+    #[error("key rotation refused: the new seed produces the same public key as the current key")]
+    RotationIdentical,
 }
 
 /// The seam a real hardware signer implements.
@@ -150,6 +266,8 @@ pub struct StubHsm {
     spent: BTreeSet<[u8; 32]>,
     last_signed: Option<u64>,
     unlocked: bool,
+    /// Append-only record of every key rotation on this slot.
+    audit: RotationAudit,
 }
 
 impl StubHsm {
@@ -166,6 +284,7 @@ impl StubHsm {
             spent: BTreeSet::new(),
             last_signed: None,
             unlocked: false,
+            audit: RotationAudit::new(),
         }
     }
 
@@ -237,6 +356,97 @@ impl StubHsm {
             .is_ok()
     }
 
+    // ── Key rotation ──────────────────────────────────────────────────────────
+
+    /// Replace the signing key with the key derived from `new_seed` and append
+    /// a [`RotationRecord`] to the slot's audit log.
+    ///
+    /// Uses the wall clock ([`std::time::SystemTime`]) for the `rotated_at`
+    /// timestamp. If you need a deterministic timestamp in tests, use
+    /// [`rotate_key_at`] instead.
+    ///
+    /// # Errors
+    ///
+    /// * [`HsmError::Locked`] — the signer must be unlocked before rotating.
+    ///   This mirrors the sign path: a PIN is required for any key-material
+    ///   change.
+    /// * [`HsmError::RotationIdentical`] — `new_seed` produces the same public
+    ///   key as the current key. A no-op rotation is refused because it would
+    ///   emit a misleading audit record.
+    ///
+    /// [`rotate_key_at`]: Self::rotate_key_at
+    pub fn rotate_key(
+        &mut self,
+        new_seed: &[u8; 32],
+        reason: Option<impl Into<String>>,
+    ) -> Result<&RotationRecord, HsmError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.rotate_key_at(new_seed, reason, now)
+    }
+
+    /// Replace the signing key with the key derived from `new_seed`, recording
+    /// `rotated_at` as the event timestamp.
+    ///
+    /// This variant is intended for tests and deterministic replay scenarios
+    /// where wall-clock non-determinism is undesirable. All invariants from
+    /// [`rotate_key`] apply.
+    ///
+    /// [`rotate_key`]: Self::rotate_key
+    pub fn rotate_key_at(
+        &mut self,
+        new_seed: &[u8; 32],
+        reason: Option<impl Into<String>>,
+        rotated_at: u64,
+    ) -> Result<&RotationRecord, HsmError> {
+        if !self.unlocked {
+            return Err(HsmError::Locked {
+                handle: self.handle.clone(),
+            });
+        }
+
+        let new_key = SigningKey::from_bytes(new_seed);
+        let new_pub = new_key.verifying_key().to_bytes();
+        let old_pub = self.verifying_key().to_bytes();
+
+        if new_pub == old_pub {
+            return Err(HsmError::RotationIdentical);
+        }
+
+        let record = RotationRecord {
+            handle: self.handle.clone(),
+            previous_public_key_hex: hex::encode(old_pub),
+            new_public_key_hex: hex::encode(new_pub),
+            last_sequence_before_rotation: self.last_signed,
+            rotated_at,
+            reason: reason.map(Into::into),
+        };
+
+        // Install the new key and clear per-key state: approvals from the old
+        // key are meaningless for the new one, so they must not carry over.
+        // The sequence counter and the audit log are retained because they
+        // belong to the slot, not to the key.
+        self.signing_key = new_key;
+        self.reviewed.clear();
+        self.spent.clear();
+
+        self.audit.append(record);
+
+        // Safety: we just pushed a record, so `last()` is always `Some`.
+        Ok(self.audit.last().expect("record just appended"))
+    }
+
+    /// Read-only reference to the rotation audit log for this slot.
+    ///
+    /// The log is append-only: the caller can read all records but cannot
+    /// modify or remove any entry.
+    #[must_use]
+    pub fn rotation_audit(&self) -> &RotationAudit {
+        &self.audit
+    }
+
     fn verifying_key(&self) -> VerifyingKey {
         self.signing_key.verifying_key()
     }
@@ -298,6 +508,7 @@ impl fmt::Debug for StubHsm {
             .field("unlocked", &self.unlocked)
             .field("approved", &self.reviewed.len())
             .field("last_signed", &self.last_signed)
+            .field("rotation_count", &self.audit.len())
             .finish_non_exhaustive()
     }
 }
@@ -513,5 +724,188 @@ mod tests {
 
         assert!(first.verify(&request, &signature));
         assert!(!second.verify(&request, &signature));
+    }
+
+    // ── Rotation audit tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn rotation_records_old_and_new_public_keys() {
+        let mut signer = unlocked(1);
+        let old_pub = hex::encode(signer.public_key());
+        let new_seed = seed(2);
+
+        let record = signer
+            .rotate_key_at(&new_seed, Some("test rotation"), 1_700_000_000)
+            .expect("rotation must succeed");
+
+        assert_eq!(record.handle, "deploy-key");
+        assert_eq!(record.previous_public_key_hex, old_pub);
+        assert_eq!(record.new_public_key_hex, hex::encode(signer.public_key()));
+        assert_ne!(record.previous_public_key_hex, record.new_public_key_hex);
+        assert_eq!(record.rotated_at, 1_700_000_000);
+        assert_eq!(record.reason.as_deref(), Some("test rotation"));
+        assert_eq!(record.last_sequence_before_rotation, None);
+    }
+
+    #[test]
+    fn rotation_records_last_signed_sequence_before_rotation() {
+        let mut signer = unlocked(1);
+        let req = req(5);
+        signer.approve(&req);
+        signer.sign(&req).unwrap();
+
+        signer
+            .rotate_key_at(&seed(2), None::<&str>, 1_700_000_001)
+            .expect("rotation must succeed");
+
+        let record = signer.rotation_audit().last().unwrap();
+        assert_eq!(record.last_sequence_before_rotation, Some(5));
+    }
+
+    #[test]
+    fn rotation_clears_pending_approvals_but_keeps_sequence_counter() {
+        let mut signer = unlocked(1);
+
+        // Sign something to advance the sequence counter.
+        let first = req(1);
+        signer.approve(&first);
+        signer.sign(&first).unwrap();
+
+        // Approve a second request but don't sign it yet.
+        let second = req(2);
+        signer.approve(&second);
+        assert!(signer.is_approved(&second));
+
+        // Rotate the key.
+        signer
+            .rotate_key_at(&seed(2), Some("scheduled"), 1_700_000_002)
+            .expect("rotation");
+
+        // The pending approval was cleared by the rotation.
+        assert!(!signer.is_approved(&second));
+
+        // The sequence counter is unaffected: the new key still refuses a
+        // request at or below the last signed sequence.
+        let third = req(1); // sequence <= last_signed
+        signer.approve(&third);
+        signer.unlock();
+        assert!(matches!(
+            signer.sign(&third),
+            Err(HsmError::ReplayedSequence { .. })
+        ));
+        assert_eq!(signer.last_signed_sequence(), Some(1));
+    }
+
+    #[test]
+    fn rotation_is_refused_while_locked() {
+        let mut signer = StubHsm::from_seed("deploy-key", &seed(1));
+        assert!(signer.is_locked());
+
+        let err = signer
+            .rotate_key_at(&seed(2), None::<&str>, 1_700_000_003)
+            .expect_err("locked signer must refuse rotation");
+
+        assert!(
+            matches!(err, HsmError::Locked { .. }),
+            "expected Locked, got {err:?}"
+        );
+        assert!(signer.rotation_audit().is_empty());
+    }
+
+    #[test]
+    fn rotation_to_the_same_key_is_refused() {
+        let mut signer = unlocked(5);
+        let same_seed = seed(5);
+
+        let err = signer
+            .rotate_key_at(&same_seed, Some("no-op attempt"), 1_700_000_004)
+            .expect_err("same-key rotation must be refused");
+
+        assert!(
+            matches!(err, HsmError::RotationIdentical),
+            "expected RotationIdentical, got {err:?}"
+        );
+        // No spurious record was written.
+        assert!(signer.rotation_audit().is_empty());
+    }
+
+    #[test]
+    fn multiple_rotations_accumulate_in_insertion_order() {
+        let mut signer = unlocked(1);
+
+        signer
+            .rotate_key_at(&seed(2), Some("first rotation"), 1_000)
+            .unwrap();
+        signer
+            .rotate_key_at(&seed(3), Some("second rotation"), 2_000)
+            .unwrap();
+        signer
+            .rotate_key_at(&seed(4), Some("third rotation"), 3_000)
+            .unwrap();
+
+        let audit = signer.rotation_audit();
+        assert_eq!(audit.len(), 3);
+        assert_eq!(audit.records()[0].rotated_at, 1_000);
+        assert_eq!(audit.records()[1].rotated_at, 2_000);
+        assert_eq!(audit.records()[2].rotated_at, 3_000);
+
+        // Verify forward linkage: each record's new key is the next record's
+        // previous key.
+        assert_eq!(
+            audit.records()[0].new_public_key_hex,
+            audit.records()[1].previous_public_key_hex
+        );
+        assert_eq!(
+            audit.records()[1].new_public_key_hex,
+            audit.records()[2].previous_public_key_hex
+        );
+    }
+
+    #[test]
+    fn signer_signs_with_new_key_after_rotation_and_old_signature_does_not_verify() {
+        let mut signer = unlocked(1);
+
+        let request = req(1);
+        signer.approve(&request);
+        let old_sig = signer.sign(&request).unwrap();
+
+        // Rotate to a fresh key.
+        signer
+            .rotate_key_at(&seed(2), None::<&str>, 1_700_000_005)
+            .expect("rotation");
+        signer.unlock();
+
+        // A new request signed by the new key.
+        let new_request = req(2);
+        signer.approve(&new_request);
+        let new_sig = signer.sign(&new_request).unwrap();
+
+        // The new signature verifies with the current key.
+        assert!(signer.verify(&new_request, &new_sig));
+        // The old signature does NOT verify with the new key.
+        assert!(!signer.verify(&request, &old_sig));
+    }
+
+    #[test]
+    fn rotation_without_reason_records_none() {
+        let mut signer = unlocked(1);
+        signer
+            .rotate_key_at(&seed(2), None::<&str>, 1_700_000_006)
+            .unwrap();
+        let record = signer.rotation_audit().last().unwrap();
+        assert_eq!(record.reason, None);
+    }
+
+    #[test]
+    fn rotation_audit_is_included_in_debug_output() {
+        let mut signer = unlocked(1);
+        let rendered_before = format!("{signer:?}");
+        assert!(rendered_before.contains("rotation_count: 0"));
+
+        signer
+            .rotate_key_at(&seed(2), None::<&str>, 1_700_000_007)
+            .unwrap();
+        let rendered_after = format!("{signer:?}");
+        assert!(rendered_after.contains("rotation_count: 1"));
     }
 }

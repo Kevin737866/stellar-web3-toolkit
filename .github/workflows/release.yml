@@ -104,6 +104,8 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
       - name: Download artifacts
@@ -111,6 +113,12 @@ jobs:
         with:
           name: release-wasm-${{ needs.build.outputs.version }}
           path: dist
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/*.wasm
+            dist/wasm-checksums.txt
       - name: Generate release notes
         run: |
           cat > release-notes.md <<'EOF'
@@ -130,6 +138,10 @@ jobs:
           # Docker reproducibility check
           ./scripts/verify-bytecode.sh --docker
           ./scripts/reproducible-build.sh --docker
+          ```
+
+          # Supply-chain attestation (build provenance) for a downloaded file
+          gh attestation verify <file> --repo ${{ github.repository }}
           ```
 
           ### Environments
@@ -189,6 +201,16 @@ jobs:
             echo "Live deploy would run: stellar contract deploy --wasm dist/<contract>.wasm --network ${{ inputs.environment }} --source <deployer>"
             echo "Guarded by GitHub Environment approval (prod requires manual approval)."
           fi
+      - name: Rollback smoke test
+        # A rollback redeploys the previous release's wasm, so the artifact set
+        # must still match its recorded checksums. Fail the job if any wasm is
+        # missing or differs from dist/wasm-checksums.txt (paths are rebased
+        # onto dist/ because the manifest records build-tree paths).
+        run: |
+          test -s dist/wasm-checksums.txt
+          while read -r hash file; do
+            echo "${hash}  dist/$(basename "${file#\*}")"
+          done < dist/wasm-checksums.txt | sha256sum -c -
       - name: Append deployment audit log
         run: |
           mkdir -p logs
