@@ -345,9 +345,14 @@ impl RoutingPolicy {
 
     /// Apply policy to a route request
     pub fn apply_to_request(&self, mut request: RouteRequest) -> RouteRequest {
-        // Apply hop limit
-        if request.max_hops.is_none() || request.max_hops > Some(self.max_hops) {
-            request.max_hops = Some(self.max_hops);
+        // Apply hop limit — clamp to the caller's policy if unset or too high,
+        // but never go above the protocol maximum. Because RoutingPolicy's own
+        // max_hops is validated when the policy is constructed, this call to
+        // validate_max_hop_count always succeeds; it is here as a safety net
+        // in case a policy is built by hand with an out-of-bound value.
+        let policy_hops = self.max_hops.min(crate::MAX_ROUTE_HOPS).max(crate::MIN_HOP_COUNT);
+        if request.max_hops.is_none() || request.max_hops > Some(policy_hops) {
+            request.max_hops = Some(policy_hops);
         }
 
         // Apply fee budget if not set
