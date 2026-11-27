@@ -14,6 +14,18 @@ use tracing::{debug, info, warn};
 /// A watchtower writes continuously -- a state and an update per channel per
 /// scan, plus an alert per incident -- so without retention the store grows
 /// with uptime rather than with the number of channels being watched.
+///
+/// Justice action records are the most sensitive part of the store: they
+/// contain breach evidence and are written before every justice transaction
+/// submission. Without a retention policy the action log grows without bound
+/// as the watchtower monitors channels over time, and old `Submitted` or
+/// `Confirmed` records that are no longer needed for recovery consume storage
+/// indefinitely. The fields `max_justice_actions` and
+/// `justice_action_retention_secs` bound that growth.
+///
+/// Only actions whose status is `Submitted`, `Confirmed`, or `Failed` are
+/// eligible for expiry. `Pending` actions are always kept regardless of age,
+/// because they still need to be retried.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompactionPolicy {
     /// Keep at most this many alerts, newest first.
@@ -26,6 +38,17 @@ pub struct CompactionPolicy {
     pub update_retention_secs: u64,
     /// Keep at most this many cached channel updates, newest first.
     pub max_channel_updates: usize,
+    /// Keep at most this many finalised justice action records (those with
+    /// status `Submitted`, `Confirmed`, or `Failed`). `Pending` actions are
+    /// never counted against this limit.
+    ///
+    /// A value of 0 disables the count-based limit for justice actions.
+    pub max_justice_actions: usize,
+    /// Drop finalised justice action records older than this many seconds.
+    ///
+    /// A value of 0 disables the age-based limit for justice actions.
+    /// `Pending` actions are never dropped regardless of age.
+    pub justice_action_retention_secs: u64,
 }
 
 impl Default for CompactionPolicy {
@@ -35,6 +58,10 @@ impl Default for CompactionPolicy {
             alert_retention_secs: 7 * 24 * 60 * 60, // one week
             update_retention_secs: 24 * 60 * 60,    // one day
             max_channel_updates: 10_000,
+            // Keep finalised justice action records for 90 days and no more
+            // than 100 000 of them. Pending actions are always kept.
+            max_justice_actions: 100_000,
+            justice_action_retention_secs: 90 * 24 * 60 * 60, // 90 days
         }
     }
 }
@@ -52,6 +79,10 @@ pub struct CompactionReport {
     pub channel_updates_after: usize,
     /// Duplicate subscriptions collapsed during the pass.
     pub subscriptions_deduplicated: usize,
+    /// Justice action records before the pass.
+    pub justice_actions_before: usize,
+    /// Justice action records after the pass.
+    pub justice_actions_after: usize,
 }
 
 impl CompactionReport {
@@ -66,9 +97,18 @@ impl CompactionReport {
             .saturating_sub(self.channel_updates_after)
     }
 
+    /// Justice action records removed by the pass.
+    pub fn justice_actions_removed(&self) -> usize {
+        self.justice_actions_before
+            .saturating_sub(self.justice_actions_after)
+    }
+
     /// Everything the pass removed.
     pub fn total_removed(&self) -> usize {
-        self.alerts_removed() + self.channel_updates_removed() + self.subscriptions_deduplicated
+        self.alerts_removed()
+            + self.channel_updates_removed()
+            + self.subscriptions_deduplicated
+            + self.justice_actions_removed()
     }
 
     /// Whether the pass changed anything.
@@ -850,8 +890,13 @@ impl StorageBackend for SqliteStorage {
         // unconditionally, and a silent no-op here is preferable to making
         // every caller check which backend is in use.
         info!(
-            "SQLite: compact requested (max_alerts={}, alert_retention={}s, update_retention={}s)",
-            policy.max_alerts, policy.alert_retention_secs, policy.update_retention_secs
+            "SQLite: compact requested (max_alerts={}, alert_retention={}s, update_retention={}s, \
+             max_justice_actions={}, justice_action_retention={}s)",
+            policy.max_alerts,
+            policy.alert_retention_secs,
+            policy.update_retention_secs,
+            policy.max_justice_actions,
+            policy.justice_action_retention_secs,
         );
         Ok(CompactionReport::default())
     }
