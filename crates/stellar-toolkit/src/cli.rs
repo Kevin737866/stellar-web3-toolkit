@@ -535,6 +535,32 @@ pub enum SessionCommand {
     },
 }
 
+/// Soroban transaction commands (issue #324).
+#[derive(Subcommand, Debug)]
+pub enum TxCommand {
+    /// Poll a Soroban transaction hash via `getTransaction` until SUCCESS or FAILED
+    Poll {
+        /// Soroban RPC endpoint URL (http or https)
+        #[arg(long)]
+        rpc_url: String,
+        /// 64-character hex Soroban transaction hash
+        #[arg(long)]
+        hash: String,
+        /// Maximum polling duration in seconds
+        #[arg(long, default_value_t = 30)]
+        timeout_secs: u64,
+        /// Initial polling interval in milliseconds
+        #[arg(long, default_value_t = 1000)]
+        interval_ms: u64,
+        /// Maximum polling attempts
+        #[arg(long, default_value_t = 30)]
+        max_attempts: usize,
+        /// Maximum consecutive transient RPC errors tolerated
+        #[arg(long, default_value_t = 3)]
+        max_transient_errors: usize,
+    },
+}
+
 #[derive(Subcommand)]
 pub enum WalletCommand {
     /// Generate a 24-word recovery phrase and derive a Stellar keypair
@@ -1762,6 +1788,51 @@ fn run_verify(cmd: &VerifyCommand) -> Result<()> {
                 )));
             }
             Ok(())
+        }
+    }
+}
+
+fn run_tx(cmd: &TxCommand) -> Result<()> {
+    use crate::soroban_rpc::{
+        poll_transaction, HttpSorobanRpcClient, PollConfig, TerminalTransactionResult,
+    };
+    use std::time::Duration;
+
+    match cmd {
+        TxCommand::Poll {
+            rpc_url,
+            hash,
+            timeout_secs,
+            interval_ms,
+            max_attempts,
+            max_transient_errors,
+        } => {
+            let mut client = HttpSorobanRpcClient::new(rpc_url)?;
+            let interval = Duration::from_millis(*interval_ms);
+            let config = PollConfig {
+                poll_interval: interval,
+                max_interval: interval.max(Duration::from_secs(10)),
+                timeout: Duration::from_secs(*timeout_secs),
+                max_attempts: *max_attempts,
+                max_transient_errors: *max_transient_errors,
+            };
+            let outcome = poll_transaction(&mut client, hash, &config)?;
+            match outcome.result {
+                TerminalTransactionResult::Success(receipt) => {
+                    println!(
+                        "SUCCESS hash={} ledger={:?} attempts={}",
+                        receipt.tx_hash, receipt.ledger, outcome.attempts
+                    );
+                    Ok(())
+                }
+                TerminalTransactionResult::Failed(receipt) => {
+                    Err(ToolkitError::SorobanRpc(crate::soroban_rpc::PollError::TransactionFailed {
+                        tx_hash: receipt.tx_hash,
+                        ledger: receipt.ledger,
+                        result_xdr: receipt.result_xdr,
+                    }))
+                }
+            }
         }
     }
 }
