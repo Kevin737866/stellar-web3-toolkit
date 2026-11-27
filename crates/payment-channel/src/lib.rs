@@ -121,6 +121,76 @@ pub struct LocalChannelState {
     pub remote_public_key: Vec<u8>,
 }
 
+/// Summary of a channel's status including pending HTLC count and capacity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelStatusInfo {
+    /// Channel ID
+    pub channel_id: String,
+    /// Current lifecycle status
+    pub status: ChannelStatus,
+    /// Our current balance
+    pub our_balance: i128,
+    /// Counterparty's current balance
+    pub their_balance: i128,
+    /// Number of active (unclaimed and unrefunded) pending HTLCs
+    pub pending_htlc_count: usize,
+    /// Total amount locked across active pending HTLCs
+    pub pending_htlc_amount: i128,
+    /// Total channel capacity (`our_balance + their_balance`)
+    pub capacity: i128,
+    /// Available capacity after subtracting `pending_htlc_amount`
+    pub available_capacity: i128,
+}
+
+impl LocalChannelState {
+    /// Compute a [`ChannelStatusInfo`] snapshot for this channel, validating
+    /// balance and pending HTLC invariants.
+    pub fn status_info(&self) -> Result<ChannelStatusInfo, PaymentChannelError> {
+        if self.our_balance < 0 || self.their_balance < 0 {
+            return Err(PaymentChannelError::InvalidState(
+                "Channel balances cannot be negative".to_string(),
+            ));
+        }
+
+        let capacity = self.our_balance.checked_add(self.their_balance).ok_or_else(|| {
+            PaymentChannelError::InvalidState("Channel capacity overflow".to_string())
+        })?;
+
+        let mut pending_htlc_count = 0usize;
+        let mut pending_htlc_amount = 0i128;
+        for htlc in &self.pending_htlcs {
+            if !htlc.is_claimed && !htlc.is_refunded {
+                if htlc.amount < 0 {
+                    return Err(PaymentChannelError::InvalidState(format!(
+                        "Pending HTLC '{}' has negative amount {}",
+                        htlc.htlc_id, htlc.amount
+                    )));
+                }
+                pending_htlc_count += 1;
+                pending_htlc_amount =
+                    pending_htlc_amount.checked_add(htlc.amount).ok_or_else(|| {
+                        PaymentChannelError::InvalidState(
+                            "Pending HTLC amount overflow".to_string(),
+                        )
+                    })?;
+            }
+        }
+
+        let available_capacity = capacity.saturating_sub(pending_htlc_amount);
+
+        Ok(ChannelStatusInfo {
+            channel_id: self.channel_id.clone(),
+            status: self.status,
+            our_balance: self.our_balance,
+            their_balance: self.their_balance,
+            pending_htlc_count,
+            pending_htlc_amount,
+            capacity,
+            available_capacity,
+        })
+    }
+}
+
 /// HTLC state
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HtlcState {
@@ -643,6 +713,18 @@ impl ChannelManager {
             .read()
             .get(channel_id)
             .map(|channel| channel.state.clone())
+    }
+
+    /// Get a channel's status snapshot including pending HTLC count and capacity.
+    pub fn get_channel_status(
+        &self,
+        channel_id: &str,
+    ) -> Result<ChannelStatusInfo, PaymentChannelError> {
+        let channels = self.channels.read();
+        let channel = channels
+            .get(channel_id)
+            .ok_or_else(|| PaymentChannelError::ChannelNotFound(channel_id.to_string()))?;
+        channel.state.status_info()
     }
 
     /// Get all channels
@@ -1745,5 +1827,87 @@ mod tests {
         assert_eq!(bob_state.our_balance, 1150);
         assert_eq!(bob_state.their_balance, 850);
         assert_eq!(alice_state.sequence_number, bob_state.sequence_number);
+    }
+
+    #[test]
+    fn channel_status_exposes_pending_htlc_count_and_capacity() {
+        let mut state = LocalChannelState {
+            channel_id: "ch-status".to_string(),
+            our_address: "GA".to_string(),
+            their_address: "GB".to_string(),
+            our_balance: 700,
+            their_balance: 300,
+            status: ChannelStatus::Open,
+            sequence_number: 1,
+            funding_tx_hash: None,
+            closing_tx_hash: None,
+            timeout: 100,
+            fee_percentage: 10,
+            pending_htlcs: vec![
+                HtlcState {
+                    htlc_id: "h1".to_string(),
+                    amount: 150,
+                    hashlock: vec![1; 32],
+                    timelock: 500,
+                    is_claimed: false,
+                    is_refunded: false,
+                    preimage: None,
+                    direction: HtlcDirection::Outgoing,
+                },
+                HtlcState {
+                    htlc_id: "h2".to_string(),
+                    amount: 250,
+                    hashlock: vec![2; 32],
+                    timelock: 600,
+                    is_claimed: false,
+                    is_refunded: false,
+                    preimage: None,
+                    direction: HtlcDirection::Incoming,
+                },
+                HtlcState {
+                    htlc_id: "h3-claimed".to_string(),
+                    amount: 999,
+                    hashlock: vec![3; 32],
+                    timelock: 700,
+                    is_claimed: true,
+                    is_refunded: false,
+                    preimage: Some(vec![9; 32]),
+                    direction: HtlcDirection::Outgoing,
+                },
+                HtlcState {
+                    htlc_id: "h4-refunded".to_string(),
+                    amount: 888,
+                    hashlock: vec![4; 32],
+                    timelock: 800,
+                    is_claimed: false,
+                    is_refunded: true,
+                    preimage: None,
+                    direction: HtlcDirection::Outgoing,
+                },
+            ],
+            local_secret: vec![],
+            remote_public_key: vec![],
+        };
+
+        let info = state.status_info().unwrap();
+        assert_eq!(info.status, ChannelStatus::Open);
+        assert_eq!(info.pending_htlc_count, 2);
+        assert_eq!(info.pending_htlc_amount, 400);
+        assert_eq!(info.capacity, 1_000);
+        assert_eq!(info.available_capacity, 600);
+
+        // Negative HTLC amount is rejected explicitly.
+        state.pending_htlcs[0].amount = -10;
+        assert!(matches!(
+            state.status_info(),
+            Err(PaymentChannelError::InvalidState(_))
+        ));
+    }
+
+    #[test]
+    fn get_channel_status_returns_not_found_for_missing_channel() {
+        let manager = PaymentChannelManager::new(Arc::new(Ed25519Signer::generate()));
+        let err = manager.get_channel_status("missing").unwrap_err();
+        assert!(matches!(err, PaymentChannelError::ChannelNotFound(_)));
     }
 }

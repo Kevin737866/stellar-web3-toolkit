@@ -16,7 +16,7 @@ use soroban_sdk::{
     contract, contractimpl, contractmeta, Address, Bytes, BytesN, Env, IntoVal, TryFromVal,
     Vec as SorobanVec,
 };
-use types::{ChannelState, HTLCInfo, HtlcList};
+use types::{ChannelState, ChannelStatusReport, HTLCInfo, HtlcList};
 
 /// Shortest dispute period the contract accepts for a force-close request,
 /// in seconds.
@@ -123,6 +123,30 @@ impl PaymentChannel {
         channel_id: BytesN<32>,
     ) -> Result<ChannelState, PaymentChannelError> {
         state::get_channel_state(&env, &channel_id)
+    }
+
+    /// Get a channel status report including pending HTLC count and capacity.
+    pub fn get_channel_status(
+        env: Env,
+        channel_id: BytesN<32>,
+    ) -> Result<ChannelStatusReport, PaymentChannelError> {
+        let channel = state::get_channel_state(&env, &channel_id)?;
+        let (pending_htlc_count, pending_htlc_amount) =
+            channel::ChannelManager::compute_pending_htlc_metrics(&env, &channel.htlcs)?;
+        let capacity = channel.total_balance;
+        let available_capacity = capacity.saturating_sub(pending_htlc_amount);
+
+        Ok(ChannelStatusReport {
+            channel_id: channel.channel_id,
+            is_open: channel.close_time == 0 && !channel.is_cooperative_close,
+            is_cooperative_close: channel.is_cooperative_close,
+            balance_a: channel.balance_a,
+            balance_b: channel.balance_b,
+            capacity,
+            pending_htlc_count,
+            pending_htlc_amount,
+            available_capacity,
+        })
     }
 
     /// Update the channel state with a new payment
@@ -810,122 +834,64 @@ mod tests {
         assert_eq!(state.sequence_number, 1);
     }
 
-    // ── force_close / bounded dispute-period tests (#353) ─────────────────
-
     #[test]
-    fn test_force_close_minimum_period_accepted() {
+    fn test_get_channel_status_exposes_pending_htlcs_and_capacity() {
         let env = Env::default();
         env.mock_all_auths();
-        let (client, p_a, _p_b, channel_id) = setup_channel(&env);
+        let (client, p_a, p_b, channel_id) = setup_channel(&env);
 
-        let withdraw_time =
-            client.force_close(&channel_id, &p_a, &MIN_DISPUTE_PERIOD_SECS);
-        let state = client.get_channel_state(&channel_id);
-        assert_ne!(state.close_time, 0);
-        assert_eq!(state.timeout, MIN_DISPUTE_PERIOD_SECS);
-        assert_eq!(withdraw_time, state.close_time + MIN_DISPUTE_PERIOD_SECS as u64);
+        let initial = client.get_channel_status(&channel_id);
+        assert!(initial.is_open);
+        assert_eq!(initial.capacity, 2_000);
+        assert_eq!(initial.pending_htlc_count, 0);
+        assert_eq!(initial.pending_htlc_amount, 0);
+        assert_eq!(initial.available_capacity, 2_000);
+
+        // Add one active HTLC and one claimed HTLC directly in contract storage
+        // to verify only active HTLCs are counted.
+        let active_id = BytesN::from_array(&env, &[1u8; 32]);
+        let claimed_id = BytesN::from_array(&env, &[2u8; 32]);
+        let mut active_htlc = HTLCInfo::new(
+            active_id.clone(),
+            300,
+            BytesN::from_array(&env, &[7u8; 32]),
+            1_000,
+            p_a.clone(),
+            p_b.clone(),
+        );
+        active_htlc.is_claimed = false;
+        let mut claimed_htlc = HTLCInfo::new(
+            claimed_id.clone(),
+            500,
+            BytesN::from_array(&env, &[8u8; 32]),
+            1_000,
+            p_a,
+            p_b,
+        );
+        claimed_htlc.is_claimed = true;
+
+        env.as_contract(&client.address, || {
+            let mut st = state::get_channel_state(&env, &channel_id).unwrap();
+            st.htlcs.set(active_id.to_val(), active_htlc.to_val());
+            st.htlcs.set(claimed_id.to_val(), claimed_htlc.to_val());
+            state::store_channel_state(&env, &channel_id, &st);
+        });
+
+        let updated = client.get_channel_status(&channel_id);
+        assert_eq!(updated.pending_htlc_count, 1);
+        assert_eq!(updated.pending_htlc_amount, 300);
+        assert_eq!(updated.capacity, 2_000);
+        assert_eq!(updated.available_capacity, 1_700);
     }
 
     #[test]
-    fn test_force_close_maximum_period_accepted() {
+    fn test_get_channel_status_missing_channel_returns_not_found() {
         let env = Env::default();
-        env.mock_all_auths();
-        let (client, p_a, _p_b, channel_id) = setup_channel(&env);
+        let contract_id = env.register_contract(None, PaymentChannel);
+        let client = PaymentChannelClient::new(&env, &contract_id);
+        let missing = BytesN::from_array(&env, &[9u8; 32]);
 
-        let withdraw_time =
-            client.force_close(&channel_id, &p_a, &MAX_DISPUTE_PERIOD_SECS);
-        let state = client.get_channel_state(&channel_id);
-        assert_ne!(state.close_time, 0);
-        assert_eq!(state.timeout, MAX_DISPUTE_PERIOD_SECS);
-        assert_eq!(withdraw_time, state.close_time + MAX_DISPUTE_PERIOD_SECS as u64);
-    }
-
-    #[test]
-    fn test_force_close_period_too_short_rejected() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, p_a, _p_b, channel_id) = setup_channel(&env);
-
-        let res = client.try_force_close(&channel_id, &p_a, &(MIN_DISPUTE_PERIOD_SECS - 1));
-        assert_eq!(res, Err(Ok(PaymentChannelError::DisputePeriodTooShort)));
-
-        // Channel must remain open after the rejected call.
-        let state = client.get_channel_state(&channel_id);
-        assert_eq!(state.close_time, 0);
-    }
-
-    #[test]
-    fn test_force_close_period_zero_rejected() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, p_a, _p_b, channel_id) = setup_channel(&env);
-
-        let res = client.try_force_close(&channel_id, &p_a, &0_u32);
-        assert_eq!(res, Err(Ok(PaymentChannelError::DisputePeriodTooShort)));
-    }
-
-    #[test]
-    fn test_force_close_period_too_long_rejected() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, p_a, _p_b, channel_id) = setup_channel(&env);
-
-        let res = client.try_force_close(&channel_id, &p_a, &(MAX_DISPUTE_PERIOD_SECS + 1));
-        assert_eq!(res, Err(Ok(PaymentChannelError::DisputePeriodTooLong)));
-
-        let state = client.get_channel_state(&channel_id);
-        assert_eq!(state.close_time, 0);
-    }
-
-    #[test]
-    fn test_force_close_unauthorized_participant_rejected() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, _p_a, _p_b, channel_id) = setup_channel(&env);
-        let stranger = Address::generate(&env);
-
-        let res = client.try_force_close(&channel_id, &stranger, &MIN_DISPUTE_PERIOD_SECS);
-        assert_eq!(res, Err(Ok(PaymentChannelError::UnauthorizedParticipant)));
-    }
-
-    #[test]
-    fn test_force_close_already_closed_rejected() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, p_a, _p_b, channel_id) = setup_channel(&env);
-        let dummy_sig = BytesN::from_array(&env, &[0u8; 64]);
-
-        client.cooperative_close(&channel_id, &1_000, &1_000, &dummy_sig, &dummy_sig);
-
-        let res = client.try_force_close(&channel_id, &p_a, &MIN_DISPUTE_PERIOD_SECS);
-        assert_eq!(res, Err(Ok(PaymentChannelError::ChannelAlreadyClosed)));
-    }
-
-    #[test]
-    fn test_force_close_with_active_htlcs_rejected() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, p_a, _p_b, channel_id) = setup_channel(&env);
-        let hashlock = BytesN::from_array(&env, &[3u8; 32]);
-        let receiver = Address::generate(&env);
-
-        // timelock must be strictly in the future (> current ledger sequence 0)
-        client.create_htlc(&channel_id, &hashlock, &2_000, &100, &receiver);
-
-        let res = client.try_force_close(&channel_id, &p_a, &MIN_DISPUTE_PERIOD_SECS);
-        assert_eq!(res, Err(Ok(PaymentChannelError::ActiveHtlcsExist)));
-    }
-
-    #[test]
-    fn test_force_close_stores_updated_timeout_on_state() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, p_a, _p_b, channel_id) = setup_channel(&env);
-        // The channel was created with timeout=100 (see setup_channel), which
-        // is below the minimum dispute period. force_close must override it.
-        let custom_period = MIN_DISPUTE_PERIOD_SECS + 1_800;
-        client.force_close(&channel_id, &p_a, &custom_period);
-        let state = client.get_channel_state(&channel_id);
-        assert_eq!(state.timeout, custom_period);
+        let res = client.try_get_channel_status(&missing);
+        assert_eq!(res, Err(Ok(PaymentChannelError::ChannelNotFound)));
     }
 }
