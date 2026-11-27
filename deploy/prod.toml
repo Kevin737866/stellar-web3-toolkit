@@ -1,0 +1,38 @@
+# Production deployment spec — stellar-toolkit deploy validate-offline
+#
+# Validate offline before any mainnet operation:
+#
+#   stellar-toolkit deploy validate-offline deploy/prod.toml
+#
+# REQUIRED before every production deploy:
+#   1. Run the offline validator and confirm zero errors.
+#   2. Confirm contract_id is set for every contract (upgrades, not new deploys).
+#   3. Confirm admin_account is the cold-storage key referenced in [security] of
+#      config/prod.toml.
+
+name = "prod"
+admin_account = "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN"
+
+[network]
+# Links to config/prod.toml at submission time.
+environment = "prod"
+
+[submit]
+fee = "10000"
+timeout_seconds = 120
+confirmations = 5
+dry_run = false
+
+[contracts.amm_pool]
+wasm_path = "target/wasm32v1-none/release/amm_pool.wasm"
+# contract_id is required on prod to prevent accidental first-time deploys.
+# Uncomment and fill in before running:
+# contract_id = "CABC..."
+
+[contracts.amm_factory]
+wasm_path = "target/wasm32v1-none/release/amm_factory.wasm"
+# contract_id = "CABC..."
+
+[contracts.amm_router]
+wasm_path = "target/wasm32v1-none/release/amm_router.wasm"
+# contract_id = "CABC..."

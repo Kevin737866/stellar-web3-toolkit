@@ -584,6 +584,33 @@ pub enum WalletCommand {
     },
 }
 
+/// Offline deployment configuration commands (issue #327).
+///
+/// These commands validate a `deploy/<spec>.toml` file without touching the
+/// network. The spec format is documented in
+/// [`crate::deploy_config::DeploymentSpec`].
+#[derive(Subcommand, Debug)]
+pub enum DeployCommand {
+    /// Validate a deployment spec offline and report all issues
+    ///
+    /// Exits non-zero when any error-severity finding is present. Warnings are
+    /// printed but do not affect the exit code.
+    ValidateOffline {
+        /// Path to the deployment spec TOML file
+        spec: PathBuf,
+        /// Directory to resolve relative `wasm_path` values from
+        /// (defaults to the workspace root)
+        #[arg(long, default_value = ".")]
+        workspace: PathBuf,
+        /// Print the report as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        /// Do not exit non-zero on warnings
+        #[arg(long, default_value_t = false)]
+        warn_only: bool,
+    },
+}
+
 /// Redacting `Debug` (issue #115).
 ///
 /// `main` logs the parsed command at info level, so a derived `Debug` here

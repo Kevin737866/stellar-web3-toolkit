@@ -10,6 +10,7 @@ pub mod bridge_oracle;
 pub mod cli;
 pub mod compliance;
 pub mod conviction;
+pub mod deploy_config;
 pub mod env_config;
 pub mod error;
 pub mod example_gallery;
@@ -62,6 +63,10 @@ pub use compliance::{
 pub use conviction::{
     conviction_weight, decayed_weight, isqrt, ProposalMetadata, ProposalValidationError,
     MAX_LOCK_LEDGERS, MAX_PROPOSAL_DESCRIPTION_LEN, MAX_PROPOSAL_TITLE_LEN, WEIGHT_SCALE,
+};
+pub use deploy_config::{
+    ContractEntry, DeploymentNetwork, DeploymentSpec, DeploymentValidationReport,
+    DeploymentValidator, Finding as DeployFinding, Severity as DeploySeverity, SubmitConfig,
 };
 pub use env_config::{
     validate_directory, EnvConfig, EnvValidation, EnvValidationReport, Finding as EnvFinding,
