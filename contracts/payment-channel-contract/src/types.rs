@@ -33,6 +33,30 @@ pub enum CloseReason {
 /// Represents a payment channel between two participants
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChannelStatusReport {
+    /// Unique identifier for this channel
+    pub channel_id: BytesN<32>,
+    /// Whether the channel is currently open (`close_time == 0` and not cooperatively closed)
+    pub is_open: bool,
+    /// Whether the channel was cooperatively closed
+    pub is_cooperative_close: bool,
+    /// Current balance of participant A
+    pub balance_a: i128,
+    /// Current balance of participant B
+    pub balance_b: i128,
+    /// Total channel capacity (`total_balance`)
+    pub capacity: i128,
+    /// Number of active (unclaimed and unrefunded) pending HTLCs
+    pub pending_htlc_count: u32,
+    /// Total amount locked in active pending HTLCs
+    pub pending_htlc_amount: i128,
+    /// Remaining available capacity (`capacity.saturating_sub(pending_htlc_amount)`)
+    pub available_capacity: i128,
+}
+
+/// Represents a payment channel between two participants
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChannelState {
     /// Unique identifier for this channel
     pub channel_id: BytesN<32>,

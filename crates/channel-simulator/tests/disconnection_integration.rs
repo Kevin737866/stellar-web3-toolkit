@@ -107,6 +107,7 @@ fn routing_blocks_disconnected_node_and_resumes_after_recovery() {
         max_hops: None,
         find_any: false,
         payment_metadata: None,
+        excluded_unavailable: Vec::new(),
     };
 
     let pathfinder = Pathfinder::new();

@@ -6,6 +6,7 @@ use crate::monitor::{ChannelMonitorState, ChannelUpdate};
 use crate::Alert;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use thiserror::Error;
 use tracing::{debug, info};
 
@@ -77,8 +78,148 @@ impl CompactionReport {
     }
 }
 
+/// Overall state reported by a storage health probe.
+///
+/// `Degraded` means the backend answered but could not meet the requested
+/// guarantees (for example, a slow response or a backend that cannot verify
+/// persistence). `Unhealthy` means a probe actually failed, so the backend
+/// cannot currently be trusted to hold breach evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StorageHealthState {
+    /// Every enabled probe succeeded within the configured latency budget.
+    Healthy,
+    /// Probes succeeded, but a guarantee requested by the caller was not met.
+    Degraded,
+    /// At least one required probe failed.
+    Unhealthy,
+}
+
+impl StorageHealthState {
+    /// Whether this state represents a backend that can be relied upon.
+    pub fn is_healthy(self) -> bool {
+        matches!(self, StorageHealthState::Healthy)
+    }
+
+    /// Stable label suitable for logs and alerts.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StorageHealthState::Healthy => "healthy",
+            StorageHealthState::Degraded => "degraded",
+            StorageHealthState::Unhealthy => "unhealthy",
+        }
+    }
+}
+
+/// Options for a storage health probe.
+///
+/// Invalid options are rejected with [`StorageError::HealthCheckError`] instead
+/// of being silently replaced with defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageHealthCheckOptions {
+    /// Maximum acceptable duration of the whole probe, in milliseconds.
+    /// Must be at least 1; a zero budget would make every backend fail.
+    pub max_latency_ms: u64,
+    /// Also perform a write/read/delete round-trip using a sentinel
+    /// subscription. The sentinel is removed on every path, including failures.
+    pub probe_writes: bool,
+}
+
+impl Default for StorageHealthCheckOptions {
+    fn default() -> Self {
+        StorageHealthCheckOptions {
+            max_latency_ms: 1_000,
+            probe_writes: false,
+        }
+    }
+}
+
+impl StorageHealthCheckOptions {
+    /// Reject options that cannot describe a meaningful probe.
+    pub fn validate(&self) -> Result<(), StorageError> {
+        if self.max_latency_ms == 0 {
+            return Err(StorageError::HealthCheckError(
+                "max_latency_ms must be greater than zero".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Result of a storage health probe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageHealthReport {
+    /// Name of the backend that was probed (`in-memory`, `sqlite`, or a custom
+    /// backend's [`StorageBackend::backend_name`]).
+    pub backend: String,
+    /// Overall outcome of the probe.
+    pub state: StorageHealthState,
+    /// Unix timestamp at which the probe finished.
+    pub checked_at: u64,
+    /// Wall-clock duration of the probe in milliseconds.
+    pub elapsed_ms: u64,
+    /// Whether the read probe succeeded.
+    pub read_ok: bool,
+    /// Outcome of the write/read/delete probe, or `None` when it was not
+    /// requested (or was skipped because the read probe had already failed).
+    pub write_probe_ok: Option<bool>,
+    /// Actionable messages explaining a degraded or unhealthy result.
+    pub details: Vec<String>,
+}
+
+impl StorageHealthReport {
+    /// Whether the probed backend can be relied upon.
+    pub fn is_healthy(&self) -> bool {
+        self.state.is_healthy()
+    }
+
+    /// One-line summary suitable for an alert or log entry.
+    pub fn summary(&self) -> String {
+        let mut summary = format!(
+            "{} storage backend is {}: read_ok={}",
+            self.backend,
+            self.state.as_str(),
+            self.read_ok
+        );
+        if let Some(write_ok) = self.write_probe_ok {
+            write!(summary, ", write_probe_ok={write_ok}")
+                .expect("writing to a String cannot fail");
+        }
+        for detail in &self.details {
+            write!(summary, "; {detail}").expect("writing to a String cannot fail");
+        }
+        summary
+    }
+}
+
 /// Storage backend trait
 pub trait StorageBackend: Send + Sync {
+    /// Stable name used in health reports and alerts.
+    ///
+    /// Existing implementations keep compiling with the default value.
+    fn backend_name(&self) -> &'static str {
+        "custom"
+    }
+
+    /// Probe the backend with the default options.
+    fn check_health(&self) -> Result<StorageHealthReport, StorageError> {
+        self.check_health_with(&StorageHealthCheckOptions::default())
+    }
+
+    /// Probe the backend with caller-supplied options.
+    ///
+    /// Returns `Err` only for invalid options or an internal probe failure. A
+    /// failing backend is reported as an [`StorageHealthState::Unhealthy`]
+    /// report carrying the backend's error in [`StorageHealthReport::details`].
+    /// The default implementation works for any backend; implementations may
+    /// override it to add backend-specific checks.
+    fn check_health_with(
+        &self,
+        options: &StorageHealthCheckOptions,
+    ) -> Result<StorageHealthReport, StorageError> {
+        options.validate()?;
+        Ok(probe_health(self, self.backend_name(), options))
+    }
+
     /// Store a channel state
     fn store_channel_state(
         &self,
@@ -142,6 +283,17 @@ pub trait StorageBackend: Send + Sync {
         id: &str,
     ) -> Result<Option<crate::justice::JusticeAction>, StorageError>;
 
+    /// Retrieve every persisted justice action, regardless of status.
+    ///
+    /// Recovery export needs submitted and failed records as well as pending
+    /// ones. Backends that do not override this fail explicitly instead of
+    /// silently producing a partial snapshot.
+    fn get_all_justice_actions(&self) -> Result<Vec<crate::justice::JusticeAction>, StorageError> {
+        Err(StorageError::QueryError(
+            "backend does not support full justice action export".to_string(),
+        ))
+    }
+
     /// Retrieve all justice actions whose status is `Pending`.
     ///
     /// Used by the operator recovery path: after a restart, any `Pending`
@@ -160,6 +312,31 @@ pub trait StorageBackend: Send + Sync {
         status: crate::justice::ActionStatus,
         tx_hash: Option<&str>,
     ) -> Result<(), StorageError>;
+
+    // ── Retryable alert delivery persistence (issue #373) ────────────────────
+
+    /// Persist a new alert delivery record before attempting delivery.
+    fn store_alert_delivery(
+        &self,
+        delivery: &crate::alert::AlertDelivery,
+    ) -> Result<(), StorageError>;
+
+    /// Retrieve an alert delivery record by its [`crate::alert::DeliveryId`].
+    fn get_alert_delivery(
+        &self,
+        delivery_id: &str,
+    ) -> Result<Option<crate::alert::AlertDelivery>, StorageError>;
+
+    /// Retrieve all alert deliveries in [`crate::alert::DeliveryStatus::Pending`].
+    fn get_pending_alert_deliveries(
+        &self,
+    ) -> Result<Vec<crate::alert::AlertDelivery>, StorageError>;
+
+    /// Persist an updated alert delivery record (attempts, status, backoff).
+    fn update_alert_delivery(
+        &self,
+        delivery: &crate::alert::AlertDelivery,
+    ) -> Result<(), StorageError>;
 }
 
 /// In-memory storage backend
@@ -170,6 +347,8 @@ pub struct InMemoryStorage {
     subscriptions: parking_lot::RwLock<Vec<String>>,
     /// Justice action records, keyed by action ID (issue #368).
     justice_actions: parking_lot::RwLock<HashMap<String, crate::justice::JusticeAction>>,
+    /// Alert delivery records, keyed by delivery ID.
+    alert_deliveries: parking_lot::RwLock<HashMap<String, crate::alert::AlertDelivery>>,
 }
 
 impl InMemoryStorage {
@@ -181,6 +360,7 @@ impl InMemoryStorage {
             alerts: parking_lot::RwLock::new(Vec::new()),
             subscriptions: parking_lot::RwLock::new(Vec::new()),
             justice_actions: parking_lot::RwLock::new(HashMap::new()),
+            alert_deliveries: parking_lot::RwLock::new(HashMap::new()),
         }
     }
 }
@@ -192,6 +372,10 @@ impl Default for InMemoryStorage {
 }
 
 impl StorageBackend for InMemoryStorage {
+    fn backend_name(&self) -> &'static str {
+        "in-memory"
+    }
+
     fn store_channel_state(
         &self,
         channel_id: &str,
@@ -371,6 +555,11 @@ impl StorageBackend for InMemoryStorage {
         Ok(actions.get(id).cloned())
     }
 
+    fn get_all_justice_actions(&self) -> Result<Vec<crate::justice::JusticeAction>, StorageError> {
+        let actions = self.justice_actions.read();
+        Ok(actions.values().cloned().collect())
+    }
+
     fn get_pending_justice_actions(
         &self,
     ) -> Result<Vec<crate::justice::JusticeAction>, StorageError> {
@@ -398,6 +587,55 @@ impl StorageBackend for InMemoryStorage {
         }
         Ok(())
     }
+
+    fn store_alert_delivery(
+        &self,
+        delivery: &crate::alert::AlertDelivery,
+    ) -> Result<(), StorageError> {
+        let mut deliveries = self.alert_deliveries.write();
+        let key = delivery.delivery_id.as_str();
+        if deliveries.contains_key(key) {
+            return Err(StorageError::QueryError(format!(
+                "alert delivery {key} already exists"
+            )));
+        }
+        deliveries.insert(key.to_string(), delivery.clone());
+        Ok(())
+    }
+
+    fn get_alert_delivery(
+        &self,
+        delivery_id: &str,
+    ) -> Result<Option<crate::alert::AlertDelivery>, StorageError> {
+        let deliveries = self.alert_deliveries.read();
+        Ok(deliveries.get(delivery_id).cloned())
+    }
+
+    fn get_pending_alert_deliveries(
+        &self,
+    ) -> Result<Vec<crate::alert::AlertDelivery>, StorageError> {
+        let deliveries = self.alert_deliveries.read();
+        let mut pending: Vec<_> = deliveries
+            .values()
+            .filter(|d| d.status == crate::alert::DeliveryStatus::Pending)
+            .cloned()
+            .collect();
+        pending.sort_by_key(|d| (d.next_retry_at, d.created_at));
+        Ok(pending)
+    }
+
+    fn update_alert_delivery(
+        &self,
+        delivery: &crate::alert::AlertDelivery,
+    ) -> Result<(), StorageError> {
+        let mut deliveries = self.alert_deliveries.write();
+        let key = delivery.delivery_id.as_str();
+        let slot = deliveries
+            .get_mut(key)
+            .ok_or_else(|| StorageError::QueryError(format!("alert delivery {key} not found")))?;
+        *slot = delivery.clone();
+        Ok(())
+    }
 }
 
 /// SQLite storage backend (placeholder implementation)
@@ -418,6 +656,34 @@ impl SqliteStorage {
 }
 
 impl StorageBackend for SqliteStorage {
+    fn backend_name(&self) -> &'static str {
+        "sqlite"
+    }
+
+    fn check_health_with(
+        &self,
+        options: &StorageHealthCheckOptions,
+    ) -> Result<StorageHealthReport, StorageError> {
+        options.validate()?;
+
+        // This backend is a placeholder: operations report success but no rows
+        // are persisted, so a write/read-back probe would always fail. Report
+        // that limitation explicitly rather than claiming full health or
+        // inventing a failing probe.
+        let read_only = StorageHealthCheckOptions {
+            probe_writes: false,
+            ..*options
+        };
+        let mut report = probe_health(self, self.backend_name(), &read_only);
+        if report.state == StorageHealthState::Healthy {
+            report.state = StorageHealthState::Degraded;
+        }
+        report.details.push(
+            "SQLite backend is a placeholder: persistence is not implemented, so durability cannot be verified".to_string(),
+        );
+        Ok(report)
+    }
+
     fn store_channel_state(
         &self,
         channel_id: &str,
@@ -509,6 +775,13 @@ impl StorageBackend for SqliteStorage {
         Ok(None)
     }
 
+    fn get_all_justice_actions(&self) -> Result<Vec<crate::justice::JusticeAction>, StorageError> {
+        // The placeholder backend persists no rows, so an empty snapshot here
+        // is accurate rather than a partial result.
+        info!("SQLite: getting all justice actions");
+        Ok(Vec::new())
+    }
+
     fn get_pending_justice_actions(
         &self,
     ) -> Result<Vec<crate::justice::JusticeAction>, StorageError> {
@@ -530,6 +803,144 @@ impl StorageBackend for SqliteStorage {
         );
         Ok(())
     }
+
+    fn store_alert_delivery(
+        &self,
+        delivery: &crate::alert::AlertDelivery,
+    ) -> Result<(), StorageError> {
+        info!("SQLite: storing alert delivery {}", delivery.delivery_id);
+        Ok(())
+    }
+
+    fn get_alert_delivery(
+        &self,
+        delivery_id: &str,
+    ) -> Result<Option<crate::alert::AlertDelivery>, StorageError> {
+        info!("SQLite: getting alert delivery {}", delivery_id);
+        Ok(None)
+    }
+
+    fn get_pending_alert_deliveries(
+        &self,
+    ) -> Result<Vec<crate::alert::AlertDelivery>, StorageError> {
+        info!("SQLite: getting pending alert deliveries");
+        Ok(Vec::new())
+    }
+
+    fn update_alert_delivery(
+        &self,
+        delivery: &crate::alert::AlertDelivery,
+    ) -> Result<(), StorageError> {
+        info!(
+            "SQLite: updating alert delivery {} to {:?} (attempts={})",
+            delivery.delivery_id, delivery.status, delivery.attempts
+        );
+        Ok(())
+    }
+}
+
+/// Run the generic health probe against any backend.
+///
+/// A write probe uses a sentinel subscription so it never touches a real
+/// channel subscription or a pending justice action. Cleanup is attempted on
+/// every path, including a failed write or a failed verification, so a probe
+/// cannot leave durable state behind.
+fn probe_health<B: StorageBackend + ?Sized>(
+    backend: &B,
+    backend_name: &str,
+    options: &StorageHealthCheckOptions,
+) -> StorageHealthReport {
+    let started = std::time::Instant::now();
+    let mut state = StorageHealthState::Healthy;
+    let mut details = Vec::new();
+
+    // Read probe: any storage error is a health result, not an API error.
+    let read_ok = match backend.get_subscriptions() {
+        Ok(_) => true,
+        Err(e) => {
+            state = StorageHealthState::Unhealthy;
+            details.push(format!("read probe failed: {e}"));
+            false
+        }
+    };
+
+    let mut write_probe_ok = None;
+    if options.probe_writes {
+        if read_ok {
+            let sentinel = format!("__watchtower_health_probe__{:x}", rand::random::<u128>());
+
+            match backend.store_subscription(&sentinel) {
+                Ok(()) => {
+                    let visible = match backend.get_subscriptions() {
+                        Ok(subscriptions) => subscriptions.iter().any(|id| id == &sentinel),
+                        Err(e) => {
+                            details.push(format!("write probe verification failed: {e}"));
+                            false
+                        }
+                    };
+
+                    // Always try to remove the sentinel, even if verification
+                    // failed: a probe must not leave partial state behind.
+                    if let Err(e) = backend.remove_subscription(&sentinel) {
+                        state = StorageHealthState::Unhealthy;
+                        details.push(format!("write probe cleanup failed for {sentinel}: {e}"));
+                    }
+
+                    if visible {
+                        write_probe_ok = Some(true);
+                    } else {
+                        state = StorageHealthState::Unhealthy;
+                        details.push(
+                            "write probe: sentinel subscription was not readable back".to_string(),
+                        );
+                        write_probe_ok = Some(false);
+                    }
+                }
+                Err(e) => {
+                    // The write may have partially succeeded, so still attempt
+                    // cleanup before reporting.
+                    if let Err(cleanup) = backend.remove_subscription(&sentinel) {
+                        details.push(format!(
+                            "write probe cleanup failed for {sentinel}: {cleanup}"
+                        ));
+                    }
+                    state = StorageHealthState::Unhealthy;
+                    details.push(format!("write probe failed: {e}"));
+                    write_probe_ok = Some(false);
+                }
+            }
+        } else {
+            details.push("write probe skipped because the read probe failed".to_string());
+        }
+    }
+
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    if elapsed_ms > options.max_latency_ms {
+        if state == StorageHealthState::Healthy {
+            state = StorageHealthState::Degraded;
+        }
+        details.push(format!(
+            "probe took {elapsed_ms}ms, exceeding the {}ms budget",
+            options.max_latency_ms
+        ));
+    }
+
+    debug!(
+        backend = backend_name,
+        state = state.as_str(),
+        elapsed_ms,
+        "storage health probe completed"
+    );
+
+    StorageHealthReport {
+        backend: backend_name.to_string(),
+        state,
+        checked_at: current_timestamp(),
+        elapsed_ms,
+        read_ok,
+        write_probe_ok,
+        details,
+    }
 }
 
 /// Seconds since the Unix epoch.
@@ -550,6 +961,12 @@ pub enum StorageError {
 
     #[error("Query error: {0}")]
     QueryError(String),
+
+    /// Invalid health-check options or a failure to run the probe itself.
+    /// A backend that answers but is unhealthy is reported as a
+    /// [`StorageHealthReport`] instead.
+    #[error("Health check error: {0}")]
+    HealthCheckError(String),
 }
 
 #[cfg(test)]
@@ -799,5 +1216,321 @@ mod tests {
         storage.store_alert(&alert).unwrap();
         let alerts = storage.get_alerts(10).unwrap();
         assert_eq!(alerts.len(), 1);
+    }
+
+    // ── Storage backend health checks ─────────────────────────────────────────
+
+    /// A backend that can be made to fail individual probe steps. Everything
+    /// else is delegated to a real in-memory store so failures are isolated.
+    struct FlakyStorage {
+        inner: InMemoryStorage,
+        fail_read: std::sync::atomic::AtomicBool,
+        fail_write: std::sync::atomic::AtomicBool,
+        fail_cleanup: std::sync::atomic::AtomicBool,
+        slow_read: std::sync::atomic::AtomicBool,
+    }
+
+    impl FlakyStorage {
+        fn new() -> Self {
+            FlakyStorage {
+                inner: InMemoryStorage::new(),
+                fail_read: std::sync::atomic::AtomicBool::new(false),
+                fail_write: std::sync::atomic::AtomicBool::new(false),
+                fail_cleanup: std::sync::atomic::AtomicBool::new(false),
+                slow_read: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn set_fail_read(&self, value: bool) {
+            self.fail_read
+                .store(value, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn set_fail_write(&self, value: bool) {
+            self.fail_write
+                .store(value, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn set_fail_cleanup(&self, value: bool) {
+            self.fail_cleanup
+                .store(value, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn set_slow_read(&self, value: bool) {
+            self.slow_read
+                .store(value, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn probe_error(step: &str) -> StorageError {
+            StorageError::DatabaseError(format!("injected {step} failure"))
+        }
+    }
+
+    impl StorageBackend for FlakyStorage {
+        fn backend_name(&self) -> &'static str {
+            "flaky"
+        }
+
+        fn store_channel_state(
+            &self,
+            channel_id: &str,
+            state: &ChannelMonitorState,
+        ) -> Result<(), StorageError> {
+            self.inner.store_channel_state(channel_id, state)
+        }
+
+        fn get_channel_state(
+            &self,
+            channel_id: &str,
+        ) -> Result<Option<ChannelMonitorState>, StorageError> {
+            self.inner.get_channel_state(channel_id)
+        }
+
+        fn store_alert(&self, alert: &Alert) -> Result<(), StorageError> {
+            self.inner.store_alert(alert)
+        }
+
+        fn get_alerts(&self, limit: usize) -> Result<Vec<Alert>, StorageError> {
+            self.inner.get_alerts(limit)
+        }
+
+        fn store_channel_update(&self, update: &ChannelUpdate) -> Result<(), StorageError> {
+            self.inner.store_channel_update(update)
+        }
+
+        fn get_channel_update(
+            &self,
+            channel_id: &str,
+        ) -> Result<Option<ChannelUpdate>, StorageError> {
+            self.inner.get_channel_update(channel_id)
+        }
+
+        fn store_subscription(&self, channel_id: &str) -> Result<(), StorageError> {
+            if self.fail_write.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(Self::probe_error("write"));
+            }
+            self.inner.store_subscription(channel_id)
+        }
+
+        fn get_subscriptions(&self) -> Result<Vec<String>, StorageError> {
+            if self.slow_read.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if self.fail_read.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(Self::probe_error("read"));
+            }
+            self.inner.get_subscriptions()
+        }
+
+        fn remove_subscription(&self, channel_id: &str) -> Result<(), StorageError> {
+            if self.fail_cleanup.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(Self::probe_error("cleanup"));
+            }
+            self.inner.remove_subscription(channel_id)
+        }
+
+        fn store_alert_delivery(
+            &self,
+            delivery: &crate::alert::AlertDelivery,
+        ) -> Result<(), StorageError> {
+            self.inner.store_alert_delivery(delivery)
+        }
+
+        fn get_alert_delivery(
+            &self,
+            delivery_id: &str,
+        ) -> Result<Option<crate::alert::AlertDelivery>, StorageError> {
+            self.inner.get_alert_delivery(delivery_id)
+        }
+
+        fn get_pending_alert_deliveries(
+            &self,
+        ) -> Result<Vec<crate::alert::AlertDelivery>, StorageError> {
+            self.inner.get_pending_alert_deliveries()
+        }
+
+        fn update_alert_delivery(
+            &self,
+            delivery: &crate::alert::AlertDelivery,
+        ) -> Result<(), StorageError> {
+            self.inner.update_alert_delivery(delivery)
+        }
+
+        fn compact(&self, policy: &CompactionPolicy) -> Result<CompactionReport, StorageError> {
+            self.inner.compact(policy)
+        }
+
+        fn store_justice_action(
+            &self,
+            action: &crate::justice::JusticeAction,
+        ) -> Result<(), StorageError> {
+            self.inner.store_justice_action(action)
+        }
+
+        fn get_justice_action(
+            &self,
+            id: &str,
+        ) -> Result<Option<crate::justice::JusticeAction>, StorageError> {
+            self.inner.get_justice_action(id)
+        }
+
+        fn get_pending_justice_actions(
+            &self,
+        ) -> Result<Vec<crate::justice::JusticeAction>, StorageError> {
+            self.inner.get_pending_justice_actions()
+        }
+
+        fn update_justice_action_status(
+            &self,
+            id: &str,
+            status: crate::justice::ActionStatus,
+            tx_hash: Option<&str>,
+        ) -> Result<(), StorageError> {
+            self.inner.update_justice_action_status(id, status, tx_hash)
+        }
+    }
+
+    #[test]
+    fn in_memory_probe_is_healthy_and_read_only_by_default() {
+        let report = InMemoryStorage::new().check_health().unwrap();
+        assert_eq!(report.backend, "in-memory");
+        assert_eq!(report.state, StorageHealthState::Healthy);
+        assert!(report.is_healthy());
+        assert!(report.read_ok);
+        assert_eq!(report.write_probe_ok, None);
+        assert!(report.details.is_empty());
+    }
+
+    #[test]
+    fn write_probe_verifies_and_removes_the_sentinel() {
+        let storage = InMemoryStorage::new();
+        storage.store_subscription("channel1").unwrap();
+
+        let report = storage
+            .check_health_with(&StorageHealthCheckOptions {
+                probe_writes: true,
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(report.state, StorageHealthState::Healthy);
+        assert_eq!(report.write_probe_ok, Some(true));
+        // The probe must not disturb real subscriptions or leave its sentinel.
+        assert_eq!(storage.get_subscriptions().unwrap(), vec!["channel1"]);
+    }
+
+    #[test]
+    fn invalid_health_check_options_are_rejected() {
+        let options = StorageHealthCheckOptions {
+            max_latency_ms: 0,
+            probe_writes: true,
+        };
+        let error = InMemoryStorage::new()
+            .check_health_with(&options)
+            .unwrap_err();
+        assert!(error.to_string().contains("max_latency_ms"));
+
+        // Validation is available on its own so callers can reject bad config
+        // before constructing a watchtower.
+        assert!(options.validate().is_err());
+    }
+
+    #[test]
+    fn a_failing_read_is_reported_as_unhealthy_without_a_write_probe() {
+        let storage = FlakyStorage::new();
+        storage.set_fail_read(true);
+
+        let report = storage
+            .check_health_with(&StorageHealthCheckOptions {
+                probe_writes: true,
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(report.state, StorageHealthState::Unhealthy);
+        assert!(!report.read_ok);
+        assert_eq!(report.write_probe_ok, None);
+        assert!(report
+            .details
+            .iter()
+            .any(|d| d.contains("read probe failed") && d.contains("injected read failure")));
+        assert!(storage.get_subscriptions().is_err());
+    }
+
+    #[test]
+    fn a_failed_write_probe_leaves_no_subscription_behind() {
+        let storage = FlakyStorage::new();
+        storage.set_fail_write(true);
+
+        let report = storage
+            .check_health_with(&StorageHealthCheckOptions {
+                probe_writes: true,
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(report.state, StorageHealthState::Unhealthy);
+        assert_eq!(report.write_probe_ok, Some(false));
+        assert!(report
+            .details
+            .iter()
+            .any(|d| d.contains("write probe failed")));
+        assert!(
+            storage.inner.get_subscriptions().unwrap().is_empty(),
+            "a failed probe must not leave partial state"
+        );
+    }
+
+    #[test]
+    fn a_failed_cleanup_is_actionable() {
+        let storage = FlakyStorage::new();
+        storage.set_fail_cleanup(true);
+
+        let report = storage
+            .check_health_with(&StorageHealthCheckOptions {
+                probe_writes: true,
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(report.state, StorageHealthState::Unhealthy);
+        assert_eq!(report.write_probe_ok, Some(true));
+        assert!(report.details.iter().any(|d| d.contains("cleanup failed")));
+        // The sentinel is still visible; the error tells the operator which
+        // key to remove rather than failing silently.
+        assert!(report.summary().contains("cleanup failed"));
+    }
+
+    #[test]
+    fn exceeding_the_latency_budget_degrades_the_report() {
+        let storage = FlakyStorage::new();
+        storage.set_slow_read(true);
+
+        let report = storage
+            .check_health_with(&StorageHealthCheckOptions {
+                max_latency_ms: 1,
+                probe_writes: false,
+            })
+            .unwrap();
+
+        assert_eq!(report.state, StorageHealthState::Degraded);
+        assert!(report.read_ok, "the read itself succeeded");
+        assert!(report.details.iter().any(|d| d.contains("1ms budget")));
+    }
+
+    #[test]
+    fn sqlite_probe_reports_that_durability_cannot_be_verified() {
+        let storage = SqliteStorage::new(":memory:").unwrap();
+        let report = storage
+            .check_health_with(&StorageHealthCheckOptions {
+                probe_writes: true,
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(report.backend, "sqlite");
+        assert_eq!(report.state, StorageHealthState::Degraded);
+        assert_eq!(report.write_probe_ok, None);
+        assert!(report.details.iter().any(|d| d.contains("placeholder")));
     }
 }

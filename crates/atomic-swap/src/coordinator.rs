@@ -2047,7 +2047,7 @@ mod tests {
             AtomicSwapError::RefundBeforeTimeout {
                 timeout_ledger,
                 current_ledger,
-                swap_id: _,
+                ..
             } if timeout_ledger == boundary && current_ledger == boundary
         ));
 

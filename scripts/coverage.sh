@@ -69,12 +69,15 @@ cargo llvm-cov \
   --all-features \
   --ignore-filename-regex "$IGNORE" \
   --lcov --output-path "$OUT_DIR/lcov.info" \
-  --html --output-dir "$OUT_DIR/html" \
   ${GATE_ARGS[@]+"${GATE_ARGS[@]}"} \
   "$@"
 
-# Best-effort console table. `report` re-reads the profile data the run above
-# wrote, so it does not re-run the suite.
+# Additional report formats are generated from the profile data the run above
+# wrote; cargo-llvm-cov only accepts one report format per invocation.
+cargo llvm-cov report --html --output-dir "$OUT_DIR/html"
+
+# Best-effort console table. `report` re-reads the same profile data, so it does
+# not re-run the suite.
 if cargo llvm-cov report --summary-only > "$OUT_DIR/summary.txt" 2>/dev/null; then
   cat "$OUT_DIR/summary.txt"
 else

@@ -11,6 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Represents an error in session key or account abstraction operations.
@@ -45,6 +46,8 @@ pub enum SessionError {
     RecoveryAlreadyExecuted(String),
     #[error("No veto from {0} to clear on this recovery")]
     VetoNotFound(String),
+    #[error("Invalid account identifier: {0}")]
+    InvalidAccountId(String),
 }
 
 pub type Result<T> = std::result::Result<T, SessionError>;
@@ -116,6 +119,207 @@ impl SessionKey {
     pub fn is_valid_at(&self, now: u64) -> bool {
         !self.is_revoked && self.policy.expires_at > now
     }
+
+    /// Builds a deterministic [`SessionKeySummary`] if this session key is active
+    /// (unrevoked and unexpired) at Unix timestamp `now`.
+    ///
+    /// Returns `None` when the session is revoked or `now >= policy.expires_at`.
+    #[must_use]
+    pub fn summary_at(&self, now: u64) -> Option<SessionKeySummary> {
+        if !self.is_valid_at(now) {
+            return None;
+        }
+
+        let mut allowed_contracts: Vec<String> =
+            self.policy.allowed_contracts.iter().cloned().collect();
+        allowed_contracts.sort();
+
+        let mut allowed_methods: Vec<(String, Vec<String>)> = self
+            .policy
+            .allowed_methods
+            .iter()
+            .map(|(contract, methods)| {
+                let mut sorted: Vec<String> = methods.iter().cloned().collect();
+                sorted.sort();
+                (contract.clone(), sorted)
+            })
+            .collect();
+        allowed_methods.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let remaining_spend = self
+            .policy
+            .max_spend_limit
+            .map(|limit| limit.saturating_sub(self.total_spent));
+
+        Some(SessionKeySummary {
+            session_id: self.session_id.clone(),
+            account_id: self.account_id.clone(),
+            session_public_key: self.session_public_key.clone(),
+            allowed_contracts,
+            allowed_methods,
+            max_spend_limit: self.policy.max_spend_limit,
+            total_spent: self.total_spent,
+            remaining_spend,
+            created_at: self.created_at,
+            expires_at: self.policy.expires_at,
+            expires_in_secs: self.policy.expires_at - now,
+        })
+    }
+}
+
+/// Human- and machine-readable summary of an active session key's scopes and
+/// expiry timestamp.
+///
+/// Returned by [`AccountAbstractionManager::active_session_summaries`] and
+/// [`AccountAbstractionManager::get_active_session_summary`]. All collections
+/// are sorted deterministically so display output and snapshots are stable.
+/// Only public metadata is included; secret key material is never stored or
+/// displayed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionKeySummary {
+    /// Unique identifier for the session key.
+    pub session_id: String,
+    /// Account address (G-address) owning this session key.
+    pub account_id: String,
+    /// Public key of the ephemeral session key pair.
+    pub session_public_key: String,
+    /// Sorted list of whitelisted contract IDs (empty means any contract).
+    pub allowed_contracts: Vec<String>,
+    /// Sorted list of `(contract_id, sorted_methods)` scope entries.
+    pub allowed_methods: Vec<(String, Vec<String>)>,
+    /// Optional maximum cumulative spend limit in stroops.
+    pub max_spend_limit: Option<u64>,
+    /// Cumulative amount already spent by this session key.
+    pub total_spent: u64,
+    /// Remaining spend allowance if `max_spend_limit` is set.
+    pub remaining_spend: Option<u64>,
+    /// Unix timestamp when the session key was created.
+    pub created_at: u64,
+    /// Unix timestamp when the session key expires.
+    pub expires_at: u64,
+    /// Seconds remaining until expiry relative to the query timestamp.
+    pub expires_in_secs: u64,
+}
+
+impl fmt::Display for SessionKeySummary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "Session: {}", self.session_id)?;
+        writeln!(f, "  Public Key : {}", self.session_public_key)?;
+        writeln!(
+            f,
+            "  Expires At : {} (unix: {}, in {}s)",
+            format_unix_timestamp_utc(self.expires_at),
+            self.expires_at,
+            self.expires_in_secs
+        )?;
+
+        if self.allowed_contracts.is_empty() {
+            writeln!(f, "  Contracts  : any")?;
+        } else {
+            writeln!(f, "  Contracts  : {}", self.allowed_contracts.join(", "))?;
+        }
+
+        if self.allowed_methods.is_empty() {
+            writeln!(f, "  Methods    : any")?;
+        } else {
+            let formatted: Vec<String> = self
+                .allowed_methods
+                .iter()
+                .map(|(contract, methods)| {
+                    if methods.is_empty() {
+                        format!("{contract}: any")
+                    } else {
+                        format!("{contract}: [{}]", methods.join(", "))
+                    }
+                })
+                .collect();
+            writeln!(f, "  Methods    : {}", formatted.join("; "))?;
+        }
+
+        match (self.max_spend_limit, self.remaining_spend) {
+            (Some(limit), Some(remaining)) => write!(
+                f,
+                "  Spend Limit: {remaining}/{limit} stroops remaining (spent: {})",
+                self.total_spent
+            ),
+            _ => write!(f, "  Spend Limit: unlimited (spent: {})", self.total_spent),
+        }
+    }
+}
+
+/// Formats a list of active [`SessionKeySummary`] records for `account_id` into
+/// a human-readable display string.
+#[must_use]
+pub fn format_active_session_summaries(
+    account_id: &str,
+    summaries: &[SessionKeySummary],
+) -> String {
+    if summaries.is_empty() {
+        return format!("No active session keys for account `{account_id}`.");
+    }
+
+    let mut out = format!(
+        "Active session keys for account `{account_id}` ({}):\n",
+        summaries.len()
+    );
+    for (idx, summary) in summaries.iter().enumerate() {
+        if idx > 0 {
+            out.push('\n');
+        }
+        out.push_str(&summary.to_string());
+        out.push('\n');
+    }
+    out
+}
+
+/// Formats a Unix timestamp (seconds since 1970-01-01T00:00:00Z) as an ISO-8601
+/// UTC string (`YYYY-MM-DDTHH:MM:SSZ`), or `"overflow"` if the timestamp cannot
+/// be represented as a signed 64-bit day count.
+#[must_use]
+pub fn format_unix_timestamp_utc(ts: u64) -> String {
+    let secs_of_day = ts % 86_400;
+    let Ok(days) = i64::try_from(ts / 86_400) else {
+        return "overflow".to_string();
+    };
+    let hour = secs_of_day / 3_600;
+    let minute = (secs_of_day % 3_600) / 60;
+    let second = secs_of_day % 60;
+
+    // Howard Hinnant's civil-from-days algorithm (UTC proleptic Gregorian).
+    let Some(z) = days.checked_add(719_468) else {
+        return "overflow".to_string();
+    };
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = y + i64::from(m <= 2);
+    if !(0..=9999).contains(&year) {
+        return "overflow".to_string();
+    }
+
+    format!("{year:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// Validates that `account_id` is non-empty and does not look like a Stellar
+/// secret seed (`S...` of length 56), preventing accidental secret leakage in
+/// output or logs.
+fn validate_account_id(account_id: &str) -> Result<()> {
+    if account_id.trim().is_empty() {
+        return Err(SessionError::InvalidAccountId(
+            "account_id must not be empty".to_string(),
+        ));
+    }
+    if account_id.len() == 56 && account_id.starts_with('S') {
+        return Err(SessionError::InvalidAccountId(
+            "account_id must be a public account identifier, not a secret key".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Guardian details for Account Abstraction social recovery.
@@ -304,6 +508,100 @@ impl AccountAbstractionManager {
             .values()
             .filter(|s| s.account_id == account_id)
             .collect()
+    }
+
+    /// Returns deterministic summaries of all **active** (unrevoked and
+    /// unexpired at `now`) session keys owned by `account_id`, including their
+    /// contract/method/spend scopes and expiry timestamps.
+    ///
+    /// Results are ordered by soonest expiry first, then by `session_id`.
+    /// Sessions belonging to other accounts, revoked sessions, and sessions
+    /// where `now >= policy.expires_at` are excluded.
+    ///
+    /// # Errors
+    ///
+    /// * [`SessionError::InvalidAccountId`] — `account_id` is empty,
+    ///   whitespace-only, or looks like a Stellar secret key (`S...`).
+    pub fn active_session_summaries(
+        &self,
+        account_id: &str,
+        now: u64,
+    ) -> Result<Vec<SessionKeySummary>> {
+        validate_account_id(account_id)?;
+
+        let mut summaries: Vec<SessionKeySummary> = self
+            .sessions
+            .values()
+            .filter(|s| s.account_id == account_id)
+            .filter_map(|s| s.summary_at(now))
+            .collect();
+
+        summaries.sort_by(|a, b| {
+            a.expires_at
+                .cmp(&b.expires_at)
+                .then_with(|| a.session_id.cmp(&b.session_id))
+        });
+
+        Ok(summaries)
+    }
+
+    /// Returns the [`SessionKeySummary`] for a single active session key
+    /// identified by `session_id`, verifying that it belongs to `account_id`
+    /// and is neither revoked nor expired at `now`.
+    ///
+    /// # Errors
+    ///
+    /// * [`SessionError::InvalidAccountId`] — `account_id` is empty,
+    ///   whitespace-only, or looks like a Stellar secret key (`S...`).
+    /// * [`SessionError::SessionNotFound`] — no session with `session_id` exists.
+    /// * [`SessionError::SessionNotOwned`] — the session belongs to a different
+    ///   account (error message intentionally matches `SessionNotFound`).
+    /// * [`SessionError::SessionRevoked`] — the session has been revoked.
+    /// * [`SessionError::SessionExpired`] — `now >= policy.expires_at`.
+    pub fn get_active_session_summary(
+        &self,
+        account_id: &str,
+        session_id: &str,
+        now: u64,
+    ) -> Result<SessionKeySummary> {
+        validate_account_id(account_id)?;
+
+        let session = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| SessionError::SessionNotFound(session_id.to_string()))?;
+
+        if session.account_id != account_id {
+            return Err(SessionError::SessionNotOwned(session_id.to_string()));
+        }
+
+        if session.is_revoked {
+            return Err(SessionError::SessionRevoked(session_id.to_string()));
+        }
+
+        if now >= session.policy.expires_at {
+            return Err(SessionError::SessionExpired(
+                session_id.to_string(),
+                session.policy.expires_at,
+            ));
+        }
+
+        Ok(session
+            .summary_at(now)
+            .expect("session was just validated as unrevoked and unexpired"))
+    }
+
+    /// Formats all active session keys for `account_id` at timestamp `now`
+    /// into a human-readable display string showing each key's scopes and
+    /// expiry timestamp.
+    ///
+    /// # Errors
+    ///
+    /// * [`SessionError::InvalidAccountId`] — `account_id` is empty,
+    ///   whitespace-only, or looks like a Stellar secret key (`S...`).
+    pub fn format_active_sessions(&self, account_id: &str, now: u64) -> Result<String> {
+        let summaries = self.active_session_summaries(account_id, now)?;
+        Ok(format_active_session_summaries(account_id, &summaries))
     }
 
     /// Validates an intended contract call against session key policies.
@@ -1239,5 +1537,168 @@ mod tests {
 
         let sessions_c = mgr.list_sessions("acct_C");
         assert!(sessions_c.is_empty());
+    }
+
+    // ── active session summaries & display ───────────────────────────────────
+
+    #[test]
+    fn active_session_summaries_filters_revoked_expired_and_other_accounts() {
+        let mut mgr = AccountAbstractionManager::new();
+
+        // Active session expiring later
+        mgr.register_session(SessionKey::new(
+            "sess_late",
+            "GACCT1",
+            "GPUB_LATE",
+            SessionPolicy {
+                expires_at: 2_000,
+                allowed_contracts: HashSet::from(["C_DEX".to_string(), "C_AMM".to_string()]),
+                allowed_methods: HashMap::from([(
+                    "C_AMM".to_string(),
+                    HashSet::from(["swap".to_string(), "deposit".to_string()]),
+                )]),
+                max_spend_limit: Some(1_000),
+            },
+        ));
+        // Active session expiring sooner
+        mgr.register_session(session_for("sess_soon", "GACCT1", "GPUB_SOON", 1_500));
+        // Expired at boundary (expires_at == now)
+        mgr.register_session(session_for("sess_boundary", "GACCT1", "GPUB_BOUND", 1_000));
+        // Revoked session
+        mgr.register_session(session_for("sess_revoked", "GACCT1", "GPUB_REV", 5_000));
+        mgr.revoke_session_authorized("GACCT1", "sess_revoked")
+            .unwrap();
+        // Other account's active session
+        mgr.register_session(session_for("sess_other", "GACCT2", "GPUB_OTHER", 5_000));
+
+        let summaries = mgr.active_session_summaries("GACCT1", 1_000).unwrap();
+        assert_eq!(summaries.len(), 2);
+        // Ordered soonest expiry first
+        assert_eq!(summaries[0].session_id, "sess_soon");
+        assert_eq!(summaries[0].expires_in_secs, 500);
+        assert_eq!(summaries[1].session_id, "sess_late");
+        assert_eq!(summaries[1].expires_in_secs, 1_000);
+        // Deterministic sorting of contracts and methods
+        assert_eq!(summaries[1].allowed_contracts, vec!["C_AMM", "C_DEX"]);
+        assert_eq!(
+            summaries[1].allowed_methods,
+            vec![(
+                "C_AMM".to_string(),
+                vec!["deposit".to_string(), "swap".to_string()]
+            )]
+        );
+        assert_eq!(summaries[1].remaining_spend, Some(1_000));
+    }
+
+    #[test]
+    fn active_session_summary_boundary_one_second_before_and_at_expiry() {
+        let mut mgr = AccountAbstractionManager::new();
+        mgr.register_session(session_for("s1", "GACCT1", "GPUB1", 1_700_000_000));
+
+        // 1 second before expiry: active
+        let summary = mgr
+            .get_active_session_summary("GACCT1", "s1", 1_699_999_999)
+            .unwrap();
+        assert_eq!(summary.expires_in_secs, 1);
+
+        // Exactly at expiry: rejected with SessionExpired
+        let err = mgr
+            .get_active_session_summary("GACCT1", "s1", 1_700_000_000)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            SessionError::SessionExpired("s1".to_string(), 1_700_000_000)
+        );
+    }
+
+    #[test]
+    fn active_session_summary_rejects_invalid_account_and_secret_keys() {
+        let mgr = AccountAbstractionManager::new();
+
+        // Empty and whitespace-only account_id
+        assert!(matches!(
+            mgr.active_session_summaries("", 100),
+            Err(SessionError::InvalidAccountId(_))
+        ));
+        assert!(matches!(
+            mgr.active_session_summaries("   ", 100),
+            Err(SessionError::InvalidAccountId(_))
+        ));
+
+        // Secret key (S... of length 56) must be rejected without echoing the secret
+        let fake_secret = format!("S{}", "A".repeat(55));
+        let err = mgr.active_session_summaries(&fake_secret, 100).unwrap_err();
+        assert!(matches!(err, SessionError::InvalidAccountId(_)));
+        assert!(!err.to_string().contains(&fake_secret));
+    }
+
+    #[test]
+    fn get_active_session_summary_enforces_ownership_and_revocation() {
+        let mut mgr = AccountAbstractionManager::new();
+        mgr.register_session(session_for("s1", "GACCT1", "GPUB1", 5_000));
+
+        // Wrong account -> SessionNotOwned (same message as SessionNotFound)
+        let err = mgr
+            .get_active_session_summary("GACCT2", "s1", 1_000)
+            .unwrap_err();
+        assert!(matches!(err, SessionError::SessionNotOwned(_)));
+        assert_eq!(err.to_string(), "Session key s1 not found");
+
+        // Revoked -> SessionRevoked
+        mgr.revoke_session_authorized("GACCT1", "s1").unwrap();
+        let err = mgr
+            .get_active_session_summary("GACCT1", "s1", 1_000)
+            .unwrap_err();
+        assert!(matches!(err, SessionError::SessionRevoked(_)));
+    }
+
+    #[test]
+    fn format_unix_timestamp_utc_known_dates_and_overflow() {
+        assert_eq!(format_unix_timestamp_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(
+            format_unix_timestamp_utc(1_700_000_000),
+            "2023-11-14T22:13:20Z"
+        );
+        // Leap day 2024-02-29T12:34:56Z
+        assert_eq!(
+            format_unix_timestamp_utc(1_709_210_096),
+            "2024-02-29T12:34:56Z"
+        );
+        // u64::MAX does not panic
+        assert_eq!(format_unix_timestamp_utc(u64::MAX), "overflow");
+    }
+
+    #[test]
+    fn format_active_sessions_renders_scopes_expiry_and_empty_state() {
+        let mut mgr = AccountAbstractionManager::new();
+        assert_eq!(
+            mgr.format_active_sessions("GACCT1", 1_000).unwrap(),
+            "No active session keys for account `GACCT1`."
+        );
+
+        mgr.register_session(SessionKey::new(
+            "sess_1",
+            "GACCT1",
+            "GPUB1",
+            SessionPolicy {
+                expires_at: 1_700_000_000,
+                allowed_contracts: HashSet::from(["C_TOKEN".to_string()]),
+                allowed_methods: HashMap::from([(
+                    "C_TOKEN".to_string(),
+                    HashSet::from(["transfer".to_string()]),
+                )]),
+                max_spend_limit: Some(500),
+            },
+        ));
+        mgr.validate_and_record_call("sess_1", "C_TOKEN", "transfer", 125, 1_699_999_000)
+            .unwrap();
+
+        let rendered = mgr.format_active_sessions("GACCT1", 1_699_999_000).unwrap();
+        assert!(rendered.contains("Session: sess_1"));
+        assert!(rendered.contains("Public Key : GPUB1"));
+        assert!(rendered.contains("2023-11-14T22:13:20Z (unix: 1700000000, in 1000s)"));
+        assert!(rendered.contains("Contracts  : C_TOKEN"));
+        assert!(rendered.contains("Methods    : C_TOKEN: [transfer]"));
+        assert!(rendered.contains("Spend Limit: 375/500 stroops remaining (spent: 125)"));
     }
 }

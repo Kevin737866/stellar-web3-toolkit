@@ -106,7 +106,16 @@ impl AmmFactory {
         let salt = pair_salt(&env, &t0, &t1);
         let factory = env.current_contract_address();
         let pool = env.deployer().with_current_contract(salt).deploy(wasm_hash);
-        AmmPoolClient::new(&env, &pool).initialize(&factory, &t0, &t1);
+        let client = AmmPoolClient::new(&env, &pool);
+        client.initialize(&factory, &t0, &t1);
+        // A pool is only usable if it starts empty: a non-zero reserve here
+        // would mean the factory shipped accounting it never funded, and every
+        // quote derived from it would be wrong from the first swap (#399).
+        let (reserve_a, reserve_b) = client.get_reserves();
+        assert!(
+            reserve_a == 0 && reserve_b == 0,
+            "new pool must start with empty reserves"
+        );
         env.storage().instance().set(&DataKey::Pair(pk), &pool);
         pool
     }
@@ -242,8 +251,9 @@ mod test {
         let b = Address::generate(&env);
         let c = Address::generate(&env);
         let (a0, a1) = sort_tokens(a.clone(), b.clone());
+        // `Address` is not `Copy`; each use after the first needs its own clone.
         let (b0, b1) = sort_tokens(b, a.clone());
-        let (c0, c1) = sort_tokens(a.clone(), c);
+        let (c0, c1) = sort_tokens(a, c);
 
         assert_eq!(pair_salt(&env, &a0, &a1), pair_salt(&env, &b0, &b1));
         assert_ne!(pair_salt(&env, &a0, &a1), pair_salt(&env, &c0, &c1));

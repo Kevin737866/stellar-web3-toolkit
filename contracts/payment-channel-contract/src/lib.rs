@@ -17,7 +17,7 @@ use soroban_sdk::{
     Vec as SorobanVec,
 };
 pub use types::CloseReason;
-use types::{ChannelState, HTLCInfo, HtlcList};
+use types::{ChannelState, ChannelStatusReport, HTLCInfo, HtlcList};
 
 /// Append an address's canonical strkey encoding to `out`.
 ///
@@ -107,6 +107,30 @@ impl PaymentChannel {
         channel_id: BytesN<32>,
     ) -> Result<ChannelState, PaymentChannelError> {
         state::get_channel_state(&env, &channel_id)
+    }
+
+    /// Get a channel status report including pending HTLC count and capacity.
+    pub fn get_channel_status(
+        env: Env,
+        channel_id: BytesN<32>,
+    ) -> Result<ChannelStatusReport, PaymentChannelError> {
+        let channel = state::get_channel_state(&env, &channel_id)?;
+        let (pending_htlc_count, pending_htlc_amount) =
+            channel::ChannelManager::compute_pending_htlc_metrics(&env, &channel.htlcs)?;
+        let capacity = channel.total_balance;
+        let available_capacity = capacity.saturating_sub(pending_htlc_amount);
+
+        Ok(ChannelStatusReport {
+            channel_id: channel.channel_id,
+            is_open: channel.close_time == 0 && !channel.is_cooperative_close,
+            is_cooperative_close: channel.is_cooperative_close,
+            balance_a: channel.balance_a,
+            balance_b: channel.balance_b,
+            capacity,
+            pending_htlc_count,
+            pending_htlc_amount,
+            available_capacity,
+        })
     }
 
     /// Update the channel state with a new payment
@@ -831,5 +855,67 @@ mod tests {
         assert_eq!(rejected, Err(Ok(PaymentChannelError::BalanceMismatch)));
 
         assert_eq!(client.get_close_reason(&channel_id), CloseReason::NotClosed);
+    }
+
+    #[test]
+    fn test_get_channel_status_exposes_pending_htlcs_and_capacity() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, p_a, p_b, channel_id) = setup_channel(&env);
+
+        let initial = client.get_channel_status(&channel_id);
+        assert!(initial.is_open);
+        assert_eq!(initial.capacity, 2_000);
+        assert_eq!(initial.pending_htlc_count, 0);
+        assert_eq!(initial.pending_htlc_amount, 0);
+        assert_eq!(initial.available_capacity, 2_000);
+
+        // Add one active HTLC and one claimed HTLC directly in contract storage
+        // to verify only active HTLCs are counted.
+        let mut active_htlc = HTLCInfo::new(
+            &env,
+            BytesN::from_array(&env, &[7u8; 32]),
+            1_000,
+            300,
+            p_a.clone(),
+            p_b.clone(),
+        );
+        active_htlc.is_claimed = false;
+        let active_id = active_htlc.htlc_id.clone();
+        let mut claimed_htlc = HTLCInfo::new(
+            &env,
+            BytesN::from_array(&env, &[8u8; 32]),
+            1_000,
+            500,
+            p_a,
+            p_b,
+        );
+        claimed_htlc.is_claimed = true;
+        let claimed_id = claimed_htlc.htlc_id.clone();
+
+        env.as_contract(&client.address, || {
+            let mut st = state::get_channel_state(&env, &channel_id).unwrap();
+            st.htlcs.set(active_id.to_val(), active_htlc.into_val(&env));
+            st.htlcs
+                .set(claimed_id.to_val(), claimed_htlc.into_val(&env));
+            state::store_channel_state(&env, &channel_id, &st);
+        });
+
+        let updated = client.get_channel_status(&channel_id);
+        assert_eq!(updated.pending_htlc_count, 1);
+        assert_eq!(updated.pending_htlc_amount, 300);
+        assert_eq!(updated.capacity, 2_000);
+        assert_eq!(updated.available_capacity, 1_700);
+    }
+
+    #[test]
+    fn test_get_channel_status_missing_channel_returns_not_found() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, PaymentChannel);
+        let client = PaymentChannelClient::new(&env, &contract_id);
+        let missing = BytesN::from_array(&env, &[9u8; 32]);
+
+        let res = client.try_get_channel_status(&missing);
+        assert_eq!(res, Err(Ok(PaymentChannelError::ChannelNotFound)));
     }
 }
