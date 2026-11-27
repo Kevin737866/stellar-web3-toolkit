@@ -1958,7 +1958,7 @@ mod tests {
 
         let swap = coordinator.get_swap(swap_id.clone()).await.unwrap();
         assert!(swap.is_completed());
-        assert_eq!(swap.preimage.as_deref(), Some(&preimage));
+        assert_eq!(swap.preimage.as_deref(), Some(preimage.as_str()));
         assert_eq!(swap.completed_at_ledger, Some(boundary));
 
         let entries = journal_entries(&coordinator, &swap_id);
@@ -2046,7 +2046,8 @@ mod tests {
             error,
             AtomicSwapError::RefundBeforeTimeout {
                 timeout_ledger,
-                current_ledger
+                current_ledger,
+                swap_id: _,
             } if timeout_ledger == boundary && current_ledger == boundary
         ));
 
@@ -2104,7 +2105,11 @@ mod tests {
         let boundary = timeout_ledger_of(&coordinator, &swap_id).await;
 
         coordinator
-            .complete_swap(swap_id.clone(), response.preimage.clone().unwrap(), boundary)
+            .complete_swap(
+                swap_id.clone(),
+                response.preimage.clone().unwrap(),
+                boundary,
+            )
             .await
             .unwrap();
 

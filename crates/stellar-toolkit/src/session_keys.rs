@@ -235,11 +235,7 @@ impl AccountAbstractionManager {
     ///   message is intentionally identical to `SessionNotFound` to prevent
     ///   leaking cross-account existence information.
     /// * [`SessionError::SessionRevoked`] — the session is already revoked.
-    pub fn revoke_session_authorized(
-        &mut self,
-        account_id: &str,
-        session_id: &str,
-    ) -> Result<()> {
+    pub fn revoke_session_authorized(&mut self, account_id: &str, session_id: &str) -> Result<()> {
         let session = self
             .sessions
             .get_mut(session_id)
@@ -1109,9 +1105,7 @@ mod tests {
         let mut mgr = AccountAbstractionManager::new();
         mgr.register_session(session_for("s1", "acct_A", "pubkey_A1", 9999));
 
-        let err = mgr
-            .revoke_session_authorized("acct_B", "s1")
-            .unwrap_err();
+        let err = mgr.revoke_session_authorized("acct_B", "s1").unwrap_err();
         // Returns SessionNotOwned (same display as SessionNotFound — no
         // cross-account existence leak).
         assert!(
@@ -1121,7 +1115,10 @@ mod tests {
 
         // The session must remain valid after the failed revocation.
         let session = mgr.get_session("s1").unwrap();
-        assert!(!session.is_revoked, "session must not be revoked after failed attempt");
+        assert!(
+            !session.is_revoked,
+            "session must not be revoked after failed attempt"
+        );
     }
 
     #[test]
@@ -1130,9 +1127,7 @@ mod tests {
         mgr.register_session(session_for("s1", "acct_A", "pubkey_A1", 9999));
 
         mgr.revoke_session_authorized("acct_A", "s1").unwrap();
-        let err = mgr
-            .revoke_session_authorized("acct_A", "s1")
-            .unwrap_err();
+        let err = mgr.revoke_session_authorized("acct_A", "s1").unwrap_err();
         assert!(
             matches!(err, SessionError::SessionRevoked(_)),
             "double-revoke must be rejected: {err:?}"

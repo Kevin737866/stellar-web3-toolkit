@@ -475,9 +475,7 @@ impl Watchtower {
     /// An operator calls this after a process restart or network outage to find
     /// breach responses that were persisted but not yet submitted, then passes
     /// the results to [`Self::retry_pending_justice`] to replay them.
-    pub fn pending_justice_actions(
-        &self,
-    ) -> Result<Vec<justice::JusticeAction>, WatchtowerError> {
+    pub fn pending_justice_actions(&self) -> Result<Vec<justice::JusticeAction>, WatchtowerError> {
         self.storage
             .get_pending_justice_actions()
             .map_err(|e| WatchtowerError::StorageError(e.to_string()))

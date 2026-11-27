@@ -491,8 +491,7 @@ impl TopologyFuzzer {
         }
 
         let sim_config = self.random_sim_config(&mut rng);
-        let (mut graph, mut nodes) =
-            NetworkTopology::new(sim_config, topology).generate(&mut rng);
+        let (mut graph, mut nodes) = NetworkTopology::new(sim_config, topology).generate(&mut rng);
 
         report.iterations += 1;
 
@@ -509,7 +508,11 @@ impl TopologyFuzzer {
         }
 
         let mut routed_here = false;
-        let mut tracker = self.config.disconnection.as_ref().map(|_| DisconnectionTracker::new());
+        let mut tracker = self
+            .config
+            .disconnection
+            .as_ref()
+            .map(|_| DisconnectionTracker::new());
 
         for payment_index in 0..self.config.payments_per_topology {
             if let (Some(churn_cfg), Some(churn_tracker)) =
@@ -560,17 +563,15 @@ impl TopologyFuzzer {
             }
 
             let payment = self.random_payment(&graph, &mut rng);
-            let (request, pathfinder) = match payment {
-                Some(request) => (request, Pathfinder::new()),
-                // Fewer than two nodes, or no channels at all: nothing to route.
-                None => {
-                    if self.config.disconnection.is_some() {
-                        // With churn enabled, nodes may recover on later steps.
-                        continue;
-                    }
-                    break;
+            // Fewer than two nodes, or no channels at all: nothing to route.
+            let Some(request) = payment else {
+                if self.config.disconnection.is_some() {
+                    // With churn enabled, nodes may recover on later steps.
+                    continue;
                 }
+                break;
             };
+            let pathfinder = Pathfinder::new();
 
             report.payments_attempted += 1;
             report.route_attempts += 3;
@@ -600,9 +601,7 @@ impl TopologyFuzzer {
                 }
 
                 if self.config.disconnection.is_some() {
-                    let source_online = nodes
-                        .get(&request.source)
-                        .is_some_and(|n| n.node.online);
+                    let source_online = nodes.get(&request.source).is_some_and(|n| n.node.online);
                     let offline_hop = route
                         .hops
                         .iter()
@@ -933,6 +932,7 @@ mod tests {
             min_nodes: 2,
             max_nodes: 30,
             payments_per_topology: 8,
+            disconnection: None,
         });
 
         let report = fuzzer.run();
@@ -956,6 +956,7 @@ mod tests {
             min_nodes: 2,
             max_nodes: 20,
             payments_per_topology: 5,
+            disconnection: None,
         };
 
         let first = TopologyFuzzer::new(config.clone()).run();
@@ -977,6 +978,7 @@ mod tests {
                 min_nodes: num_nodes,
                 max_nodes: num_nodes,
                 payments_per_topology: 3,
+                disconnection: None,
             });
 
             let report = fuzzer.run();
@@ -1059,7 +1061,10 @@ mod tests {
 
         assert_eq!(first.routes_checked, second.routes_checked);
         assert_eq!(first.routes_found, second.routes_found);
-        assert_eq!(first.disconnections_simulated, second.disconnections_simulated);
+        assert_eq!(
+            first.disconnections_simulated,
+            second.disconnections_simulated
+        );
         assert_eq!(first.recoveries_simulated, second.recoveries_simulated);
         assert_eq!(first.failures, second.failures);
     }

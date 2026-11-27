@@ -522,11 +522,9 @@ impl ChannelManager {
             ledger_height,
         );
 
-        let valid = self.signer.verify(
-            &digest,
-            remote_signature,
-            &channel.state.remote_public_key,
-        )?;
+        let valid =
+            self.signer
+                .verify(&digest, remote_signature, &channel.state.remote_public_key)?;
 
         if !valid {
             return Err(PaymentChannelError::SignatureError(
@@ -968,19 +966,19 @@ pub fn compute_state_digest(
     let mut hasher = Sha256::new();
     hasher.update(b"STELLAR_PAYMENT_CHANNEL_STATE_UPDATE:");
     hasher.update(channel_id.as_bytes());
-    hasher.update(&sequence_number.to_be_bytes());
+    hasher.update(sequence_number.to_be_bytes());
     if our_address <= their_address {
         hasher.update(our_address.as_bytes());
-        hasher.update(&our_balance.to_be_bytes());
+        hasher.update(our_balance.to_be_bytes());
         hasher.update(their_address.as_bytes());
-        hasher.update(&their_balance.to_be_bytes());
+        hasher.update(their_balance.to_be_bytes());
     } else {
         hasher.update(their_address.as_bytes());
-        hasher.update(&their_balance.to_be_bytes());
+        hasher.update(their_balance.to_be_bytes());
         hasher.update(our_address.as_bytes());
-        hasher.update(&our_balance.to_be_bytes());
+        hasher.update(our_balance.to_be_bytes());
     }
-    hasher.update(&ledger_height.to_be_bytes());
+    hasher.update(ledger_height.to_be_bytes());
     let res = hasher.finalize();
     let mut digest = [0u8; 32];
     digest.copy_from_slice(&res);
@@ -1634,14 +1632,17 @@ mod tests {
 
     #[tokio::test]
     async fn apply_signed_state_update_accepts_valid_signature() {
-        let manager = ChannelManager::with_history_depth(Box::new(StrictTestSigner::new(vec![1; 32])), 8);
+        let manager =
+            ChannelManager::with_history_depth(Box::new(StrictTestSigner::new(vec![1; 32])), 8);
         let remote_signer = StrictTestSigner::new(vec![2; 32]);
         let state = manager
             .create_channel("alice".to_string(), "bob".to_string(), 1_000, 1_000, 100, 0)
             .await
             .unwrap();
 
-        manager.set_remote_public_key(&state.channel_id, remote_signer.public_key()).unwrap();
+        manager
+            .set_remote_public_key(&state.channel_id, remote_signer.public_key())
+            .unwrap();
 
         // Remote party (Bob) signs an update: Alice 800, Bob 1200 at sequence 1, height 5
         let digest = compute_state_digest(&state.channel_id, 1, "alice", 800, "bob", 1200, 5);
@@ -1654,19 +1655,25 @@ mod tests {
         assert_eq!(updated.our_balance, 800);
         assert_eq!(updated.their_balance, 1200);
         assert_eq!(updated.sequence_number, 1);
-        assert_eq!(manager.recorded_heights(&state.channel_id).unwrap(), vec![0, 5]);
+        assert_eq!(
+            manager.recorded_heights(&state.channel_id).unwrap(),
+            vec![0, 5]
+        );
     }
 
     #[tokio::test]
     async fn apply_signed_state_update_rejects_corrupted_signature_without_mutation() {
-        let manager = ChannelManager::with_history_depth(Box::new(StrictTestSigner::new(vec![1; 32])), 8);
+        let manager =
+            ChannelManager::with_history_depth(Box::new(StrictTestSigner::new(vec![1; 32])), 8);
         let remote_signer = StrictTestSigner::new(vec![2; 32]);
         let state = manager
             .create_channel("alice".to_string(), "bob".to_string(), 1_000, 1_000, 100, 0)
             .await
             .unwrap();
 
-        manager.set_remote_public_key(&state.channel_id, remote_signer.public_key()).unwrap();
+        manager
+            .set_remote_public_key(&state.channel_id, remote_signer.public_key())
+            .unwrap();
 
         // Sign with wrong/foreign key
         let wrong_signer = StrictTestSigner::new(vec![99; 32]);
@@ -1684,19 +1691,25 @@ mod tests {
         assert_eq!(untouched.our_balance, 1_000);
         assert_eq!(untouched.their_balance, 1_000);
         assert_eq!(untouched.sequence_number, 0);
-        assert_eq!(manager.recorded_heights(&state.channel_id).unwrap(), vec![0]);
+        assert_eq!(
+            manager.recorded_heights(&state.channel_id).unwrap(),
+            vec![0]
+        );
     }
 
     #[tokio::test]
     async fn apply_signed_state_update_rejects_balance_mismatch() {
-        let manager = ChannelManager::with_history_depth(Box::new(StrictTestSigner::new(vec![1; 32])), 8);
+        let manager =
+            ChannelManager::with_history_depth(Box::new(StrictTestSigner::new(vec![1; 32])), 8);
         let remote_signer = StrictTestSigner::new(vec![2; 32]);
         let state = manager
             .create_channel("alice".to_string(), "bob".to_string(), 1_000, 1_000, 100, 0)
             .await
             .unwrap();
 
-        manager.set_remote_public_key(&state.channel_id, remote_signer.public_key()).unwrap();
+        manager
+            .set_remote_public_key(&state.channel_id, remote_signer.public_key())
+            .unwrap();
 
         let digest = compute_state_digest(&state.channel_id, 1, "alice", 1_500, "bob", 1_500, 5);
         let sig = remote_signer.sign(&digest).unwrap();
@@ -1710,21 +1723,30 @@ mod tests {
 
     #[tokio::test]
     async fn execute_authorized_payment_verifies_signature() {
-        let manager = ChannelManager::with_history_depth(Box::new(StrictTestSigner::new(vec![1; 32])), 8);
+        let manager =
+            ChannelManager::with_history_depth(Box::new(StrictTestSigner::new(vec![1; 32])), 8);
         let remote_signer = StrictTestSigner::new(vec![2; 32]);
         let state = manager
             .create_channel("alice".to_string(), "bob".to_string(), 1_000, 1_000, 100, 0)
             .await
             .unwrap();
 
-        manager.set_remote_public_key(&state.channel_id, remote_signer.public_key()).unwrap();
+        manager
+            .set_remote_public_key(&state.channel_id, remote_signer.public_key())
+            .unwrap();
 
         // Payment of 200 to them produces our 800, their 1200
         let digest = compute_state_digest(&state.channel_id, 1, "alice", 800, "bob", 1200, 10);
         let valid_sig = remote_signer.sign(&digest).unwrap();
 
         let updated = manager
-            .execute_authorized_payment_at(&state.channel_id, 200, PaymentDirection::ToThem, &valid_sig, 10)
+            .execute_authorized_payment_at(
+                &state.channel_id,
+                200,
+                PaymentDirection::ToThem,
+                &valid_sig,
+                10,
+            )
             .unwrap();
 
         assert_eq!(updated.our_balance, 800);
@@ -1737,14 +1759,10 @@ mod tests {
         let alice_signer = StrictTestSigner::new(vec![10; 32]);
         let bob_signer = StrictTestSigner::new(vec![20; 32]);
 
-        let alice_manager = ChannelManager::with_history_depth(
-            Box::new(StrictTestSigner::new(vec![10; 32])),
-            8,
-        );
-        let bob_manager = ChannelManager::with_history_depth(
-            Box::new(StrictTestSigner::new(vec![20; 32])),
-            8,
-        );
+        let alice_manager =
+            ChannelManager::with_history_depth(Box::new(StrictTestSigner::new(vec![10; 32])), 8);
+        let bob_manager =
+            ChannelManager::with_history_depth(Box::new(StrictTestSigner::new(vec![20; 32])), 8);
 
         let ch_alice = alice_manager
             .create_channel("alice".to_string(), "bob".to_string(), 1_000, 1_000, 100, 0)
@@ -1758,8 +1776,12 @@ mod tests {
         assert_eq!(ch_alice.channel_id, ch_bob.channel_id);
         let ch_id = ch_alice.channel_id.clone();
 
-        alice_manager.set_remote_public_key(&ch_id, bob_signer.public_key()).unwrap();
-        bob_manager.set_remote_public_key(&ch_id, alice_signer.public_key()).unwrap();
+        alice_manager
+            .set_remote_public_key(&ch_id, bob_signer.public_key())
+            .unwrap();
+        bob_manager
+            .set_remote_public_key(&ch_id, alice_signer.public_key())
+            .unwrap();
 
         // Alice pays 150 to Bob at height 1.
         // Proposed new balances: Alice 850, Bob 1150.

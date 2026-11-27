@@ -242,8 +242,8 @@ mod test {
         let b = Address::generate(&env);
         let c = Address::generate(&env);
         let (a0, a1) = sort_tokens(a.clone(), b.clone());
-        let (b0, b1) = sort_tokens(b, a);
-        let (c0, c1) = sort_tokens(a, c);
+        let (b0, b1) = sort_tokens(b, a.clone());
+        let (c0, c1) = sort_tokens(a.clone(), c);
 
         assert_eq!(pair_salt(&env, &a0, &a1), pair_salt(&env, &b0, &b1));
         assert_ne!(pair_salt(&env, &a0, &a1), pair_salt(&env, &c0, &c1));

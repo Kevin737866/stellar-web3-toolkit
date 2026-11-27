@@ -8,13 +8,13 @@
 //! account on testnet, and sign (build) transactions.
 
 use crate::error::{Result, ToolkitError};
-use aes_gcm::KeyInit;
-use zeroize::Zeroize;
 use crate::theme::{Style, Theme};
+use aes_gcm::KeyInit;
 use ed25519_dalek::{Signature, Signer, SigningKey};
 use hmac::{Hmac, Mac};
 use sha2::Sha512;
 use std::fmt::Write as _;
+use zeroize::Zeroize;
 
 type HmacSha512 = Hmac<Sha512>;
 
@@ -184,7 +184,6 @@ pub fn format_wallet_summary(wallet: &GeneratedWallet, theme: &Theme) -> String 
     out
 }
 
-
 /// Minimum passphrase length for an exported keystore.
 pub const KEYSTORE_MIN_PASSPHRASE_LENGTH: usize = 12;
 const KEYSTORE_VERSION: u32 = 1;
@@ -238,7 +237,9 @@ pub fn export_keystore(wallet: &GeneratedWallet, passphrase: &str) -> Result<Str
     let private = decode_secret(&wallet.secret)?;
     let account = encode_account(SigningKey::from_bytes(&private).verifying_key().as_bytes());
     if wallet.account != account {
-        return Err(ToolkitError::Wallet("wallet account does not match its secret key".into()));
+        return Err(ToolkitError::Wallet(
+            "wallet account does not match its secret key".into(),
+        ));
     }
     let mut payload = serde_json::to_vec(&KeystorePayload {
         secret: wallet.secret.clone(),
@@ -330,12 +331,15 @@ pub fn import_keystore(document: &str, passphrase: &str) -> Result<ImportedKeyst
     })?;
     let payload_result = serde_json::from_slice::<KeystorePayload>(&plaintext);
     plaintext.zeroize();
-    let payload: KeystorePayload = payload_result
-        .map_err(|_| ToolkitError::Wallet("decrypted keystore payload has an invalid schema".into()))?;
+    let payload: KeystorePayload = payload_result.map_err(|_| {
+        ToolkitError::Wallet("decrypted keystore payload has an invalid schema".into())
+    })?;
     let private = decode_secret(&payload.secret)?;
     let expected = encode_account(SigningKey::from_bytes(&private).verifying_key().as_bytes());
     if payload.account != expected {
-        return Err(ToolkitError::Wallet("keystore account does not match its secret key".into()));
+        return Err(ToolkitError::Wallet(
+            "keystore account does not match its secret key".into(),
+        ));
     }
     Ok(ImportedKeystore {
         secret: payload.secret,
@@ -367,7 +371,6 @@ fn derive_keystore_key(passphrase: &str, salt: &[u8]) -> Result<[u8; 32]> {
         .map_err(|_| ToolkitError::Wallet("keystore key derivation failed".into()))?;
     Ok(key)
 }
-
 
 /// Fund an account on the Stellar testnet using the Friendbot faucet.
 pub fn fund_account(account: &str) -> Result<()> {

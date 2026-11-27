@@ -2,11 +2,9 @@
 //! account key (issue #334).
 //!
 //! These tests exercise the public library API end-to-end, following the
-//! conventions of tests/keystore_workflow.rs.
+//! conventions of `tests/keystore_workflow.rs`.
 
-use stellar_toolkit::{
-    AccountAbstractionManager, SessionError, SessionKey, SessionPolicy,
-};
+use stellar_toolkit::{AccountAbstractionManager, SessionError, SessionKey, SessionPolicy};
 
 fn make_session(id: &str, account: &str, pubkey: &str) -> SessionKey {
     SessionKey::new(

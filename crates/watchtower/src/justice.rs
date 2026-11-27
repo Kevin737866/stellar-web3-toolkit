@@ -26,7 +26,7 @@
 //! ```
 
 use crate::monitor::BreachAttempt;
-use crate::storage::{StorageBackend, StorageError};
+use crate::storage::StorageBackend;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use thiserror::Error;
@@ -224,9 +224,9 @@ impl JusticeService {
         let action_id = uuid_v4();
         let mut action = JusticeAction::new(action_id, evidence.clone());
 
-        self.storage
-            .store_justice_action(&action)
-            .map_err(|e| JusticeError::BuildError(format!("failed to persist justice action: {e}")))?;
+        self.storage.store_justice_action(&action).map_err(|e| {
+            JusticeError::BuildError(format!("failed to persist justice action: {e}"))
+        })?;
 
         info!(
             "Justice action {} persisted (Pending) for channel {}",
@@ -561,8 +561,7 @@ mod tests {
 
     #[test]
     fn test_justice_transaction_creation() {
-        let _service =
-            JusticeService::new("http://localhost".to_string(), "test".to_string(), 100_000);
+        let _service = service();
 
         let _breach = valid_breach();
     }
@@ -715,7 +714,7 @@ mod tests {
         // via the unit-level flow in the action lifecycle tests below.
         let service = service();
         let result = service.submit_justice(&valid_breach()).await;
-        assert!(result.is_ok(), "valid breach must succeed: {:?}", result);
+        assert!(result.is_ok(), "valid breach must succeed: {result:?}");
 
         // Confirm: zero Pending left in storage means the persist-then-update
         // lifecycle ran to completion.
@@ -774,7 +773,7 @@ mod tests {
         use crate::storage::InMemoryStorage;
         use std::sync::Arc;
 
-        let storage = Arc::new(InMemoryStorage::new());
+        let storage: Arc<dyn StorageBackend> = Arc::new(InMemoryStorage::new());
 
         // Plant a Pending action directly in storage.
         let evidence = BreachEvidence {
