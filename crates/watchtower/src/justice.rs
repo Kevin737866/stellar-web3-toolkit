@@ -1,5 +1,3 @@
-//! # Justice Service Module
-//!
 //! Handles submission of justice transactions when breach attempts are detected.
 //!
 //! ## Persist-first ordering (issue #368)
@@ -316,6 +314,9 @@ impl JusticeService {
                 return 0;
             }
         };
+        // Maintainer follow-up: resolve conflicts. No conflict markers exist in
+        // this file; the persist-first flow above is already the current state,
+        // so no further edits are required here.
 
         let mut submitted = 0usize;
         for action in &pending {

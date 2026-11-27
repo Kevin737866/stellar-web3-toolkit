@@ -4,6 +4,7 @@
 
 pub mod anomaly;
 pub mod api_reference_gen;
+pub mod atomic_output;
 pub mod audit_allowlist;
 pub mod bridge_oracle;
 pub mod cli;
@@ -32,6 +33,7 @@ pub mod presigned_deploy;
 pub mod scaffolder;
 pub mod session_keys;
 pub mod signal_sync;
+pub mod soroban_rpc;
 pub mod state_inspector;
 pub mod theme;
 pub mod timelock;
@@ -47,6 +49,9 @@ pub use anomaly::{
     MetricVerdict, Series,
 };
 pub use api_reference_gen::{ApiFunctionDoc, ApiReferenceGenerator};
+pub use atomic_output::{
+    atomic_write_bytes, atomic_write_str, AtomicOutputError, StagedDeploymentOutput, StagedFile,
+};
 pub use bridge_oracle::{
     OracleConfirmation, OracleQuorumError, OracleSet, QuorumReport, QuorumVerdict, MAX_ORACLES,
 };
@@ -100,6 +105,11 @@ pub use session_keys::{
     SessionPolicy, VetoGuardian,
 };
 pub use signal_sync::{Signal, SignalSnapshot, SyncError, SyncReport, SNAPSHOT_VERSION};
+pub use soroban_rpc::{
+    poll_transaction, poll_transaction_with_sleep, validate_rpc_url, validate_tx_hash,
+    HttpSorobanRpcClient, PollConfig, PollError, PollOutcome, SorobanRpcTransport,
+    TerminalTransactionResult, TransactionReceipt, TransactionStatusResponse,
+};
 pub use state_inspector::{Durability, StateEntry, StateInspector, StatePage, StateQuery};
 pub use timelock::{
     authorize_governance_action, DelayKind, GovernanceAction, GovernanceRole,

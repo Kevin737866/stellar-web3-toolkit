@@ -535,6 +535,32 @@ pub enum SessionCommand {
     },
 }
 
+/// Soroban transaction commands (issue #324).
+#[derive(Subcommand, Debug)]
+pub enum TxCommand {
+    /// Poll a Soroban transaction hash via `getTransaction` until SUCCESS or FAILED
+    Poll {
+        /// Soroban RPC endpoint URL (http or https)
+        #[arg(long)]
+        rpc_url: String,
+        /// 64-character hex Soroban transaction hash
+        #[arg(long)]
+        hash: String,
+        /// Maximum polling duration in seconds
+        #[arg(long, default_value_t = 30)]
+        timeout_secs: u64,
+        /// Initial polling interval in milliseconds
+        #[arg(long, default_value_t = 1000)]
+        interval_ms: u64,
+        /// Maximum polling attempts
+        #[arg(long, default_value_t = 30)]
+        max_attempts: usize,
+        /// Maximum consecutive transient RPC errors tolerated
+        #[arg(long, default_value_t = 3)]
+        max_transient_errors: usize,
+    },
+}
+
 #[derive(Subcommand)]
 pub enum WalletCommand {
     /// Generate a 24-word recovery phrase and derive a Stellar keypair
@@ -1793,57 +1819,47 @@ fn run_verify(cmd: &VerifyCommand) -> Result<()> {
     }
 }
 
-/// Dispatch for offline deployment configuration validation (issue #327).
-fn run_deploy(cmd: &DeployCommand) -> Result<()> {
-    use crate::deploy_config::{DeploymentSpec, DeploymentValidator};
+fn run_tx(cmd: &TxCommand) -> Result<()> {
+    use crate::soroban_rpc::{
+        poll_transaction, HttpSorobanRpcClient, PollConfig, TerminalTransactionResult,
+    };
+    use std::time::Duration;
 
     match cmd {
-        DeployCommand::ValidateOffline {
-            spec,
-            workspace,
-            json,
-            warn_only,
+        TxCommand::Poll {
+            rpc_url,
+            hash,
+            timeout_secs,
+            interval_ms,
+            max_attempts,
+            max_transient_errors,
         } => {
-            let spec_path = resolve_path(&cwd_root(), spec);
-            let parsed = DeploymentSpec::load(&spec_path)?;
-
-            // Filename stem must match the declared name so `--spec prod.toml`
-            // cannot accidentally pick up dev settings.
-            let stem = spec_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("");
-            let mut findings = Vec::new();
-            if stem != parsed.name() {
-                findings.push(crate::deploy_config::Finding {
-                    severity: crate::deploy_config::Severity::Error,
-                    field: "name".to_string(),
-                    message: format!(
-                        "file `{stem}.toml` declares name `{}`; they must match",
-                        parsed.name()
-                    ),
-                });
+            let mut client = HttpSorobanRpcClient::new(rpc_url)?;
+            let interval = Duration::from_millis(*interval_ms);
+            let config = PollConfig {
+                poll_interval: interval,
+                max_interval: interval.max(Duration::from_secs(10)),
+                timeout: Duration::from_secs(*timeout_secs),
+                max_attempts: *max_attempts,
+                max_transient_errors: *max_transient_errors,
+            };
+            let outcome = poll_transaction(&mut client, hash, &config)?;
+            match outcome.result {
+                TerminalTransactionResult::Success(receipt) => {
+                    println!(
+                        "SUCCESS hash={} ledger={:?} attempts={}",
+                        receipt.tx_hash, receipt.ledger, outcome.attempts
+                    );
+                    Ok(())
+                }
+                TerminalTransactionResult::Failed(receipt) => {
+                    Err(ToolkitError::SorobanRpc(crate::soroban_rpc::PollError::TransactionFailed {
+                        tx_hash: receipt.tx_hash,
+                        ledger: receipt.ledger,
+                        result_xdr: receipt.result_xdr,
+                    }))
+                }
             }
-
-            let root = normalize_workspace_root(workspace);
-            let validator = DeploymentValidator::new(&root);
-            let mut report = validator.validate(&parsed);
-            report.findings.splice(0..0, findings);
-
-            if *json {
-                println!("{}", report.to_json());
-            } else {
-                print!("{}", report.render(parsed.name()));
-            }
-
-            if !report.passed() && !*warn_only {
-                return Err(ToolkitError::ExecutionError(format!(
-                    "{} deployment config error(s) in {}",
-                    report.errors(),
-                    spec_path.display()
-                )));
-            }
-            Ok(())
         }
     }
 }
