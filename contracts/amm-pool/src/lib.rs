@@ -1,4 +1,21 @@
 #![no_std]
+//! Constant-product AMM pool.
+//!
+//! # Overflow policy (#399)
+//!
+//! Every mutation of a reserve, an LP balance, the LP total supply or an
+//! allowance goes through the checked helpers in [`math`], which abort the
+//! invocation with a message naming the field and operands. Nothing on these
+//! paths uses `saturating_*`: saturating a reserve at `i128::MAX` would leave
+//! the stored reserve out of sync with the tokens the pool actually holds and
+//! silently misprice every later swap. A panic is safe here because Soroban
+//! rolls back the whole invocation, so a failed operation never leaves partial
+//! state behind.
+//!
+//! The only intentional saturation left is the TWAP accumulator in
+//! `grow_cumulative`: it is a derived, monotonically increasing oracle value
+//! rather than a balance, and clamping it is a documented degradation instead
+//! of an accounting error.
 
 // Public so the quorum/quorum-status helpers and `sqrt_u128` are part of the
 // crate's reachable API: as a private module their `pub` items tripped
@@ -6,7 +23,8 @@
 pub mod math;
 
 use math::{
-    amount_out, checked_mint_lp_shares, checked_redeem_amounts, flash_k_ok, quote,
+    amount_out, checked_add_amount, checked_mul_div, checked_sub_amount, flash_k_ok,
+    liquidity_amounts_first_deposit, quote,
 };
 use soroban_sdk::token::{TokenClient, TokenInterface};
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, IntoVal, String};
@@ -158,16 +176,22 @@ fn allowance_effective(env: &Env, data: &AllowanceData) -> i128 {
 fn mint_lp(env: &Env, to: Address, amount: i128) {
     assert!(amount > 0, "mint lp");
     let b = lp_balance_read(env, &to);
-    lp_balance_write(env, to, b.saturating_add(amount));
-    set_total_lp(env, total_lp(env).saturating_add(amount));
+    lp_balance_write(env, to, checked_add_amount(b, amount, "lp balance mint"));
+    set_total_lp(
+        env,
+        checked_add_amount(total_lp(env), amount, "lp total supply mint"),
+    );
 }
 
 fn burn_lp(env: &Env, from: Address, amount: i128) {
     assert!(amount > 0, "burn lp");
     let b = lp_balance_read(env, &from);
     assert!(b >= amount, "bal");
-    lp_balance_write(env, from, b - amount);
-    set_total_lp(env, total_lp(env).saturating_sub(amount));
+    lp_balance_write(env, from, checked_sub_amount(b, amount, "lp balance burn"));
+    set_total_lp(
+        env,
+        checked_sub_amount(total_lp(env), amount, "lp total supply burn"),
+    );
 }
 
 fn burn_lp_withdraw(env: &Env, from: Address, amount: i128) {
@@ -175,8 +199,8 @@ fn burn_lp_withdraw(env: &Env, from: Address, amount: i128) {
     let (reserve_a, reserve_b) = reserves(env);
     let supply = total_lp(env);
     assert!(amount > 0 && supply > 0, "burn w");
-    let (amount_a, amount_b) =
-        checked_redeem_amounts(amount, reserve_a, reserve_b, supply).expect("redeem");
+    let amount_a = checked_mul_div(amount, reserve_a, supply, "withdraw amount A");
+    let amount_b = checked_mul_div(amount, reserve_b, supply, "withdraw amount B");
     grow_cumulative(env);
     burn_lp(env, from.clone(), amount);
     let (ta, tb) = get_tokens(env);
@@ -184,8 +208,8 @@ fn burn_lp_withdraw(env: &Env, from: Address, amount: i128) {
     TokenClient::new(env, &tb).transfer(&pool, &from, &amount_b);
     set_reserves(
         env,
-        reserve_a.checked_sub(amount_a).expect("reserve_a underflow"),
-        reserve_b.checked_sub(amount_b).expect("reserve_b underflow"),
+        checked_sub_amount(reserve_a, amount_a, "reserve A withdraw"),
+        checked_sub_amount(reserve_b, amount_b, "reserve B withdraw"),
     );
     grow_cumulative(env);
 }
@@ -278,12 +302,18 @@ impl AmmPool {
         TokenClient::new(&env, &tb).transfer(&user, &pool, &amount_b);
 
         grow_cumulative(&env);
-        let new_a = reserve_a
-            .checked_add(amount_a)
-            .expect("reserve_a overflow");
-        let new_b = reserve_b
-            .checked_add(amount_b)
-            .expect("reserve_b overflow");
+
+        let liq = if total_lp(&env) == 0 {
+            liquidity_amounts_first_deposit(amount_a, amount_b)
+        } else {
+            let supply = total_lp(&env);
+            let l1 = checked_mul_div(amount_a, supply, reserve_a, "add liquidity LP for A");
+            let l2 = checked_mul_div(amount_b, supply, reserve_b, "add liquidity LP for B");
+            l1.min(l2)
+        };
+        assert!(liq > 0, "liq");
+        let new_a = checked_add_amount(reserve_a, amount_a, "reserve A deposit");
+        let new_b = checked_add_amount(reserve_b, amount_b, "reserve B deposit");
         set_reserves(&env, new_a, new_b);
         mint_lp(&env, user, liq);
         grow_cumulative(&env);
@@ -309,8 +339,8 @@ impl AmmPool {
         let supply = total_lp(&env);
         assert!(supply > 0, "supply");
 
-        let (amount_a, amount_b) =
-            checked_redeem_amounts(lp_amount, reserve_a, reserve_b, supply).expect("redeem");
+        let amount_a = checked_mul_div(lp_amount, reserve_a, supply, "remove liquidity amount A");
+        let amount_b = checked_mul_div(lp_amount, reserve_b, supply, "remove liquidity amount B");
         assert!(amount_a >= min_a && amount_b >= min_b, "slippage rm");
 
         grow_cumulative(&env);
@@ -322,8 +352,8 @@ impl AmmPool {
 
         set_reserves(
             &env,
-            reserve_a.checked_sub(amount_a).expect("reserve_a underflow"),
-            reserve_b.checked_sub(amount_b).expect("reserve_b underflow"),
+            checked_sub_amount(reserve_a, amount_a, "reserve A removal"),
+            checked_sub_amount(reserve_b, amount_b, "reserve B removal"),
         );
         grow_cumulative(&env);
         (amount_a, amount_b)
@@ -347,7 +377,10 @@ impl AmmPool {
         };
 
         let bal_in = TokenClient::new(&env, &token_in).balance(&pool);
-        let amount_in = bal_in.saturating_sub(reserve_in);
+        // A balance below the recorded reserve means the pool's accounting has
+        // already drifted from the token it holds; swapping against the
+        // difference would pay out from a phantom input.
+        let amount_in = checked_sub_amount(bal_in, reserve_in, "swap input balance");
         assert!(amount_in > 0, "amount_in");
 
         let out = amount_out(amount_in, reserve_in, reserve_out);
@@ -355,8 +388,8 @@ impl AmmPool {
         assert!(out < reserve_out, "out");
 
         grow_cumulative(&env);
-        let new_in = reserve_in.saturating_add(amount_in);
-        let new_out = reserve_out.saturating_sub(out);
+        let new_in = checked_add_amount(reserve_in, amount_in, "reserve in after swap");
+        let new_out = checked_sub_amount(reserve_out, out, "reserve out after swap");
         if token_in == ta {
             set_reserves(&env, new_in, new_out);
         } else {
@@ -449,9 +482,13 @@ impl TokenInterface for AmmPool {
         assert!(amount > 0, "amt");
         let b = lp_balance_read(&env, &from);
         assert!(b >= amount, "bal");
-        lp_balance_write(&env, from, b - amount);
+        lp_balance_write(
+            &env,
+            from,
+            checked_sub_amount(b, amount, "lp transfer from"),
+        );
         let b_to = lp_balance_read(&env, &to);
-        lp_balance_write(&env, to, b_to.saturating_add(amount));
+        lp_balance_write(&env, to, checked_add_amount(b_to, amount, "lp transfer to"));
     }
 
     fn transfer_from(env: Env, spender: Address, from: Address, to: Address, amount: i128) {
@@ -461,15 +498,22 @@ impl TokenInterface for AmmPool {
         let mut al = allowance_load(&env, from.clone(), spender.clone());
         let eff = allowance_effective(&env, &al);
         assert!(eff >= amount, "allow");
-        let new_allow = eff.saturating_sub(amount);
-        al.amount = new_allow;
+        al.amount = checked_sub_amount(eff, amount, "allowance spend");
         allowance_store(&env, from.clone(), spender, al);
 
         let b = lp_balance_read(&env, &from);
         assert!(b >= amount, "bal");
-        lp_balance_write(&env, from.clone(), b - amount);
+        lp_balance_write(
+            &env,
+            from.clone(),
+            checked_sub_amount(b, amount, "lp transfer_from from"),
+        );
         let b_to = lp_balance_read(&env, &to);
-        lp_balance_write(&env, to, b_to.saturating_add(amount));
+        lp_balance_write(
+            &env,
+            to,
+            checked_add_amount(b_to, amount, "lp transfer_from to"),
+        );
     }
 
     fn burn(env: Env, from: Address, amount: i128) {
@@ -484,7 +528,7 @@ impl TokenInterface for AmmPool {
         let mut al = allowance_load(&env, from.clone(), spender.clone());
         let eff = allowance_effective(&env, &al);
         assert!(eff >= amount, "allow");
-        al.amount = eff.saturating_sub(amount);
+        al.amount = checked_sub_amount(eff, amount, "allowance spend on burn");
         allowance_store(&env, from.clone(), spender.clone(), al);
         burn_lp_withdraw(&env, from, amount);
     }
@@ -657,6 +701,68 @@ mod test {
         pool.flash_swap(&callback_id, &1_000, &0, &callback_id);
 
         assert_eq!(pool.get_reserves(), (1_000_004, 1_000_000));
+    }
+
+    #[test]
+    fn proportional_deposit_rejects_a_quote_that_overflows_i128() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (ta, tb) = setup_tokens(&env);
+        let pool_id = env.register_contract(None, AmmPool);
+        let pool = AmmPoolClient::new(&env, &pool_id);
+        pool.initialize(&Address::generate(&env), &ta, &tb);
+
+        let u = Address::generate(&env);
+        mint(&env, ta.clone(), u.clone(), 10_000_000);
+        mint(&env, tb.clone(), u.clone(), 10_000_000);
+        pool.add_liquidity(&u, &1_000_000, &1_000_000, &1, &1);
+
+        // Push the LP supply to the i128 boundary. `1_001 * supply` then has no
+        // representable product and the old `saturating_mul` would have quoted
+        // `i128::MAX` LP instead of failing.
+        env.as_contract(&pool_id, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::TotalLp, &(i128::MAX - 1));
+        });
+        let before = pool.get_reserves();
+
+        assert!(
+            pool.try_add_liquidity(&u, &1_001, &1_001, &1, &1).is_err(),
+            "an overflowing LP quote must abort the deposit"
+        );
+        // The aborted call must leave no partial update behind.
+        assert_eq!(pool.get_reserves(), before);
+        assert_eq!(pool.balance(&u), 1_000_000);
+    }
+
+    #[test]
+    fn lp_transfer_to_a_saturated_balance_is_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (ta, tb) = setup_tokens(&env);
+        let pool_id = env.register_contract(None, AmmPool);
+        let pool = AmmPoolClient::new(&env, &pool_id);
+        pool.initialize(&Address::generate(&env), &ta, &tb);
+
+        let u = Address::generate(&env);
+        mint(&env, ta.clone(), u.clone(), 1_000_000);
+        mint(&env, tb.clone(), u.clone(), 1_000_000);
+        let lp = pool.add_liquidity(&u, &1_000, &1_000, &1, &1);
+
+        let recipient = Address::generate(&env);
+        env.as_contract(&pool_id, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::Bal(recipient.clone()), &i128::MAX);
+        });
+
+        let token = TokenClient::new(&env, &pool_id);
+        assert!(
+            token.try_transfer(&u, &recipient, &1).is_err(),
+            "adding to a saturated LP balance must abort instead of capping"
+        );
+        assert_eq!(token.balance(&u), lp);
     }
 
     #[test]

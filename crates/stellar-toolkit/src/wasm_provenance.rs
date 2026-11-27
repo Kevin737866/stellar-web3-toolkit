@@ -201,21 +201,15 @@ impl ProvenanceManifest {
         Self::from_json(&raw)
     }
 
-    /// Writes the manifest as pretty JSON, creating parent directories.
+    /// Writes the manifest as pretty JSON atomically, creating parent directories.
     ///
     /// # Errors
-    /// If serialization or the write fails.
+    /// If serialization or the atomic write fails.
     pub fn save(&self, path: &Path) -> Result<(), ManifestError> {
         let json = self
             .to_json()
             .map_err(|e| ManifestError::Malformed(e.to_string()))?;
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| ManifestError::Io(parent.display().to_string(), e.to_string()))?;
-            }
-        }
-        std::fs::write(path, json)
+        crate::atomic_output::atomic_write_str(path, &json)
             .map_err(|e| ManifestError::Io(path.display().to_string(), e.to_string()))
     }
 }

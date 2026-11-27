@@ -3,11 +3,14 @@
 //! Advanced pathfinding algorithms for payment channel routing.
 
 use crate::fee_cap::FeeCap;
-use crate::{NetworkGraph, Route, RouteHop, RouteRequest, RoutingError, MAX_ROUTE_HOPS};
+use crate::{
+    compute_hop_timeouts, NetworkGraph, PaymentMetadata, Route, RouteHop, RouteRequest,
+    RoutingError, MAX_ROUTE_HOPS,
+};
 use fxhash::FxHashMap;
 use priority_queue::PriorityQueue;
 use std::cmp::Reverse;
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 
 /// Pathfinding engine for finding optimal payment routes
 pub struct Pathfinder {
@@ -19,6 +22,8 @@ pub struct Pathfinder {
     obfuscate: bool,
     /// Ceiling on per-channel and per-route fees
     fee_cap: FeeCap,
+    /// Deterministic tie-breaking strategy for equal-cost routes
+    tie_breaker: TieBreaker,
 }
 
 impl Pathfinder {
@@ -29,6 +34,7 @@ impl Pathfinder {
             max_fee_percent: 10.0,
             obfuscate: false,
             fee_cap: FeeCap::protocol(),
+            tie_breaker: TieBreaker::default(),
         }
     }
 
@@ -61,68 +67,164 @@ impl Pathfinder {
         &self.fee_cap
     }
 
-    /// Find a route using Dijkstra's algorithm
+    /// Configure deterministic tie-breaking for equal-cost routes
+    pub fn with_tie_breaker(mut self, tie_breaker: TieBreaker) -> Self {
+        self.tie_breaker = tie_breaker;
+        self
+    }
+
+    /// The tie-breaking strategy this pathfinder uses
+    pub fn tie_breaker(&self) -> TieBreaker {
+        self.tie_breaker
+    }
+
+    fn validate_request(
+        &self,
+        graph: &NetworkGraph,
+        request: &RouteRequest,
+    ) -> Result<(), RoutingError> {
+        if request.amount <= 0 {
+            return Err(RoutingError::BelowDustLimit {
+                amount: request.amount,
+                dust_limit: 1,
+            });
+        }
+
+        if request.amount > MAX_ROUTE_AMOUNT {
+            return Err(RoutingError::AmountExceedsMaximum {
+                amount: request.amount,
+                max_amount: MAX_ROUTE_AMOUNT,
+            });
+        }
+
+        if let Some(budget) = request.max_fee_budget {
+            if budget < 0 {
+                return Err(RoutingError::FeeExceedsBudget { fee: 0, budget });
+            }
+        }
+
+        if !graph.has_node(&request.source) {
+            return Err(RoutingError::NodeNotFound {
+                node: request.source.clone(),
+            });
+        }
+
+        if !graph.has_node(&request.destination) {
+            return Err(RoutingError::NodeNotFound {
+                node: request.destination.clone(),
+            });
+        }
+
+        Ok(())
+    }
+
+    fn effective_max_hops(&self, request: &RouteRequest) -> usize {
+        request
+            .max_hops
+            .map_or(self.max_hops, |h| h.min(self.max_hops))
+    }
+
+    /// Find a route using Dijkstra's algorithm with deterministic tie-breaking
     pub fn find_route_dijkstra(
         &self,
         graph: &NetworkGraph,
         request: &RouteRequest,
     ) -> Result<Route, RoutingError> {
+        let excluded = build_exclusion_set(&request.excluded_unavailable)?;
+
         let mut dist: FxHashMap<String, (i128, Vec<RouteHop>)> = FxHashMap::default();
         let mut pq: PriorityQueue<String, Reverse<i128>> = PriorityQueue::new();
 
-        dist.insert(request.source.clone(), (0, Vec::new()));
-        pq.push(request.source.clone(), Reverse(0));
+        let mut best: FxHashMap<String, (SearchKey, Vec<RouteHop>)> = FxHashMap::default();
+        let mut pq: PriorityQueue<String, Reverse<SearchKey>> = PriorityQueue::new();
 
-        while let Some((node, Reverse(cost))) = pq.pop() {
-            let (final_cost, path) = dist.get(&node).unwrap().clone();
+        let root_key = SearchKey::root(0, self.tie_breaker);
+        best.insert(request.source.clone(), (root_key.clone(), Vec::new()));
+        pq.push(request.source.clone(), Reverse(root_key));
+
+        while let Some((node, Reverse(current_key))) = pq.pop() {
+            let (final_key, path) = best.get(&node).unwrap().clone();
 
             if node == request.destination {
-                return self.build_route(path, request.amount);
+                return self.build_route_with_metadata(
+                    path,
+                    request.amount,
+                    request.payment_metadata.as_ref(),
+                );
             }
 
-            if cost > final_cost {
+            if current_key > final_key {
                 continue;
             }
 
-            // Check hop limit
-            if path.len() >= self.max_hops {
+            // Check hop limit (Issue #364)
+            let effective_max_hops = request
+                .max_hops
+                .map(|h| h.min(self.max_hops))
+                .unwrap_or(self.max_hops);
+            if path.len() >= effective_max_hops {
                 continue;
             }
 
             let current_amount = self.calculate_amount_at_node(&path, request.amount);
+            let cost = current_key.primary_cost;
 
             if let Some(neighbors) = graph.adjacency.get(&node) {
                 for (neighbor, channel_id) in neighbors {
                     if let Some(channel) = graph.channels.get(channel_id) {
+                        // Skip temporarily unavailable channels.
+                        if excluded.contains(channel_id.as_str()) {
+                            continue;
+                        }
+
                         if self.fee_cap.check_channel(channel).is_err() {
                             continue;
                         }
 
-                        // `neighbor` is the destination of this hop, so the
-                        // capacity that matters is the one leaving the current
-                        // node -- the opposite direction's capacity says
-                        // nothing about whether this hop can forward the
-                        // payment.
-                        let capacity = if &channel.node_a == neighbor {
-                            channel.capacity_b_to_a
-                        } else {
-                            channel.capacity_a_to_b
-                        };
+                    // `neighbor` is the destination of this hop, so the
+                    // capacity that matters is the one leaving the current
+                    // node -- the opposite direction's capacity says
+                    // nothing about whether this hop can forward the
+                    // payment.
+                    let capacity = if &channel.node_a == neighbor {
+                        channel.capacity_b_to_a
+                    } else {
+                        channel.capacity_a_to_b
+                    };
 
-                        if capacity < current_amount {
+                    if capacity < current_amount {
+                        continue;
+                    }
+
+                    if channel.base_fee < 0 {
+                        continue;
+                    }
+
+                    let fee = self.calculate_fee(channel, current_amount);
+                    if fee < 0 {
+                        continue;
+                    }
+
+                    let Some(new_cost) = cost.checked_add(fee) else {
+                        continue;
+                    };
+
+                    // Fee budget check against accumulated route fee
+                    if let Some(max_fee) = request.max_fee_budget {
+                        if new_cost > max_fee {
                             continue;
                         }
+                    }
 
-                        let fee = self.calculate_fee(channel, current_amount);
-                        let new_cost = cost + fee;
+                    let next_key =
+                        current_key.extend(new_cost, channel_id, neighbor, channel.cltv_delta);
 
-                        // Fee budget check
-                        if let Some(max_fee) = request.max_fee_budget {
-                            if fee > max_fee {
-                                continue;
-                            }
-                        }
+                    let is_better = match best.get(neighbor) {
+                        None => true,
+                        Some((existing_key, _)) => next_key < *existing_key,
+                    };
 
+                    if is_better {
                         let mut new_path = path.clone();
                         new_path.push(RouteHop::new(
                             (*channel_id).clone(),
@@ -131,11 +233,8 @@ impl Pathfinder {
                             fee,
                             channel.cltv_delta,
                         ));
-
-                        if new_cost < *dist.get(neighbor).map_or(&i128::MAX, |(c, _)| c) {
-                            dist.insert((*neighbor).clone(), (new_cost, new_path));
-                            pq.push((*neighbor).clone(), Reverse(new_cost));
-                        }
+                        best.insert((*neighbor).clone(), (next_key.clone(), new_path));
+                        pq.push((*neighbor).clone(), Reverse(next_key));
                     }
                 }
             }
@@ -147,12 +246,14 @@ impl Pathfinder {
         })
     }
 
-    /// Find a route using A* algorithm
+    /// Find a route using A* algorithm with deterministic tie-breaking
     pub fn find_route_astar(
         &self,
         graph: &NetworkGraph,
         request: &RouteRequest,
     ) -> Result<Route, RoutingError> {
+        let excluded = build_exclusion_set(&request.excluded_unavailable)?;
+
         let mut open_set: PriorityQueue<String, Reverse<i128>> = PriorityQueue::new();
         let mut g_score: FxHashMap<String, i128> = FxHashMap::default();
         let mut f_score: FxHashMap<String, i128> = FxHashMap::default();
@@ -164,9 +265,10 @@ impl Pathfinder {
             hops as i128 * 10 // Minimum 10 units per hop
         };
 
-        g_score.insert(request.source.clone(), 0);
-        f_score.insert(request.source.clone(), heuristic(&request.source));
-        open_set.push(request.source.clone(), Reverse(heuristic(&request.source)));
+        let root_g = SearchKey::root(0, self.tie_breaker);
+        let root_f = SearchKey::root(heuristic(&request.source), self.tie_breaker);
+        g_keys.insert(request.source.clone(), root_g);
+        open_set.push(request.source.clone(), Reverse(root_f));
 
         while let Some((current, Reverse(_))) = open_set.pop() {
             if current == request.destination {
@@ -175,50 +277,82 @@ impl Pathfinder {
                     &request.source,
                     &request.destination,
                     request.amount,
+                    request.payment_metadata.as_ref(),
                 );
             }
 
-            let current_g = *g_score.get(&current).unwrap();
+            let current_g_key = g_keys.get(&current).unwrap().clone();
+            if current_g_key.hops >= max_hops {
+                continue;
+            }
+            let current_g = current_g_key.primary_cost;
+            let current_amount = self.get_amount_for_node(&current, &came_from, request.amount);
 
-            if let Some(neighbors) = graph.adjacency.get(&current) {
-                for (neighbor, channel_id) in neighbors {
-                    let Some(channel) = graph.channels.get(channel_id) else {
+            for (neighbor, channel_id) in sorted_neighbors(graph, &current) {
+                let Some(channel) = graph.channels.get(channel_id) else {
+                    continue;
+                };
+
+                    // Skip temporarily unavailable channels.
+                    if excluded.contains(channel_id.as_str()) {
                         continue;
-                    };
+                    }
 
                     if self.fee_cap.check_channel(channel).is_err() {
                         continue;
                     }
 
-                    let current_amount =
-                        self.get_amount_for_node(&current, &came_from, request.amount);
-                    let capacity = if &channel.node_a == neighbor {
-                        channel.capacity_b_to_a
-                    } else {
-                        channel.capacity_a_to_b
-                    };
+                let capacity = if &channel.node_a == neighbor {
+                    channel.capacity_b_to_a
+                } else {
+                    channel.capacity_a_to_b
+                };
 
-                    if capacity < current_amount {
+                if capacity < current_amount {
+                    continue;
+                }
+
+                if channel.base_fee < 0 {
+                    continue;
+                }
+
+                let fee = self.calculate_fee(channel, current_amount);
+                if fee < 0 {
+                    continue;
+                }
+
+                let Some(tentative_g) = current_g.checked_add(fee) else {
+                    continue;
+                };
+
+                if let Some(max_fee) = request.max_fee_budget {
+                    if tentative_g > max_fee {
                         continue;
                     }
+                }
 
-                    let fee = self.calculate_fee(channel, current_amount);
-                    let tentative_g = current_g + fee;
+                let tentative_g_key =
+                    current_g_key.extend(tentative_g, channel_id, neighbor, channel.cltv_delta);
 
-                    if tentative_g < *g_score.get(neighbor).unwrap_or(&i128::MAX) {
-                        let hop = RouteHop::new(
-                            (*channel_id).clone(),
-                            (*neighbor).clone(),
-                            current_amount,
-                            fee,
-                            channel.cltv_delta,
-                        );
-                        came_from.insert((*neighbor).clone(), (current.clone(), hop));
-                        g_score.insert((*neighbor).clone(), tentative_g);
-                        let f = tentative_g + heuristic(neighbor);
-                        f_score.insert((*neighbor).clone(), f);
-                        open_set.push((*neighbor).clone(), Reverse(f));
-                    }
+                let is_better = match g_keys.get(neighbor) {
+                    None => true,
+                    Some(existing) => tentative_g_key < *existing,
+                };
+
+                if is_better {
+                    let hop = RouteHop::new(
+                        (*channel_id).clone(),
+                        (*neighbor).clone(),
+                        current_amount,
+                        fee,
+                        channel.cltv_delta,
+                    );
+                    came_from.insert((*neighbor).clone(), (current.clone(), hop));
+                    g_keys.insert((*neighbor).clone(), tentative_g_key.clone());
+
+                    let mut f_key = tentative_g_key;
+                    f_key.primary_cost = tentative_g.saturating_add(heuristic(neighbor));
+                    open_set.push((*neighbor).clone(), Reverse(f_key));
                 }
             }
         }
@@ -229,59 +363,83 @@ impl Pathfinder {
         })
     }
 
-    /// Find route using BFS (for finding any path quickly)
+    /// Find route using BFS (fewest hops) with deterministic tie-breaking
     pub fn find_route_bfs(
         &self,
         graph: &NetworkGraph,
         request: &RouteRequest,
     ) -> Result<Route, RoutingError> {
+        let excluded = build_exclusion_set(&request.excluded_unavailable)?;
+
         let mut queue: VecDeque<(String, Vec<RouteHop>)> = VecDeque::new();
         let mut visited: HashSet<String> = HashSet::new();
 
-        queue.push_back((request.source.clone(), Vec::new()));
-        visited.insert(request.source.clone());
+        while let Some((current, Reverse(current_key))) = pq.pop() {
+            let (final_key, path) = best.get(&current).unwrap().clone();
 
-        while let Some((current, path)) = queue.pop_front() {
             if current == request.destination {
-                return self.build_route(path, request.amount);
+                return self.build_route_with_metadata(
+                    path,
+                    request.amount,
+                    request.payment_metadata.as_ref(),
+                );
             }
 
-            if path.len() >= self.max_hops {
+            let effective_max_hops = request
+                .max_hops
+                .map(|h| h.min(self.max_hops))
+                .unwrap_or(self.max_hops);
+            if path.len() >= effective_max_hops {
                 continue;
             }
 
             let current_amount = self.calculate_amount_at_node(&path, request.amount);
 
-            if let Some(neighbors) = graph.adjacency.get(&current) {
-                for (neighbor, channel_id) in neighbors {
-                    if visited.contains(neighbor) {
+            for (neighbor, channel_id) in sorted_neighbors(graph, &current) {
+                if let Some(channel) = graph.channels.get(channel_id) {
+                    if self.fee_cap.check_channel(channel).is_err() {
                         continue;
                     }
 
                     if let Some(channel) = graph.channels.get(channel_id) {
+                        // Skip temporarily unavailable channels.
+                        if excluded.contains(channel_id.as_str()) {
+                            continue;
+                        }
+
                         if self.fee_cap.check_channel(channel).is_err() {
                             continue;
                         }
 
-                        let capacity = if &channel.node_a == neighbor {
-                            channel.capacity_b_to_a
-                        } else {
-                            channel.capacity_a_to_b
-                        };
+                    if capacity < current_amount || channel.base_fee < 0 {
+                        continue;
+                    }
 
-                        if capacity >= current_amount {
-                            let fee = self.calculate_fee(channel, current_amount);
-                            let mut new_path = path.clone();
-                            new_path.push(RouteHop::new(
-                                (*channel_id).clone(),
-                                (*neighbor).clone(),
-                                current_amount,
-                                fee,
-                                channel.cltv_delta,
-                            ));
-                            queue.push_back(((*neighbor).clone(), new_path));
-                            visited.insert((*neighbor).clone());
-                        }
+                    let fee = self.calculate_fee(channel, current_amount);
+                    if fee < 0 {
+                        continue;
+                    }
+
+                    let next_hops = (path.len() + 1) as i128;
+                    let next_key =
+                        current_key.extend(next_hops, channel_id, neighbor, channel.cltv_delta);
+
+                    let is_better = match best.get(neighbor) {
+                        None => true,
+                        Some((existing_key, _)) => next_key < *existing_key,
+                    };
+
+                    if is_better {
+                        let mut new_path = path.clone();
+                        new_path.push(RouteHop::new(
+                            (*channel_id).clone(),
+                            (*neighbor).clone(),
+                            current_amount,
+                            fee,
+                            channel.cltv_delta,
+                        ));
+                        best.insert((*neighbor).clone(), (next_key.clone(), new_path));
+                        pq.push((*neighbor).clone(), Reverse(next_key));
                     }
                 }
             }
@@ -319,6 +477,8 @@ impl Pathfinder {
     ) -> Result<Route, RoutingError> {
         use rand::seq::SliceRandom;
 
+        let excluded = build_exclusion_set(&request.excluded_unavailable)?;
+
         let mut visited: HashSet<String> = HashSet::new();
         let mut path: Vec<RouteHop> = Vec::new();
         let mut current = request.source.clone();
@@ -333,11 +493,15 @@ impl Pathfinder {
                 .map(|n| n.iter().collect::<Vec<_>>())
                 .unwrap_or_default();
 
-            // Filter out visited nodes and nodes without capacity
+            // Filter out visited nodes, excluded channels, and nodes without capacity
             let valid_neighbors: Vec<_> = neighbors
                 .into_iter()
                 .filter(|(node_id, channel_id)| {
                     if visited.contains(*node_id) {
+                        return false;
+                    }
+                    // Skip temporarily unavailable channels.
+                    if excluded.contains(channel_id.as_str()) {
                         return false;
                     }
                     if let Some(channel) = graph.channels.get(*channel_id) {
@@ -386,7 +550,7 @@ impl Pathfinder {
             });
         }
 
-        self.build_route(path, request.amount)
+        self.build_route_with_metadata(path, request.amount, request.payment_metadata.as_ref())
     }
 
     fn calculate_fee(&self, channel: &crate::Channel, amount: i128) -> i128 {
@@ -443,6 +607,15 @@ impl Pathfinder {
     }
 
     fn build_route(&self, path: Vec<RouteHop>, amount: i128) -> Result<Route, RoutingError> {
+        self.build_route_with_metadata(path, amount, None)
+    }
+
+    fn build_route_with_metadata(
+        &self,
+        mut path: Vec<RouteHop>,
+        amount: i128,
+        payment_metadata: Option<&PaymentMetadata>,
+    ) -> Result<Route, RoutingError> {
         if path.is_empty() {
             return Err(RoutingError::NoPathFound {
                 origin: "unknown".to_string(),
@@ -462,6 +635,14 @@ impl Pathfinder {
 
         self.enforce_fee_cap(amount, &path)?;
 
+        let (final_cltv_delta, max_cltv_budget) = match payment_metadata {
+            Some(meta) => (meta.required_cltv_delta.unwrap_or(0), meta.payment_expiry),
+            None => (0, None),
+        };
+        let (total_cltv_delta, hop_timeouts) =
+            compute_hop_timeouts(&mut path, final_cltv_delta, max_cltv_budget)?;
+        let num_hops = path.len();
+
         Ok(Route {
             hops: path,
             total_fees,
@@ -472,9 +653,11 @@ impl Pathfinder {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_secs(),
-                num_nodes: 0, // Will be set correctly
+                num_nodes: num_hops,
                 estimated_time_ms: 100,
-                is_direct: false,
+                is_direct: num_hops == 1,
+                total_cltv_delta,
+                hop_timeouts,
             },
         })
     }
@@ -485,14 +668,13 @@ impl Pathfinder {
         source: &str,
         destination: &str,
         amount: i128,
+        payment_metadata: Option<&PaymentMetadata>,
     ) -> Result<Route, RoutingError> {
         let mut path = Vec::new();
         let mut current = destination.to_string();
-        let mut total_fees = 0i128;
 
         while let Some((prev, hop)) = came_from.get(&current) {
             path.push(hop.clone());
-            total_fees += hop.fee;
 
             if prev == source {
                 break;
@@ -509,23 +691,7 @@ impl Pathfinder {
             });
         }
 
-        self.enforce_fee_cap(amount, &path)?;
-
-        Ok(Route {
-            hops: path,
-            total_fees,
-            total_amount: amount,
-            success_probability: 0.9,
-            metadata: crate::RouteMetadata {
-                created_at: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-                num_nodes: 0,
-                estimated_time_ms: 100,
-                is_direct: false,
-            },
-        })
+        self.build_route_with_metadata(path, amount, payment_metadata)
     }
 }
 
@@ -585,6 +751,7 @@ mod tests {
             max_hops: None,
             find_any: false,
             payment_metadata: None,
+            excluded_unavailable: vec![],
         }
     }
 
@@ -647,5 +814,125 @@ mod tests {
         assert!(Pathfinder::new()
             .find_route_dijkstra(&graph, &request())
             .is_ok());
+    }
+
+    #[test]
+    fn test_max_hops_enforcement_in_request() {
+        // Issue #364: Request max_hops strictly limits path length
+        let make_node = |id: &str| Node {
+            id: id.to_string(),
+            public_key: vec![1],
+            alias: None,
+            online: true,
+            last_seen: 0,
+            features: NodeFeatures::default(),
+        };
+
+        let mut graph = NetworkGraph::new();
+        for i in 0..5 {
+            graph.add_node(make_node(&format!("n{}", i)));
+        }
+
+        // Linear path n0 -> n1 -> n2 -> n3 -> n4 (4 hops)
+        for i in 0..4 {
+            graph.add_channel(Channel {
+                id: format!("c{}", i),
+                node_a: format!("n{}", i),
+                node_b: format!("n{}", i + 1),
+                capacity_a_to_b: 10_000,
+                capacity_b_to_a: 10_000,
+                base_fee: 1,
+                fee_rate: 10,
+                cltv_delta: 10,
+                min_htlc_size: 1,
+                max_htlc_size: 10_000,
+                htlcs_in_flight: 0,
+                enabled: true,
+                age_seconds: 0,
+            });
+        }
+
+        let pathfinder = Pathfinder::new();
+
+        // 4 hops requested allowed: succeeds
+        let req_ok = RouteRequest::new("n0".to_string(), "n4".to_string(), 100).with_max_hops(4);
+        let route = pathfinder
+            .find_route_dijkstra(&graph, &req_ok)
+            .expect("route with 4 hops should succeed");
+        assert_eq!(route.hops.len(), 4);
+
+        // 3 hops requested: must fail since path requires 4 hops
+        let req_too_short =
+            RouteRequest::new("n0".to_string(), "n4".to_string(), 100).with_max_hops(3);
+        let err = pathfinder.find_route_dijkstra(&graph, &req_too_short);
+        assert!(err.is_err(), "route exceeding request max_hops must fail");
+    }
+
+    #[test]
+    fn test_route_search_disconnected_network_components() {
+        // Issue #366: Route search between disconnected network components
+        let make_node = |id: &str| Node {
+            id: id.to_string(),
+            public_key: vec![1],
+            alias: None,
+            online: true,
+            last_seen: 0,
+            features: NodeFeatures::default(),
+        };
+
+        let mut graph = NetworkGraph::new();
+
+        // Component A: n0 <-> n1
+        graph.add_node(make_node("n0"));
+        graph.add_node(make_node("n1"));
+        graph.add_channel(Channel {
+            id: "c_a".to_string(),
+            node_a: "n0".to_string(),
+            node_b: "n1".to_string(),
+            capacity_a_to_b: 5_000,
+            capacity_b_to_a: 5_000,
+            base_fee: 1,
+            fee_rate: 10,
+            cltv_delta: 10,
+            min_htlc_size: 1,
+            max_htlc_size: 5_000,
+            htlcs_in_flight: 0,
+            enabled: true,
+            age_seconds: 0,
+        });
+
+        // Component B: n2 <-> n3 (disconnected from Component A)
+        graph.add_node(make_node("n2"));
+        graph.add_node(make_node("n3"));
+        graph.add_channel(Channel {
+            id: "c_b".to_string(),
+            node_a: "n2".to_string(),
+            node_b: "n3".to_string(),
+            capacity_a_to_b: 5_000,
+            capacity_b_to_a: 5_000,
+            base_fee: 1,
+            fee_rate: 10,
+            cltv_delta: 10,
+            min_htlc_size: 1,
+            max_htlc_size: 5_000,
+            htlcs_in_flight: 0,
+            enabled: true,
+            age_seconds: 0,
+        });
+
+        // Isolated node: n_iso with 0 channels
+        graph.add_node(make_node("n_iso"));
+
+        let pathfinder = Pathfinder::new();
+
+        // Cross-component search (n0 -> n3) must fail cleanly with NoPathFound
+        let req_disconnected = RouteRequest::new("n0".to_string(), "n3".to_string(), 500);
+        let res_disc = pathfinder.find_route_dijkstra(&graph, &req_disconnected);
+        assert!(matches!(res_disc, Err(RoutingError::NoPathFound { .. })));
+
+        // Search from isolated node must fail cleanly
+        let req_iso = RouteRequest::new("n_iso".to_string(), "n1".to_string(), 500);
+        let res_iso = pathfinder.find_route_dijkstra(&graph, &req_iso);
+        assert!(matches!(res_iso, Err(RoutingError::NoPathFound { .. })));
     }
 }
