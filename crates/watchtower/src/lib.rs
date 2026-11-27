@@ -12,9 +12,12 @@
 //! - Alert notification system
 //! - Retry of transient storage failures without duplicate actions
 //! - Health checks for the storage backends that hold breach evidence
+//! - Signed operator recovery bundles for key and data recovery
 
+pub mod alert;
 pub mod justice;
 pub mod monitor;
+pub mod recovery;
 pub mod storage;
 
 use parking_lot::RwLock;
@@ -132,6 +135,9 @@ pub struct WatchtowerConfig {
     pub db_path: Option<String>,
     /// Alert webhook URL
     pub alert_webhook_url: Option<String>,
+    /// Retry policy for alert delivery
+    #[serde(default)]
+    pub alert_delivery: alert::AlertDeliveryConfig,
     /// Retention rules applied when the store is compacted
     #[serde(default)]
     pub compaction: storage::CompactionPolicy,
@@ -173,6 +179,7 @@ impl Default for WatchtowerConfig {
             justice_fee_budget: 100_000, // 0.1 XLM
             db_path: None,
             alert_webhook_url: None,
+            alert_delivery: alert::AlertDeliveryConfig::default(),
             compaction: storage::CompactionPolicy::default(),
             compaction_interval_secs: default_compaction_interval_secs(),
             storage_retry: StorageRetryPolicy::default(),
@@ -379,6 +386,10 @@ pub struct WatchtowerStats {
     pub justice_actions_persisted: u64,
     /// Total alerts generated
     pub alerts_generated: u64,
+    /// Total alerts successfully delivered
+    pub alerts_delivered: u64,
+    /// Total alert delivery attempts that failed
+    pub alert_deliveries_failed: u64,
     /// Last scan timestamp
     pub last_scan_ts: u64,
     /// Uptime in seconds
@@ -401,6 +412,8 @@ pub struct Watchtower {
     monitor: monitor::ChannelMonitor,
     /// Justice service
     justice: justice::JusticeService,
+    /// Retryable alert delivery service
+    alert_delivery: alert::AlertDeliveryService,
     /// Persistent storage for subscriptions, channel state and alerts
     storage: Arc<dyn storage::StorageBackend>,
 }
@@ -409,13 +422,25 @@ impl Watchtower {
     /// Create a new watchtower with the given configuration
     pub fn new(config: WatchtowerConfig) -> Result<Self, WatchtowerError> {
         config.storage_retry.validate()?;
+        Self::with_alert_transport(config, Arc::new(alert::WebhookAlertTransport))
+    }
+
+    /// Create a new watchtower with a custom [`alert::AlertTransport`].
+    pub fn with_alert_transport(
+        config: WatchtowerConfig,
+        transport: Arc<dyn alert::AlertTransport>,
+    ) -> Result<Self, WatchtowerError> {
+        config.alert_delivery.validate()?;
+        if let Some(ref url) = config.alert_webhook_url {
+            alert::validate_destination(url)?;
+        }
 
         let storage: Arc<dyn storage::StorageBackend> = match &config.db_path {
             Some(path) => Arc::new(storage::SqliteStorage::new(path)?),
             None => Arc::new(storage::InMemoryStorage::new()),
         };
 
-        Self::with_storage(config, storage)
+        Self::with_storage_and_transport(config, storage, transport)
     }
 
     /// Create a watchtower backed by a caller-supplied storage backend.
@@ -427,6 +452,14 @@ impl Watchtower {
     pub fn with_storage(
         config: WatchtowerConfig,
         storage: Arc<dyn storage::StorageBackend>,
+    ) -> Result<Self, WatchtowerError> {
+        Self::with_storage_and_transport(config, storage, Arc::new(alert::WebhookAlertTransport))
+    }
+
+    fn with_storage_and_transport(
+        config: WatchtowerConfig,
+        storage: Arc<dyn storage::StorageBackend>,
+        transport: Arc<dyn alert::AlertTransport>,
     ) -> Result<Self, WatchtowerError> {
         config
             .storage_health_check
@@ -445,6 +478,12 @@ impl Watchtower {
             Arc::clone(&storage),
         );
 
+        let alert_delivery = alert::AlertDeliveryService::new(
+            config.alert_delivery,
+            Arc::clone(&storage),
+            transport,
+        )?;
+
         let state = Arc::new(WatchtowerState {
             subscribed_channels: RwLock::new(std::collections::HashSet::new()),
             channel_states: RwLock::new(std::collections::HashMap::new()),
@@ -462,6 +501,7 @@ impl Watchtower {
             state,
             monitor,
             justice,
+            alert_delivery,
             storage,
         })
     }
@@ -478,6 +518,7 @@ impl Watchtower {
         let config = self.config.clone();
         let monitor = self.monitor.clone();
         let justice = self.justice.clone();
+        let alert_delivery = self.alert_delivery.clone();
 
         tokio::spawn(async move {
             loop {
@@ -502,7 +543,23 @@ impl Watchtower {
                                     breach.old_sequence,
                                     breach.new_sequence,
                                 );
-                                state.add_alert(alert);
+                                state.add_alert(alert.clone());
+                                state.stats.write().alerts_generated += 1;
+
+                                if let Some(ref webhook_url) = config.alert_webhook_url {
+                                    match alert_delivery
+                                        .enqueue_and_deliver(&alert, webhook_url)
+                                        .await
+                                    {
+                                        Ok(_) => {
+                                            state.stats.write().alerts_delivered += 1;
+                                        }
+                                        Err(e) => {
+                                            state.stats.write().alert_deliveries_failed += 1;
+                                            error!("Failed to deliver breach alert: {:?}", e);
+                                        }
+                                    }
+                                }
 
                                 // Submit justice if enabled
                                 if config.auto_justice {
@@ -529,6 +586,21 @@ impl Watchtower {
                         Err(e) => {
                             error!("Error checking channel {}: {:?}", channel_id, e);
                         }
+                    }
+                }
+
+                // Retry any pending alert deliveries whose backoff has elapsed.
+                match alert_delivery.retry_pending_deliveries().await {
+                    Ok(report) => {
+                        if report.delivered > 0 || report.failed > 0 {
+                            let mut stats = state.stats.write();
+                            stats.alerts_delivered += report.delivered as u64;
+                            stats.alert_deliveries_failed +=
+                                (report.rescheduled + report.failed) as u64;
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to retry pending alert deliveries: {:?}", e);
                     }
                 }
 
@@ -687,6 +759,149 @@ impl Watchtower {
         self.justice.retry_pending_actions().await
     }
 
+    /// Export a signed snapshot of the durable watchtower data (issue #377).
+    ///
+    /// The bundle covers subscriptions, channel states and updates, alerts and
+    /// every persisted justice action. It is signed with `key`; the key itself
+    /// is never written into the bundle, storage or logs.
+    pub fn export_recovery_bundle(
+        &self,
+        key: &recovery::OperatorKey,
+    ) -> Result<recovery::RecoveryBundle, WatchtowerError> {
+        let subscriptions = self.storage.get_subscriptions()?;
+        let mut channel_states = Vec::with_capacity(subscriptions.len());
+        let mut channel_updates = Vec::with_capacity(subscriptions.len());
+        for channel_id in &subscriptions {
+            if let Some(state) = self.storage.get_channel_state(channel_id)? {
+                channel_states.push(state);
+            }
+            if let Some(update) = self.storage.get_channel_update(channel_id)? {
+                channel_updates.push(update);
+            }
+        }
+
+        let payload = recovery::RecoveryPayload {
+            version: recovery::RECOVERY_FORMAT_VERSION,
+            created_at: current_timestamp(),
+            network_passphrase: self.config.network_passphrase.clone(),
+            subscriptions,
+            channel_states,
+            channel_updates,
+            alerts: self.storage.get_alerts(usize::MAX)?,
+            justice_actions: self.storage.get_all_justice_actions()?,
+        };
+
+        info!(
+            "Exported recovery bundle with key fingerprint {}: {} subscriptions, {} alerts, {} justice actions",
+            key.fingerprint(),
+            payload.subscriptions.len(),
+            payload.alerts.len(),
+            payload.justice_actions.len()
+        );
+
+        Ok(recovery::RecoveryBundle::new(payload, key))
+    }
+
+    /// Restore a watchtower from a verified bundle using a fresh store chosen
+    /// by `config.db_path` (issue #377).
+    ///
+    /// Signature, format version, passphrase and record invariants are checked
+    /// before any write. A mismatched key or network leaves the target store
+    /// untouched.
+    pub fn restore_from_bundle(
+        config: WatchtowerConfig,
+        key: &recovery::OperatorKey,
+        bundle: &recovery::RecoveryBundle,
+    ) -> Result<Self, WatchtowerError> {
+        let storage: Arc<dyn storage::StorageBackend> = match &config.db_path {
+            Some(path) => Arc::new(storage::SqliteStorage::new(path)?),
+            None => Arc::new(storage::InMemoryStorage::new()),
+        };
+        Self::restore_from_bundle_with_storage(config, key, bundle, storage)
+    }
+
+    /// Restore from a verified bundle into a caller-supplied empty backend.
+    ///
+    /// The backend must be empty; recovery never overwrites an existing store.
+    /// On any failure the partially written store is discarded instead of being
+    /// exposed as a restored watchtower.
+    pub fn restore_from_bundle_with_storage(
+        config: WatchtowerConfig,
+        key: &recovery::OperatorKey,
+        bundle: &recovery::RecoveryBundle,
+        storage: Arc<dyn storage::StorageBackend>,
+    ) -> Result<Self, WatchtowerError> {
+        bundle.verify(key)?;
+        if bundle.payload.network_passphrase != config.network_passphrase {
+            return Err(recovery::RecoveryError::Configuration(format!(
+                "bundle is for network '{}', but config targets '{}'",
+                bundle.payload.network_passphrase, config.network_passphrase
+            ))
+            .into());
+        }
+        Self::ensure_recovery_target_is_empty(&storage)?;
+
+        for channel_id in &bundle.payload.subscriptions {
+            storage.store_subscription(channel_id)?;
+        }
+        for state in &bundle.payload.channel_states {
+            storage.store_channel_state(&state.channel_id, state)?;
+        }
+        for update in &bundle.payload.channel_updates {
+            storage.store_channel_update(update)?;
+        }
+        for alert in &bundle.payload.alerts {
+            storage.store_alert(alert)?;
+        }
+        for action in &bundle.payload.justice_actions {
+            storage.store_justice_action(action)?;
+        }
+
+        let watchtower = Self::with_storage(config, storage)?;
+        watchtower
+            .state
+            .subscribed_channels
+            .write()
+            .extend(bundle.payload.subscriptions.iter().cloned());
+        watchtower.state.channel_states.write().extend(
+            bundle
+                .payload
+                .channel_states
+                .iter()
+                .map(|state| (state.channel_id.clone(), state.clone())),
+        );
+        watchtower
+            .state
+            .recent_alerts
+            .write()
+            .extend(bundle.payload.alerts.iter().cloned());
+
+        info!(
+            "Restored recovery bundle with key fingerprint {}: {} subscriptions, {} alerts, {} justice actions",
+            key.fingerprint(),
+            bundle.payload.subscriptions.len(),
+            bundle.payload.alerts.len(),
+            bundle.payload.justice_actions.len()
+        );
+
+        Ok(watchtower)
+    }
+
+    fn ensure_recovery_target_is_empty(
+        storage: &Arc<dyn storage::StorageBackend>,
+    ) -> Result<(), WatchtowerError> {
+        if !storage.get_subscriptions()?.is_empty()
+            || !storage.get_alerts(1)?.is_empty()
+            || !storage.get_all_justice_actions()?.is_empty()
+        {
+            return Err(recovery::RecoveryError::Storage(
+                "recovery target must be a fresh, empty storage backend".to_string(),
+            )
+            .into());
+        }
+        Ok(())
+    }
+
     /// Get current watchtower status
     pub fn status(&self) -> WatchtowerStatus {
         let stats = self.state.stats.read();
@@ -730,15 +945,38 @@ impl Watchtower {
 }
 
 impl WatchtowerState {
-    /// Add an alert to the recent alerts list
-    pub fn add_alert(&self, alert: Alert) {
+    /// Add an alert to the recent alerts list, deduplicating identical
+    /// [`AlertType::BreachAttempt`] notifications.
+    ///
+    /// Returns `true` if the alert was recorded, or `false` if an identical
+    /// breach notification was already present. Non-breach alerts are always
+    /// recorded and return `true`.
+    pub fn add_alert_dedup(&self, alert: Alert) -> bool {
         let mut alerts = self.recent_alerts.write();
+        if matches!(alert.alert_type, AlertType::BreachAttempt { .. })
+            && alerts
+                .iter()
+                .any(|existing| existing.alert_type == alert.alert_type)
+        {
+            return false;
+        }
+
         alerts.push(alert);
 
         // Keep only last 1000 alerts
         if alerts.len() > 1000 {
             alerts.drain(0..500);
         }
+        true
+    }
+
+    /// Add an alert to the recent alerts list.
+    ///
+    /// Duplicate [`AlertType::BreachAttempt`] notifications are suppressed via
+    /// [`Self::add_alert_dedup`]; all other alert types preserve existing
+    /// append behavior.
+    pub fn add_alert(&self, alert: Alert) {
+        let _ = self.add_alert_dedup(alert);
     }
 
     /// Apply a channel update to the in-memory state and persist both the
@@ -874,8 +1112,26 @@ pub enum WatchtowerError {
     #[error("Justice transaction failed: {0}")]
     JusticeFailed(String),
 
+    #[error("Invalid configuration: {0}")]
+    InvalidConfig(String),
+
+    #[error("Alert delivery failed: {0}")]
+    AlertDeliveryFailed(String),
+
     #[error("Watchtower not running")]
     NotRunning,
+}
+
+impl From<alert::AlertDeliveryError> for WatchtowerError {
+    fn from(e: alert::AlertDeliveryError) -> Self {
+        match e {
+            alert::AlertDeliveryError::InvalidConfig(msg)
+            | alert::AlertDeliveryError::InvalidDestination(msg) => {
+                WatchtowerError::InvalidConfig(msg)
+            }
+            other => WatchtowerError::AlertDeliveryFailed(other.to_string()),
+        }
+    }
 }
 
 impl From<storage::StorageError> for WatchtowerError {
@@ -896,8 +1152,17 @@ impl From<justice::JusticeError> for WatchtowerError {
     }
 }
 
+impl From<recovery::RecoveryError> for WatchtowerError {
+    fn from(error: recovery::RecoveryError) -> Self {
+        match error {
+            recovery::RecoveryError::Storage(reason) => WatchtowerError::StorageError(reason),
+            other => WatchtowerError::InvalidConfiguration(other.to_string()),
+        }
+    }
+}
+
 /// Generate a UUID v4
-fn uuid_v4() -> String {
+pub(crate) fn uuid_v4() -> String {
     use rand::Rng;
     let mut rng = rand::thread_rng();
     let bytes: [u8; 16] = rng.gen();
@@ -1136,5 +1401,50 @@ mod tests {
             .unwrap()
             .expect("state should be persisted");
         assert_eq!(state.last_known_sequence, 4);
+    }
+
+    #[test]
+    fn duplicate_breach_alert_is_deduplicated() {
+        let watchtower = Watchtower::new(WatchtowerConfig::default()).unwrap();
+        let first = Alert::breach_attempt("channel-dup".to_string(), 2, 5);
+        let duplicate = Alert::breach_attempt("channel-dup".to_string(), 2, 5);
+
+        assert!(watchtower.state().add_alert_dedup(first));
+        assert!(!watchtower.state().add_alert_dedup(duplicate));
+        assert_eq!(watchtower.get_alerts(10).len(), 1);
+    }
+
+    #[test]
+    fn distinct_breach_alerts_are_not_deduplicated() {
+        let watchtower = Watchtower::new(WatchtowerConfig::default()).unwrap();
+        assert!(watchtower
+            .state()
+            .add_alert_dedup(Alert::breach_attempt("channel-a".to_string(), 2, 5)));
+        assert!(watchtower
+            .state()
+            .add_alert_dedup(Alert::breach_attempt("channel-a".to_string(), 3, 5)));
+        assert!(watchtower
+            .state()
+            .add_alert_dedup(Alert::breach_attempt("channel-b".to_string(), 2, 5)));
+        assert_eq!(watchtower.get_alerts(10).len(), 3);
+    }
+
+    #[test]
+    fn non_breach_alerts_preserve_existing_behavior() {
+        let watchtower = Watchtower::new(WatchtowerConfig::default()).unwrap();
+        let health = || Alert {
+            id: "h1".to_string(),
+            alert_type: AlertType::HealthCheckFailed {
+                component: "rpc".to_string(),
+                error: "timeout".to_string(),
+            },
+            severity: AlertSeverity::Warning,
+            timestamp: current_timestamp(),
+            context: serde_json::json!({}),
+        };
+
+        assert!(watchtower.state().add_alert_dedup(health()));
+        assert!(watchtower.state().add_alert_dedup(health()));
+        assert_eq!(watchtower.get_alerts(10).len(), 2);
     }
 }

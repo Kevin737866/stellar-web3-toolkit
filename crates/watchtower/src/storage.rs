@@ -394,6 +394,17 @@ pub trait StorageBackend: Send + Sync {
         id: &str,
     ) -> Result<Option<crate::justice::JusticeAction>, StorageError>;
 
+    /// Retrieve every persisted justice action, regardless of status.
+    ///
+    /// Recovery export needs submitted and failed records as well as pending
+    /// ones. Backends that do not override this fail explicitly instead of
+    /// silently producing a partial snapshot.
+    fn get_all_justice_actions(&self) -> Result<Vec<crate::justice::JusticeAction>, StorageError> {
+        Err(StorageError::QueryError(
+            "backend does not support full justice action export".to_string(),
+        ))
+    }
+
     /// Retrieve all justice actions whose status is `Pending`.
     ///
     /// Used by the operator recovery path: after a restart, any `Pending`
@@ -411,6 +422,31 @@ pub trait StorageBackend: Send + Sync {
         id: &str,
         status: crate::justice::ActionStatus,
         tx_hash: Option<&str>,
+    ) -> Result<(), StorageError>;
+
+    // ── Retryable alert delivery persistence (issue #373) ────────────────────
+
+    /// Persist a new alert delivery record before attempting delivery.
+    fn store_alert_delivery(
+        &self,
+        delivery: &crate::alert::AlertDelivery,
+    ) -> Result<(), StorageError>;
+
+    /// Retrieve an alert delivery record by its [`crate::alert::DeliveryId`].
+    fn get_alert_delivery(
+        &self,
+        delivery_id: &str,
+    ) -> Result<Option<crate::alert::AlertDelivery>, StorageError>;
+
+    /// Retrieve all alert deliveries in [`crate::alert::DeliveryStatus::Pending`].
+    fn get_pending_alert_deliveries(
+        &self,
+    ) -> Result<Vec<crate::alert::AlertDelivery>, StorageError>;
+
+    /// Persist an updated alert delivery record (attempts, status, backoff).
+    fn update_alert_delivery(
+        &self,
+        delivery: &crate::alert::AlertDelivery,
     ) -> Result<(), StorageError>;
 }
 
@@ -433,6 +469,7 @@ impl InMemoryStorage {
             alerts: parking_lot::RwLock::new(Vec::new()),
             subscriptions: parking_lot::RwLock::new(Vec::new()),
             justice_actions: parking_lot::RwLock::new(HashMap::new()),
+            alert_deliveries: parking_lot::RwLock::new(HashMap::new()),
         }
     }
 }
@@ -618,6 +655,11 @@ impl StorageBackend for InMemoryStorage {
         Ok(actions.get(id).cloned())
     }
 
+    fn get_all_justice_actions(&self) -> Result<Vec<crate::justice::JusticeAction>, StorageError> {
+        let actions = self.justice_actions.read();
+        Ok(actions.values().cloned().collect())
+    }
+
     fn get_pending_justice_actions(
         &self,
     ) -> Result<Vec<crate::justice::JusticeAction>, StorageError> {
@@ -642,6 +684,55 @@ impl StorageBackend for InMemoryStorage {
                 action.tx_hash = Some(hash.to_string());
             }
         }
+        Ok(())
+    }
+
+    fn store_alert_delivery(
+        &self,
+        delivery: &crate::alert::AlertDelivery,
+    ) -> Result<(), StorageError> {
+        let mut deliveries = self.alert_deliveries.write();
+        let key = delivery.delivery_id.as_str();
+        if deliveries.contains_key(key) {
+            return Err(StorageError::QueryError(format!(
+                "alert delivery {key} already exists"
+            )));
+        }
+        deliveries.insert(key.to_string(), delivery.clone());
+        Ok(())
+    }
+
+    fn get_alert_delivery(
+        &self,
+        delivery_id: &str,
+    ) -> Result<Option<crate::alert::AlertDelivery>, StorageError> {
+        let deliveries = self.alert_deliveries.read();
+        Ok(deliveries.get(delivery_id).cloned())
+    }
+
+    fn get_pending_alert_deliveries(
+        &self,
+    ) -> Result<Vec<crate::alert::AlertDelivery>, StorageError> {
+        let deliveries = self.alert_deliveries.read();
+        let mut pending: Vec<_> = deliveries
+            .values()
+            .filter(|d| d.status == crate::alert::DeliveryStatus::Pending)
+            .cloned()
+            .collect();
+        pending.sort_by_key(|d| (d.next_retry_at, d.created_at));
+        Ok(pending)
+    }
+
+    fn update_alert_delivery(
+        &self,
+        delivery: &crate::alert::AlertDelivery,
+    ) -> Result<(), StorageError> {
+        let mut deliveries = self.alert_deliveries.write();
+        let key = delivery.delivery_id.as_str();
+        let slot = deliveries.get_mut(key).ok_or_else(|| {
+            StorageError::QueryError(format!("alert delivery {key} not found"))
+        })?;
+        *slot = delivery.clone();
         Ok(())
     }
 }
@@ -783,6 +874,13 @@ impl StorageBackend for SqliteStorage {
         Ok(None)
     }
 
+    fn get_all_justice_actions(&self) -> Result<Vec<crate::justice::JusticeAction>, StorageError> {
+        // The placeholder backend persists no rows, so an empty snapshot here
+        // is accurate rather than a partial result.
+        info!("SQLite: getting all justice actions");
+        Ok(Vec::new())
+    }
+
     fn get_pending_justice_actions(
         &self,
     ) -> Result<Vec<crate::justice::JusticeAction>, StorageError> {
@@ -801,6 +899,40 @@ impl StorageBackend for SqliteStorage {
         info!(
             "SQLite: updating justice action {} to {:?} (tx: {:?})",
             id, status, tx_hash
+        );
+        Ok(())
+    }
+
+    fn store_alert_delivery(
+        &self,
+        delivery: &crate::alert::AlertDelivery,
+    ) -> Result<(), StorageError> {
+        info!("SQLite: storing alert delivery {}", delivery.delivery_id);
+        Ok(())
+    }
+
+    fn get_alert_delivery(
+        &self,
+        delivery_id: &str,
+    ) -> Result<Option<crate::alert::AlertDelivery>, StorageError> {
+        info!("SQLite: getting alert delivery {}", delivery_id);
+        Ok(None)
+    }
+
+    fn get_pending_alert_deliveries(
+        &self,
+    ) -> Result<Vec<crate::alert::AlertDelivery>, StorageError> {
+        info!("SQLite: getting pending alert deliveries");
+        Ok(Vec::new())
+    }
+
+    fn update_alert_delivery(
+        &self,
+        delivery: &crate::alert::AlertDelivery,
+    ) -> Result<(), StorageError> {
+        info!(
+            "SQLite: updating alert delivery {} to {:?} (attempts={})",
+            delivery.delivery_id, delivery.status, delivery.attempts
         );
         Ok(())
     }

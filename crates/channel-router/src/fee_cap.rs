@@ -400,6 +400,7 @@ mod tests {
             max_hops: None,
             find_any: false,
             payment_metadata: None,
+            excluded_unavailable: vec![],
         };
         assert_eq!(request.amount, 0);
         assert!(cap
