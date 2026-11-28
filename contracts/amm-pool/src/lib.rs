@@ -295,6 +295,11 @@ impl AmmPool {
 
         assert!(amount_a >= min_a && amount_b >= min_b, "slippage add");
 
+        let supply = total_lp(&env);
+        let liq =
+            checked_mint_lp_shares(amount_a, amount_b, reserve_a, reserve_b, supply).expect("liq");
+        assert!(liq > 0, "liq");
+
         TokenClient::new(&env, &ta).transfer(&user, &pool, &amount_a);
         TokenClient::new(&env, &tb).transfer(&user, &pool, &amount_b);
 

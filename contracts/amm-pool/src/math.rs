@@ -536,6 +536,92 @@ pub fn liquidity_amounts_first_deposit(amount_a: i128, amount_b: i128) -> i128 {
     sqrt_u128(p) as i128
 }
 
+/// Rounding direction for integer division in LP share minting and redemption (#401).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rounding {
+    /// Round toward zero (floor). Favors the pool on both LP minting and redemption.
+    Down,
+    /// Round away from zero (ceiling).
+    Up,
+}
+
+/// Checked `(a * b) / denom` with explicit [`Rounding`] direction (#401).
+///
+/// Returns `None` if `a < 0`, `b < 0`, `denom <= 0`, or `a * b` overflows `i128`.
+pub fn checked_mul_div(a: i128, b: i128, denom: i128, rounding: Rounding) -> Option<i128> {
+    if a < 0 || b < 0 || denom <= 0 {
+        return None;
+    }
+    if a == 0 || b == 0 {
+        return Some(0);
+    }
+    let prod = a.checked_mul(b)?;
+    match rounding {
+        Rounding::Down => prod.checked_div(denom),
+        Rounding::Up => prod
+            .checked_sub(1)?
+            .checked_div(denom)?
+            .checked_add(1),
+    }
+}
+
+/// Compute LP shares to mint for a deposit, explicitly rounding **down** (floor) (#401).
+///
+/// - Initial deposit (`total_lp == 0`, `reserve_a == 0`, `reserve_b == 0`):
+///   `floor(sqrt(amount_a * amount_b))`.
+/// - Subsequent deposit (`total_lp > 0`, `reserve_a > 0`, `reserve_b > 0`):
+///   `min(floor(amount_a * total_lp / reserve_a), floor(amount_b * total_lp / reserve_b))`.
+///
+/// Rounding down guarantees depositors never receive more LP shares than backed by
+/// their proportional contribution. Returns `None` on invalid, inconsistent, or
+/// overflowing inputs.
+pub fn checked_mint_lp_shares(
+    amount_a: i128,
+    amount_b: i128,
+    reserve_a: i128,
+    reserve_b: i128,
+    total_lp: i128,
+) -> Option<i128> {
+    if amount_a <= 0 || amount_b <= 0 || reserve_a < 0 || reserve_b < 0 || total_lp < 0 {
+        return None;
+    }
+    if total_lp == 0 {
+        if reserve_a != 0 || reserve_b != 0 {
+            return None;
+        }
+        let p = (amount_a as u128).checked_mul(amount_b as u128)?;
+        return i128::try_from(sqrt_u128(p)).ok();
+    }
+    if reserve_a == 0 || reserve_b == 0 {
+        return None;
+    }
+    let l1 = checked_mul_div(amount_a, total_lp, reserve_a, Rounding::Down)?;
+    let l2 = checked_mul_div(amount_b, total_lp, reserve_b, Rounding::Down)?;
+    Some(l1.min(l2))
+}
+
+/// Compute underlying token amounts returned on LP share redemption, explicitly rounding **down** (floor) (#401).
+///
+/// Computes `(floor(lp_amount * reserve_a / total_lp), floor(lp_amount * reserve_b / total_lp))`.
+/// Rounding down guarantees redeemers cannot withdraw more reserves than their
+/// proportional share entitles them to, protecting remaining LPs from dust drain.
+///
+/// Returns `None` when `lp_amount <= 0`, `total_lp <= 0`, `lp_amount > total_lp`,
+/// reserves are negative, or intermediate multiplication overflows `i128`.
+pub fn checked_redeem_amounts(
+    lp_amount: i128,
+    reserve_a: i128,
+    reserve_b: i128,
+    total_lp: i128,
+) -> Option<(i128, i128)> {
+    if lp_amount <= 0 || total_lp <= 0 || lp_amount > total_lp || reserve_a < 0 || reserve_b < 0 {
+        return None;
+    }
+    let amount_a = checked_mul_div(lp_amount, reserve_a, total_lp, Rounding::Down)?;
+    let amount_b = checked_mul_div(lp_amount, reserve_b, total_lp, Rounding::Down)?;
+    Some((amount_a, amount_b))
+}
+
 /// Uniswap V2–style K check after flash repayment (`balance*` are live token balances of the pool).
 ///
 /// Charges a 0.3% (30 bps, `3 / 1000` parts per thousand) fee on the repaid input leg(s)
@@ -1182,5 +1268,50 @@ mod math_tests {
         assert_eq!(amount_in_for_price(1_000, 1_000, -1, 2), None);
         // 1997 * target_num * reserve_in does not fit in i128.
         assert_eq!(amount_in_for_price(i128::MAX, i128::MAX, 1, 2), None);
+    }
+
+    #[test]
+    fn mul_div_rounding_directions() {
+        // Exact division is identical in both directions
+        assert_eq!(checked_mul_div(6, 10, 3, Rounding::Down), Some(20));
+        assert_eq!(checked_mul_div(6, 10, 3, Rounding::Up), Some(20));
+        // Non-exact division: 10 / 3 = 3.333...
+        assert_eq!(checked_mul_div(2, 5, 3, Rounding::Down), Some(3));
+        assert_eq!(checked_mul_div(2, 5, 3, Rounding::Up), Some(4));
+        // Zero numerator
+        assert_eq!(checked_mul_div(0, 5, 3, Rounding::Down), Some(0));
+        assert_eq!(checked_mul_div(0, 5, 3, Rounding::Up), Some(0));
+        // Invalid inputs and overflow
+        assert_eq!(checked_mul_div(-1, 5, 3, Rounding::Down), None);
+        assert_eq!(checked_mul_div(5, -1, 3, Rounding::Down), None);
+        assert_eq!(checked_mul_div(5, 5, 0, Rounding::Down), None);
+        assert_eq!(checked_mul_div(i128::MAX, 2, 3, Rounding::Down), None);
+    }
+
+    #[test]
+    fn lp_mint_and_redeem_round_down() {
+        // Initial deposit: floor(sqrt(2 * 3)) = floor(sqrt(6)) = 2
+        assert_eq!(checked_mint_lp_shares(2, 3, 0, 0, 0), Some(2));
+        // Subsequent deposit with non-divisible ratio:
+        // l1 = floor(10 * 100 / 30) = 33, l2 = floor(10 * 100 / 31) = 32 -> min = 32
+        assert_eq!(checked_mint_lp_shares(10, 10, 30, 31, 100), Some(32));
+        // Redemption with non-divisible ratio:
+        // floor(1 * 10 / 3) = 3, floor(1 * 20 / 3) = 6
+        assert_eq!(checked_redeem_amounts(1, 10, 20, 3), Some((3, 6)));
+        // Full supply redemption returns exact reserves
+        assert_eq!(checked_redeem_amounts(3, 10, 20, 3), Some((10, 20)));
+    }
+
+    #[test]
+    fn lp_mint_and_redeem_reject_invalid_inputs() {
+        assert_eq!(checked_mint_lp_shares(0, 10, 0, 0, 0), None);
+        assert_eq!(checked_mint_lp_shares(10, 10, 100, 100, 0), None);
+        assert_eq!(checked_mint_lp_shares(10, 10, 0, 100, 10), None);
+        assert_eq!(checked_mint_lp_shares(i128::MAX, 2, 100, 100, 100), None);
+
+        assert_eq!(checked_redeem_amounts(0, 10, 20, 3), None);
+        assert_eq!(checked_redeem_amounts(4, 10, 20, 3), None);
+        assert_eq!(checked_redeem_amounts(1, 10, 20, 0), None);
+        assert_eq!(checked_redeem_amounts(1, -1, 20, 3), None);
     }
 }

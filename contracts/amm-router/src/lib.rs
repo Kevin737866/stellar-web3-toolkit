@@ -148,6 +148,8 @@ mod test {
         assert!(out > 9000);
     }
 
+    #[test]
+    fn router_swap_and_lp_rounding_preserves_reserves() {
     fn create_token(env: &Env, admin: &Address) -> Address {
         env.register_stellar_asset_contract_v2(admin.clone())
             .address()
