@@ -82,7 +82,7 @@ impl Default for SimulatorConfig {
 }
 
 /// Network simulation statistics
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SimulationStats {
     /// Total payments attempted
     pub total_payments: usize,
@@ -155,6 +155,10 @@ pub struct Simulator {
     failure_summary: Arc<RwLock<FailureSummary>>,
     /// Random number generator
     rng: parking_lot::Mutex<rand::rngs::StdRng>,
+    /// The seed the RNG was actually created with, including the seed drawn
+    /// when the configuration left it unset. Reported in logs so any run can be
+    /// replayed, and used to derive per-batch seeds for concurrent generation.
+    seed: u64,
 }
 
 impl Simulator {
@@ -177,7 +181,17 @@ impl Simulator {
             disconnection_tracker: Arc::new(RwLock::new(DisconnectionTracker::new())),
             failure_summary: Arc::new(RwLock::new(FailureSummary::new())),
             rng: parking_lot::Mutex::new(rng),
+            seed,
         }
+    }
+
+    /// The seed this simulator's RNG was created with.
+    ///
+    /// Equal to `SimulatorConfig::seed` when one was configured, and to the
+    /// drawn seed otherwise. A run can be replayed by passing it back as
+    /// `SimulatorConfig::seed`.
+    pub fn seed(&self) -> u64 {
+        self.seed
     }
 
     /// Initialize the network with random topology
@@ -302,7 +316,12 @@ impl Simulator {
         Ok(())
     }
 
-    /// Run the payment simulation
+    /// Run the payment simulation.
+    ///
+    /// Payments are generated from the simulator's RNG, then executed in the
+    /// canonical order defined by [`order_events`] rather than in generation
+    /// order. The order depends only on the payments, so the same seed always
+    /// executes the same simulation.
     #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // public API; a concurrent runner awaits this
     pub async fn run_simulation(&self) -> Result<SimulationStats, SimulatorError> {
         if let Some(ref disconnection) = self.config.disconnection {
@@ -310,11 +329,73 @@ impl Simulator {
         }
 
         info!(
-            "Starting simulation with {} payments",
-            self.config.num_payments
+            "Starting simulation with {} payments (seed={:#018x})",
+            self.config.num_payments, self.seed
         );
 
-        let mut rng = self.rng.lock();
+        let events = {
+            let mut rng = self.rng.lock();
+            let node_ids = self.routable_node_ids()?;
+            let mut events = Vec::with_capacity(self.config.num_payments);
+
+            for sequence in 0..self.config.num_payments {
+                // A payment to itself is not a payment; draw again on the next
+                // iteration rather than substituting a different destination.
+                let source_idx = rng.gen_range(0..node_ids.len());
+                let dest_idx = rng.gen_range(0..node_ids.len());
+                if source_idx == dest_idx {
+                    continue;
+                }
+
+                let amount: i128 = rng.gen_range(100..self.config.max_payment_amount);
+                events.push(SimulationEvent {
+                    timestamp: 0,
+                    sequence: sequence as u64,
+                    source: node_ids[source_idx].clone(),
+                    destination: node_ids[dest_idx].clone(),
+                    amount,
+                });
+            }
+
+            events
+        };
+
+        self.run_ordered_events(events)
+    }
+
+    /// Execute an explicit set of simulation inputs.
+    ///
+    /// The events are validated, sorted into the canonical order defined by
+    /// [`order_events`] and only then executed, so two runs of the same multiset
+    /// of events produce identical statistics regardless of the order the caller
+    /// supplied them in.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SimulatorError::InvalidEvent`] for an event that cannot be
+    /// executed — an unknown node, a payment to itself, or a non-positive
+    /// amount — and [`SimulatorError::SimulationError`] if the network has not
+    /// been initialized.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // async for symmetry with the other runners
+    pub async fn run_events(
+        &self,
+        events: Vec<SimulationEvent>,
+    ) -> Result<SimulationStats, SimulatorError> {
+        if let Some(ref disconnection) = self.config.disconnection {
+            disconnection.validate()?;
+        }
+        // Reject an uninitialized network before validating events, so the
+        // error names the real problem instead of "unknown node".
+        self.routable_node_ids()?;
+        self.validate_events(&events)?;
+        self.run_ordered_events(events)
+    }
+
+    /// Node IDs in a deterministic order, or an error if the network is empty.
+    ///
+    /// Sorted because `HashMap` iteration order is randomised per map: drawing
+    /// from it would make one seed produce a different simulation every run.
+    fn routable_node_ids(&self) -> Result<Vec<String>, SimulatorError> {
         let mut node_ids: Vec<String> = self.nodes.read().keys().cloned().collect();
         if node_ids.is_empty() {
             return Err(SimulatorError::SimulationError(
@@ -322,28 +403,63 @@ impl Simulator {
                     .to_string(),
             ));
         }
-        if self.config.disconnection.is_some() {
-            node_ids.sort();
+        node_ids.sort();
+        Ok(node_ids)
+    }
+
+    /// Check that every event can be executed against this network.
+    fn validate_events(&self, events: &[SimulationEvent]) -> Result<(), SimulatorError> {
+        if events.is_empty() {
+            return Err(SimulatorError::InvalidEvent(
+                "no simulation events were supplied".to_string(),
+            ));
         }
-        let mut payments = Vec::new();
 
-        // Generate random payments
-        for _i in 0..self.config.num_payments {
-            let source_idx = rng.gen_range(0..node_ids.len());
-            let dest_idx = rng.gen_range(0..node_ids.len());
-
-            if source_idx == dest_idx {
-                continue;
+        let nodes = self.nodes.read();
+        for event in events {
+            event.validate()?;
+            if !nodes.contains_key(&event.source) {
+                return Err(SimulatorError::InvalidEvent(format!(
+                    "event {} has unknown source '{}'",
+                    event.sequence, event.source
+                )));
             }
-
-            let source = &node_ids[source_idx];
-            let dest = &node_ids[dest_idx];
-            let amount: i128 = rng.gen_range(100..self.config.max_payment_amount);
-
-            payments.push((source.clone(), dest.clone(), amount));
+            if !nodes.contains_key(&event.destination) {
+                return Err(SimulatorError::InvalidEvent(format!(
+                    "event {} has unknown destination '{}'",
+                    event.sequence, event.destination
+                )));
+            }
         }
 
-        // Run payments through the router
+        Ok(())
+    }
+
+    /// Sort events canonically, then execute them.
+    fn run_ordered_events(
+        &self,
+        events: Vec<SimulationEvent>,
+    ) -> Result<SimulationStats, SimulatorError> {
+        let ordered = order_events(events);
+        debug!("Executing {} events in canonical order", ordered.len());
+
+        let payments = ordered
+            .into_iter()
+            .map(|event| (event.source, event.destination, event.amount))
+            .collect();
+
+        self.execute_payments(payments)
+    }
+
+    /// Run a payment list through the router and build the statistics.
+    ///
+    /// The order of `payments` is the execution order; callers are responsible
+    /// for putting it in canonical form.
+    fn execute_payments(
+        &self,
+        payments: Vec<(String, String, i128)>,
+    ) -> Result<SimulationStats, SimulatorError> {
+        let mut rng = self.rng.lock();
         let pathfinder = Pathfinder::new();
 
         let mut successful = 0;
@@ -433,7 +549,6 @@ impl Simulator {
             }
         }
 
-        // Update statistics
         let avg_path = if path_lengths.is_empty() {
             0.0
         } else {
@@ -468,8 +583,8 @@ impl Simulator {
         *self.failure_summary.write() = failure_summary;
 
         info!(
-            "Simulation complete: {} successful, {} failed, {:.2}% success rate",
-            successful, failed, success_rate
+            "Simulation complete: {} successful, {} failed, {:.2}% success rate (seed={:#018x})",
+            successful, failed, success_rate, self.seed
         );
         info!("Average path length: {:.2}, Max: {}", avg_path, max_path);
         info!(
@@ -551,18 +666,91 @@ impl Simulator {
     }
 
     /// Run a stress test with parallel payments
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // async for symmetry with the other runners
     pub async fn run_stress_test(
         &self,
         concurrent: usize,
     ) -> Result<SimulationStats, SimulatorError> {
+        if concurrent == 0 {
+            return Err(SimulatorError::InvalidConfig(
+                "concurrent must be at least 1".to_string(),
+            ));
+        }
+        if let Some(ref disconnection) = self.config.disconnection {
+            disconnection.validate()?;
+        }
+
+        let node_ids = self.routable_node_ids()?;
+
         info!(
-            "Running stress test with {} concurrent payments",
-            concurrent
+            "Running stress test with {} concurrent producers (seed={:#018x})",
+            concurrent, self.seed
         );
 
-        // For now, just run the regular simulation
-        // In production, this would use tokio to run payments concurrently
-        self.run_simulation().await
+        // Each producer generates its own batch from a seed derived from the
+        // simulator's seed, and the batches are then merged and sorted into the
+        // canonical order. The threads finish in whatever order they finish in;
+        // that cannot affect the result because ordering never looks at arrival.
+        let events = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(concurrent);
+
+            for batch in 0..concurrent {
+                let node_ids = &node_ids;
+                let count = self.config.num_payments / concurrent
+                    + usize::from(batch < self.config.num_payments % concurrent);
+                let batch_seed = self
+                    .seed
+                    .wrapping_add((batch as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                let max_payment_amount = self.config.max_payment_amount;
+
+                handles.push(scope.spawn(move || {
+                    Self::generate_events(node_ids, count, batch_seed, max_payment_amount)
+                }));
+            }
+
+            handles
+                .into_iter()
+                .flat_map(|handle| handle.join().unwrap_or_default())
+                .collect::<Vec<_>>()
+        });
+
+        self.run_ordered_events(events)
+    }
+
+    /// Generate one producer's batch of events from an explicit seed.
+    ///
+    /// Kept free of `&self` so a batch can be generated on another thread
+    /// without sharing the simulator's RNG (or fighting over its lock).
+    fn generate_events(
+        node_ids: &[String],
+        count: usize,
+        seed: u64,
+        max_payment_amount: i128,
+    ) -> Vec<SimulationEvent> {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        let mut events = Vec::with_capacity(count);
+
+        if node_ids.len() < 2 {
+            return events;
+        }
+
+        for sequence in 0..count {
+            let source_idx = rng.gen_range(0..node_ids.len());
+            let dest_idx = rng.gen_range(0..node_ids.len());
+            if source_idx == dest_idx {
+                continue;
+            }
+
+            events.push(SimulationEvent {
+                timestamp: 0,
+                sequence: sequence as u64,
+                source: node_ids[source_idx].clone(),
+                destination: node_ids[dest_idx].clone(),
+                amount: rng.gen_range(100..max_payment_amount),
+            });
+        }
+
+        events
     }
 
     /// Measure routing algorithm performance
@@ -682,9 +870,13 @@ pub enum SimulatorError {
 
     #[error("Invalid node state: {0}")]
     InvalidNodeState(String),
+
+    #[error("Invalid simulation event: {0}")]
+    InvalidEvent(String),
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)] // the fixtures assert exact values they construct
 mod tests {
     use super::*;
 
@@ -798,6 +990,146 @@ mod tests {
         ));
         assert!(matches!(
             simulator.run_simulation().await,
+            Err(SimulatorError::InvalidConfig(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn events_run_in_canonical_order_whatever_order_they_arrive_in() {
+        let config = SimulatorConfig {
+            num_nodes: 10,
+            avg_channels_per_node: 3.0,
+            num_payments: 0,
+            seed: Some(31),
+            ..Default::default()
+        };
+        let simulator = Simulator::new(config);
+        simulator.initialize_network().unwrap();
+
+        let mut events = Vec::new();
+        let mut sequence = 0;
+        for source in 0..10 {
+            for destination in 0..10 {
+                if source == destination {
+                    continue;
+                }
+                events.push(SimulationEvent {
+                    timestamp: sequence % 3,
+                    sequence,
+                    source: format!("node_{source:03}"),
+                    destination: format!("node_{destination:03}"),
+                    amount: 100 + i128::from(sequence),
+                });
+                sequence += 1;
+            }
+        }
+
+        let in_order = simulator.run_events(events.clone()).await.unwrap();
+
+        let mut reversed = events.clone();
+        reversed.reverse();
+        let in_reverse = simulator.run_events(reversed).await.unwrap();
+
+        let mut rotated = events;
+        rotated.rotate_left(17);
+        let in_rotation = simulator.run_events(rotated).await.unwrap();
+
+        assert_eq!(in_order.total_payments, 90);
+        assert_eq!(in_order.successful_payments, in_reverse.successful_payments);
+        assert_eq!(
+            in_order.successful_payments,
+            in_rotation.successful_payments
+        );
+        assert_eq!(in_order.total_value_routed, in_reverse.total_value_routed);
+        assert_eq!(
+            in_order.total_fees_collected,
+            in_rotation.total_fees_collected
+        );
+        assert_eq!(in_order.avg_path_length, in_reverse.avg_path_length);
+    }
+
+    #[tokio::test]
+    async fn events_are_validated_before_anything_runs() {
+        let simulator = Simulator::new(SimulatorConfig {
+            num_nodes: 5,
+            num_payments: 0,
+            seed: Some(8),
+            ..Default::default()
+        });
+
+        // Uninitialized network: no nodes exist.
+        let event = SimulationEvent {
+            timestamp: 0,
+            sequence: 0,
+            source: "node_000".to_string(),
+            destination: "node_001".to_string(),
+            amount: 10,
+        };
+        assert!(matches!(
+            simulator.run_events(vec![event]).await,
+            Err(SimulatorError::SimulationError(_))
+        ));
+
+        simulator.initialize_network().unwrap();
+
+        let unknown = SimulationEvent {
+            timestamp: 0,
+            sequence: 4,
+            source: "node_999".to_string(),
+            destination: "node_001".to_string(),
+            amount: 10,
+        };
+        let err = simulator.run_events(vec![unknown]).await.unwrap_err();
+        assert!(matches!(err, SimulatorError::InvalidEvent(_)));
+        assert!(err.to_string().contains("node_999"), "{err}");
+
+        let self_payment = SimulationEvent {
+            timestamp: 0,
+            sequence: 1,
+            source: "node_000".to_string(),
+            destination: "node_000".to_string(),
+            amount: 10,
+        };
+        assert!(matches!(
+            simulator.run_events(vec![self_payment]).await,
+            Err(SimulatorError::InvalidEvent(_))
+        ));
+
+        assert!(matches!(
+            simulator.run_events(Vec::new()).await,
+            Err(SimulatorError::InvalidEvent(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn concurrent_producers_still_produce_one_deterministic_simulation() {
+        let config = SimulatorConfig {
+            num_nodes: 14,
+            avg_channels_per_node: 3.0,
+            num_payments: 120,
+            seed: Some(606),
+            ..Default::default()
+        };
+
+        let simulator = Simulator::new(config.clone());
+        simulator.initialize_network().unwrap();
+        assert_eq!(simulator.seed(), 606);
+
+        let first = simulator.run_stress_test(6).await.unwrap();
+        let second = simulator.run_stress_test(6).await.unwrap();
+
+        assert_eq!(first.total_payments, second.total_payments);
+        assert_eq!(first.successful_payments, second.successful_payments);
+        assert_eq!(first.total_value_routed, second.total_value_routed);
+
+        // A different producer count is a different simulation, but still
+        // deterministic for its own configuration.
+        let other = simulator.run_stress_test(3).await.unwrap();
+        let other_again = simulator.run_stress_test(3).await.unwrap();
+        assert_eq!(other.successful_payments, other_again.successful_payments);
+
+        assert!(matches!(
+            simulator.run_stress_test(0).await,
             Err(SimulatorError::InvalidConfig(_))
         ));
     }
