@@ -37,10 +37,12 @@ stellar-toolkit deploy ./contracts/my_contract --network testnet
 stellar-toolkit verify <contract_id>
 
 # Wallet commands (end-user onboarding)
-stellar-toolkit wallet generate                # new recovery phrase + keypair
-stellar-toolkit wallet recover "<phrase>"     # restore a keypair from a phrase
-stellar-toolkit wallet fund <G...>            # fund an account on testnet (Friendbot)
-stellar-toolkit wallet sign <S...> <tx_hex>   # sign a message/transaction envelope
+stellar-toolkit wallet generate                 # new keypair; secrets stay hidden
+stellar-toolkit wallet generate --show-secret   # ...after explicitly confirming nobody is watching
+stellar-toolkit wallet recover "<phrase>"       # restore a keypair from a phrase
+stellar-toolkit wallet recover "<phrase>" --show-secret
+stellar-toolkit wallet fund <G...>              # fund an account on testnet (Friendbot)
+stellar-toolkit wallet sign <S...> <tx_hex>     # sign a message/transaction envelope
 ```
 
 ```bash
@@ -129,11 +131,15 @@ The `wallet` command gives end users a self-contained way to interact with
 toolkit contracts:
 
 - **Recovery phrase backup** – `wallet generate` mints a cryptographically random
-  24-word BIP-39 recovery phrase and shows the derived Stellar secret key (`S…`)
-  and account id (`G…`). Keep the phrase somewhere safe; it is shown only once.
+  24-word BIP-39 recovery phrase and derives the Stellar secret key (`S…`) and
+  account id (`G…`). By default it prints only the account id: the phrase and the
+  secret key are replaced by `<hidden>` until you re-run with `--show-secret`,
+  which is the explicit confirmation to display them. When revealed, write the
+  phrase down and keep it somewhere safe.
 - **Recovery** – `wallet recover "<phrase>"` re-derives the same keypair from an
-  existing phrase. The phrase checksum is validated first, so a mistyped phrase
-  is rejected before any key is derived.
+  existing phrase, and follows the same hidden-by-default rule. The phrase
+  checksum is validated first, so a mistyped phrase is rejected before any key
+  is derived.
 - **Key derivation** – keys are derived with BIP-39 plus SLIP-0010 hardened
   Ed25519 derivation at `m/44'/148'/0'`, the standard Stellar path.
 - **Gas funding** – `wallet fund <G…>` tops up a testnet account through the

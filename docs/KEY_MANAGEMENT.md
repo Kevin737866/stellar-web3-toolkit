@@ -28,6 +28,7 @@ copied from, and (b) making a single key insufficient to move funds.
 |---------|-----------------|---------|
 | Source control | A key pasted into a config, test, or doc | `security secrets` (CI gate), `.gitignore` |
 | Shell history | `wallet recover "<phrase>"` typed at a prompt | Prefer `--phrase-file`/env input; clear history in shared shells |
+| Terminal output | Recovery phrase or `S…` key left in the scrollback after `wallet generate` | Secrets are hidden by default; displaying them requires the explicit `--show-secret` confirmation (issue #328) |
 | Process arguments | `wallet sign <S…>` visible in `ps`, `/proc/<pid>/cmdline` | Redacting `Debug` prevents logging it; args are still visible to the same user |
 | Logs and CI output | `{:?}` of a command or wallet struct | Redacting `Debug` impls in `wallet.rs` and `cli.rs` |
 | Error messages | A rejected key echoed back in the error | Every CLI error is passed through `error::redact_secret_material` before printing; `decode_secret` also masks its own input (issue #331) |
@@ -66,9 +67,17 @@ audit_log_retention_days = 365
 
 ## 3. Handling the recovery phrase
 
-`stellar-toolkit wallet generate` prints a 24-word phrase **once** and warns that
-it is shown only once. It is the backup: the `S…` key can be re-derived from it,
-and nothing can re-derive the phrase.
+`stellar-toolkit wallet generate` derives a 24-word phrase and prints only the
+account id unless you add `--show-secret`. With that flag the phrase and the
+`S…` key are displayed once, with a warning that they are shown only once. The
+phrase is the backup: the `S…` key can be re-derived from it, and nothing can
+re-derive the phrase.
+
+The default is masked on purpose. A phrase printed into a terminal is a phrase
+in the scrollback, in the tmux buffer and in any session recording; requiring a
+second, explicit flag means displaying it is a decision rather than a side
+effect of generating a wallet. `--show-secret` is the confirmation — it is not
+implied by any other flag or environment variable.
 
 Rules:
 

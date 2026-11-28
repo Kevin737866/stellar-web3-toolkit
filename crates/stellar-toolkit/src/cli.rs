@@ -573,11 +573,22 @@ pub enum TxCommand {
 #[derive(Subcommand)]
 pub enum WalletCommand {
     /// Generate a 24-word recovery phrase and derive a Stellar keypair
-    Generate,
+    Generate {
+        /// Print the recovery phrase and secret key
+        ///
+        /// This is the explicit confirmation: without it the command prints the
+        /// account id only, with both secrets replaced by `<hidden>` (issue
+        /// #328). Use it only when nobody can see the terminal or its scrollback.
+        #[arg(long, default_value_t = false)]
+        show_secret: bool,
+    },
     /// Recover a Stellar keypair from an existing recovery phrase
     Recover {
         /// The BIP-39 recovery phrase (quote it for shell safety)
         phrase: String,
+        /// Print the recovery phrase and secret key (explicit confirmation)
+        #[arg(long, default_value_t = false)]
+        show_secret: bool,
     },
     /// Fund a Stellar account on testnet using the Friendbot faucet
     Fund {
@@ -603,8 +614,15 @@ pub enum WalletCommand {
 impl std::fmt::Debug for WalletCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Generate => f.write_str("Generate"),
-            Self::Recover { .. } => f.write_str("Recover { phrase: \"<redacted>\" }"),
+            Self::Generate { show_secret } => f
+                .debug_struct("Generate")
+                .field("show_secret", show_secret)
+                .finish(),
+            Self::Recover { show_secret, .. } => f
+                .debug_struct("Recover")
+                .field("phrase", &"<redacted>")
+                .field("show_secret", show_secret)
+                .finish(),
             Self::Fund { account } => f.debug_struct("Fund").field("account", account).finish(),
             Self::Sign { message, .. } => f
                 .debug_struct("Sign")
@@ -820,16 +838,21 @@ fn run_deploy(cmd: &DeployCommand) -> Result<()> {
 fn run_wallet(wallet: &WalletCommand) -> Result<()> {
     use crate::wallet;
     match wallet {
-        WalletCommand::Generate => {
+        WalletCommand::Generate { show_secret } => {
             let w = wallet::generate_wallet()?;
-            print_wallet(&w);
-            println!("\n⚠  Write down your recovery phrase and store it somewhere safe. ");
-            println!("Anyone with it controls the account. It is shown only once.");
+            print_wallet(&w, *show_secret);
+            if *show_secret {
+                println!("\n⚠  Write down your recovery phrase and store it somewhere safe. ");
+                println!("Anyone with it controls the account. It is shown only once.");
+            }
             Ok(())
         }
-        WalletCommand::Recover { phrase } => {
+        WalletCommand::Recover {
+            phrase,
+            show_secret,
+        } => {
             let w = wallet::recover_wallet(phrase)?;
-            print_wallet(&w);
+            print_wallet(&w, *show_secret);
             Ok(())
         }
         WalletCommand::Fund { account } => wallet::fund_account(account),
@@ -920,10 +943,17 @@ fn run_session(cmd: &SessionCommand) -> Result<()> {
     }
 }
 
-fn print_wallet(w: &crate::wallet::GeneratedWallet) {
+/// Print a wallet summary. `show_secret` is the operator's explicit confirmation
+/// to reveal the recovery phrase and secret key; without it the summary is
+/// masked (issue #328).
+fn print_wallet(w: &crate::wallet::GeneratedWallet, show_secret: bool) {
     print!(
         "{}",
-        crate::wallet::format_wallet_summary(w, &crate::theme::Theme::from_env())
+        crate::wallet::format_wallet_summary(
+            w,
+            &crate::theme::Theme::from_env(),
+            crate::wallet::SecretVisibility::from_confirmation(show_secret)
+        )
     );
 }
 

@@ -156,31 +156,97 @@ fn encode_account(public_key: &[u8; 32]) -> String {
     format!("{}", stellar_strkey::ed25519::PublicKey(*public_key))
 }
 
+/// Whether a rendered wallet summary may contain the recovery phrase and the
+/// secret key (#328).
+///
+/// Displaying either value is the one action that turns "my wallet" into "anyone
+/// standing behind me owns my wallet", so it is never the default. A caller has
+/// to ask for [`SecretVisibility::Revealed`] explicitly — the CLI does that only
+/// for `--show-secret` — and the masked rendering is what every other path gets.
+///
+/// This is a type rather than a `bool` so the decision has to be written down at
+/// each call site (`SecretVisibility::Revealed`), and a future caller cannot pick
+/// up "show the secret" by copying a `true` it did not read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretVisibility {
+    /// Print the public account id, but withhold the recovery phrase and secret
+    /// key behind a [`SECRET_CONFIRMATION_HINT`] line.
+    Masked,
+    /// Print the recovery phrase and secret key. Only after explicit
+    /// confirmation from the person running the command.
+    Revealed,
+}
+
+impl SecretVisibility {
+    /// `Revealed` when the caller confirmed the display, `Masked` otherwise.
+    #[must_use]
+    pub fn from_confirmation(confirmed: bool) -> Self {
+        if confirmed {
+            Self::Revealed
+        } else {
+            Self::Masked
+        }
+    }
+
+    #[must_use]
+    pub fn is_revealed(self) -> bool {
+        self == Self::Revealed
+    }
+}
+
+/// Placeholder printed in place of a withheld recovery phrase or secret key.
+pub const HIDDEN_SECRET_PLACEHOLDER: &str = "<hidden>";
+
+/// Explains how to display the withheld values, printed with the masked summary.
+pub const SECRET_CONFIRMATION_HINT: &str =
+    "Secrets are hidden. Re-run with --show-secret to display the recovery phrase and secret \
+     key, but only after checking that nobody can see this terminal or its scrollback.";
+
 /// Render a wallet for terminal display, honouring the active colour theme.
 ///
-/// Only the *labels* are themed. The recovery phrase and the secret key are
-/// printed verbatim: styling a secret risks a dimmed or recoloured value
-/// reading as "less important", and in `off` mode this function returns the
-/// same text the CLI printed before theming existed, with no escape sequences
-/// at all.
+/// Only the *labels* are themed. When [`SecretVisibility::Revealed`] is passed,
+/// the recovery phrase and the secret key are printed verbatim: styling a secret
+/// risks a dimmed or recoloured value reading as "less important".
+///
+/// When [`SecretVisibility::Masked`] is passed — the default for every CLI path —
+/// both values are replaced by [`HIDDEN_SECRET_PLACEHOLDER`] and a
+/// [`SECRET_CONFIRMATION_HINT`] line explains how to reveal them. The public
+/// account id is always printed: it is not a secret, and without it the output
+/// would not identify the wallet at all.
+///
+/// In `off` mode this function returns plain text with no escape sequences.
 #[must_use]
-pub fn format_wallet_summary(wallet: &GeneratedWallet, theme: &Theme) -> String {
+pub fn format_wallet_summary(
+    wallet: &GeneratedWallet,
+    theme: &Theme,
+    visibility: SecretVisibility,
+) -> String {
+    let revealed = visibility.is_revealed();
+    let mnemonic = if revealed {
+        wallet.mnemonic.as_str()
+    } else {
+        HIDDEN_SECRET_PLACEHOLDER
+    };
+    let secret = if revealed {
+        wallet.secret.as_str()
+    } else {
+        HIDDEN_SECRET_PLACEHOLDER
+    };
+
     let mut out = String::new();
     out.push_str(&theme.heading("Wallet"));
     out.push('\n');
-    let _ = writeln!(
-        out,
-        "  {}\n{}",
-        theme.key("Recovery phrase:"),
-        wallet.mnemonic
-    );
+    let _ = writeln!(out, "  {}\n{}", theme.key("Recovery phrase:"), mnemonic);
     let _ = writeln!(
         out,
         "  {}\n{}",
         theme.paint(Style::Secret, "Secret key:"),
-        wallet.secret
+        secret
     );
     let _ = writeln!(out, "  {}\n{}", theme.key("Account (G):"), wallet.account);
+    if !revealed {
+        let _ = writeln!(out, "\n{SECRET_CONFIRMATION_HINT}");
+    }
     out
 }
 
@@ -712,7 +778,7 @@ mod tests {
             crate::theme::ThemeMode::Off,
             crate::theme::ThemeEnv::detect(),
         );
-        let out = format_wallet_summary(&wallet, &theme);
+        let out = format_wallet_summary(&wallet, &theme, SecretVisibility::Revealed);
         assert!(!out.contains('\x1b'), "off mode must emit no escapes");
         assert!(out.contains(&wallet.account));
         assert!(out.contains(&wallet.secret));
@@ -729,7 +795,7 @@ mod tests {
                 ..crate::theme::ThemeEnv::default()
             },
         );
-        let out = format_wallet_summary(&wallet, &theme);
+        let out = format_wallet_summary(&wallet, &theme, SecretVisibility::Revealed);
         assert!(out.contains('\x1b'), "colour must be emitted when forced");
         // The secret is highlighted, never dimmed or recoloured as a value.
         assert!(out.contains("\x1b[1;35m"));
