@@ -88,6 +88,15 @@ pub enum ToolkitCommand {
         #[arg(long, default_value_t = 0)]
         width: usize,
     },
+    /// Generate shell completion scripts for top-level toolkit commands
+    Completions {
+        /// Target shell (bash, zsh, fish, powershell)
+        #[arg(value_enum)]
+        shell: crate::completions::Shell,
+        /// Write the completion script to a file instead of stdout
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -653,6 +662,10 @@ impl ToolkitCommand {
                     *width
                 };
                 print!("{}", help_text::render_command_help(resolved));
+                Ok(())
+            }
+            Self::Completions { shell, out } => {
+                crate::completions::write_completion(*shell, out.as_deref())?;
                 Ok(())
             }
         }

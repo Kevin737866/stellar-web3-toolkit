@@ -47,6 +47,10 @@ stellar-toolkit wallet sign <S...> <tx_hex>   # sign a message/transaction envel
 # Wrapped command overview (respects $COLUMNS)
 stellar-toolkit help
 
+# Generate shell completions for top-level commands (bash, zsh, fish, powershell)
+stellar-toolkit completions bash
+stellar-toolkit completions zsh --out ~/.zsh/completions/_stellar-toolkit
+
 # Scaffold a contract project, then lint it (CI friendly)
 stellar-toolkit scaffold new amm-pool --out target/scaffold/amm-pool
 stellar-toolkit scaffold lint --dir contracts/amm-pool
