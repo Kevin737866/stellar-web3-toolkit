@@ -173,8 +173,10 @@ impl Scaffolder {
     }
 
     /// Writes the rendered template below `root`, refusing to clobber files
-    /// unless `force` is set. Returns the paths that were written.
+    /// unless `force` is set. Validates the template name before creating any
+    /// directories or files. Returns the paths that were written.
     pub fn write(&self, root: &Path, force: bool) -> Result<Vec<PathBuf>> {
+        validate_template_name(&self.options.name)?;
         write_files(root, &self.render(), force)
     }
 
@@ -246,20 +248,46 @@ stellar-toolkit scaffold lint --dir .
 }
 
 /// Writes rendered files below `root`, creating parent directories as needed.
+///
+/// Validates all relative paths and checks for existing files (when `force` is
+/// `false`) before creating any directories or writing any files, preventing
+/// partial state updates on failure.
 pub fn write_files(root: &Path, files: &[GeneratedFile], force: bool) -> Result<Vec<PathBuf>> {
-    let mut written = Vec::with_capacity(files.len());
+    use std::path::Component;
+
+    let mut targets = Vec::with_capacity(files.len());
     for file in files {
-        let path = root.join(&file.path);
+        let rel = Path::new(&file.path);
+        if file.path.is_empty()
+            || rel.is_absolute()
+            || rel.components().any(|c| {
+                matches!(
+                    c,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            })
+        {
+            return Err(ToolkitError::ExecutionError(format!(
+                "invalid template file path '{}': must be a safe relative path",
+                file.path
+            )));
+        }
+        let path = root.join(rel);
         if path.exists() && !force {
             return Err(ToolkitError::ExecutionError(format!(
                 "{} already exists (pass --force to overwrite)",
                 path.display()
             )));
         }
+        targets.push((path, &file.contents));
+    }
+
+    let mut written = Vec::with_capacity(targets.len());
+    for (path, contents) in targets {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&path, &file.contents)?;
+        std::fs::write(&path, contents)?;
         written.push(path);
     }
     Ok(written)
@@ -489,23 +517,60 @@ pub fn lint_template(files: &[GeneratedFile]) -> LintReport {
     }
 }
 
+/// Maximum allowed length for a scaffolded crate/template name.
+pub const MAX_TEMPLATE_NAME_LEN: usize = 64;
+
+/// Validates a scaffold template/crate name before any files are created.
+///
+/// A valid name must:
+/// - be non-empty and at most [`MAX_TEMPLATE_NAME_LEN`] (64) characters long
+/// - not contain path separators (`/`, `\`), parent traversal (`..`), or null bytes
+/// - contain only lowercase ASCII letters (`a-z`), ASCII digits (`0-9`), and `-`
+/// - not start or end with `-`, and not contain consecutive `--`
+///
+/// # Compatibility
+///
+/// Matches the kebab-case naming rules enforced by `lint_template` (`package-name`
+/// rule), rejecting invalid or unsafe names explicitly before disk writes occur.
+pub fn validate_template_name(name: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        return Err(ToolkitError::ExecutionError(
+            "invalid template name '': name must not be empty; use kebab-case such as 'amm-pool'"
+                .to_string(),
+        ));
+    }
+    if name.len() > MAX_TEMPLATE_NAME_LEN {
+        return Err(ToolkitError::ExecutionError(format!(
+            "invalid template name '{name}': length {} exceeds maximum of {MAX_TEMPLATE_NAME_LEN} characters",
+            name.len()
+        )));
+    }
+    if name.contains('/') || name.contains('\\') || name.contains("..") || name.contains('\0') {
+        return Err(ToolkitError::ExecutionError(format!(
+            "invalid template name '{name}': path separators and traversal segments are not allowed"
+        )));
+    }
+    if !name
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+    {
+        return Err(ToolkitError::ExecutionError(format!(
+            "invalid template name '{name}': use only lowercase ASCII letters, digits, and hyphens (e.g. 'amm-pool')"
+        )));
+    }
+    if name.starts_with('-') || name.ends_with('-') || name.contains("--") {
+        return Err(ToolkitError::ExecutionError(format!(
+            "invalid template name '{name}': hyphens cannot appear at the start, end, or consecutively"
+        )));
+    }
+    Ok(())
+}
+
 /// Crate names must be kebab-case so they can be used as Cargo targets and
 /// turned into wasm file names.
 #[must_use]
 pub fn is_valid_crate_name(name: &str) -> bool {
-    if name.is_empty() || name.len() > 64 {
-        return false;
-    }
-    if !name
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
-    {
-        return false;
-    }
-    if name.starts_with('-') || name.ends_with('-') || name.contains("--") {
-        return false;
-    }
-    true
+    validate_template_name(name).is_ok()
 }
 
 fn contents_of(files: &[GeneratedFile], path: &str) -> String {
@@ -704,5 +769,72 @@ mod tests {
         scaffolder.write(dir.path(), false).unwrap();
         let report = lint_directory(dir.path()).unwrap();
         assert!(report.passed(), "unexpected findings: {report:?}");
+    }
+
+    #[test]
+    fn test_validate_template_name_normal_and_boundary_cases() {
+        assert!(validate_template_name("a").is_ok());
+        assert!(validate_template_name("amm-pool").is_ok());
+        assert!(validate_template_name("pool2").is_ok());
+
+        let max_len = "a".repeat(MAX_TEMPLATE_NAME_LEN);
+        assert!(validate_template_name(&max_len).is_ok());
+
+        let too_long = "a".repeat(MAX_TEMPLATE_NAME_LEN + 1);
+        let err = validate_template_name(&too_long).unwrap_err();
+        assert!(err.to_string().contains("exceeds maximum"));
+    }
+
+    #[test]
+    fn test_validate_template_name_rejects_invalid_and_unsafe_inputs() {
+        for bad in [
+            "",
+            "   ",
+            "../evil",
+            "foo/bar",
+            r"foo\bar",
+            "foo\0bar",
+            "AmmPool",
+            "amm_pool",
+            "amm pool",
+            "-amm",
+            "amm-",
+            "amm--pool",
+        ] {
+            assert!(
+                validate_template_name(bad).is_err(),
+                "expected '{bad}' to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_scaffolder_write_rejects_invalid_name_before_creating_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let scaffolder = Scaffolder::new(ScaffoldOptions::new("../escape"));
+        let err = scaffolder.write(dir.path(), false).unwrap_err();
+        assert!(err.to_string().contains("invalid template name"));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn test_write_files_prevents_partial_writes_when_later_file_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("README.md"), "existing").unwrap();
+
+        let files = vec![
+            GeneratedFile {
+                path: "Cargo.toml".to_string(),
+                contents: "[package]\nname = \"amm-pool\"\n".to_string(),
+            },
+            GeneratedFile {
+                path: "README.md".to_string(),
+                contents: "# amm-pool\n".to_string(),
+            },
+        ];
+
+        let err = write_files(dir.path(), &files, false).unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+        assert!(!dir.path().join("Cargo.toml").exists());
     }
 }
