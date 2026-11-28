@@ -56,6 +56,7 @@ fn request(source: &str, destination: &str) -> RouteRequest {
         max_hops: None,
         find_any: false,
         payment_metadata: None,
+        excluded_unavailable: Vec::new(),
     }
 }
 
@@ -142,10 +143,10 @@ fn a_valid_route_is_returned_with_a_clean_report() {
 #[test]
 fn selection_is_deterministic_for_equal_cost_routes() {
     let graph = graph(vec![
-        channel("zeta", "alice", "carol", 0, 0),
-        channel("carol_bob", "carol", "bob", 0, 0),
-        channel("alpha", "alice", "dave", 0, 0),
-        channel("dave_bob", "dave", "bob", 0, 0),
+        channel("zeta", "alice", "carol", 0, 10),
+        channel("carol_bob", "carol", "bob", 0, 10),
+        channel("alpha", "alice", "dave", 0, 10),
+        channel("dave_bob", "dave", "bob", 0, 10),
     ]);
     let request = request("alice", "bob");
     let first = find_best_route_with_policy(&graph, &request, &RoutingPolicy::default()).unwrap();
@@ -182,8 +183,10 @@ fn invalid_inputs_are_rejected_without_touching_the_graph() {
         Err(RoutePolicyError::InvalidRequest(_))
     ));
 
-    let mut bad_policy = RoutingPolicy::default();
-    bad_policy.max_fee_bps = 0;
+    let bad_policy = RoutingPolicy {
+        max_fee_bps: 0,
+        ..RoutingPolicy::default()
+    };
     assert!(matches!(
         evaluate_route_policy(&graph, &request("alice", "bob"), &bad_policy),
         Err(RoutePolicyError::InvalidPolicy(_))

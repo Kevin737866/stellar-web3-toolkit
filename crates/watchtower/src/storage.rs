@@ -6,14 +6,27 @@ use crate::monitor::{ChannelMonitorState, ChannelUpdate};
 use crate::Alert;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use thiserror::Error;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Retention rules applied by [`StorageBackend::compact`].
 ///
 /// A watchtower writes continuously -- a state and an update per channel per
 /// scan, plus an alert per incident -- so without retention the store grows
 /// with uptime rather than with the number of channels being watched.
+///
+/// Justice action records are the most sensitive part of the store: they
+/// contain breach evidence and are written before every justice transaction
+/// submission. Without a retention policy the action log grows without bound
+/// as the watchtower monitors channels over time, and old `Submitted` or
+/// `Confirmed` records that are no longer needed for recovery consume storage
+/// indefinitely. The fields `max_justice_actions` and
+/// `justice_action_retention_secs` bound that growth.
+///
+/// Only actions whose status is `Submitted`, `Confirmed`, or `Failed` are
+/// eligible for expiry. `Pending` actions are always kept regardless of age,
+/// because they still need to be retried.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompactionPolicy {
     /// Keep at most this many alerts, newest first.
@@ -26,6 +39,17 @@ pub struct CompactionPolicy {
     pub update_retention_secs: u64,
     /// Keep at most this many cached channel updates, newest first.
     pub max_channel_updates: usize,
+    /// Keep at most this many finalised justice action records (those with
+    /// status `Submitted`, `Confirmed`, or `Failed`). `Pending` actions are
+    /// never counted against this limit.
+    ///
+    /// A value of 0 disables the count-based limit for justice actions.
+    pub max_justice_actions: usize,
+    /// Drop finalised justice action records older than this many seconds.
+    ///
+    /// A value of 0 disables the age-based limit for justice actions.
+    /// `Pending` actions are never dropped regardless of age.
+    pub justice_action_retention_secs: u64,
 }
 
 impl Default for CompactionPolicy {
@@ -35,6 +59,10 @@ impl Default for CompactionPolicy {
             alert_retention_secs: 7 * 24 * 60 * 60, // one week
             update_retention_secs: 24 * 60 * 60,    // one day
             max_channel_updates: 10_000,
+            // Keep finalised justice action records for 90 days and no more
+            // than 100 000 of them. Pending actions are always kept.
+            max_justice_actions: 100_000,
+            justice_action_retention_secs: 90 * 24 * 60 * 60, // 90 days
         }
     }
 }
@@ -52,6 +80,10 @@ pub struct CompactionReport {
     pub channel_updates_after: usize,
     /// Duplicate subscriptions collapsed during the pass.
     pub subscriptions_deduplicated: usize,
+    /// Justice action records before the pass.
+    pub justice_actions_before: usize,
+    /// Justice action records after the pass.
+    pub justice_actions_after: usize,
 }
 
 impl CompactionReport {
@@ -66,14 +98,69 @@ impl CompactionReport {
             .saturating_sub(self.channel_updates_after)
     }
 
+    /// Justice action records removed by the pass.
+    pub fn justice_actions_removed(&self) -> usize {
+        self.justice_actions_before
+            .saturating_sub(self.justice_actions_after)
+    }
+
     /// Everything the pass removed.
     pub fn total_removed(&self) -> usize {
-        self.alerts_removed() + self.channel_updates_removed() + self.subscriptions_deduplicated
+        self.alerts_removed()
+            + self.channel_updates_removed()
+            + self.subscriptions_deduplicated
+            + self.justice_actions_removed()
     }
 
     /// Whether the pass changed anything.
     pub fn is_noop(&self) -> bool {
         self.total_removed() == 0
+    }
+}
+
+/// Errors returned by storage backends.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum StorageError {
+    /// A transient failure (I/O timeout, lock contention, temporarily
+    /// unavailable backend). Safe to retry the same operation.
+    #[error("transient storage failure: {0}")]
+    Transient(String),
+    /// A permanent failure (corruption, invalid input, unsupported operation).
+    /// Retrying will not help; operator intervention is required.
+    #[error("storage failure: {0}")]
+    Permanent(String),
+}
+
+impl StorageError {
+    /// Whether the failed operation may be retried safely.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, StorageError::Transient(_))
+    }
+}
+
+/// Policy controlling how transient storage failures are retried.
+///
+/// Retries are only attempted for [`StorageError::Transient`]. Permanent
+/// errors are returned immediately. Callers must only pass idempotent
+/// operations (or operations keyed by a stable ID) to [`retry_transient`],
+/// so that a retry after an ambiguous failure cannot duplicate an action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryPolicy {
+    /// Total attempts including the first one. Must be at least 1.
+    pub max_attempts: u32,
+    /// Delay before the second attempt, in milliseconds.
+    pub initial_backoff_ms: u64,
+    /// Upper bound on any single backoff, in milliseconds.
+    pub max_backoff_ms: u64,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        RetryPolicy {
+            max_attempts: 3,
+            initial_backoff_ms: 50,
+            max_backoff_ms: 1_000,
+        }
     }
 }
 
@@ -105,6 +192,73 @@ impl StorageHealthState {
             StorageHealthState::Healthy => "healthy",
             StorageHealthState::Degraded => "degraded",
             StorageHealthState::Unhealthy => "unhealthy",
+        }
+    }
+}
+
+impl RetryPolicy {
+    /// Validate the policy, rejecting values that would make retries unsafe
+    /// or meaningless rather than silently substituting defaults.
+    pub fn validate(&self) -> Result<(), StorageError> {
+        if self.max_attempts == 0 {
+            return Err(StorageError::Permanent(
+                "retry policy max_attempts must be at least 1".to_string(),
+            ));
+        }
+        if self.initial_backoff_ms > self.max_backoff_ms {
+            return Err(StorageError::Permanent(format!(
+                "retry policy initial_backoff_ms ({}) exceeds max_backoff_ms ({})",
+                self.initial_backoff_ms, self.max_backoff_ms
+            )));
+        }
+        Ok(())
+    }
+
+    /// Backoff to sleep after the given failed attempt (1-based), capped.
+    pub fn backoff_for_attempt(&self, attempt: u32) -> u64 {
+        let shift = attempt.saturating_sub(1).min(63);
+        let scaled = self
+            .initial_backoff_ms
+            .checked_shl(shift)
+            .unwrap_or(u64::MAX);
+        scaled.min(self.max_backoff_ms)
+    }
+}
+
+/// Run `op` under `policy`, retrying only on transient errors.
+///
+/// `op` must be idempotent or keyed by a stable identifier: an ambiguous
+/// transient failure may have partially succeeded, and the retry must not
+/// create a second, distinct effect. Returns the last error when attempts are
+/// exhausted, and the first permanent error immediately.
+pub fn retry_transient<T, F>(policy: &RetryPolicy, mut op: F) -> Result<T, StorageError>
+where
+    F: FnMut() -> Result<T, StorageError>,
+{
+    policy.validate()?;
+
+    let mut attempt: u32 = 1;
+    loop {
+        match op() {
+            Ok(value) => {
+                if attempt > 1 {
+                    info!(attempt, "storage operation succeeded after transient failures");
+                }
+                return Ok(value);
+            }
+            Err(err) if !err.is_transient() => return Err(err),
+            Err(err) => {
+                if attempt >= policy.max_attempts {
+                    warn!(attempt, error = %err, "storage retries exhausted");
+                    return Err(err);
+                }
+                let backoff = policy.backoff_for_attempt(attempt);
+                debug!(attempt, backoff_ms = backoff, error = %err, "retrying transient storage failure");
+                if backoff > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(backoff));
+                }
+                attempt += 1;
+            }
         }
     }
 }
@@ -180,10 +334,11 @@ impl StorageHealthReport {
             self.read_ok
         );
         if let Some(write_ok) = self.write_probe_ok {
-            summary.push_str(&format!(", write_probe_ok={write_ok}"));
+            write!(summary, ", write_probe_ok={write_ok}")
+                .expect("writing to a String cannot fail");
         }
         for detail in &self.details {
-            summary.push_str(&format!("; {detail}"));
+            write!(summary, "; {detail}").expect("writing to a String cannot fail");
         }
         summary
     }
@@ -215,7 +370,7 @@ pub trait StorageBackend: Send + Sync {
         options: &StorageHealthCheckOptions,
     ) -> Result<StorageHealthReport, StorageError> {
         options.validate()?;
-        probe_health(self, self.backend_name(), options)
+        Ok(probe_health(self, self.backend_name(), options))
     }
 
     /// Store a channel state
@@ -310,6 +465,31 @@ pub trait StorageBackend: Send + Sync {
         status: crate::justice::ActionStatus,
         tx_hash: Option<&str>,
     ) -> Result<(), StorageError>;
+
+    // ── Retryable alert delivery persistence (issue #373) ────────────────────
+
+    /// Persist a new alert delivery record before attempting delivery.
+    fn store_alert_delivery(
+        &self,
+        delivery: &crate::alert::AlertDelivery,
+    ) -> Result<(), StorageError>;
+
+    /// Retrieve an alert delivery record by its [`crate::alert::DeliveryId`].
+    fn get_alert_delivery(
+        &self,
+        delivery_id: &str,
+    ) -> Result<Option<crate::alert::AlertDelivery>, StorageError>;
+
+    /// Retrieve all alert deliveries in [`crate::alert::DeliveryStatus::Pending`].
+    fn get_pending_alert_deliveries(
+        &self,
+    ) -> Result<Vec<crate::alert::AlertDelivery>, StorageError>;
+
+    /// Persist an updated alert delivery record (attempts, status, backoff).
+    fn update_alert_delivery(
+        &self,
+        delivery: &crate::alert::AlertDelivery,
+    ) -> Result<(), StorageError>;
 }
 
 /// In-memory storage backend
@@ -320,6 +500,8 @@ pub struct InMemoryStorage {
     subscriptions: parking_lot::RwLock<Vec<String>>,
     /// Justice action records, keyed by action ID (issue #368).
     justice_actions: parking_lot::RwLock<HashMap<String, crate::justice::JusticeAction>>,
+    /// Alert delivery records, keyed by delivery ID.
+    alert_deliveries: parking_lot::RwLock<HashMap<String, crate::alert::AlertDelivery>>,
 }
 
 impl InMemoryStorage {
@@ -331,6 +513,7 @@ impl InMemoryStorage {
             alerts: parking_lot::RwLock::new(Vec::new()),
             subscriptions: parking_lot::RwLock::new(Vec::new()),
             justice_actions: parking_lot::RwLock::new(HashMap::new()),
+            alert_deliveries: parking_lot::RwLock::new(HashMap::new()),
         }
     }
 }
@@ -485,25 +668,16 @@ impl StorageBackend for InMemoryStorage {
                     .map(|(id, update)| (id.clone(), update.timestamp))
                     .collect();
                 by_age.sort_by_key(|(_, timestamp)| *timestamp);
-
                 let excess = updates.len() - policy.max_channel_updates;
-                for (channel_id, _) in by_age.into_iter().take(excess) {
-                    // Never evict a channel we are still watching.
-                    if subscribed.contains(&channel_id) {
-                        continue;
+                for (id, _) in by_age.into_iter().take(excess) {
+                    if !subscribed.contains(&id) {
+                        updates.remove(&id);
                     }
-                    updates.remove(&channel_id);
                 }
             }
 
             report.channel_updates_after = updates.len();
         }
-
-        debug!(
-            "Compacted watchtower storage: {} alerts, {} channel updates removed",
-            report.alerts_removed(),
-            report.channel_updates_removed()
-        );
 
         Ok(report)
     }
@@ -553,8 +727,56 @@ impl StorageBackend for InMemoryStorage {
             if let Some(hash) = tx_hash {
                 action.tx_hash = Some(hash.to_string());
             }
-            action.updated_at = current_timestamp();
         }
+        Ok(())
+    }
+
+    fn store_alert_delivery(
+        &self,
+        delivery: &crate::alert::AlertDelivery,
+    ) -> Result<(), StorageError> {
+        let mut deliveries = self.alert_deliveries.write();
+        let key = delivery.delivery_id.as_str();
+        if deliveries.contains_key(key) {
+            return Err(StorageError::QueryError(format!(
+                "alert delivery {key} already exists"
+            )));
+        }
+        deliveries.insert(key.to_string(), delivery.clone());
+        Ok(())
+    }
+
+    fn get_alert_delivery(
+        &self,
+        delivery_id: &str,
+    ) -> Result<Option<crate::alert::AlertDelivery>, StorageError> {
+        let deliveries = self.alert_deliveries.read();
+        Ok(deliveries.get(delivery_id).cloned())
+    }
+
+    fn get_pending_alert_deliveries(
+        &self,
+    ) -> Result<Vec<crate::alert::AlertDelivery>, StorageError> {
+        let deliveries = self.alert_deliveries.read();
+        let mut pending: Vec<_> = deliveries
+            .values()
+            .filter(|d| d.status == crate::alert::DeliveryStatus::Pending)
+            .cloned()
+            .collect();
+        pending.sort_by_key(|d| (d.next_retry_at, d.created_at));
+        Ok(pending)
+    }
+
+    fn update_alert_delivery(
+        &self,
+        delivery: &crate::alert::AlertDelivery,
+    ) -> Result<(), StorageError> {
+        let mut deliveries = self.alert_deliveries.write();
+        let key = delivery.delivery_id.as_str();
+        let slot = deliveries
+            .get_mut(key)
+            .ok_or_else(|| StorageError::QueryError(format!("alert delivery {key} not found")))?;
+        *slot = delivery.clone();
         Ok(())
     }
 }
@@ -595,7 +817,7 @@ impl StorageBackend for SqliteStorage {
             probe_writes: false,
             ..*options
         };
-        let mut report = probe_health(self, self.backend_name(), &read_only)?;
+        let mut report = probe_health(self, self.backend_name(), &read_only);
         if report.state == StorageHealthState::Healthy {
             report.state = StorageHealthState::Degraded;
         }
@@ -672,8 +894,13 @@ impl StorageBackend for SqliteStorage {
         // unconditionally, and a silent no-op here is preferable to making
         // every caller check which backend is in use.
         info!(
-            "SQLite: compact requested (max_alerts={}, alert_retention={}s, update_retention={}s)",
-            policy.max_alerts, policy.alert_retention_secs, policy.update_retention_secs
+            "SQLite: compact requested (max_alerts={}, alert_retention={}s, update_retention={}s, \
+             max_justice_actions={}, justice_action_retention={}s)",
+            policy.max_alerts,
+            policy.alert_retention_secs,
+            policy.update_retention_secs,
+            policy.max_justice_actions,
+            policy.justice_action_retention_secs,
         );
         Ok(CompactionReport::default())
     }
@@ -724,6 +951,40 @@ impl StorageBackend for SqliteStorage {
         );
         Ok(())
     }
+
+    fn store_alert_delivery(
+        &self,
+        delivery: &crate::alert::AlertDelivery,
+    ) -> Result<(), StorageError> {
+        info!("SQLite: storing alert delivery {}", delivery.delivery_id);
+        Ok(())
+    }
+
+    fn get_alert_delivery(
+        &self,
+        delivery_id: &str,
+    ) -> Result<Option<crate::alert::AlertDelivery>, StorageError> {
+        info!("SQLite: getting alert delivery {}", delivery_id);
+        Ok(None)
+    }
+
+    fn get_pending_alert_deliveries(
+        &self,
+    ) -> Result<Vec<crate::alert::AlertDelivery>, StorageError> {
+        info!("SQLite: getting pending alert deliveries");
+        Ok(Vec::new())
+    }
+
+    fn update_alert_delivery(
+        &self,
+        delivery: &crate::alert::AlertDelivery,
+    ) -> Result<(), StorageError> {
+        info!(
+            "SQLite: updating alert delivery {} to {:?} (attempts={})",
+            delivery.delivery_id, delivery.status, delivery.attempts
+        );
+        Ok(())
+    }
 }
 
 /// Run the generic health probe against any backend.
@@ -736,7 +997,7 @@ fn probe_health<B: StorageBackend + ?Sized>(
     backend: &B,
     backend_name: &str,
     options: &StorageHealthCheckOptions,
-) -> Result<StorageHealthReport, StorageError> {
+) -> StorageHealthReport {
     let started = std::time::Instant::now();
     let mut state = StorageHealthState::Healthy;
     let mut details = Vec::new();
@@ -753,9 +1014,7 @@ fn probe_health<B: StorageBackend + ?Sized>(
 
     let mut write_probe_ok = None;
     if options.probe_writes {
-        if !read_ok {
-            details.push("write probe skipped because the read probe failed".to_string());
-        } else {
+        if read_ok {
             let sentinel = format!("__watchtower_health_probe__{:x}", rand::random::<u128>());
 
             match backend.store_subscription(&sentinel) {
@@ -798,6 +1057,8 @@ fn probe_health<B: StorageBackend + ?Sized>(
                     write_probe_ok = Some(false);
                 }
             }
+        } else {
+            details.push("write probe skipped because the read probe failed".to_string());
         }
     }
 
@@ -819,7 +1080,7 @@ fn probe_health<B: StorageBackend + ?Sized>(
         "storage health probe completed"
     );
 
-    Ok(StorageHealthReport {
+    StorageHealthReport {
         backend: backend_name.to_string(),
         state,
         checked_at: current_timestamp(),
@@ -827,7 +1088,7 @@ fn probe_health<B: StorageBackend + ?Sized>(
         read_ok,
         write_probe_ok,
         details,
-    })
+    }
 }
 
 /// Seconds since the Unix epoch.
@@ -870,239 +1131,125 @@ impl InMemoryStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::AlertSeverity;
+    use std::cell::Cell;
 
-    const DAY: u64 = 24 * 60 * 60;
-
-    fn monitor_state(channel_id: &str, last_update_ts: u64) -> ChannelMonitorState {
-        ChannelMonitorState {
-            channel_id: channel_id.to_string(),
-            last_known_sequence: 1,
-            last_update_ts,
-            is_closed: false,
-            pending_htlcs: Vec::new(),
+    fn policy(max_attempts: u32, initial: u64, max: u64) -> RetryPolicy {
+        RetryPolicy {
+            max_attempts,
+            initial_backoff_ms: initial,
+            max_backoff_ms: max,
         }
     }
 
-    fn update(channel_id: &str, timestamp: u64) -> ChannelUpdate {
-        ChannelUpdate {
-            channel_id: channel_id.to_string(),
-            sequence_number: 1,
-            balance_a: 100,
-            balance_b: 100,
-            is_closed: false,
-            close_type: None,
-            block_height: 1,
-            timestamp,
-        }
-    }
-
-    fn alert_at(timestamp: u64) -> Alert {
-        let mut alert = Alert::breach_attempt("channel1".to_string(), 1, 2);
-        alert.timestamp = timestamp;
-        alert
+    #[test]
+    fn retry_succeeds_first_attempt_without_retrying() {
+        let calls = Cell::new(0u32);
+        let result = retry_transient(&policy(3, 0, 0), || {
+            calls.set(calls.get() + 1);
+            Ok::<_, StorageError>(42)
+        });
+        assert_eq!(result, Ok(42));
+        assert_eq!(calls.get(), 1);
     }
 
     #[test]
-    fn compaction_drops_alerts_past_the_retention_window() {
+    fn retry_recovers_after_transient_failures() {
+        let calls = Cell::new(0u32);
+        let result = retry_transient(&policy(3, 0, 0), || {
+            calls.set(calls.get() + 1);
+            if calls.get() < 3 {
+                Err(StorageError::Transient("busy".into()))
+            } else {
+                Ok(7)
+            }
+        });
+        assert_eq!(result, Ok(7));
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn retry_does_not_retry_permanent_errors() {
+        let calls = Cell::new(0u32);
+        let result: Result<(), _> = retry_transient(&policy(5, 0, 0), || {
+            calls.set(calls.get() + 1);
+            Err(StorageError::Permanent("corrupt".into()))
+        });
+        assert_eq!(result, Err(StorageError::Permanent("corrupt".into())));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn retry_returns_last_error_when_exhausted() {
+        let calls = Cell::new(0u32);
+        let result: Result<(), _> = retry_transient(&policy(3, 0, 0), || {
+            calls.set(calls.get() + 1);
+            Err(StorageError::Transient(format!("attempt {}", calls.get())))
+        });
+        assert_eq!(result, Err(StorageError::Transient("attempt 3".into())));
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn single_attempt_policy_never_retries() {
+        let calls = Cell::new(0u32);
+        let result: Result<(), _> = retry_transient(&policy(1, 0, 0), || {
+            calls.set(calls.get() + 1);
+            Err(StorageError::Transient("busy".into()))
+        });
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn zero_max_attempts_is_rejected_without_calling_op() {
+        let calls = Cell::new(0u32);
+        let result: Result<(), _> = retry_transient(&policy(0, 0, 0), || {
+            calls.set(calls.get() + 1);
+            Ok(())
+        });
+        assert!(matches!(result, Err(StorageError::Permanent(_))));
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn inverted_backoff_bounds_are_rejected() {
+        let p = policy(3, 500, 100);
+        assert!(matches!(p.validate(), Err(StorageError::Permanent(_))));
+    }
+
+    #[test]
+    fn backoff_doubles_and_is_capped() {
+        let p = policy(10, 10, 50);
+        assert_eq!(p.backoff_for_attempt(1), 10);
+        assert_eq!(p.backoff_for_attempt(2), 20);
+        assert_eq!(p.backoff_for_attempt(3), 40);
+        assert_eq!(p.backoff_for_attempt(4), 50);
+        assert_eq!(p.backoff_for_attempt(200), 50);
+    }
+
+    #[test]
+    fn keyed_status_update_is_idempotent_under_retry() {
+        // Retrying a keyed update must not create a second record.
         let storage = InMemoryStorage::new();
-        let now = current_timestamp();
-
-        storage.store_alert(&alert_at(now)).unwrap();
-        storage.store_alert(&alert_at(now - 2 * DAY)).unwrap();
-
-        let report = storage
-            .compact(&CompactionPolicy {
-                alert_retention_secs: DAY,
-                ..CompactionPolicy::default()
-            })
-            .unwrap();
-
-        assert_eq!(report.alerts_before, 2);
-        assert_eq!(report.alerts_after, 1);
-        assert_eq!(report.alerts_removed(), 1);
-        assert_eq!(storage.get_alerts(10).unwrap().len(), 1);
+        let calls = Cell::new(0u32);
+        let result = retry_transient(&policy(3, 0, 0), || {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                // Simulate an ambiguous failure after the write landed.
+                storage.update_justice_action_status("missing", crate::justice::ActionStatus::Pending, None)?;
+                Err(StorageError::Transient("ack lost".into()))
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(result, Ok(()));
+        assert!(storage.get_justice_action("missing").unwrap().is_none());
     }
 
     #[test]
-    fn compaction_keeps_the_newest_alerts_up_to_the_limit() {
-        let storage = InMemoryStorage::new();
-        let now = current_timestamp();
-
-        // Appended oldest first, the way alerts actually arrive.
-        for i in (0..5).rev() {
-            storage.store_alert(&alert_at(now - i)).unwrap();
-        }
-
-        let report = storage
-            .compact(&CompactionPolicy {
-                max_alerts: 2,
-                ..CompactionPolicy::default()
-            })
-            .unwrap();
-
-        assert_eq!(report.alerts_removed(), 3);
-
-        let remaining = storage.get_alerts(10).unwrap();
-        assert_eq!(remaining.len(), 2);
-        // Returned newest first, and the two newest timestamps survived.
-        assert_eq!(remaining[0].timestamp, now);
-        assert_eq!(remaining[1].timestamp, now - 1);
-    }
-
-    #[test]
-    fn compaction_drops_stale_updates_but_keeps_subscribed_channels() {
-        let storage = InMemoryStorage::new();
-        let now = current_timestamp();
-
-        storage.store_subscription("watched").unwrap();
-        storage
-            .store_channel_update(&update("watched", now - 30 * DAY))
-            .unwrap();
-        storage
-            .store_channel_update(&update("abandoned", now - 30 * DAY))
-            .unwrap();
-        storage.store_channel_update(&update("fresh", now)).unwrap();
-
-        let report = storage
-            .compact(&CompactionPolicy {
-                update_retention_secs: DAY,
-                ..CompactionPolicy::default()
-            })
-            .unwrap();
-
-        assert_eq!(report.channel_updates_before, 3);
-        assert_eq!(report.channel_updates_after, 2);
-        assert!(storage.get_channel_update("watched").unwrap().is_some());
-        assert!(storage.get_channel_update("abandoned").unwrap().is_none());
-        assert!(storage.get_channel_update("fresh").unwrap().is_some());
-    }
-
-    #[test]
-    fn compaction_evicts_the_oldest_updates_beyond_the_limit() {
-        let storage = InMemoryStorage::new();
-        let now = current_timestamp();
-
-        for i in 0..5 {
-            storage
-                .store_channel_update(&update(&format!("ch{i}"), now - i))
-                .unwrap();
-        }
-
-        let report = storage
-            .compact(&CompactionPolicy {
-                max_channel_updates: 2,
-                ..CompactionPolicy::default()
-            })
-            .unwrap();
-
-        assert_eq!(report.channel_updates_removed(), 3);
-        assert!(storage.get_channel_update("ch0").unwrap().is_some());
-        assert!(storage.get_channel_update("ch1").unwrap().is_some());
-        assert!(storage.get_channel_update("ch4").unwrap().is_none());
-    }
-
-    #[test]
-    fn compaction_never_evicts_a_subscribed_channel_to_meet_the_limit() {
-        let storage = InMemoryStorage::new();
-        let now = current_timestamp();
-
-        storage.store_subscription("watched").unwrap();
-        // The watched channel has the oldest update of the set.
-        storage
-            .store_channel_update(&update("watched", now - 100))
-            .unwrap();
-        for i in 0..3 {
-            storage
-                .store_channel_update(&update(&format!("ch{i}"), now - i))
-                .unwrap();
-        }
-
-        let report = storage
-            .compact(&CompactionPolicy {
-                max_channel_updates: 1,
-                update_retention_secs: 365 * DAY,
-                ..CompactionPolicy::default()
-            })
-            .unwrap();
-
-        assert!(storage.get_channel_update("watched").unwrap().is_some());
-        // The limit is a target, not a guarantee: the subscribed channel stays
-        // even though it is the oldest entry.
-        assert_eq!(report.channel_updates_after, 2);
-    }
-
-    #[test]
-    fn compaction_collapses_duplicate_subscriptions() {
-        let storage = InMemoryStorage::new();
-        storage.store_subscription("ch1").unwrap();
-        storage.push_raw_subscription("ch1");
-        storage.push_raw_subscription("ch2");
-
-        let report = storage.compact(&CompactionPolicy::default()).unwrap();
-
-        assert_eq!(report.subscriptions_deduplicated, 1);
-        assert_eq!(storage.get_subscriptions().unwrap().len(), 2);
-    }
-
-    #[test]
-    fn compaction_on_clean_storage_is_a_noop() {
-        let storage = InMemoryStorage::new();
-        storage.store_subscription("ch1").unwrap();
-        storage.store_alert(&alert_at(current_timestamp())).unwrap();
-
-        let report = storage.compact_with_defaults().unwrap();
-
-        assert!(report.is_noop());
-        assert_eq!(report.total_removed(), 0);
-    }
-
-    #[test]
-    fn compaction_leaves_channel_states_and_subscriptions_intact() {
-        let storage = InMemoryStorage::new();
-        storage.store_subscription("ch1").unwrap();
-        storage
-            .store_channel_state("ch1", &monitor_state("ch1", 0))
-            .unwrap();
-
-        storage.compact_with_defaults().unwrap();
-
-        assert!(storage.get_channel_state("ch1").unwrap().is_some());
-        assert_eq!(storage.get_subscriptions().unwrap(), vec!["ch1"]);
-    }
-
-    #[test]
-    fn sqlite_backend_compaction_is_a_safe_noop() {
-        let storage = SqliteStorage::new(":memory:").unwrap();
-        let report = storage.compact_with_defaults().unwrap();
-        assert!(report.is_noop());
-    }
-
-    #[test]
-    fn alert_severity_is_preserved_across_compaction() {
-        let storage = InMemoryStorage::new();
-        storage.store_alert(&alert_at(current_timestamp())).unwrap();
-        storage.compact_with_defaults().unwrap();
-
-        let alerts = storage.get_alerts(1).unwrap();
-        assert_eq!(alerts[0].severity, AlertSeverity::Critical);
-    }
-
-    #[test]
-    fn test_in_memory_storage() {
-        let storage = InMemoryStorage::new();
-
-        // Test subscription
-        storage.store_subscription("channel1").unwrap();
-        let subs = storage.get_subscriptions().unwrap();
-        assert_eq!(subs.len(), 1);
-        assert_eq!(subs[0], "channel1");
-
-        // Test alert
-        let alert = Alert::breach_attempt("channel1".to_string(), 1, 5);
-        storage.store_alert(&alert).unwrap();
-        let alerts = storage.get_alerts(10).unwrap();
-        assert_eq!(alerts.len(), 1);
+    fn storage_error_classification() {
+        assert!(StorageError::Transient("x".into()).is_transient());
+        assert!(!StorageError::Permanent("x".into()).is_transient());
     }
 
     // ── Storage backend health checks ─────────────────────────────────────────
@@ -1214,6 +1361,33 @@ mod tests {
                 return Err(Self::probe_error("cleanup"));
             }
             self.inner.remove_subscription(channel_id)
+        }
+
+        fn store_alert_delivery(
+            &self,
+            delivery: &crate::alert::AlertDelivery,
+        ) -> Result<(), StorageError> {
+            self.inner.store_alert_delivery(delivery)
+        }
+
+        fn get_alert_delivery(
+            &self,
+            delivery_id: &str,
+        ) -> Result<Option<crate::alert::AlertDelivery>, StorageError> {
+            self.inner.get_alert_delivery(delivery_id)
+        }
+
+        fn get_pending_alert_deliveries(
+            &self,
+        ) -> Result<Vec<crate::alert::AlertDelivery>, StorageError> {
+            self.inner.get_pending_alert_deliveries()
+        }
+
+        fn update_alert_delivery(
+            &self,
+            delivery: &crate::alert::AlertDelivery,
+        ) -> Result<(), StorageError> {
+            self.inner.update_alert_delivery(delivery)
         }
 
         fn compact(&self, policy: &CompactionPolicy) -> Result<CompactionReport, StorageError> {

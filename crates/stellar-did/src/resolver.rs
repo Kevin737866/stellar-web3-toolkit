@@ -1,221 +1,442 @@
-//! DID document resolution with unknown property preservation (issue #344).
+//! DID resolution and paginated history responses (issue #342).
 //!
-//! Per the [W3C DID Core specification](https://www.w3.org/TR/did-core/),
-//! DID documents are extensible JSON-LD / JSON objects that may carry
-//! standard properties (`@context`, `alsoKnownAs`, `controller`,
-//! `verificationMethod`, `authentication`, `assertionMethod`, etc.) as well as
-//! method-specific or application-specific extension fields.
+//! This module provides [`DidResolver`], an in-memory DID document store and
+//! resolver that tracks document version history and supports cursor-based
+//! pagination over history entries.
 //!
-//! [`DidResolver`] parses and validates resolved DID documents while
-//! preserving all unknown top-level properties in
-//! [`DidDocument::additional_properties`]. Because `additional_properties` is
-//! backed by a [`std::collections::BTreeMap`], re-serializing a resolved
-//! document produces deterministic key ordering across resolver responses.
+//! # Compatibility
 //!
-//! # Invariants enforced
+//! Callers that do not use pagination can continue calling
+//! [`DidResolver::resolve`] (latest document) and
+//! [`DidResolver::resolve_history`] (full unpaginated slice).
 //!
-//! - The requested DID must conform to `did:<method>:<method-specific-id>`.
-//! - The resolved payload must be a valid JSON object representing a
-//!   [`DidDocument`].
-//! - The document's `id` must match the requested DID.
-//! - All service endpoints must pass the URI scheme allowlist and have unique
-//!   IDs.
+//! # Validation & Invariants
+//!
+//! - DIDs are validated against [W3C DID Core](https://www.w3.org/TR/did-core/#did-syntax)
+//!   syntax (`did:<method>:<method-specific-id>`).
+//! - Pagination parameters are validated explicitly via [`PaginationParams::new`]
+//!   and [`DidResolver::resolve_history_paginated`]: `limit` must be in
+//!   `1..=MAX_PAGE_LIMIT`, and cursors must be non-empty ASCII unsigned integers
+//!   within the bounds of the DID's history. Invalid inputs are rejected with
+//!   actionable [`DidError`] variants rather than silently clamping or
+//!   substituting defaults.
+//! - History entries are ordered deterministically by monotonically increasing
+//!   `version` (`1, 2, ...`).
 
-use crate::service::{validate_did, DidDocument, DidError};
+use crate::service::{DidDocument, DidError};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
-/// Stateless DID document resolver that validates DID Core invariants while
-/// preserving unknown top-level DID document properties.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct DidResolver;
+/// Maximum number of history entries returned in a single page.
+pub const MAX_PAGE_LIMIT: usize = 100;
 
-impl DidResolver {
-    /// Create a new [`DidResolver`].
-    #[must_use]
-    pub const fn new() -> Self {
-        Self
-    }
+/// Suggested default page limit for callers constructing [`PaginationParams`].
+pub const DEFAULT_PAGE_LIMIT: usize = 20;
 
-    /// Resolve a DID from its raw JSON document representation.
-    ///
-    /// Unknown top-level properties (such as `@context`, `alsoKnownAs`,
-    /// `verificationMethod`, `authentication`, or custom extension fields) are
-    /// preserved in [`DidDocument::additional_properties`].
+/// Parameters controlling a paginated history query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaginationParams {
+    /// Maximum number of entries to return (`1..=MAX_PAGE_LIMIT`).
+    pub limit: usize,
+    /// Opaque cursor returned as `next_cursor` by a previous page, or `None`
+    /// to start from the first entry.
+    pub cursor: Option<String>,
+}
+
+impl PaginationParams {
+    /// Construct and validate pagination parameters.
     ///
     /// # Errors
     ///
-    /// * [`DidError::InvalidDid`] — `did` or the document's `id` is malformed.
-    /// * [`DidError::InvalidDocumentJson`] — `raw_json` is not valid JSON or
-    ///   not a JSON object.
-    /// * [`DidError::DidMismatch`] — the document's `id` does not match `did`.
-    /// * [`DidError::InvalidScheme`] / [`DidError::InvalidUri`] /
-    ///   [`DidError::DuplicateServiceId`] / [`DidError::EmptyServiceId`] /
-    ///   [`DidError::EmptyServiceType`] — a service entry failed validation.
-    pub fn resolve_json(&self, did: &str, raw_json: &str) -> Result<DidDocument, DidError> {
-        validate_did(did)?;
-        let doc = DidDocument::from_json(raw_json)?;
-        if doc.id != did {
-            return Err(DidError::DidMismatch {
-                expected: did.to_string(),
-                actual: doc.id,
-            });
-        }
-        Ok(doc)
+    /// - [`DidError::InvalidPaginationLimit`] if `limit == 0` or `limit > MAX_PAGE_LIMIT`.
+    /// - [`DidError::InvalidCursor`] if `cursor` is `Some` and is not a valid
+    ///   unsigned integer cursor.
+    pub fn new(limit: usize, cursor: Option<String>) -> Result<Self, DidError> {
+        let params = Self { limit, cursor };
+        params.validate()?;
+        Ok(params)
     }
 
-    /// Resolve a DID from a pre-parsed [`serde_json::Value`].
+    /// Validate `self` and return the decoded starting offset.
     ///
-    /// Unknown top-level properties are preserved in
-    /// [`DidDocument::additional_properties`].
-    pub fn resolve_value(
+    /// # Errors
+    ///
+    /// Returns [`DidError::InvalidPaginationLimit`] or [`DidError::InvalidCursor`]
+    /// if any parameter is out of range or malformed.
+    pub fn validate(&self) -> Result<usize, DidError> {
+        if self.limit == 0 || self.limit > MAX_PAGE_LIMIT {
+            return Err(DidError::InvalidPaginationLimit {
+                limit: self.limit,
+                max: MAX_PAGE_LIMIT,
+            });
+        }
+
+        match &self.cursor {
+            None => Ok(0),
+            Some(raw) => {
+                if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(DidError::InvalidCursor {
+                        cursor: raw.clone(),
+                        reason: "cursor must be a non-negative integer".to_string(),
+                    });
+                }
+                raw.parse::<usize>().map_err(|e| DidError::InvalidCursor {
+                    cursor: raw.clone(),
+                    reason: e.to_string(),
+                })
+            }
+        }
+    }
+}
+
+/// A single versioned snapshot in a DID document's resolution history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DidHistoryEntry {
+    /// Monotonically increasing 1-based version number.
+    pub version: u64,
+    /// Unix timestamp (seconds) when this version was recorded.
+    pub updated_at: u64,
+    /// Snapshot of the DID document at this version.
+    pub document: DidDocument,
+}
+
+/// Paginated response for DID document history queries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaginatedHistoryResponse {
+    /// The resolved DID subject.
+    pub did: String,
+    /// History entries for the requested page, ordered by `version` ascending.
+    pub items: Vec<DidHistoryEntry>,
+    /// Total number of history entries recorded for `did`.
+    pub total: usize,
+    /// Effective page limit used for this response.
+    pub limit: usize,
+    /// Cursor to pass to the next query to retrieve subsequent entries, or
+    /// `None` when this is the final page.
+    pub next_cursor: Option<String>,
+    /// `true` when additional entries exist beyond this page.
+    pub has_more: bool,
+}
+
+/// Validate a DID string against W3C DID Core syntax (`did:<method>:<id>`).
+///
+/// # Errors
+///
+/// Returns [`DidError::InvalidDid`] if the DID is empty, contains whitespace,
+/// lacks the `did:` scheme, has an invalid method name, or has an empty
+/// method-specific identifier.
+pub fn validate_did(did: &str) -> Result<(), DidError> {
+    if did.is_empty() {
+        return Err(DidError::InvalidDid {
+            did: did.to_string(),
+            reason: "DID must not be empty".to_string(),
+        });
+    }
+    if did.chars().any(char::is_whitespace) {
+        return Err(DidError::InvalidDid {
+            did: did.to_string(),
+            reason: "DID must not contain whitespace".to_string(),
+        });
+    }
+    let Some(rest) = did.strip_prefix("did:") else {
+        return Err(DidError::InvalidDid {
+            did: did.to_string(),
+            reason: "DID must start with `did:`".to_string(),
+        });
+    };
+    let Some((method, method_id)) = rest.split_once(':') else {
+        return Err(DidError::InvalidDid {
+            did: did.to_string(),
+            reason: "DID must have format `did:<method>:<method-specific-id>`".to_string(),
+        });
+    };
+    if method.is_empty()
+        || !method
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+    {
+        return Err(DidError::InvalidDid {
+            did: did.to_string(),
+            reason: format!("invalid DID method `{method}`"),
+        });
+    }
+    if method_id.is_empty() {
+        return Err(DidError::InvalidDid {
+            did: did.to_string(),
+            reason: "method-specific identifier must not be empty".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// In-memory DID resolver that maintains versioned document history.
+#[derive(Debug, Default, Clone)]
+pub struct DidResolver {
+    entries: HashMap<String, Vec<DidHistoryEntry>>,
+}
+
+impl DidResolver {
+    /// Create a new, empty [`DidResolver`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a new version of `document` at `updated_at` (Unix seconds).
+    ///
+    /// Returns the assigned 1-based version number. If validation fails, the
+    /// resolver state is left unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DidError::InvalidDid`] if `document.id` is not a valid DID.
+    pub fn register_version(
+        &mut self,
+        document: DidDocument,
+        updated_at: u64,
+    ) -> Result<u64, DidError> {
+        validate_did(&document.id)?;
+
+        let history = self.entries.entry(document.id.clone()).or_default();
+        let version = history.len() as u64 + 1;
+        history.push(DidHistoryEntry {
+            version,
+            updated_at,
+            document,
+        });
+        Ok(version)
+    }
+
+    /// Resolve the latest [`DidDocument`] for `did`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DidError::InvalidDid`] if `did` is malformed, or
+    /// [`DidError::DidNotFound`] if no versions are registered for `did`.
+    pub fn resolve(&self, did: &str) -> Result<&DidDocument, DidError> {
+        let history = self.resolve_history(did)?;
+        history
+            .last()
+            .map(|entry| &entry.document)
+            .ok_or_else(|| DidError::DidNotFound(did.to_string()))
+    }
+
+    /// Return the complete, unpaginated version history for `did`.
+    ///
+    /// Preserves legacy behavior for callers that do not use pagination.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DidError::InvalidDid`] if `did` is malformed, or
+    /// [`DidError::DidNotFound`] if no versions are registered for `did`.
+    pub fn resolve_history(&self, did: &str) -> Result<&[DidHistoryEntry], DidError> {
+        validate_did(did)?;
+        self.entries
+            .get(did)
+            .map(Vec::as_slice)
+            .ok_or_else(|| DidError::DidNotFound(did.to_string()))
+    }
+
+    /// Return a paginated slice of the version history for `did`.
+    ///
+    /// # Errors
+    ///
+    /// - [`DidError::InvalidDid`] if `did` is malformed.
+    /// - [`DidError::InvalidPaginationLimit`] if `params.limit` is `0` or
+    ///   exceeds [`MAX_PAGE_LIMIT`].
+    /// - [`DidError::InvalidCursor`] if `params.cursor` is malformed or points
+    ///   past the end of the recorded history.
+    /// - [`DidError::DidNotFound`] if no versions are registered for `did`.
+    pub fn resolve_history_paginated(
         &self,
         did: &str,
-        value: serde_json::Value,
-    ) -> Result<DidDocument, DidError> {
+        params: &PaginationParams,
+    ) -> Result<PaginatedHistoryResponse, DidError> {
         validate_did(did)?;
-        if !value.is_object() {
-            return Err(DidError::InvalidDocumentJson {
-                reason: "DID document must be a JSON object".to_string(),
+        let offset = params.validate()?;
+
+        let history = self
+            .entries
+            .get(did)
+            .ok_or_else(|| DidError::DidNotFound(did.to_string()))?;
+
+        let total = history.len();
+        if offset >= total {
+            return Err(DidError::InvalidCursor {
+                cursor: params.cursor.clone().unwrap_or_default(),
+                reason: format!(
+                    "cursor offset {offset} is out of bounds for history of length {total}"
+                ),
             });
         }
-        let doc: DidDocument =
-            serde_json::from_value(value).map_err(|e| DidError::InvalidDocumentJson {
-                reason: e.to_string(),
-            })?;
-        doc.validate()?;
-        if doc.id != did {
-            return Err(DidError::DidMismatch {
-                expected: did.to_string(),
-                actual: doc.id,
-            });
-        }
-        Ok(doc)
+
+        let end = offset.saturating_add(params.limit).min(total);
+        let items = history[offset..end].to_vec();
+        let has_more = end < total;
+        let next_cursor = if has_more { Some(end.to_string()) } else { None };
+
+        Ok(PaginatedHistoryResponse {
+            did: did.to_string(),
+            items,
+            total,
+            limit: params.limit,
+            next_cursor,
+            has_more,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use crate::service::{Service, ServiceEndpoint};
 
-    const VALID_DID: &str = "did:stellar:testnet:GABC123";
+    fn sample_did() -> &'static str {
+        "did:stellar:testnet:GABC123"
+    }
+
+    fn seeded_resolver(count: usize) -> DidResolver {
+        let mut resolver = DidResolver::new();
+        for i in 1..=count {
+            let mut doc = DidDocument::new(sample_did());
+            let ep = ServiceEndpoint::uri(format!("https://hub.example.com/v{i}")).unwrap();
+            let svc = Service::new(format!("{}#svc-{i}", sample_did()), "IdentityHub", ep).unwrap();
+            doc.add_service(svc).unwrap();
+            resolver.register_version(doc, 1_700_000_000 + i as u64).unwrap();
+        }
+        resolver
+    }
+
+    // ── Normal cases ─────────────────────────────────────────────────────────
 
     #[test]
-    fn resolve_json_preserves_unknown_properties() {
-        let raw = r#"{
-            "@context": ["https://www.w3.org/ns/did/v1"],
-            "id": "did:stellar:testnet:GABC123",
-            "alsoKnownAs": ["https://alice.example.com"],
-            "controller": "did:stellar:testnet:GCTRL",
-            "verificationMethod": [
-                {
-                    "id": "did:stellar:testnet:GABC123#key-1",
-                    "type": "Ed25519VerificationKey2020",
-                    "controller": "did:stellar:testnet:GABC123"
-                }
-            ],
-            "customExtension": { "version": 2, "enabled": true },
-            "service": []
-        }"#;
+    fn paginated_history_returns_first_page_and_next_cursor() {
+        let resolver = seeded_resolver(5);
+        let params = PaginationParams::new(2, None).unwrap();
+        let page = resolver
+            .resolve_history_paginated(sample_did(), &params)
+            .unwrap();
 
-        let resolver = DidResolver::new();
-        let doc = resolver.resolve_json(VALID_DID, raw).unwrap();
-
-        assert_eq!(doc.id, VALID_DID);
-        assert_eq!(
-            doc.get_property("@context"),
-            Some(&json!(["https://www.w3.org/ns/did/v1"]))
-        );
-        assert_eq!(
-            doc.get_property("alsoKnownAs"),
-            Some(&json!(["https://alice.example.com"]))
-        );
-        assert_eq!(
-            doc.get_property("controller"),
-            Some(&json!("did:stellar:testnet:GCTRL"))
-        );
-        assert!(doc.get_property("verificationMethod").is_some());
-        assert_eq!(
-            doc.get_property("customExtension"),
-            Some(&json!({ "version": 2, "enabled": true }))
-        );
+        assert_eq!(page.did, sample_did());
+        assert_eq!(page.total, 5);
+        assert_eq!(page.limit, 2);
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.items[0].version, 1);
+        assert_eq!(page.items[1].version, 2);
+        assert!(page.has_more);
+        assert_eq!(page.next_cursor.as_deref(), Some("2"));
     }
 
     #[test]
-    fn resolve_json_produces_deterministic_output() {
-        let raw_a = r#"{
-            "zProp": 1,
-            "id": "did:stellar:testnet:GABC123",
-            "aProp": 2,
-            "mProp": { "b": 2, "a": 1 }
-        }"#;
-        let raw_b = r#"{
-            "aProp": 2,
-            "mProp": { "a": 1, "b": 2 },
-            "id": "did:stellar:testnet:GABC123",
-            "zProp": 1
-        }"#;
+    fn unpaginated_resolve_and_history_remain_unchanged() {
+        let resolver = seeded_resolver(3);
+        let latest = resolver.resolve(sample_did()).unwrap();
+        assert_eq!(latest.service[0].id, format!("{}#svc-3", sample_did()));
 
-        let resolver = DidResolver::new();
-        let doc_a = resolver.resolve_json(VALID_DID, raw_a).unwrap();
-        let doc_b = resolver.resolve_json(VALID_DID, raw_b).unwrap();
+        let full = resolver.resolve_history(sample_did()).unwrap();
+        assert_eq!(full.len(), 3);
+        assert_eq!(full[0].version, 1);
+        assert_eq!(full[2].version, 3);
+    }
 
-        assert_eq!(doc_a.to_json().unwrap(), doc_b.to_json().unwrap());
+    // ── Boundary cases ───────────────────────────────────────────────────────
+
+    #[test]
+    fn exact_page_size_sets_has_more_false_and_no_next_cursor() {
+        let resolver = seeded_resolver(3);
+        let params = PaginationParams::new(3, None).unwrap();
+        let page = resolver
+            .resolve_history_paginated(sample_did(), &params)
+            .unwrap();
+
+        assert_eq!(page.items.len(), 3);
+        assert!(!page.has_more);
+        assert_eq!(page.next_cursor, None);
     }
 
     #[test]
-    fn resolve_json_rejects_mismatched_did() {
-        let raw = r#"{"id": "did:stellar:testnet:GOTHER"}"#;
-        let err = DidResolver::new().resolve_json(VALID_DID, raw).unwrap_err();
+    fn max_page_limit_is_accepted_and_above_is_rejected() {
+        let ok = PaginationParams::new(MAX_PAGE_LIMIT, None);
+        assert!(ok.is_ok());
+
+        let err = PaginationParams::new(MAX_PAGE_LIMIT + 1, None).unwrap_err();
         assert!(matches!(
             err,
-            DidError::DidMismatch { ref expected, ref actual }
-                if expected == VALID_DID && actual == "did:stellar:testnet:GOTHER"
+            DidError::InvalidPaginationLimit {
+                limit,
+                max
+            } if limit == MAX_PAGE_LIMIT + 1 && max == MAX_PAGE_LIMIT
+        ));
+    }
+
+    // ── Failure cases ────────────────────────────────────────────────────────
+
+    #[test]
+    fn zero_limit_is_rejected_explicitly() {
+        let err = PaginationParams::new(0, None).unwrap_err();
+        assert!(matches!(
+            err,
+            DidError::InvalidPaginationLimit { limit: 0, .. }
         ));
     }
 
     #[test]
-    fn resolve_json_rejects_invalid_did_argument() {
-        let raw = r#"{"id": "did:stellar:testnet:GABC123"}"#;
-        let err = DidResolver::new()
-            .resolve_json("not-a-did", raw)
+    fn malformed_and_out_of_bounds_cursors_are_rejected() {
+        let err = PaginationParams::new(10, Some("abc".to_string())).unwrap_err();
+        assert!(matches!(err, DidError::InvalidCursor { .. }));
+
+        let err_neg = PaginationParams::new(10, Some("-1".to_string())).unwrap_err();
+        assert!(matches!(err_neg, DidError::InvalidCursor { .. }));
+
+        let resolver = seeded_resolver(2);
+        let params = PaginationParams::new(10, Some("2".to_string())).unwrap();
+        let err_oob = resolver
+            .resolve_history_paginated(sample_did(), &params)
             .unwrap_err();
+        assert!(matches!(err_oob, DidError::InvalidCursor { .. }));
+    }
+
+    #[test]
+    fn invalid_did_and_missing_did_return_actionable_errors() {
+        let mut resolver = DidResolver::new();
+        let bad_doc = DidDocument::new("not-a-did");
+        let err = resolver.register_version(bad_doc, 100).unwrap_err();
         assert!(matches!(err, DidError::InvalidDid { .. }));
-    }
+        assert!(resolver.entries.is_empty());
 
-    #[test]
-    fn resolve_json_rejects_non_object_json() {
-        let err = DidResolver::new()
-            .resolve_json(VALID_DID, r#"["not", "an", "object"]"#)
+        let params = PaginationParams::new(10, None).unwrap();
+        let not_found = resolver
+            .resolve_history_paginated(sample_did(), &params)
             .unwrap_err();
-        assert!(matches!(err, DidError::InvalidDocumentJson { .. }));
+        assert!(matches!(not_found, DidError::DidNotFound(_)));
     }
 
-    #[test]
-    fn resolve_json_rejects_disallowed_service_scheme() {
-        let raw = r#"{
-            "id": "did:stellar:testnet:GABC123",
-            "custom": "kept-only-on-success",
-            "service": [{
-                "id": "did:stellar:testnet:GABC123#bad",
-                "service_type": "LinkedDomains",
-                "service_endpoint": "javascript:alert(1)"
-            }]
-        }"#;
-        let err = DidResolver::new().resolve_json(VALID_DID, raw).unwrap_err();
-        assert!(matches!(err, DidError::InvalidScheme { .. }));
-    }
+    // ── Integration workflow ─────────────────────────────────────────────────
 
     #[test]
-    fn resolve_value_preserves_unknown_properties() {
-        let val = json!({
-            "id": VALID_DID,
-            "@context": "https://www.w3.org/ns/did/v1",
-            "authentication": ["did:stellar:testnet:GABC123#key-1"]
-        });
-        let doc = DidResolver::new().resolve_value(VALID_DID, val).unwrap();
-        assert_eq!(
-            doc.get_property("authentication"),
-            Some(&json!(["did:stellar:testnet:GABC123#key-1"]))
-        );
+    fn full_pagination_workflow_reconstructs_complete_history() {
+        let resolver = seeded_resolver(7);
+        let mut collected_versions = Vec::new();
+        let mut cursor: Option<String> = None;
+
+        loop {
+            let params = PaginationParams::new(3, cursor).unwrap();
+            let page = resolver
+                .resolve_history_paginated(sample_did(), &params)
+                .unwrap();
+
+            for entry in page.items {
+                collected_versions.push(entry.version);
+            }
+
+            if !page.has_more {
+                assert!(page.next_cursor.is_none());
+                break;
+            }
+            cursor = page.next_cursor;
+            assert!(cursor.is_some());
+        }
+
+        assert_eq!(collected_versions, vec![1, 2, 3, 4, 5, 6, 7]);
     }
 }

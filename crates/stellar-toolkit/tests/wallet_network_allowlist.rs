@@ -5,7 +5,7 @@
 //! entry point. No live HTTP is made; the tests cover only the input-validation
 //! and allowlist-enforcement layers.
 
-use stellar_toolkit::wallet::{AllowedNetwork, fund_account_on, generate_wallet};
+use stellar_toolkit::wallet::{fund_account_on, generate_wallet, AllowedNetwork};
 
 // ── AllowedNetwork construction ───────────────────────────────────────────────
 
@@ -27,10 +27,8 @@ fn futurenet_passphrase_resolves_to_futurenet() {
 fn mainnet_passphrase_is_not_in_the_allowlist() {
     // The public network passphrase must be rejected: Friendbot does not exist
     // on mainnet and accidental mainnet funding is a security risk.
-    let err = AllowedNetwork::from_passphrase(
-        "Public Global Stellar Network ; September 2015",
-    )
-    .expect_err("mainnet must not be in the allowlist");
+    let err = AllowedNetwork::from_passphrase("Public Global Stellar Network ; September 2015")
+        .expect_err("mainnet must not be in the allowlist");
 
     assert!(
         err.to_string().contains("not in the funding allowlist"),
@@ -147,12 +145,12 @@ fn fund_account_on_accepts_a_valid_stellar_account_id_format() {
     // The call will fail (no live Friendbot) but the error must be a network
     // error, not an "invalid account id" error — proving that validation passed.
     let wallet = generate_wallet().expect("generate wallet");
-    let err = fund_account_on(&wallet.account, AllowedNetwork::Testnet)
-        .expect_err("network request will fail in a test environment");
-
-    // The error must come from the HTTP layer, not from input validation.
-    assert!(
-        !err.to_string().contains("invalid account id"),
-        "a valid account id must pass validation: {err}"
-    );
+    // Depending on connectivity this either succeeds or fails at the HTTP
+    // layer; either way it must not be rejected by input validation.
+    if let Err(err) = fund_account_on(&wallet.account, AllowedNetwork::Testnet) {
+        assert!(
+            !err.to_string().contains("invalid account id"),
+            "a valid account id must pass validation: {err}"
+        );
+    }
 }

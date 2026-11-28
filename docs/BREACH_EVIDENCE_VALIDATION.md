@@ -66,6 +66,23 @@ A rejected breach leaves no trace in `pending_txs`; the next scan re-evaluates
 it from scratch. That matters because the monitor re-detects a breach on every
 scan, so a validation failure does not need any cleanup.
 
+## Retrying transient storage failures
+
+Reading the channel's stored state goes through `StorageBackend`, which can fail
+transiently (timeouts, dropped connections, lock contention). Such failures are
+retried so that a momentary storage hiccup does not delay a justice response.
+
+- Only errors classified as transient are retried. Validation errors
+  (`JusticeError::InvalidBreach`) are never retried, since re-running the same
+  check on the same input yields the same result.
+- Retries use bounded exponential backoff. Exhausting the retry budget returns
+  the last storage error to the caller; no partial state is written.
+- **No duplicate actions.** A justice transaction is recorded in `pending_txs`
+  under its breach identity (`channel_id` plus `new_sequence`) before submission.
+  A retry that finds the identity already recorded returns the existing
+  transaction instead of building and submitting a second one. Operators can
+  inspect `pending_txs` to recover a claim whose submission outcome is unknown.
+
 ## What this does *not* cover
 
 Validation is an internal-consistency check, not a proof of fraud. It cannot

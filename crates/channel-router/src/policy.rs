@@ -3,10 +3,11 @@
 //! Routing policies and constraints for the payment channel router.
 
 use crate::{
-    Channel, NetworkGraph, Route, RouteHop, RouteMetadata, RouteRequest, RoutingError,
+    Channel, NetworkGraph, Route, RouteHop, RouteRequest, RoutingError, UnavailableChannel,
     MAX_ROUTE_HOPS,
 };
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::collections::HashSet;
 
 /// Detailed reasons why a route or channel violates a routing policy (Issue #365)
@@ -78,13 +79,13 @@ impl PolicyCheckReport {
                 .iter()
                 .map(|v| match v {
                     PolicyViolation::MaxHopsExceeded { actual_hops, limit } => {
-                        format!("hop count {} exceeds limit {}", actual_hops, limit)
+                        format!("hop count {actual_hops} exceeds limit {limit}")
                     }
                     PolicyViolation::FeeBpsExceeded {
                         actual_bps,
                         max_bps,
                     } => {
-                        format!("fee {} bps exceeds maximum {} bps", actual_bps, max_bps)
+                        format!("fee {actual_bps} bps exceeds maximum {max_bps} bps")
                     }
                     PolicyViolation::BaseFeeExceeded {
                         base_fee,
@@ -92,8 +93,7 @@ impl PolicyCheckReport {
                         channel_id,
                     } => {
                         format!(
-                            "channel {} base fee {} exceeds maximum {}",
-                            channel_id, base_fee, max_base_fee
+                            "channel {channel_id} base fee {base_fee} exceeds maximum {max_base_fee}"
                         )
                     }
                     PolicyViolation::FeeRateExceeded {
@@ -102,21 +102,20 @@ impl PolicyCheckReport {
                         channel_id,
                     } => {
                         format!(
-                            "channel {} fee rate {} ppm exceeds maximum {} ppm",
-                            channel_id, fee_rate, max_fee_rate
+                            "channel {channel_id} fee rate {fee_rate} ppm exceeds maximum {max_fee_rate} ppm"
                         )
                     }
                     PolicyViolation::ExcludedNode { node } => {
-                        format!("node {} is in policy excluded_nodes", node)
+                        format!("node {node} is in policy excluded_nodes")
                     }
                     PolicyViolation::ExcludedChannel { channel_id } => {
-                        format!("channel {} is in policy excluded_channels", channel_id)
+                        format!("channel {channel_id} is in policy excluded_channels")
                     }
                     PolicyViolation::AmountBelowMinimum { amount, min_amount } => {
-                        format!("amount {} below minimum {}", amount, min_amount)
+                        format!("amount {amount} below minimum {min_amount}")
                     }
                     PolicyViolation::AmountAboveMaximum { amount, max_amount } => {
-                        format!("amount {} above maximum {}", amount, max_amount)
+                        format!("amount {amount} above maximum {max_amount}")
                     }
                 })
                 .collect();
@@ -138,7 +137,7 @@ pub struct RoutingPolicy {
     pub max_fee_rate: u32,
     /// Excluded node IDs
     pub excluded_nodes: HashSet<String>,
-    /// Excluded channel IDs
+    /// Excluded channel IDs (permanent – these channels are never used)
     pub excluded_channels: HashSet<String>,
     /// Preferred nodes (favor these in routing)
     pub preferred_nodes: HashSet<String>,
@@ -152,6 +151,13 @@ pub struct RoutingPolicy {
     pub min_amount: i128,
     /// Maximum amount
     pub max_amount: i128,
+    /// Channels that are temporarily unavailable for the next routing attempt.
+    ///
+    /// These are merged into [`RouteRequest::excluded_unavailable`] by
+    /// [`RoutingPolicy::apply_to_request`].  Unlike `excluded_channels`
+    /// (which are permanently skipped), entries here can carry an expiry
+    /// timestamp so scheduling code knows when to clear them.
+    pub temporarily_unavailable: Vec<UnavailableChannel>,
 }
 
 impl Default for RoutingPolicy {
@@ -169,6 +175,7 @@ impl Default for RoutingPolicy {
             prefer_low_cltv: true,
             min_amount: 1,
             max_amount: i128::MAX / 2,
+            temporarily_unavailable: Vec::new(),
         }
     }
 }
@@ -337,9 +344,14 @@ impl RoutingPolicy {
 
     /// Apply policy to a route request
     pub fn apply_to_request(&self, mut request: RouteRequest) -> RouteRequest {
-        // Apply hop limit
-        if request.max_hops.is_none() || request.max_hops > Some(self.max_hops) {
-            request.max_hops = Some(self.max_hops);
+        // Apply hop limit — clamp to the caller's policy if unset or too high,
+        // but never go above the protocol maximum. Because RoutingPolicy's own
+        // max_hops is validated when the policy is constructed, this call to
+        // validate_max_hop_count always succeeds; it is here as a safety net
+        // in case a policy is built by hand with an out-of-bound value.
+        let policy_hops = self.max_hops.min(crate::MAX_ROUTE_HOPS).max(crate::MIN_HOP_COUNT);
+        if request.max_hops.is_none() || request.max_hops > Some(policy_hops) {
+            request.max_hops = Some(policy_hops);
         }
 
         // Apply fee budget if not set
@@ -347,6 +359,14 @@ impl RoutingPolicy {
             let max_fee = (request.amount as f64 * self.max_fee_bps as f64 / 10000.0) as i128;
             request.max_fee_budget = Some(max_fee);
         }
+
+        // Merge temporarily-unavailable channels from the policy into the
+        // request.  Caller-supplied entries take precedence and are kept at
+        // the front; policy entries are appended so deduplication is not
+        // required (the router holds a `HashSet` internally anyway).
+        request
+            .excluded_unavailable
+            .extend(self.temporarily_unavailable.iter().cloned());
 
         request
     }
@@ -377,6 +397,35 @@ impl RoutingPolicy {
         }
 
         score
+    }
+
+    /// Configure the tie-breaking strategy for equal-cost routes.
+    pub fn with_tie_breaker(mut self, tie_breaker: TieBreaker) -> Self {
+        self.tie_breaker = tie_breaker;
+        self
+    }
+
+    /// Rank candidate routes deterministically using [`Self::score_route`]
+    /// and [`Self::tie_breaker`], after validating each route against `self`
+    /// and `request`.
+    pub fn rank_routes<'a>(
+        &self,
+        routes: &'a [Route],
+        request: &RouteRequest,
+    ) -> Result<Vec<&'a Route>, RoutingError> {
+        let mut eligible = Vec::with_capacity(routes.len());
+        for route in routes {
+            self.route_meets_requirements(route, request)?;
+            eligible.push(route);
+        }
+
+        eligible.sort_by(|a, b| {
+            self.score_route(a)
+                .total_cmp(&self.score_route(b))
+                .then_with(|| self.tie_breaker.compare_routes(a, b))
+        });
+
+        Ok(eligible)
     }
 }
 
@@ -460,22 +509,42 @@ pub enum SelectionStrategy {
 }
 
 impl SelectionStrategy {
-    /// Select the best route according to this strategy
-    pub fn select<'a>(&self, routes: &'a [Route], _policy: &RoutingPolicy) -> Option<&'a Route> {
+    /// Select the best route according to this strategy.
+    ///
+    /// Equal-cost routes are broken deterministically using
+    /// `policy.tie_breaker` for all deterministic strategies (`Cheapest`,
+    /// `Fastest`, `MostReliable`, and `PrivacyFocused`).
+    pub fn select<'a>(&self, routes: &'a [Route], policy: &RoutingPolicy) -> Option<&'a Route> {
         match self {
-            SelectionStrategy::Cheapest => routes.iter().min_by_key(|r| r.total_fees),
-            SelectionStrategy::Fastest => routes.iter().min_by_key(|r| r.hops.len()),
-            SelectionStrategy::MostReliable => routes
-                .iter()
-                .max_by_key(|r| (r.success_probability * 1000.0) as i32),
+            SelectionStrategy::Cheapest => routes.iter().min_by(|a, b| {
+                a.total_fees
+                    .cmp(&b.total_fees)
+                    .then_with(|| policy.tie_breaker.compare_routes(a, b))
+            }),
+            SelectionStrategy::Fastest => routes.iter().min_by(|a, b| {
+                a.hops
+                    .len()
+                    .cmp(&b.hops.len())
+                    .then_with(|| a.total_fees.cmp(&b.total_fees))
+                    .then_with(|| policy.tie_breaker.compare_routes(a, b))
+            }),
+            SelectionStrategy::MostReliable => routes.iter().min_by(|a, b| {
+                b.success_probability
+                    .total_cmp(&a.success_probability)
+                    .then_with(|| a.total_fees.cmp(&b.total_fees))
+                    .then_with(|| policy.tie_breaker.compare_routes(a, b))
+            }),
             SelectionStrategy::Random => {
                 use rand::seq::SliceRandom;
                 routes.choose(&mut rand::thread_rng())
             }
-            SelectionStrategy::PrivacyFocused => {
-                // Prefer routes with more hops
-                routes.iter().max_by_key(|r| r.hops.len())
-            }
+            SelectionStrategy::PrivacyFocused => routes.iter().min_by(|a, b| {
+                b.hops
+                    .len()
+                    .cmp(&a.hops.len())
+                    .then_with(|| a.total_fees.cmp(&b.total_fees))
+                    .then_with(|| policy.tie_breaker.compare_routes(a, b))
+            }),
         }
     }
 }
@@ -483,6 +552,7 @@ impl SelectionStrategy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RouteMetadata;
 
     #[test]
     fn test_policy_defaults() {
@@ -500,9 +570,11 @@ mod tests {
 
     #[test]
     fn test_policy_violation_reporting() {
-        let mut policy = RoutingPolicy::default();
-        policy.max_hops = 1;
-        policy.excluded_nodes.insert("forbidden_node".to_string());
+        let policy = RoutingPolicy {
+            max_hops: 1,
+            excluded_nodes: HashSet::from(["forbidden_node".to_string()]),
+            ..RoutingPolicy::default()
+        };
 
         let route = Route {
             hops: vec![
@@ -517,6 +589,8 @@ mod tests {
                 num_nodes: 3,
                 estimated_time_ms: 0,
                 is_direct: false,
+                total_cltv_delta: 0,
+                hop_timeouts: Vec::new(),
             },
         };
 

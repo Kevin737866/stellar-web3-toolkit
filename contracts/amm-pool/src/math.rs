@@ -8,8 +8,12 @@
 //! `#[cfg(test)] mod math_tests`, and putting them anywhere else would only add
 //! a file without making them more testable.
 
-/// Swap fee: 0.3% → multiply input amount by 997 / 1000 before applying x*y=k.
+/// Swap fee numerator and denominator in parts per thousand (`FEE_DEN = 1000`).
+///
+/// Represents a 0.3% (30 basis points, `3 / 1000`) fee deducted from `amount_in`,
+/// leaving `FEE_NUM / FEE_DEN` (`997 / 1000`) of the input for the constant-product curve.
 pub const FEE_NUM: i128 = 997;
+/// Denominator for swap fee scaling (parts per thousand: `1000` = 100%, `3` = 0.3% = 30 bps).
 pub const FEE_DEN: i128 = 1000;
 
 /// Add two reserve, LP or allowance amounts, aborting on overflow (#399).
@@ -113,6 +117,11 @@ pub fn mul_u128_wide(a: u128, b: u128) -> (u128, u128) {
 
 /// Checked constant-product output calculation (#216).
 ///
+/// Applies a 0.3% (30 bps, `997 / 1000` parts per thousand) input fee and computes
+/// `(amount_in_with_fee * reserve_out) / (reserve_in + amount_in_with_fee)`.
+/// Both `amount_in * FEE_NUM / FEE_DEN` and the final division truncate toward zero
+/// (round down), favoring pool reserves.
+///
 /// Returns `None` when any input is non-positive or when intermediate or
 /// denominator arithmetic overflows `i128`.
 pub fn checked_amount_out(amount_in: i128, reserve_in: i128, reserve_out: i128) -> Option<i128> {
@@ -128,13 +137,20 @@ pub fn checked_amount_out(amount_in: i128, reserve_in: i128, reserve_out: i128) 
     numerator.checked_div(denominator)
 }
 
+/// Constant-product output calculation with 0.3% (30 bps, `997 / 1000`) input fee.
+///
+/// Both the fee-adjusted input and output integer divisions round down (truncate toward zero),
+/// favoring the pool. Panics on non-positive inputs or `i128` overflow.
 pub fn amount_out(amount_in: i128, reserve_in: i128, reserve_out: i128) -> i128 {
     assert!(amount_in > 0, "amount_in");
     assert!(reserve_in > 0 && reserve_out > 0, "reserves");
     checked_amount_out(amount_in, reserve_in, reserve_out).expect("amount_out overflow")
 }
 
-/// Checked proportional quote without fee (#216).
+/// Checked proportional quote without fee (0% fee, #216).
+///
+/// Computes `amount_a * reserve_b / reserve_a` using integer division that
+/// truncates toward zero (rounds down).
 ///
 /// Returns `None` when any input is non-positive or when `amount_a * reserve_b`
 /// overflows `i128`.
@@ -506,6 +522,9 @@ pub fn amount_in_for_price(
     None
 }
 
+/// Initial LP token minting for the first deposit (0% fee).
+///
+/// Returns `floor(sqrt(amount_a * amount_b))`, rounding down toward zero.
 pub fn liquidity_amounts_first_deposit(amount_a: i128, amount_b: i128) -> i128 {
     assert!(
         amount_a > 0 && amount_b > 0,
@@ -519,9 +538,9 @@ pub fn liquidity_amounts_first_deposit(amount_a: i128, amount_b: i128) -> i128 {
 
 /// Uniswap V2–style K check after flash repayment (`balance*` are live token balances of the pool).
 ///
-/// Uses checked pre-scaling plus exact 256-bit product comparison (#216) so
-/// large reserves cannot saturate both sides to `i128::MAX` and falsely pass an
-/// under-repaid flash loan.
+/// Charges a 0.3% (30 bps, `3 / 1000` parts per thousand) fee on the repaid input leg(s)
+/// (`balance * FEE_DEN - amount_in * 3`) and enforces `lhs >= rhs` using exact 256-bit
+/// product comparison (#216) so rounding never permits under-repayment.
 pub fn flash_k_ok(
     balance_a: i128,
     balance_b: i128,

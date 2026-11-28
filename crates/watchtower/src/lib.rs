@@ -10,9 +10,11 @@
 //! - HTLC timeout monitoring and refund triggering
 //! - Automated justice transaction submission
 //! - Alert notification system
+//! - Retry of transient storage failures without duplicate actions
 //! - Health checks for the storage backends that hold breach evidence
 //! - Signed operator recovery bundles for key and data recovery
 
+pub mod alert;
 pub mod justice;
 pub mod monitor;
 pub mod recovery;
@@ -23,6 +25,94 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::{error, info, warn};
+
+/// Retry policy for transient watchtower storage failures.
+///
+/// Retries are only attempted for errors classified as transient by
+/// [`WatchtowerError::is_transient`]. Each retry reuses the same idempotency
+/// key so that a write which actually landed before the error was reported is
+/// not applied twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageRetryPolicy {
+    /// Maximum number of attempts, including the first. Must be at least 1.
+    pub max_attempts: u32,
+    /// Backoff before the second attempt, in milliseconds. Doubles each retry.
+    pub initial_backoff_ms: u64,
+    /// Upper bound on any single backoff, in milliseconds.
+    pub max_backoff_ms: u64,
+}
+
+impl Default for StorageRetryPolicy {
+    fn default() -> Self {
+        StorageRetryPolicy {
+            max_attempts: 3,
+            initial_backoff_ms: 50,
+            max_backoff_ms: 1_000,
+        }
+    }
+}
+
+impl StorageRetryPolicy {
+    /// Validate the policy, rejecting values that would silently misbehave.
+    pub fn validate(&self) -> Result<(), WatchtowerError> {
+        if self.max_attempts == 0 {
+            return Err(WatchtowerError::InvalidConfig(
+                "storage retry max_attempts must be at least 1".to_string(),
+            ));
+        }
+        if self.max_backoff_ms < self.initial_backoff_ms {
+            return Err(WatchtowerError::InvalidConfig(format!(
+                "storage retry max_backoff_ms ({}) must be >= initial_backoff_ms ({})",
+                self.max_backoff_ms, self.initial_backoff_ms
+            )));
+        }
+        Ok(())
+    }
+
+    /// Backoff to sleep before retry number `retry` (1-based).
+    pub fn backoff_for(&self, retry: u32) -> std::time::Duration {
+        let shift = retry.saturating_sub(1).min(63);
+        let ms = self
+            .initial_backoff_ms
+            .saturating_mul(1u64.checked_shl(shift).unwrap_or(u64::MAX))
+            .min(self.max_backoff_ms);
+        std::time::Duration::from_millis(ms)
+    }
+}
+
+/// Run a storage operation with retries for transient failures.
+///
+/// The closure is invoked once per attempt and must be idempotent (keyed by a
+/// stable identifier) so that retrying after an ambiguous failure cannot
+/// produce duplicate durable actions. Non-transient errors are returned
+/// immediately without retrying.
+pub fn retry_storage<T, F>(policy: &StorageRetryPolicy, mut op: F) -> Result<T, WatchtowerError>
+where
+    F: FnMut() -> Result<T, WatchtowerError>,
+{
+    policy.validate()?;
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        match op() {
+            Ok(value) => return Ok(value),
+            Err(err) => {
+                if !err.is_transient() || attempt >= policy.max_attempts {
+                    return Err(err);
+                }
+                let backoff = policy.backoff_for(attempt);
+                warn!(
+                    attempt,
+                    max_attempts = policy.max_attempts,
+                    ?backoff,
+                    error = %err,
+                    "transient storage failure, retrying with same idempotency key"
+                );
+                std::thread::sleep(backoff);
+            }
+        }
+    }
+}
 
 /// Watchtower configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +135,9 @@ pub struct WatchtowerConfig {
     pub db_path: Option<String>,
     /// Alert webhook URL
     pub alert_webhook_url: Option<String>,
+    /// Retry policy for alert delivery
+    #[serde(default)]
+    pub alert_delivery: alert::AlertDeliveryConfig,
     /// Retention rules applied when the store is compacted
     #[serde(default)]
     pub compaction: storage::CompactionPolicy,
@@ -52,6 +145,10 @@ pub struct WatchtowerConfig {
     /// pass, leaving [`Watchtower::compact_storage`] as the only entry point.
     #[serde(default = "default_compaction_interval_secs")]
     pub compaction_interval_secs: u64,
+    /// Retry policy for transient storage failures. Defaults preserve the
+    /// previous single-attempt behavior only when `max_attempts` is 1.
+    #[serde(default)]
+    pub storage_retry: StorageRetryPolicy,
     /// How often the monitor loop probes storage health, in seconds. Zero
     /// (the default) disables automatic probes, so existing deployments keep
     /// their current behaviour; call [`Watchtower::check_storage_health`]
@@ -82,8 +179,10 @@ impl Default for WatchtowerConfig {
             justice_fee_budget: 100_000, // 0.1 XLM
             db_path: None,
             alert_webhook_url: None,
+            alert_delivery: alert::AlertDeliveryConfig::default(),
             compaction: storage::CompactionPolicy::default(),
             compaction_interval_secs: default_compaction_interval_secs(),
+            storage_retry: StorageRetryPolicy::default(),
             storage_health_check_interval_secs: 0,
             storage_health_check: storage::StorageHealthCheckOptions::default(),
         }
@@ -287,6 +386,10 @@ pub struct WatchtowerStats {
     pub justice_actions_persisted: u64,
     /// Total alerts generated
     pub alerts_generated: u64,
+    /// Total alerts successfully delivered
+    pub alerts_delivered: u64,
+    /// Total alert delivery attempts that failed
+    pub alert_deliveries_failed: u64,
     /// Last scan timestamp
     pub last_scan_ts: u64,
     /// Uptime in seconds
@@ -295,6 +398,8 @@ pub struct WatchtowerStats {
     pub compactions_run: u64,
     /// Total records removed by compaction
     pub records_compacted: u64,
+    /// Total storage operations that were retried after a transient failure
+    pub storage_retries: u64,
 }
 
 /// Watchtower service
@@ -307,6 +412,8 @@ pub struct Watchtower {
     monitor: monitor::ChannelMonitor,
     /// Justice service
     justice: justice::JusticeService,
+    /// Retryable alert delivery service
+    alert_delivery: alert::AlertDeliveryService,
     /// Persistent storage for subscriptions, channel state and alerts
     storage: Arc<dyn storage::StorageBackend>,
 }
@@ -314,12 +421,26 @@ pub struct Watchtower {
 impl Watchtower {
     /// Create a new watchtower with the given configuration
     pub fn new(config: WatchtowerConfig) -> Result<Self, WatchtowerError> {
+        config.storage_retry.validate()?;
+        Self::with_alert_transport(config, Arc::new(alert::WebhookAlertTransport))
+    }
+
+    /// Create a new watchtower with a custom [`alert::AlertTransport`].
+    pub fn with_alert_transport(
+        config: WatchtowerConfig,
+        transport: Arc<dyn alert::AlertTransport>,
+    ) -> Result<Self, WatchtowerError> {
+        config.alert_delivery.validate()?;
+        if let Some(ref url) = config.alert_webhook_url {
+            alert::validate_destination(url)?;
+        }
+
         let storage: Arc<dyn storage::StorageBackend> = match &config.db_path {
             Some(path) => Arc::new(storage::SqliteStorage::new(path)?),
             None => Arc::new(storage::InMemoryStorage::new()),
         };
 
-        Self::with_storage(config, storage)
+        Self::with_storage_and_transport(config, storage, transport)
     }
 
     /// Create a watchtower backed by a caller-supplied storage backend.
@@ -331,6 +452,14 @@ impl Watchtower {
     pub fn with_storage(
         config: WatchtowerConfig,
         storage: Arc<dyn storage::StorageBackend>,
+    ) -> Result<Self, WatchtowerError> {
+        Self::with_storage_and_transport(config, storage, Arc::new(alert::WebhookAlertTransport))
+    }
+
+    fn with_storage_and_transport(
+        config: WatchtowerConfig,
+        storage: Arc<dyn storage::StorageBackend>,
+        transport: Arc<dyn alert::AlertTransport>,
     ) -> Result<Self, WatchtowerError> {
         config
             .storage_health_check
@@ -349,6 +478,12 @@ impl Watchtower {
             Arc::clone(&storage),
         );
 
+        let alert_delivery = alert::AlertDeliveryService::new(
+            config.alert_delivery,
+            Arc::clone(&storage),
+            transport,
+        )?;
+
         let state = Arc::new(WatchtowerState {
             subscribed_channels: RwLock::new(std::collections::HashSet::new()),
             channel_states: RwLock::new(std::collections::HashMap::new()),
@@ -366,8 +501,52 @@ impl Watchtower {
             state,
             monitor,
             justice,
+            alert_delivery,
             storage,
         })
+    }
+
+    /// Deliver `alert` through the configured alert webhook and persist the
+    /// delivery record so it can be retried.
+    pub async fn deliver_alert(
+        &self,
+        alert: &Alert,
+    ) -> Result<alert::AlertDelivery, WatchtowerError> {
+        let destination = self.config.alert_webhook_url.as_deref().ok_or_else(|| {
+            WatchtowerError::InvalidConfig(
+                "alert_webhook_url is required to deliver alerts".to_string(),
+            )
+        })?;
+        Ok(self
+            .alert_delivery
+            .enqueue_and_deliver(alert, destination)
+            .await?)
+    }
+
+    /// List alert deliveries that are still pending.
+    pub fn pending_alert_deliveries(&self) -> Result<Vec<alert::AlertDelivery>, WatchtowerError> {
+        Ok(self.alert_delivery.pending_deliveries()?)
+    }
+
+    /// Retry every pending delivery that is due.
+    pub async fn retry_pending_alerts(&self) -> Result<alert::RetryReport, WatchtowerError> {
+        Ok(self.alert_delivery.retry_pending_deliveries().await?)
+    }
+
+    /// Retry one specific delivery immediately, bypassing its backoff.
+    pub async fn retry_alert_delivery(
+        &self,
+        delivery_id: &alert::DeliveryId,
+    ) -> Result<alert::AlertDelivery, WatchtowerError> {
+        Ok(self.alert_delivery.retry_delivery(delivery_id).await?)
+    }
+
+    /// Look up one alert delivery record.
+    pub fn get_alert_delivery(
+        &self,
+        delivery_id: &alert::DeliveryId,
+    ) -> Result<Option<alert::AlertDelivery>, WatchtowerError> {
+        Ok(self.alert_delivery.get_delivery(delivery_id)?)
     }
 
     /// Start the watchtower service
@@ -382,6 +561,7 @@ impl Watchtower {
         let config = self.config.clone();
         let monitor = self.monitor.clone();
         let justice = self.justice.clone();
+        let alert_delivery = self.alert_delivery.clone();
 
         tokio::spawn(async move {
             loop {
@@ -406,7 +586,23 @@ impl Watchtower {
                                     breach.old_sequence,
                                     breach.new_sequence,
                                 );
-                                state.add_alert(alert);
+                                state.add_alert(alert.clone());
+                                state.stats.write().alerts_generated += 1;
+
+                                if let Some(ref webhook_url) = config.alert_webhook_url {
+                                    match alert_delivery
+                                        .enqueue_and_deliver(&alert, webhook_url)
+                                        .await
+                                    {
+                                        Ok(_) => {
+                                            state.stats.write().alerts_delivered += 1;
+                                        }
+                                        Err(e) => {
+                                            state.stats.write().alert_deliveries_failed += 1;
+                                            error!("Failed to deliver breach alert: {:?}", e);
+                                        }
+                                    }
+                                }
 
                                 // Submit justice if enabled
                                 if config.auto_justice {
@@ -433,6 +629,21 @@ impl Watchtower {
                         Err(e) => {
                             error!("Error checking channel {}: {:?}", channel_id, e);
                         }
+                    }
+                }
+
+                // Retry any pending alert deliveries whose backoff has elapsed.
+                match alert_delivery.retry_pending_deliveries().await {
+                    Ok(report) => {
+                        if report.delivered > 0 || report.failed > 0 {
+                            let mut stats = state.stats.write();
+                            stats.alerts_delivered += report.delivered as u64;
+                            stats.alert_deliveries_failed +=
+                                (report.rescheduled + report.failed) as u64;
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to retry pending alert deliveries: {:?}", e);
                     }
                 }
 
@@ -944,8 +1155,26 @@ pub enum WatchtowerError {
     #[error("Justice transaction failed: {0}")]
     JusticeFailed(String),
 
+    #[error("Invalid configuration: {0}")]
+    InvalidConfig(String),
+
+    #[error("Alert delivery failed: {0}")]
+    AlertDeliveryFailed(String),
+
     #[error("Watchtower not running")]
     NotRunning,
+}
+
+impl From<alert::AlertDeliveryError> for WatchtowerError {
+    fn from(e: alert::AlertDeliveryError) -> Self {
+        match e {
+            alert::AlertDeliveryError::InvalidConfig(msg)
+            | alert::AlertDeliveryError::InvalidDestination(msg) => {
+                WatchtowerError::InvalidConfig(msg)
+            }
+            other => WatchtowerError::AlertDeliveryFailed(other.to_string()),
+        }
+    }
 }
 
 impl From<storage::StorageError> for WatchtowerError {
@@ -976,7 +1205,7 @@ impl From<recovery::RecoveryError> for WatchtowerError {
 }
 
 /// Generate a UUID v4
-fn uuid_v4() -> String {
+pub(crate) fn uuid_v4() -> String {
     use rand::Rng;
     let mut rng = rand::thread_rng();
     let bytes: [u8; 16] = rng.gen();
@@ -1118,9 +1347,8 @@ mod tests {
             },
             ..Default::default()
         };
-        let error = match Watchtower::new(config) {
-            Ok(_) => panic!("invalid health-check options must be rejected"),
-            Err(error) => error,
+        let Err(error) = Watchtower::new(config) else {
+            panic!("invalid health-check options must be rejected");
         };
         assert!(matches!(error, WatchtowerError::InvalidConfiguration(_)));
         assert!(error.to_string().contains("max_latency_ms"));
@@ -1231,15 +1459,21 @@ mod tests {
     #[test]
     fn distinct_breach_alerts_are_not_deduplicated() {
         let watchtower = Watchtower::new(WatchtowerConfig::default()).unwrap();
-        assert!(watchtower
-            .state()
-            .add_alert_dedup(Alert::breach_attempt("channel-a".to_string(), 2, 5)));
-        assert!(watchtower
-            .state()
-            .add_alert_dedup(Alert::breach_attempt("channel-a".to_string(), 3, 5)));
-        assert!(watchtower
-            .state()
-            .add_alert_dedup(Alert::breach_attempt("channel-b".to_string(), 2, 5)));
+        assert!(watchtower.state().add_alert_dedup(Alert::breach_attempt(
+            "channel-a".to_string(),
+            2,
+            5
+        )));
+        assert!(watchtower.state().add_alert_dedup(Alert::breach_attempt(
+            "channel-a".to_string(),
+            3,
+            5
+        )));
+        assert!(watchtower.state().add_alert_dedup(Alert::breach_attempt(
+            "channel-b".to_string(),
+            2,
+            5
+        )));
         assert_eq!(watchtower.get_alerts(10).len(), 3);
     }
 

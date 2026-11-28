@@ -69,7 +69,7 @@ fn end_to_end_presigned_deploy_with_wasm_check_and_receipt() {
         ),
     ]);
 
-    let mut req = PresignedDeployRequest::new(&url, "AAAA==");
+    let mut req = PresignedDeployRequest::new(&url, "AAAA");
     req.network_passphrase = Some("Test SDF Network ; September 2015".to_string());
     req.wasm_check = Some(WasmArtifactCheck {
         wasm_path,
@@ -106,7 +106,7 @@ fn end_to_end_duplicate_submission_is_recoverable() {
             .to_string(),
     )]);
 
-    let req = PresignedDeployRequest::new(&url, "AAAA==");
+    let req = PresignedDeployRequest::new(&url, "AAAA");
     let receipt =
         submit_presigned_deployment(&req, &UreqRpcTransport).expect("duplicate is recoverable");
     handle.join().expect("server thread");
@@ -123,7 +123,7 @@ fn wasm_mismatch_never_contacts_rpc_and_leaves_no_receipt() {
     std::fs::write(&wasm_path, b"\0asm\x01\x00\x00\x00tampered").expect("write wasm");
     let receipt_path = dir.path().join("deploy.json");
 
-    let mut req = PresignedDeployRequest::new("http://127.0.0.1:9", "AAAA==");
+    let mut req = PresignedDeployRequest::new("http://127.0.0.1:9", "AAAA");
     req.wasm_check = Some(WasmArtifactCheck {
         wasm_path,
         expected_sha256: "f".repeat(64),

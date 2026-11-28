@@ -734,13 +734,15 @@ mod tests {
         let old_pub = hex::encode(signer.public_key());
         let new_seed = seed(2);
 
+        let expected_new_public_key =
+            hex::encode(StubHsm::from_seed("deploy-key", &seed(2)).public_key());
         let record = signer
             .rotate_key_at(&new_seed, Some("test rotation"), 1_700_000_000)
             .expect("rotation must succeed");
 
         assert_eq!(record.handle, "deploy-key");
         assert_eq!(record.previous_public_key_hex, old_pub);
-        assert_eq!(record.new_public_key_hex, hex::encode(signer.public_key()));
+        assert_eq!(record.new_public_key_hex, expected_new_public_key);
         assert_ne!(record.previous_public_key_hex, record.new_public_key_hex);
         assert_eq!(record.rotated_at, 1_700_000_000);
         assert_eq!(record.reason.as_deref(), Some("test rotation"));

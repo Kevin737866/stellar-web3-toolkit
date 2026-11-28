@@ -306,9 +306,7 @@ fn receive_rewards(env: &Env, token: &Address, from: &Address, amount: i128) {
     let delivered = client.balance(&contract).saturating_sub(before);
     assert!(
         delivered == amount,
-        "reward transfer delivered {} of {}",
-        delivered,
-        amount
+        "reward transfer delivered {delivered} of {amount}"
     );
 }
 
@@ -326,9 +324,7 @@ fn pay_reward(env: &Env, token: &Address, to: &Address, amount: i128) {
     let delivered = client.balance(to).saturating_sub(before);
     assert!(
         delivered == amount,
-        "reward transfer delivered {} of {}",
-        delivered,
-        amount
+        "reward transfer delivered {delivered} of {amount}"
     );
 }
 
@@ -807,9 +803,26 @@ impl YieldFarm {
     ///
     /// Deliberately callable while paused or when the pool is inactive, so a
     /// depositor can always exit.
+    ///
+    /// # Errors
+    ///
+    /// * Panics with `"amount must be positive"` if `amount <= 0`.
+    /// * Panics with `"unknown pool"` if `pool_id` is not registered.
+    /// * Panics with `"insufficient staked balance"` if `amount` exceeds the
+    ///   user's staked `position.amount`, before any state updates occur.
     pub fn withdraw(env: Env, user: Address, pool_id: u32, amount: i128) -> i128 {
         user.require_auth();
         assert!(amount > 0, "amount must be positive");
+
+        // Validate against the user's staked balance before settling so a
+        // rejected over-withdrawal never writes partial state updates.
+        let existing_pool = read_pool(&env, pool_id).unwrap_or_else(|| panic!("unknown pool"));
+        let existing_position =
+            read_position(&env, pool_id, &user, existing_pool.acc_reward_per_share);
+        assert!(
+            existing_position.amount >= amount,
+            "insufficient staked balance"
+        );
 
         let (cfg, mut pool) = settle_one(&env, pool_id);
         let mut position = read_position(&env, pool_id, &user, pool.acc_reward_per_share);
@@ -817,7 +830,10 @@ impl YieldFarm {
         assert!(position.amount >= amount, "insufficient staked balance");
 
         position.amount -= amount;
-        pool.total_staked -= amount;
+        pool.total_staked = pool
+            .total_staked
+            .checked_sub(amount)
+            .expect("pool balance underflow");
 
         if !write_position(&env, &user, &position) {
             untrack_user_pool(&env, &user, pool_id);

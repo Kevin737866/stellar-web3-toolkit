@@ -136,7 +136,7 @@ npm test        # node --test test/*.test.mjs
 What they cover:
 
 - **`test/mnemonic.test.mjs`** — the `abandon … about` vector derives exactly the
-  account and secret that `stellar-toolkit wallet recover` prints
+  account and secret that `stellar-toolkit wallet recover --show-secret` prints
   (`GB3JDWCQJCWMJ3IILWIGDTQJJC5567PGVEVXSCVPEQOTDN64VJBDQBYX`), which is what keeps
   the browser and the Rust implementations from drifting apart; account indices
   differ; each class of invalid phrase is rejected with its own reason.
