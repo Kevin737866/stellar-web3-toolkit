@@ -4,6 +4,32 @@
 
 use soroban_sdk::{contracttype, Address, Bytes, BytesN, Env, Map, Val, Vec};
 
+/// Why a channel closed, and by which lifecycle path (#350).
+///
+/// A channel that is still open carries [`CloseReason::NotClosed`]. The reason
+/// is written by the entry point that closes the channel and is never
+/// rewritten afterwards, so it is a stable, externally observable answer to
+/// "how did this channel end?".
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloseReason {
+    /// The channel is still open (or closing cooperatively but not settled).
+    NotClosed,
+    /// Both participants agreed on a final split and called [`cooperative_close`].
+    ///
+    /// [`cooperative_close`]: crate::PaymentChannel::cooperative_close
+    Cooperative,
+    /// The channel settled on a state both participants had signed.
+    ///
+    /// [`settle_signed_state`]: crate::PaymentChannel::settle_signed_state
+    SignedSettlement,
+    /// A participant force-closed the channel without the counterparty's
+    /// agreement.
+    ///
+    /// [`initiate_unilateral_close`]: crate::PaymentChannel::initiate_unilateral_close
+    Unilateral,
+}
+
 /// Represents a payment channel between two participants
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,12 +83,23 @@ pub struct ChannelState {
     pub close_sequence: u32,
     /// Timestamp when channel was closed (0 if open)
     pub close_time: u64,
+    /// Why the channel closed (#350), reported by `get_close_reason`.
+    ///
+    /// Set once by the entry point that closes the channel: cooperative close,
+    /// signed settlement or a unilateral close. Retries of an already-applied
+    /// close do not change it.
+    pub close_reason: CloseReason,
     /// Timeout in seconds for unilateral close dispute period
     pub timeout: u32,
     /// When the channel was created
     pub created_at: u64,
     /// Fee percentage for routing payments (in basis points, 10000 = 100%)
     pub fee_percentage: u32,
+    /// Minimum balance each participant must maintain during active payments (#356).
+    ///
+    /// Defaults to `0` in [`ChannelState::new`] to preserve existing behavior
+    /// for callers that do not configure a reserve.
+    pub channel_reserve: i128,
     /// Active HTLCs in this channel
     pub htlcs: Map<Val, Val>,
 }
@@ -80,6 +117,32 @@ impl ChannelState {
         timeout: u32,
         fee_percentage: u32,
     ) -> Self {
+        Self::with_reserve(
+            env,
+            channel_id,
+            participant_a,
+            participant_b,
+            initial_balance_a,
+            initial_balance_b,
+            timeout,
+            fee_percentage,
+            0,
+        )
+    }
+
+    /// Construct a [`ChannelState`] with an explicit per-participant reserve.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_reserve(
+        env: &Env,
+        channel_id: BytesN<32>,
+        participant_a: Address,
+        participant_b: Address,
+        initial_balance_a: i128,
+        initial_balance_b: i128,
+        timeout: u32,
+        fee_percentage: u32,
+        channel_reserve: i128,
+    ) -> Self {
         ChannelState {
             channel_id,
             participant_a,
@@ -91,33 +154,44 @@ impl ChannelState {
             is_cooperative_close: false,
             close_sequence: 0,
             close_time: 0,
+            close_reason: CloseReason::NotClosed,
             timeout,
             created_at: env.ledger().timestamp(),
             fee_percentage,
+            channel_reserve,
             htlcs: Map::new(env),
         }
     }
 
-    /// Check if the channel can make a payment of given amount
+    /// Check if the channel can make a payment of given amount while maintaining its reserve.
     pub fn can_pay(&self, amount: i128, from_a: bool) -> bool {
-        if from_a {
-            self.balance_a >= amount
-        } else {
-            self.balance_b >= amount
+        if amount <= 0 {
+            return false;
         }
+        let balance = if from_a { self.balance_a } else { self.balance_b };
+        balance >= amount && balance - amount >= self.channel_reserve
     }
 
-    /// Execute a payment, updating balances
+    /// Execute a payment, updating balances after verifying sufficient funds and reserve.
     pub fn execute_payment(&mut self, amount: i128, from_a: bool) -> Result<(), &'static str> {
+        if amount <= 0 {
+            return Err("Payment amount must be positive");
+        }
         if from_a {
             if self.balance_a < amount {
                 return Err("Insufficient balance");
+            }
+            if self.balance_a - amount < self.channel_reserve {
+                return Err("Channel reserve not met");
             }
             self.balance_a -= amount;
             self.balance_b += amount;
         } else {
             if self.balance_b < amount {
                 return Err("Insufficient balance");
+            }
+            if self.balance_b - amount < self.channel_reserve {
+                return Err("Channel reserve not met");
             }
             self.balance_b -= amount;
             self.balance_a += amount;

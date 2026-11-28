@@ -55,14 +55,16 @@ impl<'a> GraphView<'a> {
             for (neighbor_id, channel_id) in neighbors {
                 if let Some(channel) = self.graph.channels.get(channel_id) {
                     // Add edge from node_id to neighbor
-                    let (capacity, fee, cltv) = if &channel.node_a == node_id {
+                    let (direction, capacity, fee, cltv) = if &channel.node_a == node_id {
                         (
+                            Direction::AToB,
                             channel.capacity_a_to_b,
                             channel.base_fee,
                             channel.cltv_delta,
                         )
                     } else {
                         (
+                            Direction::BToA,
                             channel.capacity_b_to_a,
                             channel.base_fee,
                             channel.cltv_delta,
@@ -72,7 +74,7 @@ impl<'a> GraphView<'a> {
                     edges.push(GraphEdge {
                         target: neighbor_id.clone(),
                         channel_id: channel_id.clone(),
-                        direction: Direction::AToB, // Relative to the source
+                        direction,
                         capacity,
                         fee,
                         cltv_delta: cltv,

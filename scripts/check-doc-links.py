@@ -69,7 +69,7 @@ def slugify_heading(text: str) -> str:
     # Strip inline markdown formatting like [label](url), `code`, **bold**, *em*
     cleaned = re.sub(r"!\[([^\]]*)\]\([^)]+\)", r"\1", text)
     cleaned = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", cleaned)
-    cleaned = re.sub(r"[`*_~]", "", cleaned)
+    cleaned = re.sub(r"[`*~]", "", cleaned)
     cleaned = cleaned.strip().lower()
     # Keep alphanumerics, spaces, and hyphens; collapse spaces to hyphens
     cleaned = re.sub(r"[^\w\s-]", "", cleaned)

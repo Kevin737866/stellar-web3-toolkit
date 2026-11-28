@@ -181,15 +181,27 @@ mod tests {
             Err(DidError::EmptyVerificationMethodId)
         ));
         assert!(matches!(
-            VerificationMethod::new("   ", "Ed25519VerificationKey2020", "did:stellar:testnet:GABC"),
+            VerificationMethod::new(
+                "   ",
+                "Ed25519VerificationKey2020",
+                "did:stellar:testnet:GABC"
+            ),
             Err(DidError::EmptyVerificationMethodId)
         ));
         assert!(matches!(
-            VerificationMethod::new("did:stellar:testnet:GABC#key-1", " ", "did:stellar:testnet:GABC"),
+            VerificationMethod::new(
+                "did:stellar:testnet:GABC#key-1",
+                " ",
+                "did:stellar:testnet:GABC"
+            ),
             Err(DidError::EmptyVerificationMethodType)
         ));
         assert!(matches!(
-            VerificationMethod::new("did:stellar:testnet:GABC#key-1", "Ed25519VerificationKey2020", ""),
+            VerificationMethod::new(
+                "did:stellar:testnet:GABC#key-1",
+                "Ed25519VerificationKey2020",
+                ""
+            ),
             Err(DidError::EmptyVerificationMethodController)
         ));
     }

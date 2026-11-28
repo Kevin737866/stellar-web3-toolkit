@@ -19,8 +19,9 @@
 //! to exercise the routing fallback logic and boundary conditions.
 
 use channel_router::{
-    find_best_route, find_best_route_with_cap, pathfinder::Pathfinder, FeeCap, NetworkGraph,
-    RouteRequest, RoutingError, UnavailabilityReason, UnavailableChannel,
+    find_best_route, find_best_route_with_cap,
+    pathfinder::Pathfinder,
+    FeeCap, NetworkGraph, RouteRequest, RoutingError, UnavailabilityReason, UnavailableChannel,
     {Channel, Node, NodeFeatures},
 };
 
@@ -104,9 +105,7 @@ fn router_uses_alternative_path_when_one_path_excluded() {
     let route = find_best_route(
         &graph,
         &RouteRequest {
-            excluded_unavailable: vec![
-                exclude("ch_ab", UnavailabilityReason::ForwardingFailure),
-            ],
+            excluded_unavailable: vec![exclude("ch_ab", UnavailabilityReason::ForwardingFailure)],
             ..req("alice", "carol", 100_000)
         },
     )
@@ -115,7 +114,10 @@ fn router_uses_alternative_path_when_one_path_excluded() {
     // Route must only use the dave leg.
     for hop in &route.hops {
         assert_ne!(hop.channel_id, "ch_ab", "ch_ab must be skipped");
-        assert_ne!(hop.channel_id, "ch_bc", "ch_bc must be skipped (unreachable via bob)");
+        assert_ne!(
+            hop.channel_id, "ch_bc",
+            "ch_bc must be skipped (unreachable via bob)"
+        );
     }
     let channel_ids: Vec<_> = route.hops.iter().map(|h| h.channel_id.as_str()).collect();
     assert!(
@@ -181,10 +183,7 @@ fn excluding_nonexistent_channel_is_harmless() {
     let route = find_best_route(
         &graph,
         &RouteRequest {
-            excluded_unavailable: vec![exclude(
-                "ch_does_not_exist",
-                UnavailabilityReason::Other,
-            )],
+            excluded_unavailable: vec![exclude("ch_does_not_exist", UnavailabilityReason::Other)],
             ..req("alice", "carol", 100_000)
         },
     )

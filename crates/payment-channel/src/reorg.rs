@@ -183,7 +183,7 @@ impl ReorgLog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ChannelStatus, HtlcDirection, HtlcState};
+    use crate::{ChannelStatus, CloseReason, HtlcDirection, HtlcState};
 
     fn state(sequence_number: u32, our_balance: i128) -> LocalChannelState {
         LocalChannelState {
@@ -193,6 +193,7 @@ mod tests {
             our_balance,
             their_balance: 1_000 - our_balance,
             status: ChannelStatus::Open,
+            close_reason: CloseReason::NotClosed,
             sequence_number,
             funding_tx_hash: None,
             closing_tx_hash: None,

@@ -8,13 +8,13 @@
 //! account on testnet, and sign (build) transactions.
 
 use crate::error::{Result, ToolkitError};
-use aes_gcm::KeyInit;
-use zeroize::Zeroize;
 use crate::theme::{Style, Theme};
+use aes_gcm::KeyInit;
 use ed25519_dalek::{Signature, Signer, SigningKey};
 use hmac::{Hmac, Mac};
 use sha2::Sha512;
 use std::fmt::Write as _;
+use zeroize::Zeroize;
 
 type HmacSha512 = Hmac<Sha512>;
 
@@ -156,34 +156,99 @@ fn encode_account(public_key: &[u8; 32]) -> String {
     format!("{}", stellar_strkey::ed25519::PublicKey(*public_key))
 }
 
+/// Whether a rendered wallet summary may contain the recovery phrase and the
+/// secret key (#328).
+///
+/// Displaying either value is the one action that turns "my wallet" into "anyone
+/// standing behind me owns my wallet", so it is never the default. A caller has
+/// to ask for [`SecretVisibility::Revealed`] explicitly — the CLI does that only
+/// for `--show-secret` — and the masked rendering is what every other path gets.
+///
+/// This is a type rather than a `bool` so the decision has to be written down at
+/// each call site (`SecretVisibility::Revealed`), and a future caller cannot pick
+/// up "show the secret" by copying a `true` it did not read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretVisibility {
+    /// Print the public account id, but withhold the recovery phrase and secret
+    /// key behind a [`SECRET_CONFIRMATION_HINT`] line.
+    Masked,
+    /// Print the recovery phrase and secret key. Only after explicit
+    /// confirmation from the person running the command.
+    Revealed,
+}
+
+impl SecretVisibility {
+    /// `Revealed` when the caller confirmed the display, `Masked` otherwise.
+    #[must_use]
+    pub fn from_confirmation(confirmed: bool) -> Self {
+        if confirmed {
+            Self::Revealed
+        } else {
+            Self::Masked
+        }
+    }
+
+    #[must_use]
+    pub fn is_revealed(self) -> bool {
+        self == Self::Revealed
+    }
+}
+
+/// Placeholder printed in place of a withheld recovery phrase or secret key.
+pub const HIDDEN_SECRET_PLACEHOLDER: &str = "<hidden>";
+
+/// Explains how to display the withheld values, printed with the masked summary.
+pub const SECRET_CONFIRMATION_HINT: &str =
+    "Secrets are hidden. Re-run with --show-secret to display the recovery phrase and secret \
+     key, but only after checking that nobody can see this terminal or its scrollback.";
+
 /// Render a wallet for terminal display, honouring the active colour theme.
 ///
-/// Only the *labels* are themed. The recovery phrase and the secret key are
-/// printed verbatim: styling a secret risks a dimmed or recoloured value
-/// reading as "less important", and in `off` mode this function returns the
-/// same text the CLI printed before theming existed, with no escape sequences
-/// at all.
+/// Only the *labels* are themed. When [`SecretVisibility::Revealed`] is passed,
+/// the recovery phrase and the secret key are printed verbatim: styling a secret
+/// risks a dimmed or recoloured value reading as "less important".
+///
+/// When [`SecretVisibility::Masked`] is passed — the default for every CLI path —
+/// both values are replaced by [`HIDDEN_SECRET_PLACEHOLDER`] and a
+/// [`SECRET_CONFIRMATION_HINT`] line explains how to reveal them. The public
+/// account id is always printed: it is not a secret, and without it the output
+/// would not identify the wallet at all.
+///
+/// In `off` mode this function returns plain text with no escape sequences.
 #[must_use]
-pub fn format_wallet_summary(wallet: &GeneratedWallet, theme: &Theme) -> String {
+pub fn format_wallet_summary(
+    wallet: &GeneratedWallet,
+    theme: &Theme,
+    visibility: SecretVisibility,
+) -> String {
+    let revealed = visibility.is_revealed();
+    let mnemonic = if revealed {
+        wallet.mnemonic.as_str()
+    } else {
+        HIDDEN_SECRET_PLACEHOLDER
+    };
+    let secret = if revealed {
+        wallet.secret.as_str()
+    } else {
+        HIDDEN_SECRET_PLACEHOLDER
+    };
+
     let mut out = String::new();
     out.push_str(&theme.heading("Wallet"));
     out.push('\n');
-    let _ = writeln!(
-        out,
-        "  {}\n{}",
-        theme.key("Recovery phrase:"),
-        wallet.mnemonic
-    );
+    let _ = writeln!(out, "  {}\n{}", theme.key("Recovery phrase:"), mnemonic);
     let _ = writeln!(
         out,
         "  {}\n{}",
         theme.paint(Style::Secret, "Secret key:"),
-        wallet.secret
+        secret
     );
     let _ = writeln!(out, "  {}\n{}", theme.key("Account (G):"), wallet.account);
+    if !revealed {
+        let _ = writeln!(out, "\n{SECRET_CONFIRMATION_HINT}");
+    }
     out
 }
-
 
 /// Minimum passphrase length for an exported keystore.
 pub const KEYSTORE_MIN_PASSPHRASE_LENGTH: usize = 12;
@@ -238,7 +303,9 @@ pub fn export_keystore(wallet: &GeneratedWallet, passphrase: &str) -> Result<Str
     let private = decode_secret(&wallet.secret)?;
     let account = encode_account(SigningKey::from_bytes(&private).verifying_key().as_bytes());
     if wallet.account != account {
-        return Err(ToolkitError::Wallet("wallet account does not match its secret key".into()));
+        return Err(ToolkitError::Wallet(
+            "wallet account does not match its secret key".into(),
+        ));
     }
     let mut payload = serde_json::to_vec(&KeystorePayload {
         secret: wallet.secret.clone(),
@@ -330,12 +397,15 @@ pub fn import_keystore(document: &str, passphrase: &str) -> Result<ImportedKeyst
     })?;
     let payload_result = serde_json::from_slice::<KeystorePayload>(&plaintext);
     plaintext.zeroize();
-    let payload: KeystorePayload = payload_result
-        .map_err(|_| ToolkitError::Wallet("decrypted keystore payload has an invalid schema".into()))?;
+    let payload: KeystorePayload = payload_result.map_err(|_| {
+        ToolkitError::Wallet("decrypted keystore payload has an invalid schema".into())
+    })?;
     let private = decode_secret(&payload.secret)?;
     let expected = encode_account(SigningKey::from_bytes(&private).verifying_key().as_bytes());
     if payload.account != expected {
-        return Err(ToolkitError::Wallet("keystore account does not match its secret key".into()));
+        return Err(ToolkitError::Wallet(
+            "keystore account does not match its secret key".into(),
+        ));
     }
     Ok(ImportedKeystore {
         secret: payload.secret,
@@ -367,7 +437,6 @@ fn derive_keystore_key(passphrase: &str, salt: &[u8]) -> Result<[u8; 32]> {
         .map_err(|_| ToolkitError::Wallet("keystore key derivation failed".into()))?;
     Ok(key)
 }
-
 
 // ── Network allowlist for wallet funding (issue #332) ────────────────────────
 
@@ -492,15 +561,13 @@ pub fn fund_account_on(account: &str, network: AllowedNetwork) -> Result<()> {
     })?;
 
     let url = format!("{}?addr={account}", network.friendbot_url());
-    let response = ureq::get(&url)
-        .call()
-        .map_err(|e| {
-            ToolkitError::Wallet(format!(
-                "friendbot request for {} on {} failed: {e}",
-                crate::key_hygiene::mask_secret(account),
-                network,
-            ))
-        })?;
+    let response = ureq::get(&url).call().map_err(|e| {
+        ToolkitError::Wallet(format!(
+            "friendbot request for {} on {} failed: {e}",
+            crate::key_hygiene::mask_secret(account),
+            network,
+        ))
+    })?;
     let body = response
         .into_string()
         .map_err(|e| ToolkitError::Wallet(format!("could not read friendbot response: {e}")))?;
@@ -711,7 +778,7 @@ mod tests {
             crate::theme::ThemeMode::Off,
             crate::theme::ThemeEnv::detect(),
         );
-        let out = format_wallet_summary(&wallet, &theme);
+        let out = format_wallet_summary(&wallet, &theme, SecretVisibility::Revealed);
         assert!(!out.contains('\x1b'), "off mode must emit no escapes");
         assert!(out.contains(&wallet.account));
         assert!(out.contains(&wallet.secret));
@@ -728,7 +795,7 @@ mod tests {
                 ..crate::theme::ThemeEnv::default()
             },
         );
-        let out = format_wallet_summary(&wallet, &theme);
+        let out = format_wallet_summary(&wallet, &theme, SecretVisibility::Revealed);
         assert!(out.contains('\x1b'), "colour must be emitted when forced");
         // The secret is highlighted, never dimmed or recoloured as a value.
         assert!(out.contains("\x1b[1;35m"));
@@ -751,10 +818,8 @@ mod tests {
 
     #[test]
     fn from_passphrase_rejects_unknown_passphrase() {
-        let err = AllowedNetwork::from_passphrase(
-            "Public Global Stellar Network ; September 2015",
-        )
-        .unwrap_err();
+        let err = AllowedNetwork::from_passphrase("Public Global Stellar Network ; September 2015")
+            .unwrap_err();
         assert!(
             err.to_string().contains("not in the funding allowlist"),
             "error should name the reason: {err}"
@@ -776,9 +841,7 @@ mod tests {
     #[test]
     fn from_passphrase_is_case_sensitive() {
         // Lower-casing any character must yield a rejection, not a fuzzy match.
-        assert!(
-            AllowedNetwork::from_passphrase("test sdf network ; september 2015").is_err()
-        );
+        assert!(AllowedNetwork::from_passphrase("test sdf network ; september 2015").is_err());
     }
 
     #[test]

@@ -326,9 +326,7 @@ fn receive_rewards(env: &Env, token: &Address, from: &Address, amount: i128) {
     let delivered = client.balance(&contract).saturating_sub(before);
     assert!(
         delivered == amount,
-        "reward transfer delivered {} of {}",
-        delivered,
-        amount
+        "reward transfer delivered {delivered} of {amount}"
     );
 }
 
@@ -346,9 +344,7 @@ fn pay_reward(env: &Env, token: &Address, to: &Address, amount: i128) {
     let delivered = client.balance(to).saturating_sub(before);
     assert!(
         delivered == amount,
-        "reward transfer delivered {} of {}",
-        delivered,
-        amount
+        "reward transfer delivered {delivered} of {amount}"
     );
 }
 

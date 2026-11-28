@@ -3,8 +3,10 @@
 //! These tests exercise the public library API end-to-end using a temporary
 //! config directory, mirroring the `keystore_workflow.rs` conventions.
 
-use stellar_toolkit::{validate_directory, EnvFinding, EnvSeverity, EnvValidation, EnvValidationReport};
 use std::path::PathBuf;
+use stellar_toolkit::{
+    validate_directory, EnvFinding, EnvSeverity, EnvValidation, EnvValidationReport,
+};
 
 /// Real workspace config directory, used as a source for valid TOML.
 fn workspace_config_dir() -> PathBuf {
@@ -18,8 +20,8 @@ fn workspace_config_dir() -> PathBuf {
 
 #[test]
 fn json_output_round_trips_for_a_passing_directory() {
-    let report = validate_directory(&workspace_config_dir(), None)
-        .expect("checked-in configs must load");
+    let report =
+        validate_directory(&workspace_config_dir(), None).expect("checked-in configs must load");
 
     assert!(report.passed(), "checked-in configs must be valid");
 
@@ -109,8 +111,8 @@ fn json_output_includes_warning_findings_with_correct_severity_string() {
 
 #[test]
 fn json_output_for_single_env_filter_contains_only_that_environment() {
-    let report = validate_directory(&workspace_config_dir(), Some("dev"))
-        .expect("dev config must load");
+    let report =
+        validate_directory(&workspace_config_dir(), Some("dev")).expect("dev config must load");
 
     let json = report.to_json();
     let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
@@ -125,8 +127,7 @@ fn json_output_for_single_env_filter_contains_only_that_environment() {
 #[test]
 fn json_output_for_missing_config_directory_surfaces_actionable_error() {
     let missing = PathBuf::from("/tmp/stellar-toolkit-no-such-dir-308");
-    let err = validate_directory(&missing, None)
-        .expect_err("missing dir must return an error");
+    let err = validate_directory(&missing, None).expect_err("missing dir must return an error");
 
     // The error message must be actionable: it must mention the missing file.
     let msg = err.to_string();
