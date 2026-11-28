@@ -148,6 +148,7 @@ fn fuzzer_workflow_with_disconnection_is_clean() {
             max_concurrent_disconnections: Some(3),
             recover_at_end: true,
         }),
+        ..TopologyFuzzConfig::default()
     })
     .unwrap();
 

@@ -7,6 +7,7 @@ use crate::{
     MAX_ROUTE_HOPS,
 };
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::collections::HashSet;
 
 /// Detailed reasons why a route or channel violates a routing policy (Issue #365)
@@ -343,9 +344,14 @@ impl RoutingPolicy {
 
     /// Apply policy to a route request
     pub fn apply_to_request(&self, mut request: RouteRequest) -> RouteRequest {
-        // Apply hop limit
-        if request.max_hops.is_none() || request.max_hops > Some(self.max_hops) {
-            request.max_hops = Some(self.max_hops);
+        // Apply hop limit — clamp to the caller's policy if unset or too high,
+        // but never go above the protocol maximum. Because RoutingPolicy's own
+        // max_hops is validated when the policy is constructed, this call to
+        // validate_max_hop_count always succeeds; it is here as a safety net
+        // in case a policy is built by hand with an out-of-bound value.
+        let policy_hops = self.max_hops.min(crate::MAX_ROUTE_HOPS).max(crate::MIN_HOP_COUNT);
+        if request.max_hops.is_none() || request.max_hops > Some(policy_hops) {
+            request.max_hops = Some(policy_hops);
         }
 
         // Apply fee budget if not set
@@ -391,6 +397,35 @@ impl RoutingPolicy {
         }
 
         score
+    }
+
+    /// Configure the tie-breaking strategy for equal-cost routes.
+    pub fn with_tie_breaker(mut self, tie_breaker: TieBreaker) -> Self {
+        self.tie_breaker = tie_breaker;
+        self
+    }
+
+    /// Rank candidate routes deterministically using [`Self::score_route`]
+    /// and [`Self::tie_breaker`], after validating each route against `self`
+    /// and `request`.
+    pub fn rank_routes<'a>(
+        &self,
+        routes: &'a [Route],
+        request: &RouteRequest,
+    ) -> Result<Vec<&'a Route>, RoutingError> {
+        let mut eligible = Vec::with_capacity(routes.len());
+        for route in routes {
+            self.route_meets_requirements(route, request)?;
+            eligible.push(route);
+        }
+
+        eligible.sort_by(|a, b| {
+            self.score_route(a)
+                .total_cmp(&self.score_route(b))
+                .then_with(|| self.tie_breaker.compare_routes(a, b))
+        });
+
+        Ok(eligible)
     }
 }
 
@@ -474,22 +509,42 @@ pub enum SelectionStrategy {
 }
 
 impl SelectionStrategy {
-    /// Select the best route according to this strategy
-    pub fn select<'a>(&self, routes: &'a [Route], _policy: &RoutingPolicy) -> Option<&'a Route> {
+    /// Select the best route according to this strategy.
+    ///
+    /// Equal-cost routes are broken deterministically using
+    /// `policy.tie_breaker` for all deterministic strategies (`Cheapest`,
+    /// `Fastest`, `MostReliable`, and `PrivacyFocused`).
+    pub fn select<'a>(&self, routes: &'a [Route], policy: &RoutingPolicy) -> Option<&'a Route> {
         match self {
-            SelectionStrategy::Cheapest => routes.iter().min_by_key(|r| r.total_fees),
-            SelectionStrategy::Fastest => routes.iter().min_by_key(|r| r.hops.len()),
-            SelectionStrategy::MostReliable => routes
-                .iter()
-                .max_by_key(|r| (r.success_probability * 1000.0) as i32),
+            SelectionStrategy::Cheapest => routes.iter().min_by(|a, b| {
+                a.total_fees
+                    .cmp(&b.total_fees)
+                    .then_with(|| policy.tie_breaker.compare_routes(a, b))
+            }),
+            SelectionStrategy::Fastest => routes.iter().min_by(|a, b| {
+                a.hops
+                    .len()
+                    .cmp(&b.hops.len())
+                    .then_with(|| a.total_fees.cmp(&b.total_fees))
+                    .then_with(|| policy.tie_breaker.compare_routes(a, b))
+            }),
+            SelectionStrategy::MostReliable => routes.iter().min_by(|a, b| {
+                b.success_probability
+                    .total_cmp(&a.success_probability)
+                    .then_with(|| a.total_fees.cmp(&b.total_fees))
+                    .then_with(|| policy.tie_breaker.compare_routes(a, b))
+            }),
             SelectionStrategy::Random => {
                 use rand::seq::SliceRandom;
                 routes.choose(&mut rand::thread_rng())
             }
-            SelectionStrategy::PrivacyFocused => {
-                // Prefer routes with more hops
-                routes.iter().max_by_key(|r| r.hops.len())
-            }
+            SelectionStrategy::PrivacyFocused => routes.iter().min_by(|a, b| {
+                b.hops
+                    .len()
+                    .cmp(&a.hops.len())
+                    .then_with(|| a.total_fees.cmp(&b.total_fees))
+                    .then_with(|| policy.tie_breaker.compare_routes(a, b))
+            }),
         }
     }
 }

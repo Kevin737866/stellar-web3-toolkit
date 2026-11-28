@@ -44,6 +44,7 @@
 //! ));
 //! ```
 
+use crate::key_rotation::{KeyRotationRecord, VerificationMethod};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
@@ -254,6 +255,12 @@ pub struct DidDocument {
     /// Service endpoints registered in this document.
     #[serde(default)]
     pub service: Vec<Service>,
+    /// Active verification methods (public keys) for this DID subject.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verification_method: Vec<VerificationMethod>,
+    /// Ordered history of key rotations performed on this document.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_rotation_history: Vec<KeyRotationRecord>,
 }
 
 impl DidDocument {
@@ -264,6 +271,8 @@ impl DidDocument {
             id: id.into(),
             verification_method: Vec::new(),
             service: Vec::new(),
+            verification_method: Vec::new(),
+            key_rotation_history: Vec::new(),
         }
     }
 
@@ -432,6 +441,105 @@ impl DidDocument {
     #[must_use]
     pub fn get_service(&self, id: &str) -> Option<&Service> {
         self.service.iter().find(|s| s.id == id)
+    }
+
+    /// Register a new active [`VerificationMethod`] on this document.
+    ///
+    /// # Errors
+    ///
+    /// - [`DidError::InvalidKey`] if any field of `method` is invalid.
+    /// - [`DidError::DuplicateKeyId`] if a key with `method.id` is already active.
+    pub fn add_verification_method(&mut self, method: VerificationMethod) -> Result<(), DidError> {
+        method.validate()?;
+        if self.verification_method.iter().any(|k| k.id == method.id) {
+            return Err(DidError::DuplicateKeyId(method.id));
+        }
+        self.verification_method.push(method);
+        Ok(())
+    }
+
+    /// Atomically rotate an active verification method to `new_key` and append
+    /// a [`KeyRotationRecord`] to `key_rotation_history`.
+    ///
+    /// On any validation failure, neither `verification_method` nor
+    /// `key_rotation_history` is modified.
+    ///
+    /// # Errors
+    ///
+    /// - [`DidError::InvalidKey`] if `previous_key_id` is blank or `new_key` is invalid.
+    /// - [`DidError::KeyNotFound`] if `previous_key_id` is not an active key.
+    /// - [`DidError::DuplicateKeyId`] if `new_key.id` is already active or
+    ///   equals `previous_key_id`.
+    /// - [`DidError::InvalidKeyRotation`] if `new_key` has the same public key
+    ///   material as the key being retired.
+    /// - [`DidError::InvalidRotationTimestamp`] if `rotated_at` is earlier than
+    ///   the most recent rotation timestamp.
+    pub fn rotate_key(
+        &mut self,
+        previous_key_id: &str,
+        new_key: VerificationMethod,
+        rotated_at: u64,
+        reason: Option<String>,
+    ) -> Result<&KeyRotationRecord, DidError> {
+        if previous_key_id.trim().is_empty() {
+            return Err(DidError::InvalidKey(
+                "previous_key_id must not be empty".to_string(),
+            ));
+        }
+        new_key.validate()?;
+
+        let prev_idx = self
+            .verification_method
+            .iter()
+            .position(|k| k.id == previous_key_id)
+            .ok_or_else(|| DidError::KeyNotFound(previous_key_id.to_string()))?;
+
+        if new_key.id == previous_key_id
+            || self.verification_method.iter().any(|k| k.id == new_key.id)
+        {
+            return Err(DidError::DuplicateKeyId(new_key.id));
+        }
+
+        if self.verification_method[prev_idx].public_key_multibase == new_key.public_key_multibase {
+            return Err(DidError::InvalidKeyRotation(
+                "new key material must differ from the retired key".to_string(),
+            ));
+        }
+
+        if let Some(last) = self.key_rotation_history.last() {
+            if rotated_at < last.rotated_at {
+                return Err(DidError::InvalidRotationTimestamp {
+                    attempted: rotated_at,
+                    previous: last.rotated_at,
+                });
+            }
+        }
+
+        let new_key_id = new_key.id.clone();
+        self.verification_method[prev_idx] = new_key;
+
+        let sequence = self.key_rotation_history.len() as u64 + 1;
+        self.key_rotation_history.push(KeyRotationRecord {
+            sequence,
+            previous_key_id: previous_key_id.to_string(),
+            new_key_id,
+            rotated_at,
+            reason,
+        });
+
+        Ok(self.key_rotation_history.last().expect("just pushed"))
+    }
+
+    /// Return the currently active verification methods.
+    #[must_use]
+    pub fn active_keys(&self) -> &[VerificationMethod] {
+        &self.verification_method
+    }
+
+    /// Return the ordered key-rotation history for this document.
+    #[must_use]
+    pub fn key_rotation_history(&self) -> &[KeyRotationRecord] {
+        &self.key_rotation_history
     }
 }
 

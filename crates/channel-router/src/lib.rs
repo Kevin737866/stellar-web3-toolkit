@@ -33,6 +33,99 @@ pub const MAX_ROUTE_HOPS: usize = 20;
 /// Maximum amount we'll attempt to route (to prevent overflow)
 pub const MAX_ROUTE_AMOUNT: i128 = i128::MAX / 2;
 
+/// Minimum value accepted for `RouteSearchConfig::max_hop_count`.
+///
+/// A hop count of zero would mean "no path is acceptable", which is never a
+/// useful configuration.  Setting this to 1 allows direct (single-hop) routes
+/// while rejecting configurations that can never produce a result.
+pub const MIN_HOP_COUNT: usize = 1;
+
+/// Configuration for a route search, including an optional bounded hop limit.
+///
+/// `RouteSearchConfig` complements [`RouteRequest`] with search-time policy
+/// that is validated before the pathfinder runs.  The main addition over
+/// using `RouteRequest::max_hops` directly is that an invalid hop count is
+/// rejected with an actionable error rather than silently clamped or ignored.
+///
+/// # Compatibility
+///
+/// Callers that do not need a custom hop limit should continue calling
+/// [`find_best_route`] or [`find_best_route_with_cap`], which are unchanged.
+/// `RouteSearchConfig` is only required when you want explicit validation of
+/// the hop-count bound.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let config = RouteSearchConfig::new(request)
+///     .with_max_hop_count(5)?;
+/// let route = find_best_route_with_config(&graph, &config, &FeeCap::protocol())?;
+/// ```
+#[derive(Debug, Clone)]
+pub struct RouteSearchConfig {
+    /// The underlying route request.
+    pub request: RouteRequest,
+    /// Maximum number of hops the search may traverse.
+    ///
+    /// When `Some`, it must satisfy `MIN_HOP_COUNT <= n <= MAX_ROUTE_HOPS`;
+    /// the constructor enforces this.  When `None`, `MAX_ROUTE_HOPS` is used.
+    pub max_hop_count: Option<usize>,
+}
+
+impl RouteSearchConfig {
+    /// Wrap `request` in a `RouteSearchConfig` with no hop-count override.
+    pub fn new(request: RouteRequest) -> Self {
+        RouteSearchConfig {
+            request,
+            max_hop_count: None,
+        }
+    }
+
+    /// Set an explicit maximum hop count, validating the bounds.
+    ///
+    /// Returns [`RoutingError::MaxHopCountTooLow`] when `count < MIN_HOP_COUNT`
+    /// and [`RoutingError::MaxHopCountTooHigh`] when `count > MAX_ROUTE_HOPS`.
+    pub fn with_max_hop_count(mut self, count: usize) -> Result<Self, RoutingError> {
+        validate_max_hop_count(count)?;
+        self.max_hop_count = Some(count);
+        Ok(self)
+    }
+
+    /// The effective hop limit: the explicit override, or the value from the
+    /// inner `RouteRequest`, or the protocol maximum.
+    pub fn effective_max_hops(&self) -> usize {
+        self.max_hop_count
+            .or(self.request.max_hops)
+            .unwrap_or(MAX_ROUTE_HOPS)
+    }
+}
+
+/// Validate that `count` is a legal hop-count value.
+///
+/// Returns:
+/// - [`RoutingError::MaxHopCountTooLow`] when `count < MIN_HOP_COUNT`
+/// - [`RoutingError::MaxHopCountTooHigh`] when `count > MAX_ROUTE_HOPS`
+/// - `Ok(())` otherwise
+///
+/// This function is the single enforcement point for hop-count bounds.  Both
+/// [`RouteSearchConfig::with_max_hop_count`] and callers that set
+/// `RouteRequest::max_hops` manually can call it to get the same error types.
+pub fn validate_max_hop_count(count: usize) -> Result<(), RoutingError> {
+    if count < MIN_HOP_COUNT {
+        return Err(RoutingError::MaxHopCountTooLow {
+            count,
+            min: MIN_HOP_COUNT,
+        });
+    }
+    if count > MAX_ROUTE_HOPS {
+        return Err(RoutingError::MaxHopCountTooHigh {
+            count,
+            max: MAX_ROUTE_HOPS,
+        });
+    }
+    Ok(())
+}
+
 /// Errors that can occur during routing
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum RoutingError {
@@ -250,6 +343,36 @@ pub struct Channel {
     pub enabled: bool,
     /// Channel age in seconds
     pub age_seconds: u64,
+}
+
+impl Channel {
+    /// Determine the [`Direction`] of travel from `from` to `to` across this channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoutingError::InvalidRouteDirection`] if `from` and `to` do
+    /// not match the channel's two endpoints.
+    pub fn direction_for_hop(&self, from: &str, to: &str) -> Result<Direction, RoutingError> {
+        if self.node_a == from && self.node_b == to {
+            Ok(Direction::AToB)
+        } else if self.node_b == from && self.node_a == to {
+            Ok(Direction::BToA)
+        } else {
+            Err(RoutingError::InvalidRouteDirection {
+                channel_id: self.id.clone(),
+                from: from.to_string(),
+                to: to.to_string(),
+            })
+        }
+    }
+
+    /// Return the available balance in `direction`.
+    pub fn available_capacity(&self, direction: Direction) -> i128 {
+        match direction {
+            Direction::AToB => self.capacity_a_to_b,
+            Direction::BToA => self.capacity_b_to_a,
+        }
+    }
 }
 
 /// Direction for capacity checks
@@ -728,17 +851,44 @@ pub fn find_best_route(
 
 /// Find the best route using Dijkstra's algorithm with fees, rejecting any
 /// channel or route that breaks `cap`.
+///
+/// Equal-cost routes are broken deterministically using [`TieBreaker::Canonical`].
+/// Use [`find_best_route_with_tie_breaker`] to select a different tie-breaker.
 pub fn find_best_route_with_cap(
     graph: &NetworkGraph,
     request: &RouteRequest,
     cap: &FeeCap,
 ) -> Result<Route, RoutingError> {
-    // Validate inputs
+    find_best_route_with_tie_breaker(graph, request, cap, TieBreaker::Canonical)
+}
+
+/// Find the best route using Dijkstra's algorithm with fees, enforcing `cap`
+/// and breaking equal-cost ties deterministically according to `tie_breaker`.
+pub fn find_best_route_with_tie_breaker(
+    graph: &NetworkGraph,
+    request: &RouteRequest,
+    cap: &FeeCap,
+    tie_breaker: TieBreaker,
+) -> Result<Route, RoutingError> {
+    // Validate inputs explicitly
     if request.amount <= 0 {
         return Err(RoutingError::BelowDustLimit {
             amount: request.amount,
             dust_limit: 1,
         });
+    }
+
+    if request.amount > MAX_ROUTE_AMOUNT {
+        return Err(RoutingError::AmountExceedsMaximum {
+            amount: request.amount,
+            max_amount: MAX_ROUTE_AMOUNT,
+        });
+    }
+
+    if let Some(budget) = request.max_fee_budget {
+        if budget < 0 {
+            return Err(RoutingError::FeeExceedsBudget { fee: 0, budget });
+        }
     }
 
     if !graph.has_node(&request.source) {
@@ -759,33 +909,46 @@ pub fn find_best_route_with_cap(
 
     let max_hops = request.max_hops.unwrap_or(MAX_ROUTE_HOPS);
 
-    // Dijkstra's algorithm with weighted edges (fees)
-    let mut dist: FxHashMap<String, i128> = FxHashMap::default();
+    // Dijkstra's algorithm with weighted edges (fees) and deterministic tie-breaking
+    let mut best_keys: FxHashMap<String, policy::SearchKey> = FxHashMap::default();
     let mut prev: FxHashMap<String, (String, String, i128, i128)> = FxHashMap::default(); // node -> (prev_node, channel_id, amount, fee)
                                                                                           // The amount that actually arrives at each node. A hop's fee is charged on
                                                                                           // the amount forwarded through it, which is the payment plus every fee
                                                                                           // already paid upstream, so this has to be tracked per node rather than
                                                                                           // derived from the accumulated fee.
     let mut amount_at: FxHashMap<String, i128> = FxHashMap::default();
-    let mut pq: PriorityQueue<String, Reverse<i128>> = PriorityQueue::new();
+    let mut pq: PriorityQueue<String, Reverse<policy::SearchKey>> = PriorityQueue::new();
 
-    dist.insert(request.source.clone(), 0);
+    let root_key = policy::SearchKey::root(0, tie_breaker);
+    best_keys.insert(request.source.clone(), root_key.clone());
     amount_at.insert(request.source.clone(), request.amount);
-    pq.push(request.source.clone(), Reverse(0));
+    pq.push(request.source.clone(), Reverse(root_key));
 
-    while let Some((node_id, Reverse(dist_cost))) = pq.pop() {
+    while let Some((node_id, Reverse(current_key))) = pq.pop() {
         // Found destination
         if node_id == request.destination {
             break;
         }
 
         // Skip if we've found a better path
-        if dist_cost > *dist.get(&node_id).unwrap_or(&i128::MAX) {
-            continue;
+        if let Some(best) = best_keys.get(&node_id) {
+            if &current_key > best {
+                continue;
+            }
         }
 
         // Amount arriving at this node, which is what the next hop charges on.
         let current_amount = *amount_at.get(&node_id).unwrap_or(&request.amount);
+        let dist_cost = current_key.primary_cost;
+
+        // Check all neighbors in deterministic sorted order
+        for (neighbor_id, channel_id) in policy::sorted_neighbors(graph, &node_id) {
+            if let Some(channel) = graph.channels.get(channel_id) {
+                // A hop that advertises an absurd fee schedule is never
+                // admitted, no matter how cheap the rest of the route is.
+                if cap.check_channel(channel).is_err() {
+                    continue;
+                }
 
         // Check all neighbors
         if let Some(neighbors) = graph.adjacency.get(&node_id) {
@@ -829,18 +992,45 @@ pub fn find_best_route_with_cap(
                         channel.cltv_delta,
                     );
 
-                    let next_dist = dist_cost + fee;
+                // Reject negative base fees to prevent negative-weight cycles
+                if channel.base_fee < 0 {
+                    continue;
+                }
 
-                    // Check if this is a better path
-                    if next_dist < *dist.get(neighbor_id).unwrap_or(&i128::MAX) {
-                        dist.insert(neighbor_id.clone(), next_dist);
-                        amount_at.insert(neighbor_id.clone(), current_amount + fee);
-                        prev.insert(
-                            neighbor_id.clone(),
-                            (node_id.clone(), channel_id.clone(), current_amount, fee),
-                        );
-                        pq.push(neighbor_id.clone(), Reverse(next_dist));
-                    }
+                // Calculate fee for this hop
+                let fee = calculate_channel_fee(
+                    amount_at_next_hop,
+                    channel.base_fee,
+                    channel.fee_rate,
+                    channel.cltv_delta,
+                );
+                if fee < 0 {
+                    continue;
+                }
+
+                let Some(next_dist) = dist_cost.checked_add(fee) else {
+                    continue;
+                };
+                let Some(next_amount) = current_amount.checked_add(fee) else {
+                    continue;
+                };
+
+                let next_key =
+                    current_key.extend(next_dist, channel_id, neighbor_id, channel.cltv_delta);
+
+                let is_better = match best_keys.get(neighbor_id) {
+                    None => true,
+                    Some(existing) => &next_key < existing,
+                };
+
+                if is_better {
+                    best_keys.insert(neighbor_id.clone(), next_key.clone());
+                    amount_at.insert(neighbor_id.clone(), next_amount);
+                    prev.insert(
+                        neighbor_id.clone(),
+                        (node_id.clone(), channel_id.clone(), current_amount, fee),
+                    );
+                    pq.push(neighbor_id.clone(), Reverse(next_key));
                 }
             }
         }
@@ -931,6 +1121,7 @@ pub fn find_best_route_with_cap(
 
     // Individually acceptable hops can still add up past the payment budget.
     cap.check_route(request.amount, &route)?;
+    validate_route_direction_and_balance(graph, &request.source, &route)?;
 
     Ok(route)
 }

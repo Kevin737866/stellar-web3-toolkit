@@ -52,6 +52,82 @@ pub enum SessionError {
 
 pub type Result<T> = std::result::Result<T, SessionError>;
 
+/// Target scope for a [`ScopedExpiry`] entry (issue #333).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ExpiryScope {
+    /// Applies to all invocations of `contract_id`.
+    Contract(String),
+    /// Applies to invocations of `method` on `contract_id`.
+    Method { contract_id: String, method: String },
+}
+
+impl ExpiryScope {
+    fn label(&self) -> String {
+        match self {
+            Self::Contract(contract_id) => contract_id.clone(),
+            Self::Method {
+                contract_id,
+                method,
+            } => format!("{contract_id}::{method}"),
+        }
+    }
+
+    fn matches(&self, contract_id: &str, method: Option<&str>) -> bool {
+        match self {
+            Self::Contract(c) => c == contract_id,
+            Self::Method {
+                contract_id: c,
+                method: m,
+            } => c == contract_id && method == Some(m.as_str()),
+        }
+    }
+}
+
+/// Scoped expiry metadata binding an earlier expiration timestamp and optional
+/// audit reason to a specific contract or contract+method scope (issue #333).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopedExpiry {
+    /// Contract or contract+method scope this expiry applies to.
+    pub scope: ExpiryScope,
+    /// Unix timestamp at which this scope expires (`now >= expires_at` is expired).
+    pub expires_at: u64,
+    /// Optional human-readable reason or audit reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl ScopedExpiry {
+    /// Creates scoped expiry metadata for an entire contract.
+    pub fn for_contract(
+        contract_id: impl Into<String>,
+        expires_at: u64,
+        reason: Option<String>,
+    ) -> Self {
+        Self {
+            scope: ExpiryScope::Contract(contract_id.into()),
+            expires_at,
+            reason,
+        }
+    }
+
+    /// Creates scoped expiry metadata for a specific contract method.
+    pub fn for_method(
+        contract_id: impl Into<String>,
+        method: impl Into<String>,
+        expires_at: u64,
+        reason: Option<String>,
+    ) -> Self {
+        Self {
+            scope: ExpiryScope::Method {
+                contract_id: contract_id.into(),
+                method: method.into(),
+            },
+            expires_at,
+            reason,
+        }
+    }
+}
+
 /// Permissions and policies bound to a session key.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionPolicy {
@@ -63,6 +139,12 @@ pub struct SessionPolicy {
     pub allowed_methods: HashMap<String, HashSet<String>>,
     /// Optional maximum cumulative spend limit in stroops/stroop equivalent.
     pub max_spend_limit: Option<u64>,
+    /// Optional per-contract or per-method expiry metadata (issue #333).
+    ///
+    /// When present, a call matching a scope is rejected if `now >= scope.expires_at`,
+    /// even if the parent session's global `expires_at` has not yet elapsed.
+    #[serde(default)]
+    pub scoped_expiries: Vec<ScopedExpiry>,
 }
 
 impl Default for SessionPolicy {
@@ -72,7 +154,97 @@ impl Default for SessionPolicy {
             allowed_contracts: HashSet::new(),
             allowed_methods: HashMap::new(),
             max_spend_limit: None,
+            scoped_expiries: Vec::new(),
         }
+    }
+}
+
+impl SessionPolicy {
+    /// Validates a single [`ScopedExpiry`] against this policy's global
+    /// `expires_at` and non-empty identifier invariants.
+    fn validate_single_scoped_expiry(&self, entry: &ScopedExpiry) -> Result<()> {
+        match &entry.scope {
+            ExpiryScope::Contract(contract_id) => {
+                if contract_id.trim().is_empty() {
+                    return Err(SessionError::InvalidScopedExpiry(
+                        "contract_id must not be empty".to_string(),
+                    ));
+                }
+            }
+            ExpiryScope::Method {
+                contract_id,
+                method,
+            } => {
+                if contract_id.trim().is_empty() {
+                    return Err(SessionError::InvalidScopedExpiry(
+                        "contract_id must not be empty".to_string(),
+                    ));
+                }
+                if method.trim().is_empty() {
+                    return Err(SessionError::InvalidScopedExpiry(
+                        "method must not be empty".to_string(),
+                    ));
+                }
+            }
+        }
+        if entry.expires_at == 0 {
+            return Err(SessionError::InvalidScopedExpiry(format!(
+                "scoped expires_at for `{}` must be greater than zero",
+                entry.scope.label()
+            )));
+        }
+        if entry.expires_at > self.expires_at {
+            return Err(SessionError::InvalidScopedExpiry(format!(
+                "scoped expires_at ({}) for `{}` exceeds parent session expires_at ({})",
+                entry.expires_at,
+                entry.scope.label(),
+                self.expires_at
+            )));
+        }
+        Ok(())
+    }
+
+    /// Validates all [`ScopedExpiry`] entries on this policy, rejecting
+    /// empty identifiers, zero/out-of-bounds timestamps, and duplicate scopes.
+    pub fn validate_scoped_expiries(&self) -> Result<()> {
+        let mut seen = HashSet::with_capacity(self.scoped_expiries.len());
+        for entry in &self.scoped_expiries {
+            self.validate_single_scoped_expiry(entry)?;
+            if !seen.insert(&entry.scope) {
+                return Err(SessionError::InvalidScopedExpiry(format!(
+                    "duplicate scoped expiry entry for `{}`",
+                    entry.scope.label()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Appends a validated [`ScopedExpiry`] entry to this policy.
+    pub fn with_scoped_expiry(mut self, entry: ScopedExpiry) -> Result<Self> {
+        self.validate_single_scoped_expiry(&entry)?;
+        if self.scoped_expiries.iter().any(|e| e.scope == entry.scope) {
+            return Err(SessionError::InvalidScopedExpiry(format!(
+                "duplicate scoped expiry entry for `{}`",
+                entry.scope.label()
+            )));
+        }
+        self.scoped_expiries.push(entry);
+        Ok(self)
+    }
+
+    /// Returns the effective expiration timestamp for `(contract_id, method)`,
+    /// taking the minimum of the global `expires_at` and any matching
+    /// [`ScopedExpiry`] entries.
+    #[must_use]
+    pub fn effective_expiry_for(&self, contract_id: &str, method: Option<&str>) -> u64 {
+        let mut effective = self.expires_at;
+        for entry in &self.scoped_expiries {
+            if entry.scope.matches(contract_id, method) {
+                effective = effective.min(entry.expires_at);
+            }
+        }
+        effective
     }
 }
 
@@ -407,6 +579,65 @@ impl AccountAbstractionManager {
         self.sessions.insert(session.session_id.clone(), session);
     }
 
+    /// Validates scoped expiry metadata on `session` before registering it.
+    ///
+    /// Rejects invalid or out-of-bounds scoped expiry entries without mutating
+    /// manager state.
+    pub fn register_session_checked(&mut self, session: SessionKey) -> Result<()> {
+        session.policy.validate_scoped_expiries()?;
+        self.sessions.insert(session.session_id.clone(), session);
+        Ok(())
+    }
+
+    /// Adds or updates a [`ScopedExpiry`] entry on an existing active session
+    /// key after verifying account ownership (issue #333).
+    pub fn set_scoped_expiry(
+        &mut self,
+        account_id: &str,
+        session_id: &str,
+        entry: ScopedExpiry,
+    ) -> Result<()> {
+        let session = self
+            .sessions
+            .get_mut(session_id)
+            .ok_or_else(|| SessionError::SessionNotFound(session_id.to_string()))?;
+
+        if session.account_id != account_id {
+            return Err(SessionError::SessionNotOwned(session_id.to_string()));
+        }
+        if session.is_revoked {
+            return Err(SessionError::SessionRevoked(session_id.to_string()));
+        }
+
+        session.policy.validate_single_scoped_expiry(&entry)?;
+
+        if let Some(existing) = session
+            .policy
+            .scoped_expiries
+            .iter_mut()
+            .find(|e| e.scope == entry.scope)
+        {
+            *existing = entry;
+        } else {
+            session.policy.scoped_expiries.push(entry);
+        }
+        Ok(())
+    }
+
+    /// Computes the effective expiry timestamp for `(session_id, contract_id, method)`.
+    pub fn effective_expiry(
+        &self,
+        session_id: &str,
+        contract_id: &str,
+        method: Option<&str>,
+    ) -> Result<u64> {
+        let session = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| SessionError::SessionNotFound(session_id.to_string()))?;
+        Ok(session.policy.effective_expiry_for(contract_id, method))
+    }
+
     /// Retrieve a reference to a session key.
     #[must_use]
     pub fn get_session(&self, session_id: &str) -> Option<&SessionKey> {
@@ -645,6 +876,17 @@ impl AccountAbstractionManager {
                     contract_id.to_string(),
                     session_id.to_string(),
                 ));
+            }
+        }
+
+        // Enforce scoped expiry metadata before mutating `total_spent`.
+        for scoped in &session.policy.scoped_expiries {
+            if scoped.scope.matches(contract_id, Some(method)) && now >= scoped.expires_at {
+                return Err(SessionError::ScopeExpired {
+                    session_id: session_id.to_string(),
+                    scope: scoped.scope.label(),
+                    expires_at: scoped.expires_at,
+                });
             }
         }
 
