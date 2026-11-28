@@ -71,6 +71,17 @@ pub enum PaymentChannelError {
         recorded: u32,
         presented: u32,
     },
+
+    /// A payment or state update would drop a participant's balance below the
+    /// channel's configured reserve requirement (#356).
+    #[error(
+        "Channel reserve not met for channel {channel_id}: balance {remaining} is below required reserve {reserve}"
+    )]
+    ReserveNotMet {
+        channel_id: String,
+        remaining: i128,
+        reserve: i128,
+    },
 }
 
 /// Channel status
@@ -113,6 +124,12 @@ pub struct LocalChannelState {
     pub timeout: u32,
     /// Fee percentage for routing
     pub fee_percentage: u32,
+    /// Minimum balance each participant must maintain during off-chain payments (#356).
+    ///
+    /// Defaults to `0` for channels created via [`ChannelManager::create_channel`]
+    /// to preserve backward compatibility with callers that do not configure a reserve.
+    #[serde(default)]
+    pub channel_reserve: i128,
     /// Pending HTLCs
     pub pending_htlcs: Vec<HtlcState>,
     /// Local secret for signing
@@ -324,7 +341,11 @@ impl ChannelManager {
         }
     }
 
-    /// Create a new payment channel
+    /// Create a new payment channel with a default `channel_reserve` of `0`.
+    ///
+    /// Preserves existing behavior for callers that do not configure a reserve.
+    /// Use [`ChannelManager::create_channel_with_reserve`] to enforce a non-zero
+    /// minimum balance per participant during off-chain payments.
     #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // public API; funding will need an RPC round trip
     pub async fn create_channel(
         &self,
@@ -335,8 +356,65 @@ impl ChannelManager {
         timeout: u32,
         fee_percentage: u32,
     ) -> Result<LocalChannelState, PaymentChannelError> {
+        self.create_channel_with_reserve(
+            our_address,
+            their_address,
+            our_initial_balance,
+            their_initial_balance,
+            timeout,
+            fee_percentage,
+            0,
+        )
+        .await
+    }
+
+    /// Create a new payment channel with an explicit per-participant reserve requirement (#356).
+    ///
+    /// Both `our_initial_balance` and `their_initial_balance` must be non-negative and at
+    /// least `channel_reserve`, and `channel_reserve` must be non-negative.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::unused_async,
+        clippy::unused_async_trait_impl
+    )]
+    pub async fn create_channel_with_reserve(
+        &self,
+        our_address: String,
+        their_address: String,
+        our_initial_balance: i128,
+        their_initial_balance: i128,
+        timeout: u32,
+        fee_percentage: u32,
+        channel_reserve: i128,
+    ) -> Result<LocalChannelState, PaymentChannelError> {
+        if our_initial_balance < 0 || their_initial_balance < 0 {
+            return Err(PaymentChannelError::InvalidState(
+                "Initial balances cannot be negative".to_string(),
+            ));
+        }
+        if channel_reserve < 0 {
+            return Err(PaymentChannelError::InvalidState(
+                "Channel reserve cannot be negative".to_string(),
+            ));
+        }
+
         // Generate channel ID
         let channel_id = Self::generate_channel_id(&our_address, &their_address);
+
+        if our_initial_balance < channel_reserve {
+            return Err(PaymentChannelError::ReserveNotMet {
+                channel_id,
+                remaining: our_initial_balance,
+                reserve: channel_reserve,
+            });
+        }
+        if their_initial_balance < channel_reserve {
+            return Err(PaymentChannelError::ReserveNotMet {
+                channel_id,
+                remaining: their_initial_balance,
+                reserve: channel_reserve,
+            });
+        }
 
         // Create local state
         let state = LocalChannelState {
@@ -351,6 +429,7 @@ impl ChannelManager {
             closing_tx_hash: None,
             timeout,
             fee_percentage,
+            channel_reserve,
             pending_htlcs: Vec::new(),
             local_secret: self.signer.public_key(),
             remote_public_key: Vec::new(), // Will be set during handshake
@@ -373,6 +452,51 @@ impl ChannelManager {
         );
 
         Ok(state)
+    }
+
+    /// Configure or update the minimum per-participant reserve on an open channel (#356).
+    ///
+    /// Rejects negative reserves, closed channels, or reserves exceeding either
+    /// participant's current balance without mutating channel state.
+    pub fn set_channel_reserve(
+        &self,
+        channel_id: &str,
+        channel_reserve: i128,
+    ) -> Result<(), PaymentChannelError> {
+        if channel_reserve < 0 {
+            return Err(PaymentChannelError::InvalidState(
+                "Channel reserve cannot be negative".to_string(),
+            ));
+        }
+
+        let mut channels = self.channels.write();
+        let channel = channels
+            .get_mut(channel_id)
+            .ok_or_else(|| PaymentChannelError::ChannelNotFound(channel_id.to_string()))?;
+
+        if channel.state.status != ChannelStatus::Open {
+            return Err(PaymentChannelError::ChannelClosed(
+                channel.state.status.to_string(),
+            ));
+        }
+
+        if channel.state.our_balance < channel_reserve {
+            return Err(PaymentChannelError::ReserveNotMet {
+                channel_id: channel_id.to_string(),
+                remaining: channel.state.our_balance,
+                reserve: channel_reserve,
+            });
+        }
+        if channel.state.their_balance < channel_reserve {
+            return Err(PaymentChannelError::ReserveNotMet {
+                channel_id: channel_id.to_string(),
+                remaining: channel.state.their_balance,
+                reserve: channel_reserve,
+            });
+        }
+
+        channel.state.channel_reserve = channel_reserve;
+        Ok(())
     }
 
     /// Execute an off-chain payment at the next inferred ledger height.
@@ -417,30 +541,11 @@ impl ChannelManager {
         // must leave the channel exactly as it was.
         check_height(channel_id, &channel.history, ledger_height)?;
 
-        // Update balances
-        match direction {
-            PaymentDirection::ToThem => {
-                if channel.state.our_balance < amount {
-                    return Err(PaymentChannelError::InsufficientBalance {
-                        have: channel.state.our_balance,
-                        need: amount,
-                    });
-                }
-                channel.state.our_balance -= amount;
-                channel.state.their_balance += amount;
-            }
-            PaymentDirection::ToUs => {
-                if channel.state.their_balance < amount {
-                    return Err(PaymentChannelError::InsufficientBalance {
-                        have: channel.state.their_balance,
-                        need: amount,
-                    });
-                }
-                channel.state.their_balance -= amount;
-                channel.state.our_balance += amount;
-            }
-        }
+        let (new_our, new_their) =
+            compute_post_payment_balances(channel_id, &channel.state, amount, direction)?;
 
+        channel.state.our_balance = new_our;
+        channel.state.their_balance = new_their;
         channel.state.sequence_number += 1;
 
         record_state(channel_id, channel, ledger_height)?;
@@ -547,13 +652,34 @@ impl ChannelManager {
             ));
         }
 
-        let expected_total = channel.state.our_balance + channel.state.their_balance;
-        if new_our_balance + new_their_balance != expected_total {
+        let expected_total = channel
+            .state
+            .our_balance
+            .checked_add(channel.state.their_balance)
+            .ok_or_else(|| PaymentChannelError::InvalidState("Channel balance overflow".to_string()))?;
+        let new_total = new_our_balance
+            .checked_add(new_their_balance)
+            .ok_or_else(|| PaymentChannelError::InvalidState("Proposed balance overflow".to_string()))?;
+        if new_total != expected_total {
             return Err(PaymentChannelError::InvalidState(format!(
                 "Total balance mismatch: expected {}, got {}",
-                expected_total,
-                new_our_balance + new_their_balance
+                expected_total, new_total
             )));
+        }
+
+        if new_our_balance < channel.state.channel_reserve {
+            return Err(PaymentChannelError::ReserveNotMet {
+                channel_id: channel_id.to_string(),
+                remaining: new_our_balance,
+                reserve: channel.state.channel_reserve,
+            });
+        }
+        if new_their_balance < channel.state.channel_reserve {
+            return Err(PaymentChannelError::ReserveNotMet {
+                channel_id: channel_id.to_string(),
+                remaining: new_their_balance,
+                reserve: channel.state.channel_reserve,
+            });
         }
 
         check_height(channel_id, &channel.history, ledger_height)?;
@@ -611,32 +737,13 @@ impl ChannelManager {
                 .get(channel_id)
                 .ok_or_else(|| PaymentChannelError::ChannelNotFound(channel_id.to_string()))?;
 
-            match direction {
-                PaymentDirection::ToThem => {
-                    if channel.state.our_balance < amount {
-                        return Err(PaymentChannelError::InsufficientBalance {
-                            have: channel.state.our_balance,
-                            need: amount,
-                        });
-                    }
-                    (
-                        channel.state.our_balance - amount,
-                        channel.state.their_balance + amount,
-                    )
-                }
-                PaymentDirection::ToUs => {
-                    if channel.state.their_balance < amount {
-                        return Err(PaymentChannelError::InsufficientBalance {
-                            have: channel.state.their_balance,
-                            need: amount,
-                        });
-                    }
-                    (
-                        channel.state.our_balance + amount,
-                        channel.state.their_balance - amount,
-                    )
-                }
+            if channel.state.status != ChannelStatus::Open {
+                return Err(PaymentChannelError::ChannelClosed(
+                    channel.state.status.to_string(),
+                ));
             }
+
+            compute_post_payment_balances(channel_id, &channel.state, amount, direction)?
         };
 
         self.apply_signed_state_update(
@@ -1026,6 +1133,51 @@ pub fn compute_state_digest(
     let mut digest = [0u8; 32];
     digest.copy_from_slice(&res);
     digest
+}
+
+/// Compute post-payment balances after validating positive amount, sufficient
+/// funds, and the channel's reserve requirement.
+fn compute_post_payment_balances(
+    channel_id: &str,
+    state: &LocalChannelState,
+    amount: i128,
+    direction: PaymentDirection,
+) -> Result<(i128, i128), PaymentChannelError> {
+    if amount <= 0 {
+        return Err(PaymentChannelError::InvalidState(
+            "Payment amount must be positive".to_string(),
+        ));
+    }
+
+    let (sender_balance, receiver_balance) = match direction {
+        PaymentDirection::ToThem => (state.our_balance, state.their_balance),
+        PaymentDirection::ToUs => (state.their_balance, state.our_balance),
+    };
+
+    if sender_balance < amount {
+        return Err(PaymentChannelError::InsufficientBalance {
+            have: sender_balance,
+            need: amount,
+        });
+    }
+
+    let new_sender = sender_balance - amount;
+    if new_sender < state.channel_reserve {
+        return Err(PaymentChannelError::ReserveNotMet {
+            channel_id: channel_id.to_string(),
+            remaining: new_sender,
+            reserve: state.channel_reserve,
+        });
+    }
+
+    let new_receiver = receiver_balance
+        .checked_add(amount)
+        .ok_or_else(|| PaymentChannelError::InvalidState("Balance overflow".to_string()))?;
+
+    match direction {
+        PaymentDirection::ToThem => Ok((new_sender, new_receiver)),
+        PaymentDirection::ToUs => Ok((new_receiver, new_sender)),
+    }
 }
 
 /// Reject an update that claims a height the channel has already passed.

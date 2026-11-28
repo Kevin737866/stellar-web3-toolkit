@@ -63,6 +63,11 @@ pub struct ChannelState {
     pub created_at: u64,
     /// Fee percentage for routing payments (in basis points, 10000 = 100%)
     pub fee_percentage: u32,
+    /// Minimum balance each participant must maintain during active payments (#356).
+    ///
+    /// Defaults to `0` in [`ChannelState::new`] to preserve existing behavior
+    /// for callers that do not configure a reserve.
+    pub channel_reserve: i128,
     /// Active HTLCs in this channel
     pub htlcs: Map<Val, Val>,
 }
@@ -80,6 +85,32 @@ impl ChannelState {
         timeout: u32,
         fee_percentage: u32,
     ) -> Self {
+        Self::with_reserve(
+            env,
+            channel_id,
+            participant_a,
+            participant_b,
+            initial_balance_a,
+            initial_balance_b,
+            timeout,
+            fee_percentage,
+            0,
+        )
+    }
+
+    /// Construct a [`ChannelState`] with an explicit per-participant reserve.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_reserve(
+        env: &Env,
+        channel_id: BytesN<32>,
+        participant_a: Address,
+        participant_b: Address,
+        initial_balance_a: i128,
+        initial_balance_b: i128,
+        timeout: u32,
+        fee_percentage: u32,
+        channel_reserve: i128,
+    ) -> Self {
         ChannelState {
             channel_id,
             participant_a,
@@ -94,30 +125,40 @@ impl ChannelState {
             timeout,
             created_at: env.ledger().timestamp(),
             fee_percentage,
+            channel_reserve,
             htlcs: Map::new(env),
         }
     }
 
-    /// Check if the channel can make a payment of given amount
+    /// Check if the channel can make a payment of given amount while maintaining its reserve.
     pub fn can_pay(&self, amount: i128, from_a: bool) -> bool {
-        if from_a {
-            self.balance_a >= amount
-        } else {
-            self.balance_b >= amount
+        if amount <= 0 {
+            return false;
         }
+        let balance = if from_a { self.balance_a } else { self.balance_b };
+        balance >= amount && balance - amount >= self.channel_reserve
     }
 
-    /// Execute a payment, updating balances
+    /// Execute a payment, updating balances after verifying sufficient funds and reserve.
     pub fn execute_payment(&mut self, amount: i128, from_a: bool) -> Result<(), &'static str> {
+        if amount <= 0 {
+            return Err("Payment amount must be positive");
+        }
         if from_a {
             if self.balance_a < amount {
                 return Err("Insufficient balance");
+            }
+            if self.balance_a - amount < self.channel_reserve {
+                return Err("Channel reserve not met");
             }
             self.balance_a -= amount;
             self.balance_b += amount;
         } else {
             if self.balance_b < amount {
                 return Err("Insufficient balance");
+            }
+            if self.balance_b - amount < self.channel_reserve {
+                return Err("Channel reserve not met");
             }
             self.balance_b -= amount;
             self.balance_a += amount;

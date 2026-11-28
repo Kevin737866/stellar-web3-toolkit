@@ -46,7 +46,11 @@ pub struct PaymentChannel;
 
 #[contractimpl]
 impl PaymentChannel {
-    /// Initialize a new payment channel between two parties
+    /// Initialize a new payment channel between two parties with `channel_reserve = 0`.
+    ///
+    /// Preserves existing behavior for callers that do not configure a reserve.
+    /// Use [`PaymentChannel::initialize_with_reserve`] to enforce a non-zero
+    /// minimum balance per participant on state updates and HTLC creation.
     pub fn initialize(
         env: Env,
         participant_a: Address,
@@ -56,8 +60,41 @@ impl PaymentChannel {
         timeout: u32,
         fee_percentage: u32,
     ) -> Result<BytesN<32>, PaymentChannelError> {
-        if initial_balance_a < 0 || initial_balance_b < 0 {
+        Self::initialize_with_reserve(
+            env,
+            participant_a,
+            participant_b,
+            initial_balance_a,
+            initial_balance_b,
+            timeout,
+            fee_percentage,
+            0,
+        )
+    }
+
+    /// Initialize a new payment channel with an explicit per-participant reserve (#356).
+    ///
+    /// Rejects negative balances, negative reserves, or initial balances below
+    /// `channel_reserve` without writing any storage.
+    #[allow(clippy::too_many_arguments)]
+    pub fn initialize_with_reserve(
+        env: Env,
+        participant_a: Address,
+        participant_b: Address,
+        initial_balance_a: i128,
+        initial_balance_b: i128,
+        timeout: u32,
+        fee_percentage: u32,
+        channel_reserve: i128,
+    ) -> Result<BytesN<32>, PaymentChannelError> {
+        if initial_balance_a < 0 || initial_balance_b < 0 || channel_reserve < 0 {
             return Err(PaymentChannelError::InvalidBalance);
+        }
+        initial_balance_a
+            .checked_add(initial_balance_b)
+            .ok_or(PaymentChannelError::BalanceMismatch)?;
+        if initial_balance_a < channel_reserve || initial_balance_b < channel_reserve {
+            return Err(PaymentChannelError::ReserveNotMet);
         }
         if timeout < 60 {
             return Err(PaymentChannelError::InvalidTimeout);
@@ -75,7 +112,7 @@ impl PaymentChannel {
 
         let channel_id: BytesN<32> = env.crypto().sha256(&data).into();
 
-        let state = ChannelState::new(
+        let state = ChannelState::with_reserve(
             &env,
             channel_id.clone(),
             participant_a.clone(),
@@ -84,6 +121,7 @@ impl PaymentChannel {
             initial_balance_b,
             timeout,
             fee_percentage,
+            channel_reserve,
         );
 
         state::store_channel_state(&env, &channel_id, &state);
@@ -98,6 +136,39 @@ impl PaymentChannel {
         state::store_participant_channels(&env, &participant_b, &b_channels);
 
         Ok(channel_id)
+    }
+
+    /// Configure or update the minimum per-participant reserve on an open channel (#356).
+    ///
+    /// Requires authorization from both participants. Rejects closed channels,
+    /// negative reserves, or reserves exceeding either participant's current balance
+    /// without mutating storage.
+    pub fn set_channel_reserve(
+        env: Env,
+        channel_id: BytesN<32>,
+        channel_reserve: i128,
+    ) -> Result<(), PaymentChannelError> {
+        let mut state = state::get_channel_state(&env, &channel_id)?;
+        if state.is_cooperative_close || state.close_time != 0 {
+            return Err(PaymentChannelError::ChannelAlreadyClosed);
+        }
+        if channel_reserve < 0 {
+            return Err(PaymentChannelError::InvalidBalance);
+        }
+        if state.balance_a < channel_reserve || state.balance_b < channel_reserve {
+            return Err(PaymentChannelError::ReserveNotMet);
+        }
+
+        state.participant_a.require_auth();
+        state.participant_b.require_auth();
+
+        state.channel_reserve = channel_reserve;
+        state::store_channel_state(&env, &channel_id, &state);
+
+        env.events()
+            .publish(("channel_reserve_updated", channel_id), channel_reserve);
+
+        Ok(())
     }
 
     /// Get the current state of a channel
@@ -162,6 +233,10 @@ impl PaymentChannel {
             return Err(PaymentChannelError::BalanceMismatch);
         }
 
+        if new_balance_a < state.channel_reserve || new_balance_b < state.channel_reserve {
+            return Err(PaymentChannelError::ReserveNotMet);
+        }
+
         state.participant_a.require_auth();
         state.participant_b.require_auth();
 
@@ -206,6 +281,9 @@ impl PaymentChannel {
 
         if state.balance_a < amount {
             return Err(PaymentChannelError::InsufficientBalance);
+        }
+        if state.balance_a - amount < state.channel_reserve {
+            return Err(PaymentChannelError::ReserveNotMet);
         }
 
         state.participant_a.require_auth();
