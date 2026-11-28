@@ -11,6 +11,7 @@ pub struct AmmRouter;
 #[contractimpl]
 impl AmmRouter {
     /// Multi-hop swap: `path[k]` is the input asset for `pools[k]`.
+    ///
     /// The router receives `amount_in` of `path[0]` from `user`, then routes through each pool.
     ///
     /// # Overflow and input guards (#399)
