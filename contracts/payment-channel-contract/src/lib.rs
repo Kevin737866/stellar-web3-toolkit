@@ -19,6 +19,23 @@ use soroban_sdk::{
 pub use types::CloseReason;
 use types::{ChannelState, ChannelStatusReport, HTLCInfo, HtlcList};
 
+/// Shortest dispute period the contract accepts for a force-close request,
+/// in seconds.
+///
+/// A period below this value leaves the non-initiating party too little time
+/// to contest a fraudulent state before the initiator can withdraw.  The
+/// value (one hour) matches the minimum enforced on `timeout` during channel
+/// initialization.
+pub const MIN_DISPUTE_PERIOD_SECS: u32 = 3_600;
+
+/// Longest dispute period the contract accepts for a force-close request,
+/// in seconds.
+///
+/// An unbounded period would let the initiator lock the channel forever and
+/// is therefore a denial-of-service vector.  The value (30 days) is generous
+/// enough for any real-world dispute while remaining practically finite.
+pub const MAX_DISPUTE_PERIOD_SECS: u32 = 30 * 24 * 3_600; // 2_592_000
+
 /// Append an address's canonical strkey encoding to `out`.
 ///
 /// `soroban-sdk` 21 exposes no accessor for an `Address`'s raw 32 bytes, so the
@@ -634,6 +651,88 @@ impl PaymentChannel {
 
         env.events().publish(
             ("channel_close_initiated", channel_id),
+            (initiator.to_val(), withdraw_time),
+        );
+
+        Ok(withdraw_time)
+    }
+
+    /// Initiate a force-close with an explicit, bounded dispute period.
+    ///
+    /// This entry point is an alternative to [`PaymentChannel::initiate_unilateral_close`]
+    /// for callers that want to override the channel's configured `timeout`.
+    /// The caller supplies `dispute_period_secs`, which the contract validates
+    /// against the protocol bounds before applying it:
+    ///
+    /// * `dispute_period_secs` must be **at least** [`MIN_DISPUTE_PERIOD_SECS`]
+    ///   (one hour); shorter periods leave the counterparty too little time to
+    ///   contest a fraudulent state.  Returns
+    ///   [`PaymentChannelError::DisputePeriodTooShort`] when this is violated.
+    ///
+    /// * `dispute_period_secs` must be **at most** [`MAX_DISPUTE_PERIOD_SECS`]
+    ///   (30 days); longer periods are a denial-of-service vector that can lock
+    ///   channel funds indefinitely.  Returns
+    ///   [`PaymentChannelError::DisputePeriodTooLong`] when this is violated.
+    ///
+    /// All other invariants from `initiate_unilateral_close` still apply:
+    ///
+    /// * only a channel participant may call this;
+    /// * the channel must be open (not already closing or closed);
+    /// * there must be no outstanding HTLCs.
+    ///
+    /// On success the channel's `timeout` field is updated to `dispute_period_secs`
+    /// and the close is recorded exactly as `initiate_unilateral_close` would.
+    /// The returned `u64` is the earliest timestamp at which funds may be
+    /// withdrawn (current ledger timestamp + dispute period).
+    ///
+    /// # Compatibility
+    ///
+    /// Callers that do not need to override the dispute period should continue
+    /// using [`PaymentChannel::initiate_unilateral_close`].
+    pub fn force_close(
+        env: Env,
+        channel_id: BytesN<32>,
+        initiator: Address,
+        dispute_period_secs: u32,
+    ) -> Result<u64, PaymentChannelError> {
+        // Validate the dispute period first so that invalid input is rejected
+        // before any state is read or authorization is checked.
+        if dispute_period_secs < MIN_DISPUTE_PERIOD_SECS {
+            return Err(PaymentChannelError::DisputePeriodTooShort);
+        }
+        if dispute_period_secs > MAX_DISPUTE_PERIOD_SECS {
+            return Err(PaymentChannelError::DisputePeriodTooLong);
+        }
+
+        let mut state = state::get_channel_state(&env, &channel_id)?;
+
+        if state.is_cooperative_close {
+            return Err(PaymentChannelError::ChannelAlreadyClosed);
+        }
+        if state.close_time != 0 {
+            return Err(PaymentChannelError::ChannelAlreadyClosed);
+        }
+        if initiator != state.participant_a && initiator != state.participant_b {
+            return Err(PaymentChannelError::UnauthorizedParticipant);
+        }
+
+        initiator.require_auth();
+
+        if state::has_active_htlcs(&env, &state.htlcs) {
+            return Err(PaymentChannelError::ActiveHtlcsExist);
+        }
+
+        // Apply the caller-supplied (and validated) dispute period.
+        state.timeout = dispute_period_secs;
+        state.close_time = env.ledger().timestamp();
+        state.sequence_number += 1;
+
+        state::store_channel_state(&env, &channel_id, &state);
+
+        let withdraw_time = state.close_time + dispute_period_secs as u64;
+
+        env.events().publish(
+            ("channel_force_close_initiated", channel_id),
             (initiator.to_val(), withdraw_time),
         );
 
