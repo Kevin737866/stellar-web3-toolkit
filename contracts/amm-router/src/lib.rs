@@ -69,7 +69,8 @@ impl AmmRouter {
 mod test {
     use super::*;
     use amm_pool::{AmmPool, AmmPoolClient};
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::{Address as _, Events as _};
+    use soroban_sdk::{symbol_short, Symbol, TryFromVal};
 
     #[test]
     fn router_rejects_invalid_amounts_and_routes_before_moving_funds() {

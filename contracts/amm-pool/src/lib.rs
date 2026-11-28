@@ -27,7 +27,7 @@ use math::{
     liquidity_amounts_first_deposit, quote,
 };
 use soroban_sdk::token::{TokenClient, TokenInterface};
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, IntoVal, String};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, IntoVal, String};
 
 #[contracttype]
 #[derive(Clone)]
@@ -394,11 +394,13 @@ impl AmmPool {
         if token_in == ta {
             set_reserves(&env, new_in, new_out);
         } else {
-            set_reserves(&env, new_out, new_in);
-        }
+            (new_out, new_in)
+        };
+        set_reserves(&env, new_a, new_b);
 
         TokenClient::new(&env, &token_out).transfer(&pool, &to, &out);
         grow_cumulative(&env);
+        emit_reserve_change(&env, reserve_a, reserve_b, new_a, new_b);
         out
     }
 
@@ -553,8 +555,9 @@ impl TokenInterface for AmmPool {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::testutils::{Address as _, Ledger as _};
+    use soroban_sdk::testutils::{Address as _, Events as _, Ledger as _};
     use soroban_sdk::token::{StellarAssetClient, TokenClient};
+    use soroban_sdk::{Symbol, TryFromVal};
 
     #[contracttype]
     #[derive(Clone)]
