@@ -128,6 +128,71 @@ fn is_scheme_allowed(scheme: &str) -> bool {
     ALLOWED_SCHEMES.contains(&scheme)
 }
 
+/// Validates a raw endpoint URI string against the scheme allowlist.
+fn validate_endpoint_uri(raw: &str) -> Result<(), DidError> {
+    let parsed = url::Url::parse(raw).map_err(|e| DidError::InvalidUri {
+        input: raw.to_string(),
+        reason: e.to_string(),
+    })?;
+
+    let scheme = parsed.scheme();
+    if !is_scheme_allowed(scheme) {
+        return Err(DidError::InvalidScheme {
+            scheme: scheme.to_string(),
+            uri: raw.to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+/// Validates a DID string against W3C DID Core `did:<method>:<id>` syntax.
+pub(crate) fn validate_did(did: &str) -> Result<(), DidError> {
+    if did.is_empty() || did.chars().any(char::is_whitespace) {
+        return Err(DidError::InvalidDid {
+            input: did.to_string(),
+            reason: "DID must be non-empty and contain no whitespace".to_string(),
+        });
+    }
+
+    let Some(rest) = did.strip_prefix("did:") else {
+        return Err(DidError::InvalidDid {
+            input: did.to_string(),
+            reason: "DID must start with `did:`".to_string(),
+        });
+    };
+
+    let Some((method, method_id)) = rest.split_once(':') else {
+        return Err(DidError::InvalidDid {
+            input: did.to_string(),
+            reason: "DID must contain a method and method-specific identifier".to_string(),
+        });
+    };
+
+    if method.is_empty()
+        || !method
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    {
+        return Err(DidError::InvalidDid {
+            input: did.to_string(),
+            reason: format!("invalid DID method `{method}`"),
+        });
+    }
+
+    if method_id.is_empty()
+        || method_id.ends_with(':')
+        || method_id.chars().any(char::is_control)
+    {
+        return Err(DidError::InvalidDid {
+            input: did.to_string(),
+            reason: "DID method-specific identifier must be non-empty and well-formed".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
 // ── ServiceEndpoint ───────────────────────────────────────────────────────────
 
 /// A validated URI used as a DID service endpoint.
@@ -151,24 +216,11 @@ impl ServiceEndpoint {
     /// the allowlist (`https`, `http`, `did`).
     pub fn uri(input: impl Into<String>) -> Result<Self, DidError> {
         let raw = input.into();
-
         // Use the `url` crate for normalization and scheme extraction.
         // `did:` URIs are parsed by the url crate with scheme "did", which is
         // exactly what we need for the allowlist check.
-        let parsed = url::Url::parse(&raw).map_err(|e| DidError::InvalidUri {
-            input: raw.clone(),
-            reason: e.to_string(),
-        })?;
-
-        let scheme = parsed.scheme();
-        if !is_scheme_allowed(scheme) {
-            return Err(DidError::InvalidScheme {
-                scheme: scheme.to_string(),
-                uri: raw,
-            });
-        }
-
-        Ok(ServiceEndpoint(raw))
+        validate_endpoint_uri(&raw)?;
+        Ok(Self(raw))
     }
 
     /// The underlying URI string.
@@ -267,13 +319,91 @@ impl DidDocument {
     /// Create an empty DID document for the given subject `id`.
     #[must_use]
     pub fn new(id: impl Into<String>) -> Self {
-        DidDocument {
+        Self {
             id: id.into(),
             verification_method: Vec::new(),
             service: Vec::new(),
             verification_method: Vec::new(),
             key_rotation_history: Vec::new(),
         }
+        let doc: Self =
+            serde_json::from_value(value).map_err(|e| DidError::InvalidDocumentJson {
+                reason: e.to_string(),
+            })?;
+        doc.validate()?;
+        Ok(doc)
+    }
+
+    /// Validate the document's DID Core invariants, service entries, and
+    /// additional properties without mutating state.
+    pub fn validate(&self) -> Result<(), DidError> {
+        validate_did(&self.id)?;
+
+        for key in self.additional_properties.keys() {
+            if key.trim().is_empty() {
+                return Err(DidError::EmptyPropertyKey);
+            }
+            if RESERVED_DOCUMENT_FIELDS.contains(&key.as_str()) {
+                return Err(DidError::ReservedProperty(key.clone()));
+            }
+        }
+
+        let mut seen_ids = HashSet::with_capacity(self.service.len());
+        for svc in &self.service {
+            if svc.id.trim().is_empty() {
+                return Err(DidError::EmptyServiceId);
+            }
+            if svc.service_type.trim().is_empty() {
+                return Err(DidError::EmptyServiceType);
+            }
+            validate_endpoint_uri(svc.service_endpoint.as_str())?;
+            if !seen_ids.insert(svc.id.as_str()) {
+                return Err(DidError::DuplicateServiceId(svc.id.clone()));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate and serialize the DID document to a deterministic JSON string.
+    pub fn to_json(&self) -> Result<String, DidError> {
+        self.validate()?;
+        serde_json::to_string(self).map_err(|e| DidError::InvalidDocumentJson {
+            reason: e.to_string(),
+        })
+    }
+
+    /// Set an additional (extension) top-level property on the document.
+    ///
+    /// # Errors
+    ///
+    /// * [`DidError::EmptyPropertyKey`] — `key` is empty or whitespace-only.
+    /// * [`DidError::ReservedProperty`] — `key` is `"id"` or `"service"`.
+    pub fn set_property(
+        &mut self,
+        key: impl Into<String>,
+        value: serde_json::Value,
+    ) -> Result<(), DidError> {
+        let key = key.into();
+        if key.trim().is_empty() {
+            return Err(DidError::EmptyPropertyKey);
+        }
+        if RESERVED_DOCUMENT_FIELDS.contains(&key.as_str()) {
+            return Err(DidError::ReservedProperty(key));
+        }
+        self.additional_properties.insert(key, value);
+        Ok(())
+    }
+
+    /// Look up an additional top-level property by key.
+    pub fn get_property(&self, key: &str) -> Option<&serde_json::Value> {
+        self.additional_properties.get(key)
+    }
+
+    /// Remove an additional top-level property by key, returning its value if
+    /// present.
+    pub fn remove_property(&mut self, key: &str) -> Option<serde_json::Value> {
+        self.additional_properties.remove(key)
     }
 
     /// Add a verification method to the document, rejecting duplicates.
@@ -406,19 +536,7 @@ impl DidDocument {
         // Re-validate the scheme as defense-in-depth.  A ServiceEndpoint
         // constructed through the public API is already valid, but a document
         // deserialized from untrusted JSON could carry any string.
-        let parsed = url::Url::parse(service.service_endpoint.as_str()).map_err(|e| {
-            DidError::InvalidUri {
-                input: service.service_endpoint.as_str().to_string(),
-                reason: e.to_string(),
-            }
-        })?;
-        let scheme = parsed.scheme();
-        if !is_scheme_allowed(scheme) {
-            return Err(DidError::InvalidScheme {
-                scheme: scheme.to_string(),
-                uri: service.service_endpoint.as_str().to_string(),
-            });
-        }
+        validate_endpoint_uri(service.service_endpoint.as_str())?;
 
         // Reject duplicate IDs: a second entry with the same ID cannot shadow
         // the first without the caller explicitly removing the original.
