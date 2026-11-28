@@ -4,9 +4,11 @@
 
 pub mod anomaly;
 pub mod api_reference_gen;
+pub mod atomic_output;
 pub mod audit_allowlist;
 pub mod bridge_oracle;
 pub mod cli;
+pub mod completions;
 pub mod compliance;
 pub mod conviction;
 pub mod env_config;
@@ -31,6 +33,7 @@ pub mod presigned_deploy;
 pub mod scaffolder;
 pub mod session_keys;
 pub mod signal_sync;
+pub mod soroban_rpc;
 pub mod state_inspector;
 pub mod theme;
 pub mod timelock;
@@ -39,17 +42,24 @@ pub mod ts_codegen;
 pub mod wallet;
 pub mod wasm_provenance;
 
-pub use wallet::{AllowedNetwork, fund_account_on};
+pub use wallet::{fund_account_on, AllowedNetwork};
 
 pub use anomaly::{
     catalog as anomaly_catalog, AnomalyDetector, AnomalyReport, AnomalyRule, Baseline, Direction,
     MetricVerdict, Series,
 };
 pub use api_reference_gen::{ApiFunctionDoc, ApiReferenceGenerator};
+pub use atomic_output::{
+    atomic_write_bytes, atomic_write_str, AtomicOutputError, StagedDeploymentOutput, StagedFile,
+};
 pub use bridge_oracle::{
     OracleConfirmation, OracleQuorumError, OracleSet, QuorumReport, QuorumVerdict, MAX_ORACLES,
 };
 pub use cli::{App, ToolkitCommand};
+pub use completions::{
+    generate_completion, generate_completion_for_command, top_level_commands, validate_bin_name,
+    write_completion, CompletionError, Shell, TopLevelCommandSpec,
+};
 pub use compliance::{
     ComplianceCategory, ComplianceChecklist, ComplianceItem, VerificationHarness,
     VerificationHarnessReport, VerificationStep,
@@ -64,7 +74,10 @@ pub use env_config::{
 };
 pub use error::{Result, ToolkitError};
 pub use example_gallery::{ContractExample, ExampleGalleryRegistry};
-pub use gas_simulator::{FeeBump, FeeBreakdown, FeeBreakdownPercents, FeeEstimate, FeeEstimateReport, FeeSchedule, GasSimulator, TransactionProfile};
+pub use gas_simulator::{
+    FeeBreakdown, FeeBreakdownPercents, FeeBump, FeeEstimate, FeeEstimateReport, FeeSchedule,
+    GasSimulator, TransactionProfile,
+};
 pub use help_text::{help_width, render_command_help, wrap, HelpEntry};
 pub use horizon::{
     page_path, paginate, Cursor, HorizonPage, HorizonPaginationError, DEFAULT_LIMIT, MAX_LIMIT,
@@ -95,6 +108,15 @@ pub use session_keys::{
     SessionPolicy, VetoGuardian,
 };
 pub use signal_sync::{Signal, SignalSnapshot, SyncError, SyncReport, SNAPSHOT_VERSION};
+pub use state_inspector::{
+    Durability, StateEntry, StateExport, StateInspector, StatePage, StateQuery,
+    STATE_EXPORT_SCHEMA_VERSION,
+};
+pub use soroban_rpc::{
+    poll_transaction, poll_transaction_with_sleep, validate_rpc_url, validate_tx_hash,
+    HttpSorobanRpcClient, PollConfig, PollError, PollOutcome, SorobanRpcTransport,
+    TerminalTransactionResult, TransactionReceipt, TransactionStatusResponse,
+};
 pub use state_inspector::{Durability, StateEntry, StateInspector, StatePage, StateQuery};
 pub use timelock::{
     authorize_governance_action, DelayKind, GovernanceAction, GovernanceRole,

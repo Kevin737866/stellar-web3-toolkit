@@ -4,7 +4,7 @@
 //! public library API, following the conventions of the other `tests/`
 //! integration tests in this crate.
 
-use stellar_toolkit::{HsmError, RotationAudit, RotationRecord, SignRequest, StubHsm};
+use stellar_toolkit::{ColdSigner, HsmError, RotationAudit, RotationRecord, SignRequest, StubHsm};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -54,10 +54,7 @@ fn rotation_appends_one_record_with_correct_public_keys() {
         "old and new public keys must differ"
     );
     assert_eq!(record.rotated_at, 1_700_000_000);
-    assert_eq!(
-        record.reason.as_deref(),
-        Some("scheduled 90-day rotation")
-    );
+    assert_eq!(record.reason.as_deref(), Some("scheduled 90-day rotation"));
 }
 
 #[test]
@@ -136,10 +133,7 @@ fn multiple_rotations_chain_correctly_and_accumulate() {
     );
 
     // The second rotation recorded the sequence signed between rotations.
-    assert_eq!(
-        audit.records()[1].last_sequence_before_rotation,
-        Some(1)
-    );
+    assert_eq!(audit.records()[1].last_sequence_before_rotation, Some(1));
 }
 
 // ── Post-rotation signing ─────────────────────────────────────────────────────

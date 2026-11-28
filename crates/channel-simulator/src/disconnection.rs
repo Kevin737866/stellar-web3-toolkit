@@ -161,9 +161,7 @@ impl DisconnectionTracker {
 
         if self.offline_nodes.contains_key(node_id)
             || !nodes[node_id].node.online
-            || !graph
-                .get_node(node_id)
-                .is_some_and(|node| node.online)
+            || !graph.get_node(node_id).is_some_and(|node| node.online)
         {
             return Err(SimulatorError::InvalidNodeState(format!(
                 "node '{node_id}' is already disconnected"
@@ -341,9 +339,7 @@ impl DisconnectionTracker {
     ) -> Result<usize, SimulatorError> {
         config.validate()?;
 
-        if config.disconnect_probability == 0.0
-            || config.max_concurrent_disconnections == Some(0)
-        {
+        if config.disconnect_probability == 0.0 || config.max_concurrent_disconnections == Some(0) {
             return Ok(0);
         }
 

@@ -2045,9 +2045,9 @@ mod tests {
         assert!(matches!(
             error,
             AtomicSwapError::RefundBeforeTimeout {
-                swap_id: _,
                 timeout_ledger,
-                current_ledger
+                current_ledger,
+                ..
             } if timeout_ledger == boundary && current_ledger == boundary
         ));
 
@@ -2105,7 +2105,11 @@ mod tests {
         let boundary = timeout_ledger_of(&coordinator, &swap_id).await;
 
         coordinator
-            .complete_swap(swap_id.clone(), response.preimage.clone().unwrap(), boundary)
+            .complete_swap(
+                swap_id.clone(),
+                response.preimage.clone().unwrap(),
+                boundary,
+            )
             .await
             .unwrap();
 

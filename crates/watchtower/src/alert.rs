@@ -321,12 +321,7 @@ impl AlertDelivery {
 
     /// Record a failed delivery attempt, transitioning to `Failed` when the
     /// error is non-retryable or `max_attempts` has been reached.
-    pub fn record_failure(
-        &mut self,
-        error: &AlertDeliveryError,
-        backoff_secs: u64,
-        now: u64,
-    ) {
+    pub fn record_failure(&mut self, error: &AlertDeliveryError, backoff_secs: u64, now: u64) {
         self.attempts = self.attempts.saturating_add(1);
         self.last_error = Some(error.to_string());
         self.updated_at = now;
@@ -717,11 +712,7 @@ mod tests {
             payload: &'a DeliveryPayload,
         ) -> BoxFuture<'a, Result<(), AlertDeliveryError>> {
             self.seen_payloads.lock().push(payload.clone());
-            let next = self
-                .outcomes
-                .lock()
-                .pop_front()
-                .unwrap_or(Ok(()));
+            let next = self.outcomes.lock().pop_front().unwrap_or(Ok(()));
             Box::pin(async move { next })
         }
     }
@@ -936,12 +927,8 @@ mod tests {
                 reason: "410 gone".to_string(),
             },
         )]));
-        let service = AlertDeliveryService::new(
-            AlertDeliveryConfig::default(),
-            storage,
-            transport,
-        )
-        .unwrap();
+        let service =
+            AlertDeliveryService::new(AlertDeliveryConfig::default(), storage, transport).unwrap();
 
         let alert = Alert::breach_attempt("chan-2".to_string(), 1, 2);
         let dest = "https://hooks.example.com/watchtower";
@@ -962,12 +949,9 @@ mod tests {
     async fn storage_failure_prevents_transport_invocation() {
         let storage = Arc::new(FailingStoreBackend);
         let transport = Arc::new(ScriptedTransport::new(vec![Ok(())]));
-        let service = AlertDeliveryService::new(
-            AlertDeliveryConfig::default(),
-            storage,
-            transport.clone(),
-        )
-        .unwrap();
+        let service =
+            AlertDeliveryService::new(AlertDeliveryConfig::default(), storage, transport.clone())
+                .unwrap();
 
         let alert = Alert::breach_attempt("chan-3".to_string(), 1, 2);
         let err = service

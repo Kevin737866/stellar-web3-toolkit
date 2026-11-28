@@ -258,6 +258,12 @@ impl AmmPool {
         )
     }
 
+    /// Add liquidity to the pool (0% fee).
+    ///
+    /// Proportional token quotes (`quote`) and LP share minting
+    /// (`floor(sqrt(amount_a * amount_b))` on first deposit, or
+    /// `min(amount_a * total_lp / reserve_a, amount_b * total_lp / reserve_b)` thereafter)
+    /// use integer division that rounds down (truncates toward zero).
     pub fn add_liquidity(
         env: Env,
         user: Address,
@@ -311,6 +317,10 @@ impl AmmPool {
         liq
     }
 
+    /// Burn LP tokens and withdraw pro-rata reserves (0% fee).
+    ///
+    /// Withdrawn amounts `lp_amount * reserve / total_lp` round down
+    /// (truncate toward zero), leaving any integer remainder in pool reserves.
     pub fn remove_liquidity(
         env: Env,
         user: Address,
@@ -346,12 +356,11 @@ impl AmmPool {
         (amount_a, amount_b)
     }
 
-    /// Executes a constant-product swap, assuming `token_in` was already transferred to this pool.
+    /// Constant-product swap; assumes `token_in` was already transferred to this pool in this transaction.
     ///
-    /// On success, updates reserves, transfers `token_out` to `to`, updates TWAP cumulative
-    /// reserves, and emits `("reserves",)` with `(old_a, old_b, new_a, new_b)`.
-    /// Reverts without emitting events if `to == pool`, `amount_in <= 0`, `out < min_out`, or
-    /// reserves are insufficient.
+    /// Applies a fixed 0.3% (30 basis points, `997 / 1000` parts per thousand) fee on `amount_in`.
+    /// Both the fee-adjusted input (`amount_in * 997 / 1000`) and the output amount
+    /// round down (truncate toward zero), favoring pool reserves. Enforces `out >= min_out`.
     pub fn swap(env: Env, token_in: Address, to: Address, min_out: i128) -> i128 {
         assert_not_in_flash_swap(&env);
         assert!(to != env.current_contract_address(), "to");
@@ -395,10 +404,10 @@ impl AmmPool {
         out
     }
 
-    /// Flash swap: sends assets out, invokes `on_flash` on `callback`, then enforces constant-product K (fee on repaid leg).
+    /// Flash swap: sends assets out, invokes `on_flash` on `callback`, then enforces constant-product K.
     ///
-    /// On success, updates reserves to the post-repayment balances and emits `("reserves",)`
-    /// with `(old_a, old_b, bal_a, bal_b)`.
+    /// Charges a 0.3% (30 basis points, `3 / 1000` parts per thousand) fee on the repaid input leg(s)
+    /// and validates `lhs >= rhs` using exact 256-bit arithmetic (`flash_k_ok`) so rounding favors the pool.
     pub fn flash_swap(
         env: Env,
         recipient: Address,

@@ -375,9 +375,6 @@ pub fn submit_presigned_deployment(
             ParsedRpcOutcome::TryAgainLater { hash } => {
                 last_retryable_status = Some("TRY_AGAIN_LATER".to_string());
                 last_hash = hash;
-                if attempt < total_attempts {
-                    continue;
-                }
             }
         }
     }
@@ -499,7 +496,7 @@ fn validate_envelope_xdr(raw: &str) -> std::result::Result<String, PresignedDepl
 
 fn is_valid_base64(input: &str) -> bool {
     let bytes = input.as_bytes();
-    if bytes.is_empty() || bytes.len() % 4 != 0 {
+    if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
         return false;
     }
     let pad = bytes.iter().rev().take_while(|&&b| b == b'=').count();
@@ -612,11 +609,11 @@ fn parse_send_transaction_response(
 }
 
 fn summarize_body(body: &str) -> String {
+    const MAX_LEN: usize = 200;
     let trimmed = body.trim();
     if trimmed.is_empty() {
         return "empty response body".to_string();
     }
-    const MAX_LEN: usize = 200;
     if trimmed.chars().count() > MAX_LEN {
         let prefix: String = trimmed.chars().take(MAX_LEN).collect();
         format!("{prefix}...")
@@ -705,19 +702,19 @@ mod tests {
         }
     }
 
-    fn ok_response(body: &str) -> std::result::Result<RpcHttpResponse, TransportError> {
-        Ok(RpcHttpResponse {
+    fn ok_response(body: &str) -> RpcHttpResponse {
+        RpcHttpResponse {
             status: 200,
             body: body.to_string(),
-        })
+        }
     }
 
     #[test]
     fn submits_pending_transaction_and_returns_receipt() {
-        let transport = MockTransport::new(vec![ok_response(
+        let transport = MockTransport::new(vec![Ok(ok_response(
             r#"{"jsonrpc":"2.0","id":1,"result":{"status":"PENDING","hash":"abc123","latestLedger":42,"latestLedgerCloseTime":"1700000000"}}"#,
-        )]);
-        let mut req = PresignedDeployRequest::new("https://soroban-testnet.stellar.org", "AAAA==");
+        ))]);
+        let mut req = PresignedDeployRequest::new("https://soroban-testnet.stellar.org", "AAAA");
         req.network_passphrase = Some("Test SDF Network ; September 2015".to_string());
 
         let receipt = submit_presigned_deployment(&req, &transport).expect("submission succeeds");
@@ -730,10 +727,10 @@ mod tests {
 
     #[test]
     fn treats_duplicate_status_as_recoverable_success() {
-        let transport = MockTransport::new(vec![ok_response(
+        let transport = MockTransport::new(vec![Ok(ok_response(
             r#"{"jsonrpc":"2.0","id":1,"result":{"status":"DUPLICATE","hash":"dup999","latestLedger":99}}"#,
-        )]);
-        let req = PresignedDeployRequest::new("https://soroban-testnet.stellar.org", "AAAA==");
+        ))]);
+        let req = PresignedDeployRequest::new("https://soroban-testnet.stellar.org", "AAAA");
 
         let receipt = submit_presigned_deployment(&req, &transport).expect("duplicate succeeds");
         assert_eq!(receipt.status, SubmissionStatus::Duplicate);
@@ -748,14 +745,14 @@ mod tests {
                 status: 503,
                 body: "service unavailable".to_string(),
             }),
-            ok_response(
+            Ok(ok_response(
                 r#"{"jsonrpc":"2.0","id":1,"result":{"status":"TRY_AGAIN_LATER","hash":"retry1"}}"#,
-            ),
-            ok_response(
+            )),
+            Ok(ok_response(
                 r#"{"jsonrpc":"2.0","id":1,"result":{"status":"PENDING","hash":"retry1","latestLedger":105}}"#,
-            ),
+            )),
         ]);
-        let mut req = PresignedDeployRequest::new("https://soroban-testnet.stellar.org", "AAAA==");
+        let mut req = PresignedDeployRequest::new("https://soroban-testnet.stellar.org", "AAAA");
         req.max_retries = 2;
 
         let receipt = submit_presigned_deployment(&req, &transport).expect("retries succeed");
@@ -769,7 +766,7 @@ mod tests {
     fn rejects_invalid_inputs_before_calling_transport() {
         let transport = MockTransport::new(vec![]);
 
-        let bad_url = PresignedDeployRequest::new("ftp://example.com", "AAAA==");
+        let bad_url = PresignedDeployRequest::new("ftp://example.com", "AAAA");
         assert!(matches!(
             submit_presigned_deployment(&bad_url, &transport),
             Err(PresignedDeployError::InvalidRpcUrl(_))
@@ -781,14 +778,14 @@ mod tests {
             Err(PresignedDeployError::InvalidEnvelope(_))
         ));
 
-        let mut bad_retries = PresignedDeployRequest::new("https://rpc.example.com", "AAAA==");
+        let mut bad_retries = PresignedDeployRequest::new("https://rpc.example.com", "AAAA");
         bad_retries.max_retries = MAX_ALLOWED_RETRIES + 1;
         assert!(matches!(
             submit_presigned_deployment(&bad_retries, &transport),
             Err(PresignedDeployError::InvalidConfig(_))
         ));
 
-        let mut bad_timeout = PresignedDeployRequest::new("https://rpc.example.com", "AAAA==");
+        let mut bad_timeout = PresignedDeployRequest::new("https://rpc.example.com", "AAAA");
         bad_timeout.timeout_secs = 0;
         assert!(matches!(
             submit_presigned_deployment(&bad_timeout, &transport),
@@ -800,9 +797,9 @@ mod tests {
 
     #[test]
     fn enforces_envelope_size_boundary() {
-        let transport = MockTransport::new(vec![ok_response(
+        let transport = MockTransport::new(vec![Ok(ok_response(
             r#"{"jsonrpc":"2.0","id":1,"result":{"status":"PENDING","hash":"bigok"}}"#,
-        )]);
+        ))]);
         let exact = "A".repeat(MAX_ENVELOPE_XDR_BYTES);
         let req_ok = PresignedDeployRequest::new("https://rpc.example.com", exact);
         assert!(submit_presigned_deployment(&req_ok, &transport).is_ok());
@@ -821,7 +818,7 @@ mod tests {
             status: 400,
             body: "bad request".to_string(),
         })]);
-        let req = PresignedDeployRequest::new("https://rpc.example.com", "AAAA==");
+        let req = PresignedDeployRequest::new("https://rpc.example.com", "AAAA");
         let err = submit_presigned_deployment(&req, &t_400).unwrap_err();
         assert!(matches!(
             err,
@@ -833,18 +830,18 @@ mod tests {
         ));
         assert_eq!(t_400.call_count(), 1);
 
-        let t_rpc = MockTransport::new(vec![ok_response(
+        let t_rpc = MockTransport::new(vec![Ok(ok_response(
             r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"invalid params"}}"#,
-        )]);
+        ))]);
         assert!(matches!(
             submit_presigned_deployment(&req, &t_rpc),
             Err(PresignedDeployError::Rpc { code: -32602, .. })
         ));
         assert_eq!(t_rpc.call_count(), 1);
 
-        let t_rej = MockTransport::new(vec![ok_response(
+        let t_rej = MockTransport::new(vec![Ok(ok_response(
             r#"{"jsonrpc":"2.0","id":1,"result":{"status":"ERROR","hash":"badtx","errorResultXdr":"AAAA"}}"#,
-        )]);
+        ))]);
         assert!(matches!(
             submit_presigned_deployment(&req, &t_rej),
             Err(PresignedDeployError::TransactionRejected {
@@ -864,7 +861,7 @@ mod tests {
         let receipt_path = dir.path().join("receipt.json");
 
         let transport = MockTransport::new(vec![]);
-        let mut req = PresignedDeployRequest::new("https://rpc.example.com", "AAAA==");
+        let mut req = PresignedDeployRequest::new("https://rpc.example.com", "AAAA");
         req.wasm_check = Some(WasmArtifactCheck {
             wasm_path,
             expected_sha256: "0".repeat(64),

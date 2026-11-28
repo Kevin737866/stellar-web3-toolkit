@@ -73,6 +73,10 @@ pub enum PaymentChannelError {
     AmountExceedsMaximum = 29,
     /// Presented state is not newer than the channel's recorded sequence (#352)
     StaleState = 30,
+    /// Dispute period is shorter than the protocol minimum (#353)
+    DisputePeriodTooShort = 31,
+    /// Dispute period is longer than the protocol maximum (#353)
+    DisputePeriodTooLong = 32,
 }
 
 impl TryFrom<u32> for PaymentChannelError {
@@ -110,6 +114,8 @@ impl TryFrom<u32> for PaymentChannelError {
             28 => Ok(PaymentChannelError::PathTooLong),
             29 => Ok(PaymentChannelError::AmountExceedsMaximum),
             30 => Ok(PaymentChannelError::StaleState),
+            31 => Ok(PaymentChannelError::DisputePeriodTooShort),
+            32 => Ok(PaymentChannelError::DisputePeriodTooLong),
             _ => Err(Error::from_contract_error(value)),
         }
     }
@@ -149,6 +155,12 @@ impl PaymentChannelError {
             PaymentChannelError::PathTooLong => "Payment path too long",
             PaymentChannelError::AmountExceedsMaximum => "Amount exceeds maximum allowed",
             PaymentChannelError::StaleState => "State is older than the recorded sequence",
+            PaymentChannelError::DisputePeriodTooShort => {
+                "Dispute period is shorter than the protocol minimum"
+            }
+            PaymentChannelError::DisputePeriodTooLong => {
+                "Dispute period is longer than the protocol maximum"
+            }
         }
     }
 }

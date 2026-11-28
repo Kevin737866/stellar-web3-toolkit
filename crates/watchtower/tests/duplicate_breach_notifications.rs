@@ -34,24 +34,20 @@ async fn duplicate_breach_notifications_are_deduplicated_across_alerts_and_justi
     let breach = sample_breach("ch-dup-integration", "tx-breach-1");
 
     // First notification: alert is recorded and justice tx is submitted.
-    assert!(watchtower
-        .state()
-        .add_alert_dedup(Alert::breach_attempt(
-            breach.channel_id.clone(),
-            breach.old_sequence,
-            breach.new_sequence,
-        )));
+    assert!(watchtower.state().add_alert_dedup(Alert::breach_attempt(
+        breach.channel_id.clone(),
+        breach.old_sequence,
+        breach.new_sequence,
+    )));
     let first_tx = justice.submit_justice(&breach).await.unwrap();
     assert_eq!(first_tx.channel_id, "ch-dup-integration");
 
     // Duplicate notification: alert is suppressed and justice submission fails cleanly.
-    assert!(!watchtower
-        .state()
-        .add_alert_dedup(Alert::breach_attempt(
-            breach.channel_id.clone(),
-            breach.old_sequence,
-            breach.new_sequence,
-        )));
+    assert!(!watchtower.state().add_alert_dedup(Alert::breach_attempt(
+        breach.channel_id.clone(),
+        breach.old_sequence,
+        breach.new_sequence,
+    )));
     let dup_err = justice.submit_justice(&breach).await.unwrap_err();
     assert!(matches!(dup_err, JusticeError::DuplicateBreach { .. }));
 

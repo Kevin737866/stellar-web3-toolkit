@@ -88,6 +88,15 @@ pub enum ToolkitCommand {
         #[arg(long, default_value_t = 0)]
         width: usize,
     },
+    /// Generate shell completion scripts for top-level toolkit commands
+    Completions {
+        /// Target shell (bash, zsh, fish, powershell)
+        #[arg(value_enum)]
+        shell: crate::completions::Shell,
+        /// Write the completion script to a file instead of stdout
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -302,6 +311,9 @@ pub enum InspectCommand {
         #[arg(long, default_value_t = 0)]
         cursor: usize,
         /// JSON state export to read instead of the built-in sample
+        ///
+        /// Accepts a bare array of entries as well as a document written by
+        /// `--output`.
         #[arg(long)]
         input: Option<PathBuf>,
         /// Print every page instead of a single one
@@ -310,6 +322,13 @@ pub enum InspectCommand {
         /// Print the page as JSON
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// Write every entry matching the filters to a single JSON document
+        ///
+        /// Unlike `--json`, which prints one page, this exports the complete
+        /// result (entries, filters and schema version) to a file that `--input`
+        /// can read back (issue #312).
+        #[arg(long)]
+        output: Option<PathBuf>,
     },
 }
 
@@ -535,14 +554,51 @@ pub enum SessionCommand {
     },
 }
 
+/// Soroban transaction commands (issue #324).
+#[derive(Subcommand, Debug)]
+pub enum TxCommand {
+    /// Poll a Soroban transaction hash via `getTransaction` until SUCCESS or FAILED
+    Poll {
+        /// Soroban RPC endpoint URL (http or https)
+        #[arg(long)]
+        rpc_url: String,
+        /// 64-character hex Soroban transaction hash
+        #[arg(long)]
+        hash: String,
+        /// Maximum polling duration in seconds
+        #[arg(long, default_value_t = 30)]
+        timeout_secs: u64,
+        /// Initial polling interval in milliseconds
+        #[arg(long, default_value_t = 1000)]
+        interval_ms: u64,
+        /// Maximum polling attempts
+        #[arg(long, default_value_t = 30)]
+        max_attempts: usize,
+        /// Maximum consecutive transient RPC errors tolerated
+        #[arg(long, default_value_t = 3)]
+        max_transient_errors: usize,
+    },
+}
+
 #[derive(Subcommand)]
 pub enum WalletCommand {
     /// Generate a 24-word recovery phrase and derive a Stellar keypair
-    Generate,
+    Generate {
+        /// Print the recovery phrase and secret key
+        ///
+        /// This is the explicit confirmation: without it the command prints the
+        /// account id only, with both secrets replaced by `<hidden>` (issue
+        /// #328). Use it only when nobody can see the terminal or its scrollback.
+        #[arg(long, default_value_t = false)]
+        show_secret: bool,
+    },
     /// Recover a Stellar keypair from an existing recovery phrase
     Recover {
         /// The BIP-39 recovery phrase (quote it for shell safety)
         phrase: String,
+        /// Print the recovery phrase and secret key (explicit confirmation)
+        #[arg(long, default_value_t = false)]
+        show_secret: bool,
     },
     /// Fund a Stellar account on testnet using the Friendbot faucet
     Fund {
@@ -568,8 +624,15 @@ pub enum WalletCommand {
 impl std::fmt::Debug for WalletCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Generate => f.write_str("Generate"),
-            Self::Recover { .. } => f.write_str("Recover { phrase: \"<redacted>\" }"),
+            Self::Generate { show_secret } => f
+                .debug_struct("Generate")
+                .field("show_secret", show_secret)
+                .finish(),
+            Self::Recover { show_secret, .. } => f
+                .debug_struct("Recover")
+                .field("phrase", &"<redacted>")
+                .field("show_secret", show_secret)
+                .finish(),
             Self::Fund { account } => f.debug_struct("Fund").field("account", account).finish(),
             Self::Sign { message, .. } => f
                 .debug_struct("Sign")
@@ -627,6 +690,10 @@ impl ToolkitCommand {
                     *width
                 };
                 print!("{}", help_text::render_command_help(resolved));
+                Ok(())
+            }
+            Self::Completions { shell, out } => {
+                crate::completions::write_completion(*shell, out.as_deref())?;
                 Ok(())
             }
         }
@@ -781,16 +848,21 @@ fn run_deploy(cmd: &DeployCommand) -> Result<()> {
 fn run_wallet(wallet: &WalletCommand) -> Result<()> {
     use crate::wallet;
     match wallet {
-        WalletCommand::Generate => {
+        WalletCommand::Generate { show_secret } => {
             let w = wallet::generate_wallet()?;
-            print_wallet(&w);
-            println!("\n⚠  Write down your recovery phrase and store it somewhere safe. ");
-            println!("Anyone with it controls the account. It is shown only once.");
+            print_wallet(&w, *show_secret);
+            if *show_secret {
+                println!("\n⚠  Write down your recovery phrase and store it somewhere safe. ");
+                println!("Anyone with it controls the account. It is shown only once.");
+            }
             Ok(())
         }
-        WalletCommand::Recover { phrase } => {
+        WalletCommand::Recover {
+            phrase,
+            show_secret,
+        } => {
             let w = wallet::recover_wallet(phrase)?;
-            print_wallet(&w);
+            print_wallet(&w, *show_secret);
             Ok(())
         }
         WalletCommand::Fund { account } => wallet::fund_account(account),
@@ -881,10 +953,17 @@ fn run_session(cmd: &SessionCommand) -> Result<()> {
     }
 }
 
-fn print_wallet(w: &crate::wallet::GeneratedWallet) {
+/// Print a wallet summary. `show_secret` is the operator's explicit confirmation
+/// to reveal the recovery phrase and secret key; without it the summary is
+/// masked (issue #328).
+fn print_wallet(w: &crate::wallet::GeneratedWallet, show_secret: bool) {
     print!(
         "{}",
-        crate::wallet::format_wallet_summary(w, &crate::theme::Theme::from_env())
+        crate::wallet::format_wallet_summary(
+            w,
+            &crate::theme::Theme::from_env(),
+            crate::wallet::SecretVisibility::from_confirmation(show_secret)
+        )
     );
 }
 
@@ -1293,7 +1372,7 @@ fn run_migration(cmd: &MigrationCommand) -> Result<()> {
 }
 
 fn run_scaffold(cmd: &ScaffoldCommand) -> Result<()> {
-    use crate::scaffolder::{lint_directory, ScaffoldOptions, Scaffolder};
+    use crate::scaffolder::{lint_directory, validate_template_name, ScaffoldOptions, Scaffolder};
     match cmd {
         ScaffoldCommand::New {
             name,
@@ -1304,6 +1383,7 @@ fn run_scaffold(cmd: &ScaffoldCommand) -> Result<()> {
             dry_run,
             force,
         } => {
+            validate_template_name(name)?;
             let mut options = ScaffoldOptions::new(name.clone()).with_tests(!no_tests);
             if let Some(description) = description {
                 options = options.with_description(description.clone());
@@ -1349,7 +1429,9 @@ fn run_scaffold(cmd: &ScaffoldCommand) -> Result<()> {
 }
 
 fn run_gas(cmd: &GasCommand) -> Result<()> {
-    use crate::gas_simulator::{format_stroops, FeeEstimateReport, FeeSchedule, GasSimulator, TransactionProfile};
+    use crate::gas_simulator::{
+        format_stroops, FeeEstimateReport, FeeSchedule, GasSimulator, TransactionProfile,
+    };
     match cmd {
         GasCommand::Estimate {
             operations,
@@ -1475,6 +1557,7 @@ fn run_inspect(cmd: &InspectCommand) -> Result<()> {
             input,
             all_pages,
             json,
+            output,
         } => {
             let inspector = match input {
                 Some(input) => {
@@ -1507,6 +1590,20 @@ fn run_inspect(cmd: &InspectCommand) -> Result<()> {
                 inspector.total(&query),
                 inspector.len()
             );
+
+            // An export is the whole filtered result in one document, so it is
+            // written before (and instead of) any page rendering (#312).
+            if let Some(output) = output {
+                let path = resolve_path(&cwd_root(), output);
+                let export = inspector.write_export(&query, &path)?;
+                println!(
+                    "exported {} entr{} to {}",
+                    export.total,
+                    if export.total == 1 { "y" } else { "ies" },
+                    path.display()
+                );
+                return Ok(());
+            }
 
             if *all_pages {
                 for (index, page) in inspector.pages(&query).iter().enumerate() {
@@ -1762,6 +1859,51 @@ fn run_verify(cmd: &VerifyCommand) -> Result<()> {
                 )));
             }
             Ok(())
+        }
+    }
+}
+
+fn run_tx(cmd: &TxCommand) -> Result<()> {
+    use crate::soroban_rpc::{
+        poll_transaction, HttpSorobanRpcClient, PollConfig, TerminalTransactionResult,
+    };
+    use std::time::Duration;
+
+    match cmd {
+        TxCommand::Poll {
+            rpc_url,
+            hash,
+            timeout_secs,
+            interval_ms,
+            max_attempts,
+            max_transient_errors,
+        } => {
+            let mut client = HttpSorobanRpcClient::new(rpc_url)?;
+            let interval = Duration::from_millis(*interval_ms);
+            let config = PollConfig {
+                poll_interval: interval,
+                max_interval: interval.max(Duration::from_secs(10)),
+                timeout: Duration::from_secs(*timeout_secs),
+                max_attempts: *max_attempts,
+                max_transient_errors: *max_transient_errors,
+            };
+            let outcome = poll_transaction(&mut client, hash, &config)?;
+            match outcome.result {
+                TerminalTransactionResult::Success(receipt) => {
+                    println!(
+                        "SUCCESS hash={} ledger={:?} attempts={}",
+                        receipt.tx_hash, receipt.ledger, outcome.attempts
+                    );
+                    Ok(())
+                }
+                TerminalTransactionResult::Failed(receipt) => {
+                    Err(ToolkitError::SorobanRpc(crate::soroban_rpc::PollError::TransactionFailed {
+                        tx_hash: receipt.tx_hash,
+                        ledger: receipt.ledger,
+                        result_xdr: receipt.result_xdr,
+                    }))
+                }
+            }
         }
     }
 }
