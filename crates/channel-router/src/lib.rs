@@ -271,6 +271,36 @@ pub struct Channel {
     pub age_seconds: u64,
 }
 
+impl Channel {
+    /// Determine the [`Direction`] of travel from `from` to `to` across this channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoutingError::InvalidRouteDirection`] if `from` and `to` do
+    /// not match the channel's two endpoints.
+    pub fn direction_for_hop(&self, from: &str, to: &str) -> Result<Direction, RoutingError> {
+        if self.node_a == from && self.node_b == to {
+            Ok(Direction::AToB)
+        } else if self.node_b == from && self.node_a == to {
+            Ok(Direction::BToA)
+        } else {
+            Err(RoutingError::InvalidRouteDirection {
+                channel_id: self.id.clone(),
+                from: from.to_string(),
+                to: to.to_string(),
+            })
+        }
+    }
+
+    /// Return the available balance in `direction`.
+    pub fn available_capacity(&self, direction: Direction) -> i128 {
+        match direction {
+            Direction::AToB => self.capacity_a_to_b,
+            Direction::BToA => self.capacity_b_to_a,
+        }
+    }
+}
+
 /// Direction for capacity checks
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
@@ -1016,6 +1046,7 @@ pub fn find_best_route_with_tie_breaker(
 
     // Individually acceptable hops can still add up past the payment budget.
     cap.check_route(request.amount, &route)?;
+    validate_route_direction_and_balance(graph, &request.source, &route)?;
 
     Ok(route)
 }
