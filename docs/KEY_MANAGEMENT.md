@@ -30,7 +30,7 @@ copied from, and (b) making a single key insufficient to move funds.
 | Shell history | `wallet recover "<phrase>"` typed at a prompt | Prefer `--phrase-file`/env input; clear history in shared shells |
 | Process arguments | `wallet sign <S…>` visible in `ps`, `/proc/<pid>/cmdline` | Redacting `Debug` prevents logging it; args are still visible to the same user |
 | Logs and CI output | `{:?}` of a command or wallet struct | Redacting `Debug` impls in `wallet.rs` and `cli.rs` |
-| Error messages | A rejected key echoed back in the error | `decode_secret` masks the input |
+| Error messages | A rejected key echoed back in the error | Every CLI error is passed through `error::redact_secret_material` before printing; `decode_secret` also masks its own input (issue #331) |
 | Build output | `target/` copied into a release artifact | `target/` is build-only; publish `dist/*.wasm` from `scripts/reproducible-build.sh` |
 | Developer laptops | Plaintext key file in a synced folder | Cold storage (see §4) |
 
