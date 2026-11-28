@@ -108,6 +108,10 @@ pub use session_keys::{
     SessionPolicy, VetoGuardian,
 };
 pub use signal_sync::{Signal, SignalSnapshot, SyncError, SyncReport, SNAPSHOT_VERSION};
+pub use state_inspector::{
+    Durability, StateEntry, StateExport, StateInspector, StatePage, StateQuery,
+    STATE_EXPORT_SCHEMA_VERSION,
+};
 pub use soroban_rpc::{
     poll_transaction, poll_transaction_with_sleep, validate_rpc_url, validate_tx_hash,
     HttpSorobanRpcClient, PollConfig, PollError, PollOutcome, SorobanRpcTransport,

@@ -208,6 +208,58 @@ impl StatePage {
     }
 }
 
+/// Schema version of the complete JSON export written by
+/// [`StateInspector::write_export`] (#312).
+pub const STATE_EXPORT_SCHEMA_VERSION: u32 = 1;
+
+/// A complete, single-document JSON export of an inspection query (#312).
+///
+/// `--json` prints one page at a time, which is what a terminal reader wants and
+/// what a script follows with a cursor loop. This document is the other half:
+/// every entry matching the filter in one object, together with the filter that
+/// produced it, so an exported file explains itself when it is opened later or
+/// handed to someone else.
+///
+/// The export is lossless — `entries` holds the same [`StateEntry`] values the
+/// paginated view serves — and can be loaded back with
+/// [`StateInspector::load`], which accepts both this document and a bare array of
+/// entries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateExport {
+    /// Document schema version, currently [`STATE_EXPORT_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// Contract filter that produced the export (`None` for all contracts).
+    pub contract_id: Option<String>,
+    /// Key-prefix filter that produced the export, if any.
+    pub key_prefix: Option<String>,
+    /// Whether temporary (rolled-back) entries are included.
+    pub include_temporary: bool,
+    /// Number of entries in `entries`.
+    pub total: usize,
+    pub entries: Vec<StateEntry>,
+}
+
+impl StateExport {
+    /// Stable, sorted entry list for the export.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Pretty-printed JSON, the format written to disk by
+    /// [`StateInspector::write_export`].
+    #[must_use]
+    pub fn to_json(&self) -> String {
+        serde_json::to_string_pretty(self).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+    }
+
+    /// Parse an export document written by [`StateExport::to_json`].
+    pub fn from_json(json: &str) -> Result<Self> {
+        serde_json::from_str(json)
+            .map_err(|e| ToolkitError::ExecutionError(format!("parse state export: {e}")))
+    }
+}
+
 /// Ordered, paginated view over contract state entries.
 #[derive(Debug, Clone, Default)]
 pub struct StateInspector {
@@ -221,9 +273,24 @@ impl StateInspector {
     }
 
     /// Builds an inspector from a JSON array of [`StateEntry`] values.
+    ///
+    /// Accepts either a bare array — the shape this function has always taken —
+    /// or a [`StateExport`] document written by [`Self::write_export`] (#312), so
+    /// an exported file can be re-read without stripping its wrapper.
     pub fn from_json(json: &str) -> Result<Self> {
-        let entries: Vec<StateEntry> = serde_json::from_str(json)
-            .map_err(|e| ToolkitError::ExecutionError(format!("parse state export: {e}")))?;
+        let entries = match serde_json::from_str::<Vec<StateEntry>>(json) {
+            Ok(entries) => entries,
+            Err(array_error) => match StateExport::from_json(json) {
+                Ok(export) => export.entries,
+                // Report the array error: it names the field that was wrong in
+                // the shape the caller most likely meant.
+                Err(_) => {
+                    return Err(ToolkitError::ExecutionError(format!(
+                        "parse state export: {array_error}"
+                    )))
+                }
+            },
+        };
         let mut inspector = Self::new();
         for entry in entries {
             inspector.insert(entry);
@@ -233,6 +300,10 @@ impl StateInspector {
 
     /// Loads a JSON state export from disk, returning the number of entries
     /// read from the file.
+    ///
+    /// Both a bare `StateEntry` array and a [`StateExport`] document are
+    /// accepted, so `inspect state --output <path>` and `--input <path>`
+    /// round-trip.
     pub fn load(&mut self, path: &Path) -> Result<usize> {
         let json = std::fs::read_to_string(path)?;
         let loaded = Self::from_json(&json)?;
@@ -241,6 +312,53 @@ impl StateInspector {
             self.insert(entry);
         }
         Ok(count)
+    }
+
+    /// Collect every entry matching `query` into one export document (#312).
+    ///
+    /// The result is the same stable `(durability, key, contract)` order the
+    /// paginated view serves, with the filter recorded alongside it.
+    #[must_use]
+    pub fn export(&self, query: &StateQuery) -> StateExport {
+        let entries = self
+            .filtered(query)
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        StateExport {
+            schema_version: STATE_EXPORT_SCHEMA_VERSION,
+            contract_id: query.contract_id().map(str::to_string),
+            key_prefix: query.key_prefix().map(str::to_string),
+            include_temporary: query.include_temporary(),
+            total: entries.len(),
+            entries,
+        }
+    }
+
+    /// Write the complete filtered result to `path` as a JSON export, returning
+    /// the document that was written (#312).
+    ///
+    /// Parent directories are created when missing, because the usual target is
+    /// `target/state/…` in a fresh checkout. A write failure is reported with the
+    /// path attached and leaves the previous file untouched: the document is
+    /// serialized in full before the file is opened.
+    pub fn write_export(&self, query: &StateQuery, path: &Path) -> Result<StateExport> {
+        let export = self.export(query);
+        let json = export.to_json();
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() && !parent.exists() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    ToolkitError::ExecutionError(format!(
+                        "create export directory {}: {e}",
+                        parent.display()
+                    ))
+                })?;
+            }
+        }
+        std::fs::write(path, format!("{json}\n")).map_err(|e| {
+            ToolkitError::ExecutionError(format!("write state export {}: {e}", path.display()))
+        })?;
+        Ok(export)
     }
 
     /// Inserts an entry, replacing an existing one with the same contract,
@@ -578,6 +696,118 @@ mod tests {
             live_until_ledger: None,
         }));
         assert_eq!(inspector.len(), 2);
+    }
+
+    #[test]
+    fn export_contains_every_filtered_entry_and_the_filter() {
+        let inspector = sample();
+        let query = StateQuery::new()
+            .with_key_prefix("Reserves/")
+            .including_temporary(true);
+        let export = inspector.export(&query);
+
+        assert_eq!(export.schema_version, STATE_EXPORT_SCHEMA_VERSION);
+        assert_eq!(export.total, 2);
+        assert_eq!(export.entries.len(), 2);
+        assert_eq!(export.key_prefix.as_deref(), Some("Reserves/"));
+        assert_eq!(export.contract_id, None);
+        assert!(export.include_temporary);
+        assert_eq!(
+            export
+                .entries
+                .iter()
+                .map(|entry| entry.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Reserves/A", "Reserves/B"]
+        );
+
+        // The whole document is valid JSON with a stable schema key.
+        let value: serde_json::Value = serde_json::from_str(&export.to_json()).unwrap();
+        assert_eq!(value["schema_version"], STATE_EXPORT_SCHEMA_VERSION);
+        assert_eq!(value["total"], 2);
+        assert_eq!(value["entries"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn export_honours_contract_and_temporary_filters() {
+        let inspector = sample();
+        let contract = inspector.export(&StateQuery::new().for_contract("CDEMO7FACTORYCONTRCT"));
+        assert_eq!(contract.total, 1);
+        assert_eq!(contract.entries[0].key, "Pool/CDEMO7POOLCONTRC");
+        assert_eq!(
+            contract.contract_id.as_deref(),
+            Some("CDEMO7FACTORYCONTRCT")
+        );
+
+        let without_temporary = inspector.export(&StateQuery::new());
+        assert_eq!(without_temporary.total, 5);
+        let with_temporary = inspector.export(&StateQuery::new().including_temporary(true));
+        assert_eq!(with_temporary.total, 7);
+        // `total` is derived from the entries, never a count that can drift.
+        assert_eq!(with_temporary.total, with_temporary.entries.len());
+    }
+
+    #[test]
+    fn exported_document_loads_back_into_an_inspector() {
+        let inspector = sample();
+        let query = StateQuery::new().including_temporary(true);
+        let json = inspector.export(&query).to_json();
+
+        let reloaded = StateInspector::from_json(&json).expect("export document parses");
+        assert_eq!(reloaded.len(), inspector.len());
+        assert_eq!(
+            reloaded.page(&query).entries,
+            inspector.page(&query).entries
+        );
+        // A bare array is still accepted, as before this change.
+        let array = serde_json::to_string(&inspector.export(&query).entries).unwrap();
+        assert_eq!(StateInspector::from_json(&array).unwrap().len(), 7);
+    }
+
+    #[test]
+    fn write_export_creates_directories_and_round_trips_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/reports/state.json");
+        let inspector = sample();
+        let query = StateQuery::new().for_contract("CDEMO7POOLCONTRACTID");
+
+        let written = inspector
+            .write_export(&query, &path)
+            .expect("export writes");
+        assert_eq!(written.total, 4);
+        assert!(path.exists(), "the export file must exist on disk");
+
+        let mut loaded = StateInspector::new();
+        assert_eq!(loaded.load(&path).unwrap(), 4);
+        assert_eq!(
+            loaded
+                .page(&StateQuery::new().for_contract("CDEMO7POOLCONTRACTID"))
+                .entries,
+            inspector.page(&query).entries
+        );
+    }
+
+    #[test]
+    fn write_export_reports_an_unwritable_path() {
+        let dir = tempfile::tempdir().unwrap();
+        // A regular file used as a directory component: neither create_dir_all
+        // nor write can succeed, and the error must name the path.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let path = blocker.join("state.json");
+
+        let err = sample()
+            .write_export(&StateQuery::new(), &path)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("create export directory") || err.contains("write state export"),
+            "the failure must name the operation: {err}"
+        );
+        assert!(
+            err.contains("blocker"),
+            "the failure must name the path: {err}"
+        );
     }
 
     #[test]
