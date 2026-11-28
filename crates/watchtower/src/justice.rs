@@ -752,7 +752,7 @@ mod tests {
         // via the unit-level flow in the action lifecycle tests below.
         let service = service();
         let result = service.submit_justice(&valid_breach()).await;
-        assert!(result.is_ok(), "valid breach must succeed: {:?}", result);
+        assert!(result.is_ok(), "valid breach must succeed: {result:?}");
 
         // Confirm: zero Pending left in storage means the persist-then-update
         // lifecycle ran to completion.
@@ -811,7 +811,8 @@ mod tests {
         use crate::storage::InMemoryStorage;
         use std::sync::Arc;
 
-        let storage = Arc::new(InMemoryStorage::new());
+        let storage: Arc<InMemoryStorage> = Arc::new(InMemoryStorage::new());
+        let backend: Arc<dyn StorageBackend> = Arc::clone(&storage) as Arc<dyn StorageBackend>;
 
         // Plant a Pending action directly in storage.
         let evidence = BreachEvidence {
@@ -825,8 +826,6 @@ mod tests {
         let action = JusticeAction::new("retry-test-action", evidence);
         storage.store_justice_action(&action).unwrap();
 
-        let concrete: Arc<crate::storage::InMemoryStorage> = Arc::clone(&storage);
-        let backend: Arc<dyn StorageBackend> = concrete;
         let service = JusticeService::new(
             "http://localhost".to_string(),
             "test".to_string(),
@@ -893,7 +892,7 @@ mod tests {
             "http://localhost".to_string(),
             "test".to_string(),
             100_000,
-            Arc::clone(&storage),
+            storage.clone() as Arc<dyn StorageBackend>,
         );
 
         let err = service.submit_justice(&breach).await.unwrap_err();

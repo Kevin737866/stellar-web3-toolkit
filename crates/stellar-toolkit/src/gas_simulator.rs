@@ -479,7 +479,8 @@ mod tests {
         let simulator = testnet();
         let estimate = simulator.estimate(&TransactionProfile::default());
         let pct = estimate.breakdown.percent_of(estimate.total_stroops);
-        let sum = pct.base_fee_pct + pct.resource_fee_pct + pct.inclusion_bid_pct + pct.per_operation_pct;
+        let sum =
+            pct.base_fee_pct + pct.resource_fee_pct + pct.inclusion_bid_pct + pct.per_operation_pct;
         // Allow ±0.4 for rounding across four components rounded to 1 decimal place.
         assert!((sum - 100.0).abs() < 0.4, "percents sum to ~100, got {sum}");
     }
@@ -493,10 +494,10 @@ mod tests {
             per_operation: 0,
         };
         let pct = bd.percent_of(0);
-        assert_eq!(pct.base_fee_pct, 0.0);
-        assert_eq!(pct.resource_fee_pct, 0.0);
-        assert_eq!(pct.inclusion_bid_pct, 0.0);
-        assert_eq!(pct.per_operation_pct, 0.0);
+        assert!((pct.base_fee_pct - 0.0).abs() < f64::EPSILON);
+        assert!((pct.resource_fee_pct - 0.0).abs() < f64::EPSILON);
+        assert!((pct.inclusion_bid_pct - 0.0).abs() < f64::EPSILON);
+        assert!((pct.per_operation_pct - 0.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -508,8 +509,8 @@ mod tests {
             per_operation: 0,
         };
         let pct = bd.percent_of(500);
-        assert_eq!(pct.base_fee_pct, 100.0);
-        assert_eq!(pct.resource_fee_pct, 0.0);
+        assert!((pct.base_fee_pct - 100.0).abs() < f64::EPSILON);
+        assert!((pct.resource_fee_pct - 0.0).abs() < f64::EPSILON);
     }
 
     // ── FeeEstimateReport ─────────────────────────────────────────────────────
@@ -522,7 +523,10 @@ mod tests {
         // The report's estimate must equal a direct call.
         let direct = simulator.estimate(&profile);
         assert_eq!(report.estimate.total_stroops, direct.total_stroops);
-        assert_eq!(report.estimate.breakdown.resource_fee, direct.breakdown.resource_fee);
+        assert_eq!(
+            report.estimate.breakdown.resource_fee,
+            direct.breakdown.resource_fee
+        );
     }
 
     #[test]
@@ -535,20 +539,32 @@ mod tests {
         // Top-level keys.
         assert!(v["profile"].is_object(), "profile key must be an object");
         assert!(v["estimate"].is_object(), "estimate key must be an object");
-        assert!(v["bump_ladder"].is_array(), "bump_ladder key must be an array");
+        assert!(
+            v["bump_ladder"].is_array(),
+            "bump_ladder key must be an array"
+        );
 
         // Breakdown sub-keys.
         let bd = &v["estimate"]["breakdown"];
         for key in ["base_fee", "resource_fee", "inclusion_bid", "per_operation"] {
-            assert!(bd[key]["stroops"].is_number(), "{key}.stroops must be a number");
+            assert!(
+                bd[key]["stroops"].is_number(),
+                "{key}.stroops must be a number"
+            );
             assert!(bd[key]["xlm"].is_string(), "{key}.xlm must be a string");
             assert!(bd[key]["pct"].is_number(), "{key}.pct must be a number");
         }
-        assert!(bd["inclusion_bid"]["bid_ledgers"].is_number(), "bid_ledgers must be present");
+        assert!(
+            bd["inclusion_bid"]["bid_ledgers"].is_number(),
+            "bid_ledgers must be present"
+        );
 
         // total_xlm must look like an XLM string.
         let xlm = v["estimate"]["total_xlm"].as_str().unwrap_or("");
-        assert!(xlm.ends_with(" XLM"), "total_xlm must end with ' XLM', got '{xlm}'");
+        assert!(
+            xlm.ends_with(" XLM"),
+            "total_xlm must end with ' XLM', got '{xlm}'"
+        );
     }
 
     #[test]
@@ -560,11 +576,24 @@ mod tests {
         let ladder = v["bump_ladder"].as_array().unwrap();
 
         for (i, entry) in ladder.iter().enumerate() {
-            assert_eq!(entry["attempt"].as_u64(), Some(i as u64 + 1), "attempt numbers are 1-indexed");
-            assert!(entry["inner_stroops"].is_number(), "inner_stroops must be a number");
-            assert!(entry["outer_stroops"].is_number(), "outer_stroops must be a number");
+            assert_eq!(
+                entry["attempt"].as_u64(),
+                Some(i as u64 + 1),
+                "attempt numbers are 1-indexed"
+            );
+            assert!(
+                entry["inner_stroops"].is_number(),
+                "inner_stroops must be a number"
+            );
+            assert!(
+                entry["outer_stroops"].is_number(),
+                "outer_stroops must be a number"
+            );
             assert!(entry["outer_xlm"].is_string(), "outer_xlm must be a string");
-            assert!(entry["pct_over_signed"].is_number(), "pct_over_signed must be a number");
+            assert!(
+                entry["pct_over_signed"].is_number(),
+                "pct_over_signed must be a number"
+            );
         }
     }
 

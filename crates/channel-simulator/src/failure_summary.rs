@@ -95,7 +95,12 @@ impl FailureCategory {
             | RoutingError::ChannelBaseFeeCapExceeded { .. }
             | RoutingError::HopFeeCapExceeded { .. }
             | RoutingError::RouteFeeCapExceeded { .. } => FailureCategory::FeeCapRejected,
-            RoutingError::InconsistentRouteFees { .. } => FailureCategory::Other,
+            RoutingError::InconsistentRouteFees { .. }
+            | RoutingError::PolicyCheckFailed(_)
+            | RoutingError::TimeoutExceedsBudget { .. }
+            | RoutingError::InvalidHopTimeout { .. }
+            | RoutingError::TimeoutOverflow
+            | RoutingError::ChannelTemporarilyUnavailable { .. } => FailureCategory::Other,
         }
     }
 }

@@ -506,6 +506,49 @@ impl Watchtower {
         })
     }
 
+    /// Deliver `alert` through the configured alert webhook and persist the
+    /// delivery record so it can be retried.
+    pub async fn deliver_alert(
+        &self,
+        alert: &Alert,
+    ) -> Result<alert::AlertDelivery, WatchtowerError> {
+        let destination = self.config.alert_webhook_url.as_deref().ok_or_else(|| {
+            WatchtowerError::InvalidConfig(
+                "alert_webhook_url is required to deliver alerts".to_string(),
+            )
+        })?;
+        Ok(self
+            .alert_delivery
+            .enqueue_and_deliver(alert, destination)
+            .await?)
+    }
+
+    /// List alert deliveries that are still pending.
+    pub fn pending_alert_deliveries(&self) -> Result<Vec<alert::AlertDelivery>, WatchtowerError> {
+        Ok(self.alert_delivery.pending_deliveries()?)
+    }
+
+    /// Retry every pending delivery that is due.
+    pub async fn retry_pending_alerts(&self) -> Result<alert::RetryReport, WatchtowerError> {
+        Ok(self.alert_delivery.retry_pending_deliveries().await?)
+    }
+
+    /// Retry one specific delivery immediately, bypassing its backoff.
+    pub async fn retry_alert_delivery(
+        &self,
+        delivery_id: &alert::DeliveryId,
+    ) -> Result<alert::AlertDelivery, WatchtowerError> {
+        Ok(self.alert_delivery.retry_delivery(delivery_id).await?)
+    }
+
+    /// Look up one alert delivery record.
+    pub fn get_alert_delivery(
+        &self,
+        delivery_id: &alert::DeliveryId,
+    ) -> Result<Option<alert::AlertDelivery>, WatchtowerError> {
+        Ok(self.alert_delivery.get_delivery(delivery_id)?)
+    }
+
     /// Start the watchtower service
     #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // public API; the loop it spawns is what awaits
     pub async fn start(&self) -> Result<(), WatchtowerError> {
@@ -1304,9 +1347,8 @@ mod tests {
             },
             ..Default::default()
         };
-        let error = match Watchtower::new(config) {
-            Ok(_) => panic!("invalid health-check options must be rejected"),
-            Err(error) => error,
+        let Err(error) = Watchtower::new(config) else {
+            panic!("invalid health-check options must be rejected");
         };
         assert!(matches!(error, WatchtowerError::InvalidConfiguration(_)));
         assert!(error.to_string().contains("max_latency_ms"));
@@ -1417,15 +1459,21 @@ mod tests {
     #[test]
     fn distinct_breach_alerts_are_not_deduplicated() {
         let watchtower = Watchtower::new(WatchtowerConfig::default()).unwrap();
-        assert!(watchtower
-            .state()
-            .add_alert_dedup(Alert::breach_attempt("channel-a".to_string(), 2, 5)));
-        assert!(watchtower
-            .state()
-            .add_alert_dedup(Alert::breach_attempt("channel-a".to_string(), 3, 5)));
-        assert!(watchtower
-            .state()
-            .add_alert_dedup(Alert::breach_attempt("channel-b".to_string(), 2, 5)));
+        assert!(watchtower.state().add_alert_dedup(Alert::breach_attempt(
+            "channel-a".to_string(),
+            2,
+            5
+        )));
+        assert!(watchtower.state().add_alert_dedup(Alert::breach_attempt(
+            "channel-a".to_string(),
+            3,
+            5
+        )));
+        assert!(watchtower.state().add_alert_dedup(Alert::breach_attempt(
+            "channel-b".to_string(),
+            2,
+            5
+        )));
         assert_eq!(watchtower.get_alerts(10).len(), 3);
     }
 

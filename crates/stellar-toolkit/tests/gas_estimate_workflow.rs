@@ -47,10 +47,8 @@ fn report_breakdown_percents_sum_to_100_for_default_profile() {
     let sim = testnet_simulator();
     let report = FeeEstimateReport::build(&sim, TransactionProfile::default());
     let pct = &report.percents;
-    let sum = pct.base_fee_pct
-        + pct.resource_fee_pct
-        + pct.inclusion_bid_pct
-        + pct.per_operation_pct;
+    let sum =
+        pct.base_fee_pct + pct.resource_fee_pct + pct.inclusion_bid_pct + pct.per_operation_pct;
     // Four components, each rounded to 1 d.p., so at most ±0.4 rounding error.
     assert!(
         (sum - 100.0).abs() < 0.4,
@@ -96,10 +94,7 @@ fn to_json_contains_all_required_top_level_keys() {
 
     assert!(v["profile"].is_object(), "profile must be an object");
     assert!(v["estimate"].is_object(), "estimate must be an object");
-    assert!(
-        v["bump_ladder"].is_array(),
-        "bump_ladder must be an array"
-    );
+    assert!(v["bump_ladder"].is_array(), "bump_ladder must be an array");
 }
 
 #[test]
@@ -115,10 +110,7 @@ fn to_json_breakdown_has_stroops_xlm_and_pct_for_every_component() {
             bd[key]["stroops"].is_number(),
             "{key}.stroops must be a number"
         );
-        assert!(
-            bd[key]["xlm"].is_string(),
-            "{key}.xlm must be a string"
-        );
+        assert!(bd[key]["xlm"].is_string(), "{key}.xlm must be a string");
         assert!(bd[key]["pct"].is_number(), "{key}.pct must be a number");
     }
     // `inclusion_bid` additionally carries bid_ledgers.
@@ -268,7 +260,9 @@ fn saturating_profile_produces_valid_report_without_panic() {
     let report = FeeEstimateReport::build(&sim, profile);
     assert_eq!(report.estimate.total_stroops, u32::MAX);
     // JSON serialisation must not panic on the saturated value.
-    let json = report.to_json().expect("to_json must not fail on saturated profile");
+    let json = report
+        .to_json()
+        .expect("to_json must not fail on saturated profile");
     let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
     assert_eq!(
         v["estimate"]["total_stroops"].as_u64().unwrap(),
@@ -288,10 +282,10 @@ fn zero_total_stroops_produces_zero_percents() {
         per_operation: 0,
     };
     let pct = bd.percent_of(0);
-    assert_eq!(pct.base_fee_pct, 0.0);
-    assert_eq!(pct.resource_fee_pct, 0.0);
-    assert_eq!(pct.inclusion_bid_pct, 0.0);
-    assert_eq!(pct.per_operation_pct, 0.0);
+    assert!((pct.base_fee_pct - 0.0).abs() < f64::EPSILON);
+    assert!((pct.resource_fee_pct - 0.0).abs() < f64::EPSILON);
+    assert!((pct.inclusion_bid_pct - 0.0).abs() < f64::EPSILON);
+    assert!((pct.per_operation_pct - 0.0).abs() < f64::EPSILON);
 }
 
 // ── Failure path: invalid base_fee is caught by the simulator ────────────────

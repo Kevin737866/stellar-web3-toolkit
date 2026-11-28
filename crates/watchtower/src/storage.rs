@@ -6,6 +6,7 @@ use crate::monitor::{ChannelMonitorState, ChannelUpdate};
 use crate::Alert;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
@@ -333,10 +334,11 @@ impl StorageHealthReport {
             self.read_ok
         );
         if let Some(write_ok) = self.write_probe_ok {
-            summary.push_str(&format!(", write_probe_ok={write_ok}"));
+            write!(summary, ", write_probe_ok={write_ok}")
+                .expect("writing to a String cannot fail");
         }
         for detail in &self.details {
-            summary.push_str(&format!("; {detail}"));
+            write!(summary, "; {detail}").expect("writing to a String cannot fail");
         }
         summary
     }
@@ -368,7 +370,7 @@ pub trait StorageBackend: Send + Sync {
         options: &StorageHealthCheckOptions,
     ) -> Result<StorageHealthReport, StorageError> {
         options.validate()?;
-        probe_health(self, self.backend_name(), options)
+        Ok(probe_health(self, self.backend_name(), options))
     }
 
     /// Store a channel state
@@ -498,6 +500,8 @@ pub struct InMemoryStorage {
     subscriptions: parking_lot::RwLock<Vec<String>>,
     /// Justice action records, keyed by action ID (issue #368).
     justice_actions: parking_lot::RwLock<HashMap<String, crate::justice::JusticeAction>>,
+    /// Alert delivery records, keyed by delivery ID.
+    alert_deliveries: parking_lot::RwLock<HashMap<String, crate::alert::AlertDelivery>>,
 }
 
 impl InMemoryStorage {
@@ -769,9 +773,9 @@ impl StorageBackend for InMemoryStorage {
     ) -> Result<(), StorageError> {
         let mut deliveries = self.alert_deliveries.write();
         let key = delivery.delivery_id.as_str();
-        let slot = deliveries.get_mut(key).ok_or_else(|| {
-            StorageError::QueryError(format!("alert delivery {key} not found"))
-        })?;
+        let slot = deliveries
+            .get_mut(key)
+            .ok_or_else(|| StorageError::QueryError(format!("alert delivery {key} not found")))?;
         *slot = delivery.clone();
         Ok(())
     }
@@ -813,7 +817,7 @@ impl StorageBackend for SqliteStorage {
             probe_writes: false,
             ..*options
         };
-        let mut report = probe_health(self, self.backend_name(), &read_only)?;
+        let mut report = probe_health(self, self.backend_name(), &read_only);
         if report.state == StorageHealthState::Healthy {
             report.state = StorageHealthState::Degraded;
         }
@@ -993,7 +997,7 @@ fn probe_health<B: StorageBackend + ?Sized>(
     backend: &B,
     backend_name: &str,
     options: &StorageHealthCheckOptions,
-) -> Result<StorageHealthReport, StorageError> {
+) -> StorageHealthReport {
     let started = std::time::Instant::now();
     let mut state = StorageHealthState::Healthy;
     let mut details = Vec::new();
@@ -1010,9 +1014,7 @@ fn probe_health<B: StorageBackend + ?Sized>(
 
     let mut write_probe_ok = None;
     if options.probe_writes {
-        if !read_ok {
-            details.push("write probe skipped because the read probe failed".to_string());
-        } else {
+        if read_ok {
             let sentinel = format!("__watchtower_health_probe__{:x}", rand::random::<u128>());
 
             match backend.store_subscription(&sentinel) {
@@ -1055,6 +1057,8 @@ fn probe_health<B: StorageBackend + ?Sized>(
                     write_probe_ok = Some(false);
                 }
             }
+        } else {
+            details.push("write probe skipped because the read probe failed".to_string());
         }
     }
 
@@ -1076,7 +1080,7 @@ fn probe_health<B: StorageBackend + ?Sized>(
         "storage health probe completed"
     );
 
-    Ok(StorageHealthReport {
+    StorageHealthReport {
         backend: backend_name.to_string(),
         state,
         checked_at: current_timestamp(),
@@ -1084,7 +1088,7 @@ fn probe_health<B: StorageBackend + ?Sized>(
         read_ok,
         write_probe_ok,
         details,
-    })
+    }
 }
 
 /// Seconds since the Unix epoch.
@@ -1357,6 +1361,33 @@ mod tests {
                 return Err(Self::probe_error("cleanup"));
             }
             self.inner.remove_subscription(channel_id)
+        }
+
+        fn store_alert_delivery(
+            &self,
+            delivery: &crate::alert::AlertDelivery,
+        ) -> Result<(), StorageError> {
+            self.inner.store_alert_delivery(delivery)
+        }
+
+        fn get_alert_delivery(
+            &self,
+            delivery_id: &str,
+        ) -> Result<Option<crate::alert::AlertDelivery>, StorageError> {
+            self.inner.get_alert_delivery(delivery_id)
+        }
+
+        fn get_pending_alert_deliveries(
+            &self,
+        ) -> Result<Vec<crate::alert::AlertDelivery>, StorageError> {
+            self.inner.get_pending_alert_deliveries()
+        }
+
+        fn update_alert_delivery(
+            &self,
+            delivery: &crate::alert::AlertDelivery,
+        ) -> Result<(), StorageError> {
+            self.inner.update_alert_delivery(delivery)
         }
 
         fn compact(&self, policy: &CompactionPolicy) -> Result<CompactionReport, StorageError> {

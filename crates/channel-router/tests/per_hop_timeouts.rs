@@ -61,6 +61,7 @@ fn end_to_end_route_search_and_policy_expose_consistent_hop_timeouts() {
             required_cltv_delta: Some(15),
             payment_expiry: Some(150),
         }),
+        excluded_unavailable: Vec::new(),
     };
 
     let route = find_best_route(&graph, &request).expect("route should succeed");

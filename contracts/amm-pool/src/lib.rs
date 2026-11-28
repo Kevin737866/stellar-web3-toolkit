@@ -258,10 +258,12 @@ impl AmmPool {
         )
     }
 
-    /// Deposits `token_a` and `token_b` and mints LP shares.
+    /// Add liquidity to the pool (0% fee).
     ///
-    /// LP share minting rounds **down** (floor) via `checked_mint_lp_shares` so
-    /// depositors never receive more shares than backed by their proportional deposit.
+    /// Proportional token quotes (`quote`) and LP share minting
+    /// (`floor(sqrt(amount_a * amount_b))` on first deposit, or
+    /// `min(amount_a * total_lp / reserve_a, amount_b * total_lp / reserve_b)` thereafter)
+    /// use integer division that rounds down (truncates toward zero).
     pub fn add_liquidity(
         env: Env,
         user: Address,
@@ -320,10 +322,10 @@ impl AmmPool {
         liq
     }
 
-    /// Burns `lp_amount` LP shares and redeems proportional `token_a` and `token_b`.
+    /// Burn LP tokens and withdraw pro-rata reserves (0% fee).
     ///
-    /// Token redemption rounds **down** (floor) via `checked_redeem_amounts` so
-    /// redeemers cannot withdraw more reserves than their proportional share entitles them to.
+    /// Withdrawn amounts `lp_amount * reserve / total_lp` round down
+    /// (truncate toward zero), leaving any integer remainder in pool reserves.
     pub fn remove_liquidity(
         env: Env,
         user: Address,
@@ -359,7 +361,11 @@ impl AmmPool {
         (amount_a, amount_b)
     }
 
-    /// Assumes `token_in` already transferred to this pool in this transaction.
+    /// Constant-product swap; assumes `token_in` was already transferred to this pool in this transaction.
+    ///
+    /// Applies a fixed 0.3% (30 basis points, `997 / 1000` parts per thousand) fee on `amount_in`.
+    /// Both the fee-adjusted input (`amount_in * 997 / 1000`) and the output amount
+    /// round down (truncate toward zero), favoring pool reserves. Enforces `out >= min_out`.
     pub fn swap(env: Env, token_in: Address, to: Address, min_out: i128) -> i128 {
         assert_not_in_flash_swap(&env);
         assert!(to != env.current_contract_address(), "to");
@@ -401,7 +407,10 @@ impl AmmPool {
         out
     }
 
-    /// Flash swap: sends assets out, invokes `on_flash` on `callback`, then enforces constant-product K (fee on repaid leg).
+    /// Flash swap: sends assets out, invokes `on_flash` on `callback`, then enforces constant-product K.
+    ///
+    /// Charges a 0.3% (30 basis points, `3 / 1000` parts per thousand) fee on the repaid input leg(s)
+    /// and validates `lhs >= rhs` using exact 256-bit arithmetic (`flash_k_ok`) so rounding favors the pool.
     pub fn flash_swap(
         env: Env,
         recipient: Address,

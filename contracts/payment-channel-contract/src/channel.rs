@@ -131,12 +131,17 @@ impl ChannelManager {
             return Err(PaymentChannelError::InsufficientBalance);
         }
 
-        // Check reserve is maintained
-        if from_a && channel.balance_a - amount < config.channel_reserve {
+        if config.channel_reserve < 0 {
+            return Err(PaymentChannelError::InvalidBalance);
+        }
+
+        // Check reserve is maintained (enforce whichever reserve is stricter)
+        let effective_reserve = config.channel_reserve.max(channel.channel_reserve);
+        if from_a && channel.balance_a - amount < effective_reserve {
             return Err(PaymentChannelError::ReserveNotMet);
         }
 
-        if !from_a && channel.balance_b - amount < config.channel_reserve {
+        if !from_a && channel.balance_b - amount < effective_reserve {
             return Err(PaymentChannelError::ReserveNotMet);
         }
 
