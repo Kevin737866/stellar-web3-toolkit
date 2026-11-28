@@ -8,13 +8,13 @@
 //! account on testnet, and sign (build) transactions.
 
 use crate::error::{Result, ToolkitError};
-use aes_gcm::KeyInit;
-use zeroize::Zeroize;
 use crate::theme::{Style, Theme};
+use aes_gcm::KeyInit;
 use ed25519_dalek::{Signature, Signer, SigningKey};
 use hmac::{Hmac, Mac};
 use sha2::Sha512;
 use std::fmt::Write as _;
+use zeroize::Zeroize;
 
 type HmacSha512 = Hmac<Sha512>;
 
@@ -184,7 +184,6 @@ pub fn format_wallet_summary(wallet: &GeneratedWallet, theme: &Theme) -> String 
     out
 }
 
-
 /// Minimum passphrase length for an exported keystore.
 pub const KEYSTORE_MIN_PASSPHRASE_LENGTH: usize = 12;
 const KEYSTORE_VERSION: u32 = 1;
@@ -238,7 +237,9 @@ pub fn export_keystore(wallet: &GeneratedWallet, passphrase: &str) -> Result<Str
     let private = decode_secret(&wallet.secret)?;
     let account = encode_account(SigningKey::from_bytes(&private).verifying_key().as_bytes());
     if wallet.account != account {
-        return Err(ToolkitError::Wallet("wallet account does not match its secret key".into()));
+        return Err(ToolkitError::Wallet(
+            "wallet account does not match its secret key".into(),
+        ));
     }
     let mut payload = serde_json::to_vec(&KeystorePayload {
         secret: wallet.secret.clone(),
@@ -330,12 +331,15 @@ pub fn import_keystore(document: &str, passphrase: &str) -> Result<ImportedKeyst
     })?;
     let payload_result = serde_json::from_slice::<KeystorePayload>(&plaintext);
     plaintext.zeroize();
-    let payload: KeystorePayload = payload_result
-        .map_err(|_| ToolkitError::Wallet("decrypted keystore payload has an invalid schema".into()))?;
+    let payload: KeystorePayload = payload_result.map_err(|_| {
+        ToolkitError::Wallet("decrypted keystore payload has an invalid schema".into())
+    })?;
     let private = decode_secret(&payload.secret)?;
     let expected = encode_account(SigningKey::from_bytes(&private).verifying_key().as_bytes());
     if payload.account != expected {
-        return Err(ToolkitError::Wallet("keystore account does not match its secret key".into()));
+        return Err(ToolkitError::Wallet(
+            "keystore account does not match its secret key".into(),
+        ));
     }
     Ok(ImportedKeystore {
         secret: payload.secret,
@@ -367,7 +371,6 @@ fn derive_keystore_key(passphrase: &str, salt: &[u8]) -> Result<[u8; 32]> {
         .map_err(|_| ToolkitError::Wallet("keystore key derivation failed".into()))?;
     Ok(key)
 }
-
 
 // ── Network allowlist for wallet funding (issue #332) ────────────────────────
 
@@ -492,15 +495,13 @@ pub fn fund_account_on(account: &str, network: AllowedNetwork) -> Result<()> {
     })?;
 
     let url = format!("{}?addr={account}", network.friendbot_url());
-    let response = ureq::get(&url)
-        .call()
-        .map_err(|e| {
-            ToolkitError::Wallet(format!(
-                "friendbot request for {} on {} failed: {e}",
-                crate::key_hygiene::mask_secret(account),
-                network,
-            ))
-        })?;
+    let response = ureq::get(&url).call().map_err(|e| {
+        ToolkitError::Wallet(format!(
+            "friendbot request for {} on {} failed: {e}",
+            crate::key_hygiene::mask_secret(account),
+            network,
+        ))
+    })?;
     let body = response
         .into_string()
         .map_err(|e| ToolkitError::Wallet(format!("could not read friendbot response: {e}")))?;
@@ -751,10 +752,8 @@ mod tests {
 
     #[test]
     fn from_passphrase_rejects_unknown_passphrase() {
-        let err = AllowedNetwork::from_passphrase(
-            "Public Global Stellar Network ; September 2015",
-        )
-        .unwrap_err();
+        let err = AllowedNetwork::from_passphrase("Public Global Stellar Network ; September 2015")
+            .unwrap_err();
         assert!(
             err.to_string().contains("not in the funding allowlist"),
             "error should name the reason: {err}"
@@ -776,9 +775,7 @@ mod tests {
     #[test]
     fn from_passphrase_is_case_sensitive() {
         // Lower-casing any character must yield a rejection, not a fuzzy match.
-        assert!(
-            AllowedNetwork::from_passphrase("test sdf network ; september 2015").is_err()
-        );
+        assert!(AllowedNetwork::from_passphrase("test sdf network ; september 2015").is_err());
     }
 
     #[test]

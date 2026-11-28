@@ -470,6 +470,9 @@ pub fn format_unix_timestamp_utc(ts: u64) -> String {
     let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
     let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
     let year = y + i64::from(m <= 2);
+    if !(0..=9999).contains(&year) {
+        return "overflow".to_string();
+    }
 
     format!("{year:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}Z")
 }

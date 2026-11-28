@@ -130,6 +130,7 @@ fn clear_expiry(env: &Env, listing_id: u64) {
         .remove(&DataKey::Expiry(listing_id));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_listing_inner(
     env: &Env,
     seller: Address,
@@ -178,6 +179,7 @@ fn create_listing_inner(
 }
 
 #[contractimpl]
+#[allow(clippy::too_many_arguments)]
 impl MarketplaceContract {
     /// One-time configuration of the marketplace fee (in basis points) and the
     /// account that collects it.
@@ -231,6 +233,7 @@ impl MarketplaceContract {
     /// escrow is taken for an order that cannot settle. Expiry timestamps are
     /// ledger timestamps (seconds), not ledger sequence numbers. Sellers can
     /// still cancel an expired listing to recover their escrow.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_listing_with_expiry(
         env: Env,
         seller: Address,

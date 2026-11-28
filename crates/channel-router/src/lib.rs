@@ -207,6 +207,80 @@ pub enum RoutingError {
 
     #[error("Cumulative CLTV timeout delta overflowed u32")]
     TimeoutOverflow,
+
+    #[error(
+        "Channel {channel_id} is temporarily unavailable ({reason:?}) and was excluded from routing"
+    )]
+    ChannelTemporarilyUnavailable {
+        channel_id: String,
+        reason: UnavailabilityReason,
+    },
+}
+
+/// Why a channel is being excluded for a single routing attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum UnavailabilityReason {
+    /// The channel returned a forwarding failure on a recent attempt.
+    ForwardingFailure,
+    /// The remote peer is not reachable right now.
+    PeerOffline,
+    /// The channel is offline or closing.
+    ChannelOffline,
+    /// The channel has insufficient liquidity in the required direction.
+    InsufficientLiquidity,
+    /// A caller-defined reason.
+    Other,
+}
+
+/// A channel that must not be used for the current routing attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnavailableChannel {
+    /// ID of the channel to exclude.
+    pub channel_id: String,
+    /// Why the channel is unavailable.
+    pub reason: UnavailabilityReason,
+    /// Unix timestamp after which the channel may be retried, if known.
+    pub unavailable_until: Option<u64>,
+}
+
+impl UnavailableChannel {
+    /// Construct an entry; validation happens when the router applies it.
+    pub fn until(
+        channel_id: String,
+        reason: UnavailabilityReason,
+        unavailable_until: Option<u64>,
+    ) -> Self {
+        UnavailableChannel {
+            channel_id,
+            reason,
+            unavailable_until,
+        }
+    }
+
+    /// Validate that the channel ID is non-empty and the expiry is unambiguous.
+    pub fn validate(&self) -> Result<(), RoutingError> {
+        if self.channel_id.is_empty() {
+            return Err(RoutingError::ChannelNotFound {
+                channel_id: "(empty)".to_string(),
+            });
+        }
+        if self.unavailable_until == Some(0) {
+            return Err(RoutingError::InvalidNodeAddress);
+        }
+        Ok(())
+    }
+}
+
+/// Build a lookup set of channel IDs that must be skipped, validating each.
+pub(crate) fn build_exclusion_set(
+    entries: &[UnavailableChannel],
+) -> Result<HashSet<&str>, RoutingError> {
+    let mut set = HashSet::with_capacity(entries.len());
+    for entry in entries {
+        entry.validate()?;
+        set.insert(entry.channel_id.as_str());
+    }
+    Ok(set)
 }
 
 /// Represents a node in the payment channel network
@@ -545,6 +619,7 @@ impl RouteRequest {
             max_hops: None,
             find_any: false,
             payment_metadata: None,
+            excluded_unavailable: Vec::new(),
         }
     }
 
@@ -1087,9 +1162,17 @@ pub fn find_best_route_with_policy(
         None => return Err(RoutePolicyError::Rejected(evaluation.report.clone())),
     };
 
-    let num_hops = best.hops.len();
+    let mut hops = best.hops.clone();
+    let num_hops = hops.len();
+    let (final_cltv_delta, max_cltv_budget) = match &request.payment_metadata {
+        Some(meta) => (meta.required_cltv_delta.unwrap_or(0), meta.payment_expiry),
+        None => (0, None),
+    };
+    let (total_cltv_delta, hop_timeouts) =
+        compute_hop_timeouts(&mut hops, final_cltv_delta, max_cltv_budget)
+            .map_err(|err| RoutePolicyError::InvalidRequest(err.to_string()))?;
     Ok(Route {
-        hops: best.hops.clone(),
+        hops,
         total_fees: best.summary.total_fees,
         total_amount: request.amount,
         success_probability: 0.95,
@@ -1101,6 +1184,8 @@ pub fn find_best_route_with_policy(
             num_nodes: num_hops,
             estimated_time_ms: 100 * num_hops as u64,
             is_direct: num_hops == 1,
+            total_cltv_delta,
+            hop_timeouts,
         },
     })
 }

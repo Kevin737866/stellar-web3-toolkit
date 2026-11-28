@@ -700,10 +700,7 @@ require_multisig = true
             assert!(entry.get("name").is_some(), "entry missing `name`");
             assert!(entry.get("path").is_some(), "entry missing `path`");
             assert!(
-                entry
-                    .get("findings")
-                    .and_then(|v| v.as_array())
-                    .is_some(),
+                entry.get("findings").and_then(|v| v.as_array()).is_some(),
                 "entry missing `findings` array"
             );
         }
@@ -802,8 +799,7 @@ require_multisig = true
     fn to_json_respects_single_env_filter() {
         let report = validate_directory(&workspace_config_dir(), Some("dev")).expect("dev only");
         let json = report.to_json();
-        let value: serde_json::Value =
-            serde_json::from_str(&json).expect("valid JSON");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
 
         let configs = value["configs"].as_array().expect("configs array");
         assert_eq!(configs.len(), 1, "only one environment should be present");

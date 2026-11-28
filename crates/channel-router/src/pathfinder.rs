@@ -4,8 +4,8 @@
 
 use crate::fee_cap::FeeCap;
 use crate::{
-    compute_hop_timeouts, NetworkGraph, PaymentMetadata, Route, RouteHop, RouteRequest,
-    RoutingError, MAX_ROUTE_HOPS,
+    build_exclusion_set, compute_hop_timeouts, NetworkGraph, PaymentMetadata, Route, RouteHop,
+    RouteRequest, RoutingError, MAX_ROUTE_HOPS,
 };
 use fxhash::FxHashMap;
 use priority_queue::PriorityQueue;
@@ -160,8 +160,7 @@ impl Pathfinder {
             // Check hop limit (Issue #364)
             let effective_max_hops = request
                 .max_hops
-                .map(|h| h.min(self.max_hops))
-                .unwrap_or(self.max_hops);
+                .map_or(self.max_hops, |h| h.min(self.max_hops));
             if path.len() >= effective_max_hops {
                 continue;
             }
@@ -387,8 +386,7 @@ impl Pathfinder {
 
             let effective_max_hops = request
                 .max_hops
-                .map(|h| h.min(self.max_hops))
-                .unwrap_or(self.max_hops);
+                .map_or(self.max_hops, |h| h.min(self.max_hops));
             if path.len() >= effective_max_hops {
                 continue;
             }
@@ -604,10 +602,6 @@ impl Pathfinder {
         }
 
         amount
-    }
-
-    fn build_route(&self, path: Vec<RouteHop>, amount: i128) -> Result<Route, RoutingError> {
-        self.build_route_with_metadata(path, amount, None)
     }
 
     fn build_route_with_metadata(
@@ -830,14 +824,14 @@ mod tests {
 
         let mut graph = NetworkGraph::new();
         for i in 0..5 {
-            graph.add_node(make_node(&format!("n{}", i)));
+            graph.add_node(make_node(&format!("n{i}")));
         }
 
         // Linear path n0 -> n1 -> n2 -> n3 -> n4 (4 hops)
         for i in 0..4 {
             graph.add_channel(Channel {
-                id: format!("c{}", i),
-                node_a: format!("n{}", i),
+                id: format!("c{i}"),
+                node_a: format!("n{i}"),
                 node_b: format!("n{}", i + 1),
                 capacity_a_to_b: 10_000,
                 capacity_b_to_a: 10_000,

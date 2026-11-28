@@ -291,10 +291,7 @@ impl DidDocument {
     ///   missing or malformed required fields.
     /// * [`DidError::DuplicateVerificationMethodId`] — a verification method
     ///   with the same canonical identifier is already registered.
-    pub fn add_verification_method(
-        &mut self,
-        method: VerificationMethod,
-    ) -> Result<(), DidError> {
+    pub fn add_verification_method(&mut self, method: VerificationMethod) -> Result<(), DidError> {
         validate_verification_method(&method)?;
 
         let candidate = canonical_verification_method_id(&self.id, &method.id);
@@ -386,10 +383,9 @@ impl DidDocument {
     /// Returns [`DidError::InvalidDocument`] on malformed JSON or any
     /// validation error from [`DidDocument::validate`].
     pub fn from_json(json: &str) -> Result<Self, DidError> {
-        let doc: Self =
-            serde_json::from_str(json).map_err(|e| DidError::InvalidDocument {
-                reason: e.to_string(),
-            })?;
+        let doc: Self = serde_json::from_str(json).map_err(|e| DidError::InvalidDocument {
+            reason: e.to_string(),
+        })?;
         doc.validate()?;
         Ok(doc)
     }
@@ -712,11 +708,10 @@ mod tests {
         // by using the Deserialize path via JSON — but since ServiceEndpoint
         // stores a plain String, deserialization does not validate; that is the
         // defence-in-depth path we are testing here).
-        let bad_ep = ServiceEndpoint(
-            // Private field — craft via json round-trip
-            serde_json::from_value::<String>(serde_json::json!("javascript:alert(1)"))
-                .expect("deserialize"),
-        );
+        // The `String` field is private, but deserialization does not validate,
+        // so a JSON round-trip crafts an endpoint that bypassed the constructor.
+        let bad_ep: ServiceEndpoint =
+            serde_json::from_value(serde_json::json!("javascript:alert(1)")).expect("deserialize");
         let svc = Service {
             id: "did:stellar:testnet:GABC#bad".to_string(),
             service_type: "Malicious".to_string(),
@@ -908,7 +903,7 @@ mod tests {
 
     #[test]
     fn from_json_rejects_duplicate_verification_method_ids() {
-        let raw = r#"{
+        let raw = r##"{
             "id": "did:stellar:testnet:GABC",
             "verificationMethod": [
                 {
@@ -922,7 +917,7 @@ mod tests {
                     "controller": "did:stellar:testnet:GABC"
                 }
             ]
-        }"#;
+        }"##;
         let err = DidDocument::from_json(raw).unwrap_err();
         assert!(matches!(err, DidError::DuplicateVerificationMethodId(_)));
     }

@@ -1,18 +1,39 @@
 //! Integration tests for pending HTLC count and capacity in channel status (issue #355).
 
-use std::sync::Arc;
 use payment_channel::{
-    ChannelStatus, Ed25519Signer, HtlcDirection, HtlcState, PaymentChannelError,
-    PaymentChannelManager,
+    ChannelManager, ChannelStatus, HtlcDirection, HtlcState, PaymentChannelError, SignatureSigner,
 };
 
-#[test]
-fn channel_status_tracks_pending_htlc_count_and_capacity_across_lifecycle() {
-    let signer = Arc::new(Ed25519Signer::generate());
-    let manager = PaymentChannelManager::new(signer);
-    let channel_id = manager
-        .open_channel("alice".to_string(), "bob".to_string(), 600, 400, 100, 10)
+/// Deterministic signer: this test exercises status reporting, not cryptography.
+struct TestSigner;
+
+impl SignatureSigner for TestSigner {
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, PaymentChannelError> {
+        Ok(message.to_vec())
+    }
+
+    fn verify(
+        &self,
+        message: &[u8],
+        signature: &[u8],
+        _public_key: &[u8],
+    ) -> Result<bool, PaymentChannelError> {
+        Ok(message == signature)
+    }
+
+    fn public_key(&self) -> Vec<u8> {
+        vec![7; 32]
+    }
+}
+
+#[tokio::test]
+async fn channel_status_tracks_pending_htlc_count_and_capacity_across_lifecycle() {
+    let manager = ChannelManager::new(Box::new(TestSigner));
+    let channel = manager
+        .create_channel("alice".to_string(), "bob".to_string(), 600, 400, 100, 10)
+        .await
         .unwrap();
+    let channel_id = channel.channel_id.clone();
 
     let initial = manager.get_channel_status(&channel_id).unwrap();
     assert_eq!(initial.status, ChannelStatus::Open);

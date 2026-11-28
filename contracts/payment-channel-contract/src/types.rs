@@ -4,6 +4,32 @@
 
 use soroban_sdk::{contracttype, Address, Bytes, BytesN, Env, Map, Val, Vec};
 
+/// Why a channel closed, and by which lifecycle path (#350).
+///
+/// A channel that is still open carries [`CloseReason::NotClosed`]. The reason
+/// is written by the entry point that closes the channel and is never
+/// rewritten afterwards, so it is a stable, externally observable answer to
+/// "how did this channel end?".
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloseReason {
+    /// The channel is still open (or closing cooperatively but not settled).
+    NotClosed,
+    /// Both participants agreed on a final split and called [`cooperative_close`].
+    ///
+    /// [`cooperative_close`]: crate::PaymentChannel::cooperative_close
+    Cooperative,
+    /// The channel settled on a state both participants had signed.
+    ///
+    /// [`settle_signed_state`]: crate::PaymentChannel::settle_signed_state
+    SignedSettlement,
+    /// A participant force-closed the channel without the counterparty's
+    /// agreement.
+    ///
+    /// [`initiate_unilateral_close`]: crate::PaymentChannel::initiate_unilateral_close
+    Unilateral,
+}
+
 /// Represents a payment channel between two participants
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,6 +83,12 @@ pub struct ChannelState {
     pub close_sequence: u32,
     /// Timestamp when channel was closed (0 if open)
     pub close_time: u64,
+    /// Why the channel closed (#350), reported by `get_close_reason`.
+    ///
+    /// Set once by the entry point that closes the channel: cooperative close,
+    /// signed settlement or a unilateral close. Retries of an already-applied
+    /// close do not change it.
+    pub close_reason: CloseReason,
     /// Timeout in seconds for unilateral close dispute period
     pub timeout: u32,
     /// When the channel was created
@@ -122,6 +154,7 @@ impl ChannelState {
             is_cooperative_close: false,
             close_sequence: 0,
             close_time: 0,
+            close_reason: CloseReason::NotClosed,
             timeout,
             created_at: env.ledger().timestamp(),
             fee_percentage,

@@ -538,11 +538,14 @@ pub fn evaluate(
             payment_expiry,
         ) {
             Ok(candidate) => accepted.push(candidate),
-            Err((route, hop_index, reason)) => failures.push(CandidateRouteFailure {
-                route,
-                hop_index,
-                reason,
-            }),
+            Err(err) => {
+                let (route, hop_index, reason) = *err;
+                failures.push(CandidateRouteFailure {
+                    route,
+                    hop_index,
+                    reason,
+                });
+            }
         }
     }
 
@@ -570,7 +573,7 @@ fn evaluate_path(
     fee_budget: i128,
     required_cltv: u32,
     payment_expiry: Option<u32>,
-) -> Result<AcceptedCandidate, (CandidateRouteSummary, Option<usize>, PolicyFailureReason)> {
+) -> Result<AcceptedCandidate, Box<(CandidateRouteSummary, Option<usize>, PolicyFailureReason)>> {
     let channel_ids: Vec<String> = path.iter().map(|(channel, _)| channel.clone()).collect();
     let node_ids: Vec<String> = path.iter().map(|(_, node)| node.clone()).collect();
     let empty_summary = || CandidateRouteSummary {
@@ -582,24 +585,24 @@ fn evaluate_path(
     };
 
     if path.len() > request.max_hops.unwrap_or(policy.max_hops) {
-        return Err((
+        return Err(Box::new((
             empty_summary(),
             None,
             PolicyFailureReason::PathTooLong {
                 hops: path.len(),
                 max: request.max_hops.unwrap_or(policy.max_hops),
             },
-        ));
+        )));
     }
     if path.len() > policy.max_hops {
-        return Err((
+        return Err(Box::new((
             empty_summary(),
             None,
             PolicyFailureReason::PathTooLong {
                 hops: path.len(),
                 max: policy.max_hops,
             },
-        ));
+        )));
     }
 
     let mut hops = Vec::with_capacity(path.len());
@@ -609,17 +612,14 @@ fn evaluate_path(
     let mut current = request.source.as_str();
 
     for (index, (channel_id, next_node)) in path.iter().enumerate() {
-        let channel = match graph.channels.get(channel_id) {
-            Some(channel) => channel,
-            None => {
-                return Err((
-                    empty_summary(),
-                    Some(index),
-                    PolicyFailureReason::ChannelDisabled {
-                        channel_id: channel_id.clone(),
-                    },
-                ))
-            }
+        let Some(channel) = graph.channels.get(channel_id) else {
+            return Err(Box::new((
+                empty_summary(),
+                Some(index),
+                PolicyFailureReason::ChannelDisabled {
+                    channel_id: channel_id.clone(),
+                },
+            )));
         };
         let summary_at = |fees: i128, cltv: u32| CandidateRouteSummary {
             channel_ids: channel_ids.clone(),
@@ -630,13 +630,13 @@ fn evaluate_path(
         };
 
         if policy.excluded_channels.contains(channel_id) {
-            return Err((
+            return Err(Box::new((
                 summary_at(total_fees, total_cltv),
                 Some(index),
                 PolicyFailureReason::ExcludedChannel {
                     channel_id: channel_id.clone(),
                 },
-            ));
+            )));
         }
         if policy.excluded_nodes.contains(next_node) || policy.excluded_nodes.contains(current) {
             let node = if policy.excluded_nodes.contains(current) {
@@ -644,22 +644,22 @@ fn evaluate_path(
             } else {
                 next_node.as_str()
             };
-            return Err((
+            return Err(Box::new((
                 summary_at(total_fees, total_cltv),
                 Some(index),
                 PolicyFailureReason::ExcludedNode {
                     node_id: node.to_string(),
                 },
-            ));
+            )));
         }
         if !channel.enabled {
-            return Err((
+            return Err(Box::new((
                 summary_at(total_fees, total_cltv),
                 Some(index),
                 PolicyFailureReason::ChannelDisabled {
                     channel_id: channel_id.clone(),
                 },
-            ));
+            )));
         }
 
         let available = if channel.node_a == current {
@@ -668,7 +668,7 @@ fn evaluate_path(
             channel.capacity_b_to_a
         };
         if available < forwarded {
-            return Err((
+            return Err(Box::new((
                 summary_at(total_fees, total_cltv),
                 Some(index),
                 PolicyFailureReason::InsufficientLiquidity {
@@ -676,10 +676,10 @@ fn evaluate_path(
                     needed: forwarded,
                     available,
                 },
-            ));
+            )));
         }
         if forwarded < channel.min_htlc_size || forwarded > channel.max_htlc_size {
-            return Err((
+            return Err(Box::new((
                 summary_at(total_fees, total_cltv),
                 Some(index),
                 PolicyFailureReason::HtlcOutsideBounds {
@@ -688,18 +688,18 @@ fn evaluate_path(
                     min: channel.min_htlc_size,
                     max: channel.max_htlc_size,
                 },
-            ));
+            )));
         }
 
         if let Err(error) = cap.check_channel(channel) {
-            return Err((
+            return Err(Box::new((
                 summary_at(total_fees, total_cltv),
                 Some(index),
                 reason_for_routing_error(channel, error),
-            ));
+            )));
         }
         if channel.fee_rate > policy.max_fee_rate {
-            return Err((
+            return Err(Box::new((
                 summary_at(total_fees, total_cltv),
                 Some(index),
                 PolicyFailureReason::FeeRateTooHigh {
@@ -707,10 +707,10 @@ fn evaluate_path(
                     fee_rate_ppm: channel.fee_rate,
                     max_fee_rate_ppm: policy.max_fee_rate,
                 },
-            ));
+            )));
         }
         if channel.base_fee > policy.max_base_fee {
-            return Err((
+            return Err(Box::new((
                 summary_at(total_fees, total_cltv),
                 Some(index),
                 PolicyFailureReason::BaseFeeTooHigh {
@@ -718,7 +718,7 @@ fn evaluate_path(
                     base_fee: channel.base_fee,
                     max_base_fee: policy.max_base_fee,
                 },
-            ));
+            )));
         }
 
         let fee = calculate_channel_fee(
@@ -728,16 +728,16 @@ fn evaluate_path(
             channel.cltv_delta,
         );
         if let Err(error) = cap.check_hop_fee(channel_id, forwarded, channel.cltv_delta, fee) {
-            return Err((
+            return Err(Box::new((
                 summary_at(total_fees, total_cltv),
                 Some(index),
                 reason_for_routing_error(channel, error),
-            ));
+            )));
         }
 
         total_cltv = total_cltv.saturating_add(channel.cltv_delta);
         if total_cltv < required_cltv {
-            return Err((
+            return Err(Box::new((
                 summary_at(total_fees, total_cltv),
                 Some(index),
                 PolicyFailureReason::UnsafeTimeout {
@@ -745,17 +745,17 @@ fn evaluate_path(
                     cltv_delta: channel.cltv_delta,
                     required: required_cltv,
                 },
-            ));
+            )));
         }
         if payment_expiry.is_some_and(|expiry| total_cltv > expiry) {
-            return Err((
+            return Err(Box::new((
                 summary_at(total_fees, total_cltv),
                 Some(index),
                 PolicyFailureReason::TimeoutExceedsExpiry {
                     total_cltv,
                     expiry: payment_expiry.expect("checked above"),
                 },
-            ));
+            )));
         }
 
         hops.push(RouteHop::new(
@@ -779,17 +779,17 @@ fn evaluate_path(
     };
 
     if total_fees > fee_budget {
-        return Err((
+        return Err(Box::new((
             summary_at(total_fees, total_cltv),
             None,
             PolicyFailureReason::RouteFeeTooHigh {
                 fee: total_fees,
                 budget: fee_budget,
             },
-        ));
+        )));
     }
     if let Err(error) = cap.check_route_fee(request.amount, total_fees) {
-        return Err((
+        return Err(Box::new((
             summary_at(total_fees, total_cltv),
             None,
             match error {
@@ -801,7 +801,7 @@ fn evaluate_path(
                     budget: cap.max_route_fee(request.amount),
                 },
             },
-        ));
+        )));
     }
 
     let summary = CandidateRouteSummary {
@@ -877,14 +877,17 @@ mod tests {
             max_hops: None,
             find_any: false,
             payment_metadata: None,
+            excluded_unavailable: Vec::new(),
         }
     }
 
     #[test]
     fn fee_rate_rejection_names_channel_and_cap() {
         let graph = graph_with(vec![channel("ch1", "alice", "bob", 10_000, 2_000, 0, 0)]);
-        let mut policy = RoutingPolicy::default();
-        policy.max_fee_rate = 1_000;
+        let policy = RoutingPolicy {
+            max_fee_rate: 1_000,
+            ..RoutingPolicy::default()
+        };
 
         let report = evaluate_route_policy(&graph, &request("alice", "bob", 1_000), &policy)
             .expect("evaluation should succeed");
@@ -979,19 +982,26 @@ mod tests {
     #[test]
     fn boundary_values_are_accepted() {
         let graph = graph_with(vec![channel("ch1", "alice", "bob", 100, 1_000, 0, 0)]);
-        let mut policy = RoutingPolicy::default();
-        policy.max_fee_rate = 1_000;
-        let mut request = request("alice", "bob", 100);
-        request.max_fee_budget = Some(0);
+        let policy = RoutingPolicy {
+            max_fee_rate: 1_000,
+            ..RoutingPolicy::default()
+        };
+        let boundary_request = RouteRequest {
+            max_fee_budget: Some(0),
+            ..request("alice", "bob", 100)
+        };
 
-        let report = evaluate_route_policy(&graph, &request, &policy).unwrap();
+        let report = evaluate_route_policy(&graph, &boundary_request, &policy).unwrap();
         assert_eq!(report.accepted, 1);
         assert!(report.failures.is_empty());
         assert!(report.has_route());
 
-        request.max_fee_budget = Some(-1);
+        let rejected = RouteRequest {
+            max_fee_budget: Some(-1),
+            ..request("alice", "bob", 100)
+        };
         assert!(matches!(
-            evaluate_route_policy(&graph, &request, &policy),
+            evaluate_route_policy(&graph, &rejected, &policy),
             Err(RoutePolicyError::InvalidRequest(_))
         ));
     }
@@ -1040,8 +1050,10 @@ mod tests {
             Err(RoutePolicyError::InvalidRequest(_))
         ));
 
-        let mut bad_policy = RoutingPolicy::default();
-        bad_policy.max_hops = 0;
+        let bad_policy = RoutingPolicy {
+            max_hops: 0,
+            ..RoutingPolicy::default()
+        };
         assert!(matches!(
             evaluate_route_policy(&graph, &request("alice", "bob", 10), &bad_policy),
             Err(RoutePolicyError::InvalidPolicy(_))

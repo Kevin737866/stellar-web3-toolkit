@@ -16,6 +16,7 @@ use soroban_sdk::{
     contract, contractimpl, contractmeta, Address, Bytes, BytesN, Env, IntoVal, TryFromVal,
     Vec as SorobanVec,
 };
+pub use types::CloseReason;
 use types::{ChannelState, ChannelStatusReport, HTLCInfo, HtlcList};
 
 /// Append an address's canonical strkey encoding to `out`.
@@ -437,6 +438,10 @@ impl PaymentChannel {
     /// A close is refused while the channel has unsettled HTLCs
     /// ([`PaymentChannelError::ActiveHtlcsExist`]): the HTLC amounts are held
     /// outside the two balances, so closing over them would strand them.
+    ///
+    /// The first successful close stamps `close_reason` with
+    /// [`CloseReason::Cooperative`] (#350); a retry leaves the stamped reason
+    /// untouched.
     pub fn cooperative_close(
         env: Env,
         channel_id: BytesN<32>,
@@ -480,6 +485,7 @@ impl PaymentChannel {
         state.balance_a = final_balance_a;
         state.balance_b = final_balance_b;
         state.is_cooperative_close = true;
+        state.close_reason = CloseReason::Cooperative;
         state.close_time = env.ledger().timestamp();
         state.sequence_number += 1;
         state.close_sequence = state.sequence_number;
@@ -509,7 +515,8 @@ impl PaymentChannel {
     ///
     /// On success the split is applied, the sequence number advances to
     /// `signed_sequence` (gaps are allowed, because a participant may have
-    /// missed intermediate updates), and the channel is marked settled.
+    /// missed intermediate updates), the channel is marked settled, and
+    /// `close_reason` is stamped with [`CloseReason::SignedSettlement`] (#350).
     ///
     /// # Signatures
     ///
@@ -571,6 +578,7 @@ impl PaymentChannel {
         state.balance_b = new_balance_b;
         state.sequence_number = signed_sequence;
         state.is_cooperative_close = true;
+        state.close_reason = CloseReason::SignedSettlement;
         state.close_time = env.ledger().timestamp();
         state.close_sequence = signed_sequence;
 
@@ -585,6 +593,12 @@ impl PaymentChannel {
     }
 
     /// Initiate unilateral close of the channel
+    ///
+    /// Only a participant may do this and the channel must be open. On success
+    /// `close_reason` is stamped with [`CloseReason::Unilateral`] (#350); the
+    /// dispute window is still reported through the returned withdraw time.
+    /// [`PaymentChannel::contest_close`] does not change the reason, because it
+    /// only records that a newer state exists.
     pub fn initiate_unilateral_close(
         env: Env,
         channel_id: BytesN<32>,
@@ -611,6 +625,7 @@ impl PaymentChannel {
         }
 
         state.close_time = env.ledger().timestamp();
+        state.close_reason = CloseReason::Unilateral;
         state.sequence_number += 1;
 
         state::store_channel_state(&env, &channel_id, &state);
@@ -694,6 +709,21 @@ impl PaymentChannel {
         );
 
         Ok(())
+    }
+
+    /// Get why a channel closed (#350).
+    ///
+    /// Returns [`CloseReason::NotClosed`] while the channel is still open, and
+    /// [`PaymentChannelError::ChannelNotFound`] for an unknown channel id, so a
+    /// caller can tell "still open" apart from "no such channel" instead of
+    /// reading a default. The same value is part of
+    /// [`PaymentChannel::get_channel_state`].
+    pub fn get_close_reason(
+        env: Env,
+        channel_id: BytesN<32>,
+    ) -> Result<CloseReason, PaymentChannelError> {
+        let state = state::get_channel_state(&env, &channel_id)?;
+        Ok(state.close_reason)
     }
 
     /// Get all HTLCs for a channel
@@ -814,6 +844,98 @@ mod tests {
     }
 
     #[test]
+    fn test_close_reason_is_not_closed_while_open() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _p_a, _p_b, channel_id) = setup_channel(&env);
+
+        assert_eq!(client.get_close_reason(&channel_id), CloseReason::NotClosed);
+        assert_eq!(
+            client.get_channel_state(&channel_id).close_reason,
+            CloseReason::NotClosed
+        );
+    }
+
+    #[test]
+    fn test_close_reason_for_unknown_channel_is_not_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _p_a, _p_b, _channel_id) = setup_channel(&env);
+        let unknown = BytesN::from_array(&env, &[9u8; 32]);
+
+        assert_eq!(
+            client.try_get_close_reason(&unknown),
+            Err(Ok(PaymentChannelError::ChannelNotFound))
+        );
+    }
+
+    #[test]
+    fn test_cooperative_close_records_cooperative_reason() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _p_a, _p_b, channel_id) = setup_channel(&env);
+        let dummy_sig = BytesN::from_array(&env, &[0u8; 64]);
+
+        client.cooperative_close(&channel_id, &1_200, &800, &dummy_sig, &dummy_sig);
+
+        assert_eq!(
+            client.get_close_reason(&channel_id),
+            CloseReason::Cooperative
+        );
+
+        // The retry is a no-op and must not rewrite the reason.
+        client.cooperative_close(&channel_id, &1_200, &800, &dummy_sig, &dummy_sig);
+        assert_eq!(
+            client.get_close_reason(&channel_id),
+            CloseReason::Cooperative
+        );
+    }
+
+    #[test]
+    fn test_signed_settlement_records_signed_settlement_reason() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _p_a, _p_b, channel_id) = setup_channel(&env);
+        let dummy_sig = BytesN::from_array(&env, &[0u8; 64]);
+
+        client.settle_signed_state(&channel_id, &1_100, &900, &1, &dummy_sig, &dummy_sig);
+
+        assert_eq!(
+            client.get_close_reason(&channel_id),
+            CloseReason::SignedSettlement
+        );
+    }
+
+    #[test]
+    fn test_unilateral_close_records_unilateral_reason() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, p_a, _p_b, channel_id) = setup_channel(&env);
+
+        client.initiate_unilateral_close(&channel_id, &p_a);
+
+        assert_eq!(
+            client.get_close_reason(&channel_id),
+            CloseReason::Unilateral
+        );
+    }
+
+    #[test]
+    fn test_a_rejected_close_does_not_record_a_reason() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _p_a, _p_b, channel_id) = setup_channel(&env);
+        let dummy_sig = BytesN::from_array(&env, &[0u8; 64]);
+
+        // The split does not conserve the channel total.
+        let rejected =
+            client.try_cooperative_close(&channel_id, &1_000, &500, &dummy_sig, &dummy_sig);
+        assert_eq!(rejected, Err(Ok(PaymentChannelError::BalanceMismatch)));
+
+        assert_eq!(client.get_close_reason(&channel_id), CloseReason::NotClosed);
+    }
+
+    #[test]
     fn test_get_channel_status_exposes_pending_htlcs_and_capacity() {
         let env = Env::default();
         env.mock_all_auths();
@@ -828,31 +950,32 @@ mod tests {
 
         // Add one active HTLC and one claimed HTLC directly in contract storage
         // to verify only active HTLCs are counted.
-        let active_id = BytesN::from_array(&env, &[1u8; 32]);
-        let claimed_id = BytesN::from_array(&env, &[2u8; 32]);
         let mut active_htlc = HTLCInfo::new(
-            active_id.clone(),
-            300,
+            &env,
             BytesN::from_array(&env, &[7u8; 32]),
             1_000,
+            300,
             p_a.clone(),
             p_b.clone(),
         );
         active_htlc.is_claimed = false;
+        let active_id = active_htlc.htlc_id.clone();
         let mut claimed_htlc = HTLCInfo::new(
-            claimed_id.clone(),
-            500,
+            &env,
             BytesN::from_array(&env, &[8u8; 32]),
             1_000,
+            500,
             p_a,
             p_b,
         );
         claimed_htlc.is_claimed = true;
+        let claimed_id = claimed_htlc.htlc_id.clone();
 
         env.as_contract(&client.address, || {
             let mut st = state::get_channel_state(&env, &channel_id).unwrap();
-            st.htlcs.set(active_id.to_val(), active_htlc.to_val());
-            st.htlcs.set(claimed_id.to_val(), claimed_htlc.to_val());
+            st.htlcs.set(active_id.to_val(), active_htlc.into_val(&env));
+            st.htlcs
+                .set(claimed_id.to_val(), claimed_htlc.into_val(&env));
             state::store_channel_state(&env, &channel_id, &st);
         });
 

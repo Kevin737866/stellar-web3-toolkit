@@ -12,9 +12,8 @@ pub mod statistics;
 
 pub use baseline::{
     baseline_network, baseline_nodes, baseline_simulated_nodes, validate_baseline_specs,
-    BaselineChannelSpec, BaselineFailureCase, BaselineNodeSpec, BaselineRouteCase,
-    BASELINE_AMOUNT, BASELINE_CHANNELS, BASELINE_NETWORK_NAME, BASELINE_NODES, BASELINE_ROUTES,
-    BASELINE_UNROUTABLE,
+    BaselineChannelSpec, BaselineFailureCase, BaselineNodeSpec, BaselineRouteCase, BASELINE_AMOUNT,
+    BASELINE_CHANNELS, BASELINE_NETWORK_NAME, BASELINE_NODES, BASELINE_ROUTES, BASELINE_UNROUTABLE,
 };
 pub use disconnection::{DisconnectionConfig, DisconnectionTracker, MAX_DOWNTIME_STEPS};
 pub use failure_summary::{FailedPayment, FailureCategory, FailureSummary, MAX_FAILURE_SAMPLES};
@@ -498,6 +497,7 @@ impl Simulator {
                 max_hops: Some(20),
                 find_any: false,
                 payment_metadata: None,
+                excluded_unavailable: Vec::new(),
             };
 
             let route_result = {
@@ -781,6 +781,7 @@ impl Simulator {
                     max_hops: None,
                     find_any: false,
                     payment_metadata: None,
+                    excluded_unavailable: Vec::new(),
                 },
             );
         }
@@ -803,6 +804,7 @@ impl Simulator {
                     max_hops: None,
                     find_any: false,
                     payment_metadata: None,
+                    excluded_unavailable: Vec::new(),
                 },
             );
         }
@@ -825,6 +827,7 @@ impl Simulator {
                     max_hops: None,
                     find_any: false,
                     payment_metadata: None,
+                    excluded_unavailable: Vec::new(),
                 },
             );
         }

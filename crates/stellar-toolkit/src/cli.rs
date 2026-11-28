@@ -1389,7 +1389,9 @@ fn run_scaffold(cmd: &ScaffoldCommand) -> Result<()> {
 }
 
 fn run_gas(cmd: &GasCommand) -> Result<()> {
-    use crate::gas_simulator::{format_stroops, FeeEstimateReport, FeeSchedule, GasSimulator, TransactionProfile};
+    use crate::gas_simulator::{
+        format_stroops, FeeEstimateReport, FeeSchedule, GasSimulator, TransactionProfile,
+    };
     match cmd {
         GasCommand::Estimate {
             operations,

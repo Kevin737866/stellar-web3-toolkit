@@ -687,6 +687,9 @@ impl TopologyFuzzer {
                 }
             }
 
+            let payment = self.random_payment(&graph, &mut rng);
+            // Fewer than two nodes, or no channels at all: nothing to route.
+            let Some(request) = payment else {
             // Fewer than two nodes, or no channels at all: nothing to route.
             let Some(request) = self.random_payment(&graph, &mut rng) else {
                 if self.config.disconnection.is_some() {
@@ -857,6 +860,7 @@ impl TopologyFuzzer {
             max_hops: None,
             find_any: false,
             payment_metadata: None,
+            excluded_unavailable: Vec::new(),
         })
     }
 }
@@ -912,7 +916,7 @@ mod tests {
                 capacity_b_to_a: 1_000_000,
                 base_fee: 1,
                 fee_rate: 1_000,
-                cltv_delta: 0,
+                cltv_delta: 40,
                 min_htlc_size: 1,
                 max_htlc_size: 1_000_000,
                 htlcs_in_flight: 0,
@@ -1018,6 +1022,7 @@ mod tests {
             max_hops: None,
             find_any: false,
             payment_metadata: None,
+            excluded_unavailable: Vec::new(),
         };
 
         let route = Pathfinder::new()
@@ -1037,6 +1042,7 @@ mod tests {
             max_hops: None,
             find_any: false,
             payment_metadata: None,
+            excluded_unavailable: Vec::new(),
         };
 
         let route = Pathfinder::new()
@@ -1047,6 +1053,7 @@ mod tests {
         // Same route, longer request: it no longer ends at the destination.
         let longer = RouteRequest {
             destination: "c".to_string(),
+            excluded_unavailable: Vec::new(),
             ..request
         };
         assert!(verify_route(&graph, &longer, &route).is_err());

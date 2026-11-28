@@ -3,7 +3,7 @@
 //! Routing policies and constraints for the payment channel router.
 
 use crate::{
-    Channel, NetworkGraph, Route, RouteHop, RouteMetadata, RouteRequest, RoutingError,
+    Channel, NetworkGraph, Route, RouteHop, RouteRequest, RoutingError, UnavailableChannel,
     MAX_ROUTE_HOPS,
 };
 use serde::{Deserialize, Serialize};
@@ -79,13 +79,13 @@ impl PolicyCheckReport {
                 .iter()
                 .map(|v| match v {
                     PolicyViolation::MaxHopsExceeded { actual_hops, limit } => {
-                        format!("hop count {} exceeds limit {}", actual_hops, limit)
+                        format!("hop count {actual_hops} exceeds limit {limit}")
                     }
                     PolicyViolation::FeeBpsExceeded {
                         actual_bps,
                         max_bps,
                     } => {
-                        format!("fee {} bps exceeds maximum {} bps", actual_bps, max_bps)
+                        format!("fee {actual_bps} bps exceeds maximum {max_bps} bps")
                     }
                     PolicyViolation::BaseFeeExceeded {
                         base_fee,
@@ -93,8 +93,7 @@ impl PolicyCheckReport {
                         channel_id,
                     } => {
                         format!(
-                            "channel {} base fee {} exceeds maximum {}",
-                            channel_id, base_fee, max_base_fee
+                            "channel {channel_id} base fee {base_fee} exceeds maximum {max_base_fee}"
                         )
                     }
                     PolicyViolation::FeeRateExceeded {
@@ -103,21 +102,20 @@ impl PolicyCheckReport {
                         channel_id,
                     } => {
                         format!(
-                            "channel {} fee rate {} ppm exceeds maximum {} ppm",
-                            channel_id, fee_rate, max_fee_rate
+                            "channel {channel_id} fee rate {fee_rate} ppm exceeds maximum {max_fee_rate} ppm"
                         )
                     }
                     PolicyViolation::ExcludedNode { node } => {
-                        format!("node {} is in policy excluded_nodes", node)
+                        format!("node {node} is in policy excluded_nodes")
                     }
                     PolicyViolation::ExcludedChannel { channel_id } => {
-                        format!("channel {} is in policy excluded_channels", channel_id)
+                        format!("channel {channel_id} is in policy excluded_channels")
                     }
                     PolicyViolation::AmountBelowMinimum { amount, min_amount } => {
-                        format!("amount {} below minimum {}", amount, min_amount)
+                        format!("amount {amount} below minimum {min_amount}")
                     }
                     PolicyViolation::AmountAboveMaximum { amount, max_amount } => {
-                        format!("amount {} above maximum {}", amount, max_amount)
+                        format!("amount {amount} above maximum {max_amount}")
                     }
                 })
                 .collect();
@@ -554,6 +552,7 @@ impl SelectionStrategy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RouteMetadata;
 
     #[test]
     fn test_policy_defaults() {
@@ -571,9 +570,11 @@ mod tests {
 
     #[test]
     fn test_policy_violation_reporting() {
-        let mut policy = RoutingPolicy::default();
-        policy.max_hops = 1;
-        policy.excluded_nodes.insert("forbidden_node".to_string());
+        let policy = RoutingPolicy {
+            max_hops: 1,
+            excluded_nodes: HashSet::from(["forbidden_node".to_string()]),
+            ..RoutingPolicy::default()
+        };
 
         let route = Route {
             hops: vec![
@@ -588,6 +589,8 @@ mod tests {
                 num_nodes: 3,
                 estimated_time_ms: 0,
                 is_direct: false,
+                total_cltv_delta: 0,
+                hop_timeouts: Vec::new(),
             },
         };
 

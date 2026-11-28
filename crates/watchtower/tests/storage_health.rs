@@ -73,6 +73,33 @@ impl StorageBackend for FailingStorage {
         self.inner.store_alert(alert)
     }
 
+    fn store_alert_delivery(
+        &self,
+        delivery: &watchtower::alert::AlertDelivery,
+    ) -> Result<(), StorageError> {
+        self.inner.store_alert_delivery(delivery)
+    }
+
+    fn get_alert_delivery(
+        &self,
+        delivery_id: &str,
+    ) -> Result<Option<watchtower::alert::AlertDelivery>, StorageError> {
+        self.inner.get_alert_delivery(delivery_id)
+    }
+
+    fn get_pending_alert_deliveries(
+        &self,
+    ) -> Result<Vec<watchtower::alert::AlertDelivery>, StorageError> {
+        self.inner.get_pending_alert_deliveries()
+    }
+
+    fn update_alert_delivery(
+        &self,
+        delivery: &watchtower::alert::AlertDelivery,
+    ) -> Result<(), StorageError> {
+        self.inner.update_alert_delivery(delivery)
+    }
+
     fn get_alerts(&self, limit: usize) -> Result<Vec<Alert>, StorageError> {
         self.inner.get_alerts(limit)
     }

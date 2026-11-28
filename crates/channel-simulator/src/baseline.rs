@@ -122,6 +122,7 @@ impl BaselineRouteCase {
             max_hops: None,
             find_any: false,
             payment_metadata: None,
+            excluded_unavailable: Vec::new(),
         }
     }
 }
@@ -150,6 +151,7 @@ impl BaselineFailureCase {
             max_hops: None,
             find_any: false,
             payment_metadata: None,
+            excluded_unavailable: Vec::new(),
         }
     }
 }
